@@ -5,6 +5,10 @@
 //! feature. Callers cannot tell whether that feature is enabled on this crate, so nothing here
 //! exposes a feature-gated type.
 
+#[cfg(feature = "experimental")]
+use crate::data_converters::{
+    StorageDriverActivityInfo, StorageDriverTargetInfo, StorageDriverWorkflowInfo,
+};
 use crate::{
     data_converters::{DataConverter, PayloadConversionError},
     payload_visitor::PayloadVisitable,
@@ -23,13 +27,76 @@ mod runner;
 pub async fn store_external_payloads<M: PayloadVisitable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
+    target: Option<StoreTarget>,
 ) -> Result<(), PayloadConversionError> {
-    // Stored without a target until the worker and client can name the execution a message is for.
     #[cfg(feature = "experimental")]
-    runner::store_in(data_converter.external_storage(), msg, None).await?;
+    runner::store_in(
+        data_converter.external_storage(),
+        msg,
+        target.as_ref().map(|t| &t.info),
+    )
+    .await?;
     #[cfg(not(feature = "experimental"))]
-    let _ = (msg, data_converter);
+    let _ = (msg, data_converter, target);
     Ok(())
+}
+
+/// The execution an outbound message's payloads are stored on behalf of, given to
+/// [`store_external_payloads`]. Callers build this rather than the driver-facing target type,
+/// which only exists with the `experimental` feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreTarget {
+    #[cfg(feature = "experimental")]
+    info: StorageDriverTargetInfo,
+}
+
+impl StoreTarget {
+    /// A workflow target. An empty string, which is how a proto leaves a field unset, means
+    /// unknown.
+    pub fn workflow(namespace: &str, id: &str, run_id: &str, workflow_type: &str) -> Self {
+        #[cfg(feature = "experimental")]
+        return Self {
+            info: StorageDriverTargetInfo::Workflow(
+                StorageDriverWorkflowInfo::builder()
+                    .namespace(namespace.to_owned())
+                    .maybe_id(non_empty(id))
+                    .maybe_run_id(non_empty(run_id))
+                    .maybe_workflow_type(non_empty(workflow_type))
+                    .build(),
+            ),
+        };
+        #[cfg(not(feature = "experimental"))]
+        {
+            let _ = (namespace, id, run_id, workflow_type);
+            Self {}
+        }
+    }
+
+    /// A standalone activity target. An empty string, which is how a proto leaves a field unset,
+    /// means unknown.
+    pub fn activity(namespace: &str, id: &str, run_id: &str, activity_type: &str) -> Self {
+        #[cfg(feature = "experimental")]
+        return Self {
+            info: StorageDriverTargetInfo::Activity(
+                StorageDriverActivityInfo::builder()
+                    .namespace(namespace.to_owned())
+                    .maybe_id(non_empty(id))
+                    .maybe_run_id(non_empty(run_id))
+                    .maybe_activity_type(non_empty(activity_type))
+                    .build(),
+            ),
+        };
+        #[cfg(not(feature = "experimental"))]
+        {
+            let _ = (namespace, id, run_id, activity_type);
+            Self {}
+        }
+    }
+}
+
+#[cfg(feature = "experimental")]
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Replace every external storage reference in an inbound message with the payload it points at.

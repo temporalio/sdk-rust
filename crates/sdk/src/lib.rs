@@ -151,7 +151,7 @@ use temporalio_common::{
         ActivitySerializationContext, DataConverter, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    external_storage::{retrieve_external_payloads, store_external_payloads},
+    external_storage::{StoreTarget, retrieve_external_payloads, store_external_payloads},
     payload_visitor::{decode_payloads, encode_payloads},
     protos::{
         TaskToken,
@@ -159,8 +159,12 @@ use temporalio_common::{
             ActivityTaskCompletion,
             activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task},
+            common::NamespacedWorkflowExecution,
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
-            workflow_completion::WorkflowActivationCompletion,
+            workflow_commands::{
+                WorkflowCommand, signal_external_workflow_execution, workflow_command,
+            },
+            workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion},
         },
         temporal::api::{
             common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
@@ -824,6 +828,105 @@ struct WorkflowHalf {
 struct WorkflowData {
     /// Channel used to send the workflow activations
     activation_chan: UnboundedSender<WorkflowActivation>,
+    store_targets: Arc<RunStoreTargets>,
+}
+
+/// Captured when the run starts, since a completion carries only its run id.
+#[derive(Debug)]
+struct RunStoreTargets {
+    namespace: String,
+    workflow_id: String,
+    run_id: String,
+    workflow_type: String,
+    /// Set for a child that was not continued from another run.
+    parent: Option<NamespacedWorkflowExecution>,
+}
+
+impl RunStoreTargets {
+    fn current(&self) -> StoreTarget {
+        StoreTarget::workflow(
+            &self.namespace,
+            &self.workflow_id,
+            &self.run_id,
+            &self.workflow_type,
+        )
+    }
+
+    fn namespace_or_current<'a>(&'a self, namespace: &'a str) -> &'a str {
+        if namespace.is_empty() {
+            &self.namespace
+        } else {
+            namespace
+        }
+    }
+
+    /// A command that hands payloads to another execution stores them on behalf of that execution.
+    ///
+    /// Every command is listed, with no catch-all, so that a command added to the API fails to
+    /// compile until someone decides its target. Falling back to the current run would give it a
+    /// target that looks right and may not be.
+    fn for_command(&self, command: &WorkflowCommand) -> Option<StoreTarget> {
+        let variant = command.variant.as_ref()?;
+        Some(match variant {
+            workflow_command::Variant::StartChildWorkflowExecution(child) => StoreTarget::workflow(
+                self.namespace_or_current(&child.namespace),
+                &child.workflow_id,
+                "",
+                &child.workflow_type,
+            ),
+            workflow_command::Variant::SignalExternalWorkflowExecution(signal) => {
+                match signal.target.as_ref()? {
+                    signal_external_workflow_execution::Target::WorkflowExecution(execution) => {
+                        StoreTarget::workflow(
+                            self.namespace_or_current(&execution.namespace),
+                            &execution.workflow_id,
+                            &execution.run_id,
+                            "",
+                        )
+                    }
+                    signal_external_workflow_execution::Target::ChildWorkflowId(id) => {
+                        StoreTarget::workflow(&self.namespace, id, "", "")
+                    }
+                }
+            }
+            workflow_command::Variant::ContinueAsNewWorkflowExecution(next) => {
+                let workflow_type = if next.workflow_type.is_empty() {
+                    &self.workflow_type
+                } else {
+                    &next.workflow_type
+                };
+                StoreTarget::workflow(&self.namespace, &self.workflow_id, "", workflow_type)
+            }
+            workflow_command::Variant::CompleteWorkflowExecution(_) => match &self.parent {
+                Some(parent) => StoreTarget::workflow(
+                    self.namespace_or_current(&parent.namespace),
+                    &parent.workflow_id,
+                    &parent.run_id,
+                    "",
+                ),
+                None => self.current(),
+            },
+            // This run reads these payloads again when it replays.
+            workflow_command::Variant::StartTimer(_)
+            | workflow_command::Variant::ScheduleActivity(_)
+            | workflow_command::Variant::RespondToQuery(_)
+            | workflow_command::Variant::RequestCancelActivity(_)
+            | workflow_command::Variant::CancelTimer(_)
+            | workflow_command::Variant::FailWorkflowExecution(_)
+            | workflow_command::Variant::CancelWorkflowExecution(_)
+            | workflow_command::Variant::SetPatchMarker(_)
+            | workflow_command::Variant::CancelChildWorkflowExecution(_)
+            | workflow_command::Variant::RequestCancelExternalWorkflowExecution(_)
+            | workflow_command::Variant::CancelSignalWorkflow(_)
+            | workflow_command::Variant::ScheduleLocalActivity(_)
+            | workflow_command::Variant::RequestCancelLocalActivity(_)
+            | workflow_command::Variant::UpsertWorkflowSearchAttributes(_)
+            | workflow_command::Variant::ModifyWorkflowProperties(_)
+            | workflow_command::Variant::UpdateResponse(_)
+            | workflow_command::Variant::ScheduleNexusOperation(_)
+            | workflow_command::Variant::RequestCancelNexusOperation(_) => self.current(),
+        })
+    }
 }
 
 struct WorkflowFutureHandle<F: Future> {
@@ -880,6 +983,7 @@ impl ActivityNotRegisteredError {
 async fn encode_workflow_completion(
     completion: &mut WorkflowActivationCompletion,
     data_converter: &DataConverter,
+    run: Option<&RunStoreTargets>,
 ) {
     let run_id = completion.run_id.clone();
     let encoded = async {
@@ -889,7 +993,19 @@ async fn encode_workflow_completion(
             &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
         .await?;
-        store_external_payloads(completion, data_converter).await?;
+        match &mut completion.status {
+            Some(workflow_activation_completion::Status::Successful(success)) => {
+                for command in &mut success.commands {
+                    let target = run.and_then(|run| run.for_command(command));
+                    store_external_payloads(command, data_converter, target).await?;
+                }
+            }
+            Some(workflow_activation_completion::Status::Failed(failed)) => {
+                let target = run.map(RunStoreTargets::current);
+                store_external_payloads(failed, data_converter, target).await?;
+            }
+            None => {}
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -909,6 +1025,7 @@ async fn encode_workflow_completion(
 async fn encode_activity_completion(
     completion: &mut ActivityTaskCompletion,
     data_converter: &DataConverter,
+    target: Option<StoreTarget>,
 ) {
     let encoded = async {
         encode_payloads(
@@ -917,7 +1034,7 @@ async fn encode_activity_completion(
             &SerializationContextData::Activity(ActivitySerializationContext::new()),
         )
         .await?;
-        store_external_payloads(completion, data_converter).await?;
+        store_external_payloads(completion, data_converter, target).await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -1194,13 +1311,26 @@ impl Worker {
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)
                 .map(Ok)
-                .try_for_each_concurrent(None, |mut completion| async {
-                    encode_workflow_completion(&mut completion, &common.data_converter).await;
-                    for i in &common.worker_interceptors {
-                        i.on_workflow_activation_completion(&completion).await;
-                    }
-                    common.worker.complete_workflow_activation(completion).await
-                })
+                .try_for_each_concurrent(
+                    None,
+                    |mut completion: WorkflowActivationCompletion| async {
+                        let run = wf_half
+                            .workflows
+                            .borrow()
+                            .get(&completion.run_id)
+                            .map(|data| Arc::clone(&data.store_targets));
+                        encode_workflow_completion(
+                            &mut completion,
+                            &common.data_converter,
+                            run.as_deref(),
+                        )
+                        .await;
+                        for i in &common.worker_interceptors {
+                            i.on_workflow_activation_completion(&completion).await;
+                        }
+                        common.worker.complete_workflow_activation(completion).await
+                    },
+                )
                 .await
                 .map_err(|source| WorkerRunError::Fatal {
                     message: "workflow completions processor encountered an error".to_owned(),
@@ -1317,6 +1447,28 @@ impl Worker {
                             message: "activity polling failed".to_owned(),
                             source: Box::new(source),
                         })?;
+                        let store_target = match &activity.variant {
+                            Some(activity_task::Variant::Start(start)) => {
+                                let namespace = &common.worker.get_config().namespace;
+                                Some(match &start.workflow_execution {
+                                    Some(execution) if !execution.workflow_id.is_empty() => {
+                                        StoreTarget::workflow(
+                                            namespace,
+                                            &execution.workflow_id,
+                                            &execution.run_id,
+                                            &start.workflow_type,
+                                        )
+                                    }
+                                    _ => StoreTarget::activity(
+                                        namespace,
+                                        &start.activity_id,
+                                        &start.run_id,
+                                        &start.activity_type,
+                                    ),
+                                })
+                            }
+                            _ => None,
+                        };
                         let decoded = async {
                             retrieve_external_payloads(&mut activity, &common.data_converter)
                                 .await?;
@@ -1342,8 +1494,12 @@ impl Worker {
                                     ),
                                 )),
                             };
-                            encode_activity_completion(&mut completion, &common.data_converter)
-                                .await;
+                            encode_activity_completion(
+                                &mut completion,
+                                &common.data_converter,
+                                store_target,
+                            )
+                            .await;
                             common
                                 .worker
                                 .complete_activity_task(completion)
@@ -1361,6 +1517,7 @@ impl Worker {
                             common.data_converter.clone(),
                             common.activity_inbound_interceptors.clone(),
                             activity,
+                            store_target.clone(),
                         ) {
                             Ok(()) => {}
                             Err(ActivityTaskHandlerError::UnregisteredActivity {
@@ -1382,8 +1539,12 @@ impl Worker {
                                     task_token,
                                     result: Some(ActivityExecutionResult::fail(failure)),
                                 };
-                                encode_activity_completion(&mut completion, &common.data_converter)
-                                    .await;
+                                encode_activity_completion(
+                                    &mut completion,
+                                    &common.data_converter,
+                                    store_target,
+                                )
+                                .await;
                                 common
                                     .worker
                                     .complete_activity_task(completion)
@@ -1466,6 +1627,16 @@ impl WorkflowHalf {
             _ => None,
         }) {
             let workflow_type = sw.workflow_type.clone();
+            let store_targets = Arc::new(RunStoreTargets {
+                namespace: common.worker.get_config().namespace.clone(),
+                workflow_id: sw.workflow_id.clone(),
+                run_id: run_id.clone(),
+                workflow_type: workflow_type.clone(),
+                parent: sw
+                    .parent_workflow_info
+                    .clone()
+                    .filter(|_| sw.continued_from_execution_run_id.is_empty()),
+            });
             let (wff, activations) = {
                 if let Some(factory) = self.workflow_definitions.get_workflow(&workflow_type) {
                     match start_workflow(
@@ -1538,6 +1709,7 @@ impl WorkflowHalf {
                 run_id.clone(),
                 WorkflowData {
                     activation_chan: activations,
+                    store_targets,
                 },
             );
         }
@@ -1577,6 +1749,7 @@ impl WorkflowHalf {
 
 impl ActivityHalf {
     /// Spawns off a task to handle the provided activity task
+    #[allow(clippy::too_many_arguments)]
     fn activity_task_handler(
         &mut self,
         worker: Arc<CoreWorker>,
@@ -1585,6 +1758,7 @@ impl ActivityHalf {
         data_converter: DataConverter,
         activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
         activity: ActivityTask,
+        store_target: Option<StoreTarget>,
     ) -> Result<(), ActivityTaskHandlerError> {
         match activity.variant {
             Some(activity_task::Variant::Start(start)) => {
@@ -1658,7 +1832,12 @@ impl ActivityHalf {
                         task_token,
                         result: Some(result),
                     };
-                    encode_activity_completion(&mut completion, &codec_data_converter).await;
+                    encode_activity_completion(
+                        &mut completion,
+                        &codec_data_converter,
+                        store_target,
+                    )
+                    .await;
                     worker.complete_activity_task(completion).await?;
                     Ok::<_, anyhow::Error>(())
                 });
@@ -1733,7 +1912,10 @@ mod tests {
         protos::coresdk::{
             activity_result::activity_execution_result,
             activity_task::{Cancel, Start},
-            workflow_commands::{CompleteWorkflowExecution, workflow_command},
+            workflow_commands::{
+                CompleteWorkflowExecution, SignalExternalWorkflowExecution,
+                StartChildWorkflowExecution, workflow_command,
+            },
             workflow_completion::workflow_activation_completion,
         },
     };
@@ -1968,6 +2150,7 @@ mod tests {
                         task_token: task_token.clone(),
                         variant: Some(variant),
                     },
+                    None,
                 )
                 .unwrap();
         };
@@ -2079,7 +2262,7 @@ mod tests {
             }),
         );
 
-        encode_workflow_completion(&mut completion, &data_converter).await;
+        encode_workflow_completion(&mut completion, &data_converter, None).await;
 
         let Some(workflow_activation_completion::Status::Failed(failed)) = completion.status else {
             panic!("expected failed workflow completion")
@@ -2108,7 +2291,7 @@ mod tests {
             result: Some(ActivityExecutionResult::ok(Payload::default())),
         };
 
-        encode_activity_completion(&mut completion, &data_converter).await;
+        encode_activity_completion(&mut completion, &data_converter, None).await;
 
         let Some(activity_execution_result::Status::Failed(failed)) =
             completion.result.unwrap().status
@@ -2419,5 +2602,79 @@ mod tests {
                 .unwrap();
             assert_eq!(config.disable_payload_error_limit, expected);
         }
+    }
+
+    #[cfg(feature = "experimental")]
+    fn run_store_targets() -> RunStoreTargets {
+        RunStoreTargets {
+            namespace: "this-ns".to_owned(),
+            workflow_id: "parent-id".to_owned(),
+            run_id: "parent-run".to_owned(),
+            workflow_type: "Parent".to_owned(),
+            parent: None,
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    #[rstest::rstest]
+    #[case::named_namespace("other-ns", "other-ns")]
+    #[case::empty_namespace("", "this-ns")]
+    fn child_start_targets_the_child_in_its_namespace(
+        #[case] namespace: &str,
+        #[case] expected_namespace: &str,
+    ) {
+        let command: WorkflowCommand =
+            workflow_command::Variant::StartChildWorkflowExecution(StartChildWorkflowExecution {
+                namespace: namespace.to_owned(),
+                workflow_id: "child-id".to_owned(),
+                workflow_type: "Child".to_owned(),
+                ..Default::default()
+            })
+            .into();
+
+        assert_eq!(
+            run_store_targets().for_command(&command),
+            Some(StoreTarget::workflow(
+                expected_namespace,
+                "child-id",
+                "",
+                "Child"
+            ))
+        );
+    }
+
+    #[cfg(feature = "experimental")]
+    #[rstest::rstest]
+    #[case::named_namespace("other-ns", "other-ns")]
+    #[case::empty_namespace("", "this-ns")]
+    fn external_signal_targets_the_signalled_workflow_in_its_namespace(
+        #[case] namespace: &str,
+        #[case] expected_namespace: &str,
+    ) {
+        let command: WorkflowCommand = workflow_command::Variant::SignalExternalWorkflowExecution(
+            SignalExternalWorkflowExecution {
+                target: Some(
+                    signal_external_workflow_execution::Target::WorkflowExecution(
+                        NamespacedWorkflowExecution {
+                            namespace: namespace.to_owned(),
+                            workflow_id: "target-id".to_owned(),
+                            run_id: "target-run".to_owned(),
+                        },
+                    ),
+                ),
+                ..Default::default()
+            },
+        )
+        .into();
+
+        assert_eq!(
+            run_store_targets().for_command(&command),
+            Some(StoreTarget::workflow(
+                expected_namespace,
+                "target-id",
+                "target-run",
+                ""
+            ))
+        );
     }
 }

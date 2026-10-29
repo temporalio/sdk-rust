@@ -12,7 +12,7 @@ use temporalio_common::{
         TemporalSerializable,
     },
     error::{ApplicationFailure, OutgoingActivityError, OutgoingError},
-    external_storage::store_external_payloads,
+    external_storage::{StoreTarget, store_external_payloads},
     payload_visitor::encode_payloads,
     protos::{
         TaskToken,
@@ -52,6 +52,20 @@ async fn encode_optional_value(
         )
         .await?;
     Ok(Some(Payloads { payloads }))
+}
+
+/// An activity identified without a workflow id is a standalone activity.
+fn by_id_store_target(
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+    activity_id: &str,
+) -> StoreTarget {
+    if workflow_id.is_empty() {
+        StoreTarget::activity(namespace, activity_id, run_id, "")
+    } else {
+        StoreTarget::workflow(namespace, workflow_id, run_id, "")
+    }
 }
 
 /// Identifies an async activity for completion outside a worker.
@@ -176,7 +190,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            store_external_payloads(&mut request, client.data_converter(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_completed(
@@ -196,7 +210,14 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 resource_id: Default::default(),
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let target = by_id_store_target(
+                                &request.namespace,
+                                &request.workflow_id,
+                                &request.run_id,
+                                &request.activity_id,
+                            );
+                            store_external_payloads(&mut request, client.data_converter(), Some(target))
+                                .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_completed_by_id(
@@ -266,7 +287,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 last_heartbeat_details,
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            store_external_payloads(&mut request, client.data_converter(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_failed(
@@ -288,7 +309,14 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 resource_id: Default::default(),
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let target = by_id_store_target(
+                                &request.namespace,
+                                &request.workflow_id,
+                                &request.run_id,
+                                &request.activity_id,
+                            );
+                            store_external_payloads(&mut request, client.data_converter(), Some(target))
+                                .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_failed_by_id(
@@ -339,7 +367,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            store_external_payloads(&mut request, client.data_converter(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_canceled(
@@ -359,7 +387,14 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let target = by_id_store_target(
+                                &request.namespace,
+                                &request.workflow_id,
+                                &request.run_id,
+                                &request.activity_id,
+                            );
+                            store_external_payloads(&mut request, client.data_converter(), Some(target))
+                                .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_canceled_by_id(
@@ -409,7 +444,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 resource_id: Default::default(),
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            store_external_payloads(&mut request, client.data_converter(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             let response = WorkflowService::record_activity_task_heartbeat(
@@ -431,7 +466,14 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 resource_id: Default::default(),
                             };
-                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let target = by_id_store_target(
+                                &request.namespace,
+                                &request.workflow_id,
+                                &request.run_id,
+                                &request.activity_id,
+                            );
+                            store_external_payloads(&mut request, client.data_converter(), Some(target))
+                                .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             let response =

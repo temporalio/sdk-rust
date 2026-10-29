@@ -137,7 +137,7 @@ use temporalio_common::{
         ActivitySerializationContext, DataConverter, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    external_storage::{retrieve_external_payloads, store_external_payloads},
+    external_storage::{StoreTarget, retrieve_external_payloads, store_external_payloads},
     payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
@@ -1908,7 +1908,16 @@ where
                             memo,
                             options,
                         );
-                        store_external_payloads(&mut request, &data_converter).await?;
+                        let target = StoreTarget::workflow(
+                            &request.namespace,
+                            &request.workflow_id,
+                            "",
+                            request
+                                .workflow_type
+                                .as_ref()
+                                .map_or("", |workflow_type| workflow_type.name.as_str()),
+                        );
+                        store_external_payloads(&mut request, &data_converter, Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = client
@@ -2040,7 +2049,16 @@ where
                             time_skipping_config: start_request.time_skipping_config,
                             ..Default::default()
                         };
-                        store_external_payloads(&mut request, &data_converter).await?;
+                        let target = StoreTarget::workflow(
+                            &request.namespace,
+                            &request.workflow_id,
+                            "",
+                            request
+                                .workflow_type
+                                .as_ref()
+                                .map_or("", |workflow_type| workflow_type.name.as_str()),
+                        );
+                        store_external_payloads(&mut request, &data_converter, Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = WorkflowService::signal_with_start_workflow_execution(
@@ -2156,6 +2174,15 @@ where
                             memo,
                             start_options,
                         );
+                        let target = StoreTarget::workflow(
+                            &namespace,
+                            &workflow_id,
+                            "",
+                            start_request
+                                .workflow_type
+                                .as_ref()
+                                .map_or("", |workflow_type| workflow_type.name.as_str()),
+                        );
 
                         let update_id = update_id.unwrap_or_else(|| Uuid::new_v4().to_string());
                         let update_request = workflow_handle::build_update_workflow_request(
@@ -2185,7 +2212,8 @@ where
                             ],
                             resource_id: workflow_id.clone(),
                         };
-                        store_external_payloads(&mut request, &data_converter).await?;
+                        store_external_payloads(&mut request, &data_converter, Some(target))
+                            .await?;
 
                         let (start_response, update_response) = loop {
                             let mut rpc_request = request.clone().into_request();
@@ -2549,7 +2577,16 @@ where
             start_delay: try_into_or_box_err(options.start_delay, StartActivityError::Other)?,
             ..Default::default()
         };
-        store_external_payloads(&mut request, dc).await?;
+        let target = StoreTarget::activity(
+            &request.namespace,
+            &request.activity_id,
+            "",
+            request
+                .activity_type
+                .as_ref()
+                .map_or("", |activity_type| activity_type.name.as_str()),
+        );
+        store_external_payloads(&mut request, dc, Some(target)).await?;
         let resp = client
             .start_activity_execution(request.into_request())
             .await?

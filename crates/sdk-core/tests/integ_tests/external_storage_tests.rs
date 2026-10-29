@@ -6,13 +6,14 @@ use futures::{
     TryStreamExt,
     future::{self, BoxFuture},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use temporalio_client::{
-    ActivityIdentifier, Client, ClientOptions, WorkflowDescribeOptions,
+    ActivityIdentifier, ActivityStartOptions, Client, ClientOptions, WorkflowDescribeOptions,
     WorkflowExecuteUpdateOptions, WorkflowListOptions, WorkflowQueryOptions, WorkflowSignalOptions,
     WorkflowStartOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
@@ -22,15 +23,16 @@ use temporalio_common::{
     MemoValues,
     data_converters::{
         DataConverter, ExternalStorage, ExternalStorageError, PayloadConversionError,
-        StorageDriver, StorageDriverClaim, StorageDriverError, StorageDriverRetrieveContext,
-        StorageDriverStoreContext,
+        StorageDriver, StorageDriverActivityInfo, StorageDriverClaim, StorageDriverError,
+        StorageDriverRetrieveContext, StorageDriverStoreContext, StorageDriverTargetInfo,
+        StorageDriverWorkflowInfo,
     },
     protos::temporal::api::{common::v1::Payload, history::v1::history_event::Attributes},
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, Runtime, SyncWorkflowContext, WorkerOptions, WorkflowContext,
-    WorkflowContextView, WorkflowResult,
+    ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions, Runtime, SyncWorkflowContext,
+    WorkerOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 use tokio::sync::mpsc;
@@ -40,6 +42,7 @@ const REFERENCE_MESSAGE_TYPE: &[u8] = b"temporal.api.sdk.v1.ExternalStorageRefer
 #[derive(Default)]
 struct InMemoryDriver {
     stored: Mutex<HashMap<String, Payload>>,
+    targets: Mutex<Vec<Option<StorageDriverTargetInfo>>>,
 }
 
 impl StorageDriver for InMemoryDriver {
@@ -53,9 +56,10 @@ impl StorageDriver for InMemoryDriver {
 
     fn store(
         &self,
-        _context: &StorageDriverStoreContext,
+        context: &StorageDriverStoreContext,
         payloads: Vec<Payload>,
     ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
+        self.targets.lock().unwrap().push(context.target.clone());
         let mut stored = self.stored.lock().unwrap();
         let claims = payloads
             .into_iter()
@@ -222,6 +226,90 @@ impl AsyncCompletionWorkflow {
             .await?;
         Ok(output)
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TargetsInput {
+    value: String,
+    child_id: String,
+    continued: bool,
+}
+
+#[workflow]
+#[derive(Default)]
+struct TargetsParentWorkflow;
+#[workflow_methods]
+impl TargetsParentWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>, input: TargetsInput) -> WorkflowResult<String> {
+        if input.continued {
+            return Ok(input.value);
+        }
+        let echoed = ctx
+            .execute_activity(
+                LargePayloadActivities::echo,
+                input.value.clone(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?;
+        let child = ctx
+            .start_child_workflow(
+                TargetsChildWorkflow::run,
+                echoed.clone(),
+                ChildWorkflowOptions::builder()
+                    .workflow_id(input.child_id.clone())
+                    .build(),
+            )
+            .await
+            .expect("child should start");
+        ctx.external_workflow(input.child_id.clone(), None)
+            .signal(TargetsChildWorkflow::deliver, echoed, Default::default())
+            .await
+            .expect("child should be signalled");
+        let value = child.result().await?;
+        match ctx.continue_as_new(
+            TargetsInput {
+                value,
+                continued: true,
+                ..input
+            },
+            ContinueAsNewOptions::default(),
+        )? {}
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct TargetsChildWorkflow {
+    delivered: bool,
+}
+#[workflow_methods]
+impl TargetsChildWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        ctx.wait_condition(|s| s.delivered).await?;
+        Ok(input)
+    }
+
+    #[signal]
+    fn deliver(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _value: String) {
+        self.delivered = true;
+    }
+}
+
+/// Fails unless `recorded` holds exactly the `expected` targets, in any order.
+fn assert_same_targets(
+    recorded: Vec<Option<StorageDriverTargetInfo>>,
+    expected: Vec<Option<StorageDriverTargetInfo>>,
+) {
+    let mut unmatched = expected;
+    for target in recorded {
+        let Some(index) = unmatched.iter().position(|e| *e == target) else {
+            panic!("unexpected target {target:?}, still expecting {unmatched:?}");
+        };
+        unmatched.remove(index);
+    }
+    assert!(unmatched.is_empty(), "never stored for {unmatched:?}");
 }
 
 fn is_reference(payload: &Payload) -> bool {
@@ -584,4 +672,133 @@ async fn async_activity_results_round_trip_through_external_storage() {
         _ => None,
     });
     assert!(is_reference(&activity_result.unwrap()));
+}
+
+#[tokio::test]
+async fn drivers_are_told_which_workflow_a_payload_is_stored_for() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let client = client_with_storage(driver.clone()).await;
+    let task_queue = format!("store_targets_{}", rand_6_chars());
+    let workflow_id = task_queue.clone();
+    let child_id = format!("{workflow_id}-child");
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_workflow::<TargetsParentWorkflow>()
+        .unwrap()
+        .register_workflow::<TargetsChildWorkflow>()
+        .unwrap()
+        .register_activities(LargePayloadActivities)
+        .build();
+    let worker = temporalio_sdk::Worker::new(&runtime, client.clone(), worker_options).unwrap();
+
+    let value = "t".repeat(10_000);
+    let mut first_run_id = String::new();
+    worker
+        .run_until(async {
+            let handle = client
+                .start_workflow(
+                    TargetsParentWorkflow::run,
+                    TargetsInput {
+                        value: value.clone(),
+                        child_id: child_id.clone(),
+                        continued: false,
+                    },
+                    WorkflowStartOptions::new(task_queue.clone(), workflow_id.clone()).build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(handle.get_result(Default::default()).await.unwrap(), value);
+            first_run_id = handle.run_id().unwrap().to_owned();
+        })
+        .await
+        .unwrap();
+    let last_run_id = client
+        .get_workflow_handle::<TargetsParentWorkflow>(workflow_id.clone())
+        .describe(WorkflowDescribeOptions::default())
+        .await
+        .unwrap()
+        .run_id()
+        .to_owned();
+
+    let workflow = |id: &str, run_id: Option<&str>, workflow_type: Option<&str>| {
+        Some(StorageDriverTargetInfo::Workflow(
+            StorageDriverWorkflowInfo::builder()
+                .namespace(integ_namespace())
+                .id(id.to_owned())
+                .maybe_run_id(run_id.map(str::to_owned))
+                .maybe_workflow_type(workflow_type.map(str::to_owned))
+                .build(),
+        ))
+    };
+    let parent_type = Some(TargetsParentWorkflow::name());
+    let child_type = Some(TargetsChildWorkflow::name());
+    let first_run = Some(first_run_id.as_str());
+    assert_same_targets(
+        driver.targets.lock().unwrap().clone(),
+        vec![
+            // Started by the client, before any run exists.
+            workflow(&workflow_id, None, parent_type),
+            // The activity's input and its result both belong to the workflow that scheduled it.
+            workflow(&workflow_id, first_run, parent_type),
+            workflow(&workflow_id, first_run, parent_type),
+            workflow(&child_id, None, child_type),
+            workflow(&child_id, None, None),
+            // A child's result is delivered to its parent.
+            workflow(&workflow_id, first_run, None),
+            // Continuing as new hands its input to a run that does not exist yet.
+            workflow(&workflow_id, None, parent_type),
+            workflow(&workflow_id, Some(&last_run_id), parent_type),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn drivers_are_told_which_standalone_activity_a_payload_is_stored_for() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let client = client_with_storage(driver.clone()).await;
+    let task_queue = format!("standalone_store_targets_{}", rand_6_chars());
+    let activity_id = task_queue.clone();
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_activities(LargePayloadActivities)
+        .build();
+    let worker = temporalio_sdk::Worker::new(&runtime, client.clone(), worker_options).unwrap();
+
+    let input = "u".repeat(10_000);
+    let mut run_id = String::new();
+    worker
+        .run_until(async {
+            let handle = client
+                .start_activity(
+                    LargePayloadActivities::echo,
+                    input.clone(),
+                    ActivityStartOptions::with_schedule_to_close_timeout(
+                        task_queue.clone(),
+                        activity_id.clone(),
+                        Duration::from_secs(60),
+                    )
+                    .build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(handle.result().await.unwrap(), input);
+            run_id = handle.run_id().unwrap().to_owned();
+        })
+        .await
+        .unwrap();
+
+    let activity = |run_id: Option<&str>| {
+        Some(StorageDriverTargetInfo::Activity(
+            StorageDriverActivityInfo::builder()
+                .namespace(integ_namespace())
+                .id(activity_id.clone())
+                .maybe_run_id(run_id.map(str::to_owned))
+                .activity_type(LargePayloadActivities::echo.name().to_owned())
+                .build(),
+        ))
+    };
+    assert_same_targets(
+        driver.targets.lock().unwrap().clone(),
+        vec![activity(None), activity(Some(&run_id))],
+    );
 }
