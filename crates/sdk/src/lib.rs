@@ -831,7 +831,9 @@ struct WorkflowData {
     store_targets: Arc<RunStoreTargets>,
 }
 
-/// Captured when the run starts, since a completion carries only its run id.
+/// Decides which execution each command in a run's completions stores its payloads on behalf of.
+/// Holds the run's identity, captured when the run starts since a completion carries only its run
+/// id.
 #[derive(Debug)]
 struct RunStoreTargets {
     namespace: String,
@@ -906,7 +908,9 @@ impl RunStoreTargets {
                 ),
                 None => self.current(),
             },
-            // This run reads these payloads again when it replays.
+            // The handler reads the operation's input, but there is no Nexus operation target yet.
+            workflow_command::Variant::ScheduleNexusOperation(_) => self.current(),
+            // Every other command's payloads belong to this run.
             workflow_command::Variant::StartTimer(_)
             | workflow_command::Variant::ScheduleActivity(_)
             | workflow_command::Variant::RespondToQuery(_)
@@ -923,7 +927,6 @@ impl RunStoreTargets {
             | workflow_command::Variant::UpsertWorkflowSearchAttributes(_)
             | workflow_command::Variant::ModifyWorkflowProperties(_)
             | workflow_command::Variant::UpdateResponse(_)
-            | workflow_command::Variant::ScheduleNexusOperation(_)
             | workflow_command::Variant::RequestCancelNexusOperation(_) => self.current(),
         })
     }

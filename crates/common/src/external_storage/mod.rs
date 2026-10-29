@@ -92,6 +92,22 @@ impl StoreTarget {
             Self {}
         }
     }
+
+    /// An activity addressed by id: its workflow when a workflow id is given, otherwise the
+    /// standalone activity. An empty string, which is how a proto leaves a field unset, means
+    /// unknown.
+    pub fn activity_by_id(
+        namespace: &str,
+        workflow_id: &str,
+        run_id: &str,
+        activity_id: &str,
+    ) -> Self {
+        if workflow_id.is_empty() {
+            Self::activity(namespace, activity_id, run_id, "")
+        } else {
+            Self::workflow(namespace, workflow_id, run_id, "")
+        }
+    }
 }
 
 #[cfg(feature = "experimental")]

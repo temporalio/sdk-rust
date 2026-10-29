@@ -54,20 +54,6 @@ async fn encode_optional_value(
     Ok(Some(Payloads { payloads }))
 }
 
-/// An activity identified without a workflow id is a standalone activity.
-fn by_id_store_target(
-    namespace: &str,
-    workflow_id: &str,
-    run_id: &str,
-    activity_id: &str,
-) -> StoreTarget {
-    if workflow_id.is_empty() {
-        StoreTarget::activity(namespace, activity_id, run_id, "")
-    } else {
-        StoreTarget::workflow(namespace, workflow_id, run_id, "")
-    }
-}
-
 /// Identifies an async activity for completion outside a worker.
 #[derive(Debug, Clone)]
 pub enum ActivityIdentifier {
@@ -210,7 +196,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 resource_id: Default::default(),
                             };
-                            let target = by_id_store_target(
+                            let target = StoreTarget::activity_by_id(
                                 &request.namespace,
                                 &request.workflow_id,
                                 &request.run_id,
@@ -309,7 +295,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 resource_id: Default::default(),
                                 ..Default::default()
                             };
-                            let target = by_id_store_target(
+                            let target = StoreTarget::activity_by_id(
                                 &request.namespace,
                                 &request.workflow_id,
                                 &request.run_id,
@@ -387,7 +373,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 ..Default::default()
                             };
-                            let target = by_id_store_target(
+                            let target = StoreTarget::activity_by_id(
                                 &request.namespace,
                                 &request.workflow_id,
                                 &request.run_id,
@@ -466,7 +452,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 resource_id: Default::default(),
                             };
-                            let target = by_id_store_target(
+                            let target = StoreTarget::activity_by_id(
                                 &request.namespace,
                                 &request.workflow_id,
                                 &request.run_id,
