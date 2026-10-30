@@ -129,20 +129,10 @@ impl TestHistoryBuilder {
         self.previous_task_completed_id = id;
     }
 
-    /// The started event id of the last scheduled workflow task, or zero if it has not started.
-    fn started_id_of_current_task(&self) -> i64 {
-        if self.final_workflow_task_started_event_id > self.workflow_task_scheduled_event_id {
-            self.final_workflow_task_started_event_id
-        } else {
-            0
-        }
-    }
-
     /// Add a workflow task timed out event.
     pub fn add_workflow_task_timed_out(&mut self) {
         let attrs = WorkflowTaskTimedOutEventAttributes {
             scheduled_event_id: self.workflow_task_scheduled_event_id,
-            started_event_id: self.started_id_of_current_task(),
             ..Default::default()
         };
         self.build_and_push_event(EventType::WorkflowTaskTimedOut, attrs.into());
@@ -253,7 +243,6 @@ impl TestHistoryBuilder {
     ) {
         let attrs = WorkflowTaskFailedEventAttributes {
             scheduled_event_id: self.workflow_task_scheduled_event_id,
-            started_event_id: self.started_id_of_current_task(),
             cause: cause.into(),
             failure: Some(failure),
             ..Default::default()
@@ -269,7 +258,6 @@ impl TestHistoryBuilder {
     ) {
         let attrs = WorkflowTaskFailedEventAttributes {
             scheduled_event_id: self.workflow_task_scheduled_event_id,
-            started_event_id: self.started_id_of_current_task(),
             cause: cause.into(),
             new_run_id: new_run_id.into(),
             ..Default::default()

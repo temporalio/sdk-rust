@@ -99,15 +99,12 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
-    /// The started event ids of the run's failed and timed out workflow tasks. Each local activity
-    /// start has them, so that the activity knows which tasks never completed. A set keeps them in
-    /// event order and ignores the ids of a history page that Core reads again.
+    /// The started event ids of the run's failed and timed out workflow tasks.
     failed_wft_started_ids: BTreeSet<i64>,
     /// The newest workflow task in history. When its completed event comes, it becomes
     /// `completed_wft`.
     last_wft: WftAttempt,
-    /// The newest workflow task that completed. A local activity start has its attempt and started
-    /// time, so that the activity knows which lower attempts at that event id never completed.
+    /// The newest workflow task that completed.
     completed_wft: Option<WftAttempt>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
@@ -456,14 +453,13 @@ impl WorkflowMachines {
     /// failed ids, so that the list stays small on a long run.
     fn note_wft_events(&mut self, events: &[HistoryEvent]) {
         for event in events {
-            let started = match &event.attributes {
+            match &event.attributes {
                 Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) => {
                     self.last_wft = WftAttempt {
                         scheduled_event_id: event.event_id,
                         attempt: a.attempt.max(0) as u32,
                         ..Default::default()
                     };
-                    continue;
                 }
                 Some(history_event::Attributes::WorkflowTaskStartedEventAttributes(a)) => {
                     if a.scheduled_event_id == self.last_wft.scheduled_event_id {
@@ -473,7 +469,6 @@ impl WorkflowMachines {
                         self.last_wft.started_time =
                             event.event_time.and_then(|t| t.try_into().ok());
                     }
-                    continue;
                 }
                 Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(a)) => {
                     let wft = self.last_wft;
@@ -486,22 +481,30 @@ impl WorkflowMachines {
                     {
                         self.completed_wft = Some(wft);
                     }
-                    continue;
                 }
                 Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(a)) => {
-                    a.started_event_id
+                    self.note_failed_wft(a.scheduled_event_id);
                 }
                 Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(a)) => {
-                    a.started_event_id
+                    self.note_failed_wft(a.scheduled_event_id);
                 }
-                _ => continue,
-            };
-            self.failed_wft_started_ids.insert(started);
-            // Past the cap, the oldest id goes. That also drops an old id from a page that Core
-            // reads again.
-            if self.failed_wft_started_ids.len() > MAX_FAILED_WFTS {
-                self.failed_wft_started_ids.pop_first();
+                _ => {}
             }
+        }
+    }
+
+    /// Notes the task that failed or timed out, by the started event that history has for it. A
+    /// task that timed out before it started dispatched no local activity, so it adds nothing.
+    fn note_failed_wft(&mut self, scheduled_event_id: i64) {
+        let wft = self.last_wft;
+        if wft.scheduled_event_id != scheduled_event_id || wft.started_event_id == 0 {
+            return;
+        }
+        self.failed_wft_started_ids.insert(wft.started_event_id);
+        // Past the cap, the oldest id goes. That also drops an old id from a page that Core reads
+        // again.
+        if self.failed_wft_started_ids.len() > MAX_FAILED_WFTS {
+            self.failed_wft_started_ids.pop_first();
         }
     }
 

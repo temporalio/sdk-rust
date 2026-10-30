@@ -211,10 +211,13 @@ async fn failed_tasks_from_every_history_page_are_named() {
     t.add_timer_fired(timer_started, "2".to_string());
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_timed_out();
+    // A task that times out before it starts has no started event, so it adds no id.
+    t.add_workflow_task_scheduled();
+    t.add_workflow_task_timed_out();
     t.add_workflow_task_scheduled_and_started();
 
     // The poll response has the first page and each history fetch adds one page. The failed task
-    // is on the second page and the timed out task is on the last.
+    // is on the second page and the timed out tasks are on the last.
     let mut first_page = hist_to_poll_resp(&t, wf_id, ResponseType::AllHistory).resp;
     first_page.history.as_mut().unwrap().events.truncate(6);
     first_page.next_page_token = vec![1];
@@ -265,7 +268,7 @@ async fn failed_tasks_from_every_history_page_are_named() {
     let task = start_of(&la).workflow_task.as_ref().unwrap();
     assert_eq!(
         (task.started_event_id, task.previous_started_event_id),
-        (19, 11)
+        (21, 11)
     );
     assert_eq!(task.failed_tasks, [8, 16]);
     assert_eq!(task.previous_started_time, Some(completed_time.into()));
