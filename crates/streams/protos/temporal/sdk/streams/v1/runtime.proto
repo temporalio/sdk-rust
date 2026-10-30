@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+// The messages of the crate's own calls, in addition to the five Stream service operations. Lang
+// sends them through the bridge's call on the runtime object, by the method name in each comment.
+// Field numbers are part of the contract with every SDK.
+package temporal.sdk.streams.v1;
+
+import "google/protobuf/duration.proto";
+import "temporal/api/stream/v1/message.proto";
+
+// Method `OpenWriter`, asynchronous. A writer for an Activity, a Local Activity or a client
+// Producer, which keeps its epoch and `sequence` order. A writer of a Local Activity, or of an
+// Activity attempt above 1, first sends an empty batch, so that the new epoch withdraws the earlier
+// one's Records. The handles of one Producer epoch on one Stream share one writer. Each open adds a
+// handle, and each `CloseWriter` or `FreeWriter` releases one. The batches of every writer in a
+// process take their `sequence` from one counter, so a writer that opens again after its close
+// continues above its earlier batches.
+message OpenWriterRequest {
+    reserved 4, 7;
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    temporal.api.stream.v1.Producer producer = 3;
+    // A write sends at most this many Records in one batch. Zero is 1000.
+    int32 max_batch_size = 5;
+    // How long a write retries a Store failure. Empty is 10 s.
+    google.protobuf.Duration max_retry_duration = 6;
+    // Local Activity only. The run's task facts, which each batch sends as AppendRecords does, so
+    // the writes withdraw the run's orphaned Local Activity Records.
+    temporal.api.stream.v1.WorkflowTaskEpoch previous_completed_task = 8;
+    repeated int64 failed_tasks = 9;
+}
+
+message OpenWriterResponse {
+    uint64 writer_id = 1;
+}
+
+// Method `WriteRecords`, asynchronous. Appends Records at once for an open writer and responds when
+// the Store has them. It uses the writer's Producer epoch and `sequence` order. After a Store
+// failure it resends the same batch, so that the Store writes it once. Records past the Store's
+// batch limit go in more batches, in order. An awaited publish of an Activity or a client uses this
+// call. A Store failure after the retries fails only that write, and the next write takes a higher
+// `sequence`. Any other failure fails the writer.
+message WriteRecordsRequest {
+    uint64 writer_id = 1;
+    repeated temporal.api.stream.v1.AppendRecord records = 2;
+}
+
+message WriteRecordsResponse {
+    // The offsets of the first and the last Record. Zero when the request has no Record.
+    int64 first_offset = 1;
+    int64 last_offset = 2;
+}
+
+// Method `CloseWriter`, asynchronous. Releases one handle of the writer. The last handle waits for
+// a write in flight, then drops the writer. It doesn't close the Stream. It fails with the
+// writer's error if the writer failed.
+message CloseWriterRequest {
+    uint64 writer_id = 1;
+}
+
+message CloseWriterResponse {
+    // The offset of the newest Record the writer wrote. Zero if it wrote none.
+    int64 last_offset = 1;
+}
+
+// Method `FreeWriter`. Releases one handle of the writer with no wait, for a handle that lang
+// drops, such as from a finalizer. The bridge may also call it with no async runtime. A write in
+// flight still completes. The writer's error, if any, is lost.
+message FreeWriterRequest {
+    uint64 writer_id = 1;
+}
+
+message FreeWriterResponse {
+}
+
+// Method `CloseWriters`, asynchronous. Drops every open writer, for example when the backend's
+// client or Worker shuts down.
+message CloseWritersRequest {
+}
+
+message CloseWritersResponse {
+    // The writers that had failed.
+    int32 failed = 1;
+}

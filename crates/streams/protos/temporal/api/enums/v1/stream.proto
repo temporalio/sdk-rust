@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package temporal.api.enums.v1;
+
+option go_package = "go.temporal.io/api/enums/v1;enums";
+option java_package = "io.temporal.api.enums.v1";
+option java_multiple_files = true;
+option java_outer_classname = "StreamProto";
+option ruby_package = "Temporalio::Api::Enums::V1";
+option csharp_namespace = "Temporalio.Api.Enums.V1";
+
+// Experimental. Might change in the future.
+enum StreamProducerKind {
+    STREAM_PRODUCER_KIND_UNSPECIFIED = 0;
+    STREAM_PRODUCER_KIND_WORKFLOW = 1;
+    STREAM_PRODUCER_KIND_LOCAL_ACTIVITY = 2;
+    STREAM_PRODUCER_KIND_ACTIVITY = 3;
+    STREAM_PRODUCER_KIND_CLIENT = 4;
+    STREAM_PRODUCER_KIND_STANDALONE_ACTIVITY = 5;
+}
+
+// Experimental. Might change in the future.
+// How a Stream closed, so a reader tells a terminated or timed out owner from a failed one
+// without parsing the failure.
+// (-- api-linter: core::0216::synonyms=disabled
+//     aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
+enum StreamCloseStatus {
+    STREAM_CLOSE_STATUS_UNSPECIFIED = 0;
+    STREAM_CLOSE_STATUS_COMPLETED = 1;
+    STREAM_CLOSE_STATUS_FAILED = 2;
+    STREAM_CLOSE_STATUS_CANCELED = 3;
+    // TERMINATED and TIMED_OUT come only from the owner's end, never from a caller.
+    STREAM_CLOSE_STATUS_TERMINATED = 4;
+    STREAM_CLOSE_STATUS_TIMED_OUT = 5;
+}
+
+// Experimental. Might change in the future.
+// (-- api-linter: core::0216::synonyms=disabled
+//     aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
+enum StreamStatus {
+    STREAM_STATUS_UNSPECIFIED = 0;
+    STREAM_STATUS_OPEN = 1;
+    STREAM_STATUS_CLOSED = 2;
+    STREAM_STATUS_EXPIRED = 3;
+}
+
+// Experimental. Might change in the future.
+enum StreamReadStart {
+    STREAM_READ_START_UNSPECIFIED = 0;
+    STREAM_READ_START_BEGINNING = 1;
+    STREAM_READ_START_END = 2;
+}
+
+// Experimental. Might change in the future.
+// Why a Stream call failed. Each reason has one gRPC status code.
+enum StreamErrorReason {
+    STREAM_ERROR_REASON_UNSPECIFIED = 0;
+    // Nobody created the Stream, even after `create_wait`. NOT_FOUND.
+    STREAM_ERROR_REASON_NOT_FOUND = 1;
+    // The Stream's Retention or safety TTL passed. NOT_FOUND.
+    STREAM_ERROR_REASON_EXPIRED = 2;
+    // The Stream is closed. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_CLOSED = 3;
+    // The Producer's epoch is lower than the newest one, its Workflow Task was withdrawn, or a
+    // Workflow retry withdrew its run. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_FENCED = 4;
+    // The batch has a lower `sequence` than the last one of its epoch. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_SEQUENCE = 5;
+    // The batch has the `sequence` of the last one of its epoch, and other content.
+    // FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_SEQ_DIVERGENT = 6;
+    // A create names another owner than the Stream has, or the owner doesn't allow this close.
+    // FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_NOT_OWNER = 7;
+    // A newer format version wrote the Stream. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_FORMAT_TOO_NEW = 8;
+    // The offset is past the newest offset + 1, for example after a failover lost the newest
+    // Records. A read from it works again once the Stream has Records up to it. OUT_OF_RANGE.
+    STREAM_ERROR_REASON_OFFSET = 9;
+    // A Record or a batch is over the Store's limit. INVALID_ARGUMENT.
+    STREAM_ERROR_REASON_TOO_LARGE = 10;
+    // The request is malformed. INVALID_ARGUMENT.
+    STREAM_ERROR_REASON_INVALID = 11;
+    // The Store failed or did not answer. UNAVAILABLE.
+    STREAM_ERROR_REASON_STORAGE = 12;
+    // No writer has the id. The SDK's in-process writer only. NOT_FOUND.
+    STREAM_ERROR_REASON_UNKNOWN_WRITER = 13;
+    // The Store lacks a capability that the call needs. UNIMPLEMENTED.
+    STREAM_ERROR_REASON_UNSUPPORTED = 14;
+}
