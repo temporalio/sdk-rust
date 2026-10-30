@@ -8,6 +8,7 @@ members = [
     "crates/macros",
     "crates/sdk",
     "crates/workflow",
+    "crates/streams",
     "crates/sdk-core-c-bridge",
     "crates/changelog-release-notes",
 ]

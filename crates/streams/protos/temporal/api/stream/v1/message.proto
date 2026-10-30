@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package temporal.api.stream.v1;
+
+option go_package = "go.temporal.io/api/stream/v1;stream";
+option java_package = "io.temporal.api.stream.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Stream::V1";
+option csharp_namespace = "Temporalio.Api.Stream.V1";
+
+import "google/protobuf/timestamp.proto";
+
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/failure/v1/message.proto";
+
+// Experimental. Might change in the future.
+// Identifies one Stream. The id is opaque to callers.
+message StreamRef {
+    string id = 1;
+    // Unset for a client's Stream. For a Workflow, business_id is the Workflow ID and run_id is
+    // the first execution run id of its run chain. For a Standalone Activity, business_id is the
+    // activity ID and run_id is its run id. A create and a close of a Workflow-owned Stream must
+    // name its owner.
+    temporal.api.common.v1.Execution owner = 2;
+    // The name of the backend that holds the Stream, as the Worker and client config register
+    // it, so every process routes a ref it receives. Empty is the default backend. The Store
+    // never reads it.
+    string backend = 3;
+}
+
+// Experimental. Might change in the future.
+// The ordered attempt of a Producer. Compared in this order: task_started_event_id,
+// task_attempt, task_started_time, attempt_scheduled_time, attempt. A field that a kind does
+// not use is empty and compares as zero. A timestamp compares seconds, then nanos.
+message ProducerEpoch {
+    // The Workflow Task of a Workflow, or the one that dispatched a Local Activity.
+    int64 task_started_event_id = 1;
+    int32 task_attempt = 2;
+    // Tells a reused started event id apart, for example after a dropped speculative task.
+    google.protobuf.Timestamp task_started_time = 5;
+    // When the server scheduled an Activity's attempt. A reset makes it later.
+    google.protobuf.Timestamp attempt_scheduled_time = 3;
+    // Activity, Local Activity and client attempt.
+    int32 attempt = 4;
+}
+
+// Experimental. Might change in the future.
+message Producer {
+    temporal.api.enums.v1.StreamProducerKind kind = 1;
+    string id = 2;
+    ProducerEpoch epoch = 3;
+    // The run of the Producer, so nobody parses the id. Empty for a client.
+    string run_id = 4;
+}
+
+// Experimental. Might change in the future.
+message WorkflowTaskEpoch {
+    int64 started_event_id = 1;
+    int32 attempt = 2;
+    google.protobuf.Timestamp started_time = 3;
+}
+
+// Experimental. Might change in the future.
+message AppendRecord {
+    reserved 1;
+    reserved "topic";
+    temporal.api.common.v1.Payload body = 2;
+}
+
+// Experimental. Might change in the future.
+message Supersession {
+    temporal.api.enums.v1.StreamProducerKind producer_kind = 1;
+    string producer_id = 2;
+    ProducerEpoch epoch = 3;
+    // Workflow only.
+    WorkflowTaskEpoch previous_completed_task = 4;
+    repeated int64 failed_tasks = 5;
+    // Workflow retry only. The previous run. Every Record whose Producer carries it is withdrawn.
+    string withdraw_run = 6;
+    // The run of the Producer, so nobody parses the id. Empty for a client.
+    string run_id = 7;
+}
+
+// Experimental. Might change in the future.
+// One Record that a Producer appended.
+message StreamData {
+    reserved 1;
+    reserved "topic";
+    Producer producer = 2;
+    temporal.api.common.v1.Payload body = 3;
+}
+
+// Experimental. Might change in the future.
+// The close of a Stream. A Stream has at most one, and a read returns it last.
+message StreamClose {
+    // The Producer that closed the Stream.
+    Producer producer = 1;
+    temporal.api.common.v1.Payload result = 2;
+    temporal.api.failure.v1.Failure failure = 3;
+    // The result or the failure stays next to it.
+    temporal.api.enums.v1.StreamCloseStatus status = 4;
+}
+
+// Experimental. Might change in the future.
+// An offset is ordered and unique in one Stream, and it is sparse. Offsets have gaps, so they
+// don't count Records. Zero is never an offset. A read names its Stream, so the read checks the
+// offset against that Stream.
+message StreamRecord {
+    int64 offset = 1;
+    // A read item is a Record, a Superseded item or the close.
+    oneof item {
+        StreamData data = 2;
+        // The first batch of a higher epoch carries it. It withdraws the earlier Records that its
+        // facts name, and a reader drops them.
+        Supersession superseded = 3;
+        StreamClose close = 4;
+    }
+}
+
+// Experimental. Might change in the future.
+// The details of a failed Stream call, in the gRPC status details and in the details of the
+// application failure of a Nexus operation.
+message StreamErrorDetails {
+    temporal.api.enums.v1.StreamErrorReason reason = 1;
+}

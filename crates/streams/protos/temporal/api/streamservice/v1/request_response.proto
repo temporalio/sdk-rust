@@ -1,0 +1,190 @@
+syntax = "proto3";
+
+package temporal.api.streamservice.v1;
+
+option go_package = "go.temporal.io/api/streamservice/v1;streamservice";
+option java_package = "io.temporal.api.streamservice.v1";
+option java_multiple_files = true;
+option java_outer_classname = "RequestResponseProto";
+option ruby_package = "Temporalio::Api::StreamService::V1";
+option csharp_namespace = "Temporalio.Api.StreamService.V1";
+
+// The messages of the Stream service. An SDK Store (Redis or memory) and the server answer the
+// same five operations with them. A field that only the server reads says so.
+
+import "google/protobuf/duration.proto";
+
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/failure/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
+
+// Experimental. Might change in the future.
+// Creates the Stream, or gets it when it exists. Then created is false, and the Stream keeps its
+// own Retention. It fails with CLOSED on a closed Stream, EXPIRED on an expired one, and NOT_OWNER
+// on one with another owner.
+// (-- api-linter: core::0133=disabled
+//     aip.dev/not-precedent: The request names a Stream by namespace and stream_id. --)
+message CreateStreamRequest {
+    reserved 5;
+    reserved "auto_close";
+    string namespace = 1;
+    // Required, and never empty.
+    string stream_id = 2;
+    // The age after which a Record is dropped. Empty is the Store default.
+    google.protobuf.Duration retention = 3;
+    // Workflow only. The previous run on a retry run's first create, to withdraw its Records.
+    string withdraw_run = 4;
+    // The Workflow run that owns the Stream. Workflow kind, with its run_id and epoch. It needs a
+    // ref whose owner names the run's chain.
+    temporal.api.stream.v1.Producer owner = 6;
+    // Only the server reads it. The server closes the Stream with the outcome of the owner's run
+    // chain, terminate and timeout included. It needs owner, and a ref with a Workflow owner.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "with" ties the close to the owner's run chain. --)
+    bool close_with_run = 7;
+    // The ref of the Stream, with stream_id as its id. A Workflow-owned Stream sets the ref's
+    // owner, which names the owner's run chain.
+    temporal.api.stream.v1.StreamRef ref = 8;
+    // Only the server reads it. The server checks that the token is the Activity's current
+    // attempt, so a caller can't put a Stream into a Standalone Activity it isn't.
+    bytes task_token = 9;
+}
+
+// Experimental. Might change in the future.
+message CreateStreamResponse {
+    reserved 3;
+    reserved "status";
+    // The ref, with the owner of a Workflow-owned Stream.
+    temporal.api.stream.v1.StreamRef stream = 1;
+    bool created = 2;
+}
+
+// Experimental. Might change in the future.
+// FAILED_PRECONDITION if closed, fenced, or if the Stream's meta has a higher format version v
+// (detail stream_format_too_new). NOT_FOUND if absent.
+message AppendRecordsRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // Required outside a Workflow. In a Workflow the transport sets it.
+    temporal.api.stream.v1.Producer producer = 3;
+    // The batch number in this epoch. With the Producer and epoch it is the dedupe key. Zero takes
+    // the next number of the epoch. Such a batch has no dedupe, so a retry writes it again.
+    int64 sequence = 4;
+    repeated temporal.api.stream.v1.AppendRecord records = 5;
+    // The run's last completed Workflow Task (started_event_id 0 before the first) and its failed
+    // tasks, from a Local Activity's start. The batch withdraws the run's Local Activity Records
+    // whose task never completed.
+    temporal.api.stream.v1.WorkflowTaskEpoch previous_completed_task = 6;
+    repeated int64 failed_tasks = 7;
+    // Local Activity only. The previous run on a retry run's first batch, to withdraw its Records.
+    string withdraw_run = 8;
+    // Only the server reads it, on a Workflow Producer's batch. The batch withdraws no Workflow
+    // Task and keeps no task facts, but withdraw_run still applies.
+    bool defer_withdrawal = 9;
+    // Only the server reads it. The server checks the Producer against the Activity's current
+    // attempt, so nobody else writes as that Activity.
+    bytes task_token = 10;
+}
+
+// Experimental. Might change in the future.
+message AppendRecordsResponse {
+    int64 first_offset = 1;
+    int64 last_offset = 2;
+}
+
+// Experimental. Might change in the future.
+message CloseStreamRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    temporal.api.stream.v1.Producer producer = 3;
+    temporal.api.common.v1.Payload result = 4;
+    // The close status comes from it. No failure is COMPLETED. A failure is CANCELED when it has
+    // canceled_failure_info, or when it is an Activity, child Workflow or Nexus Operation failure
+    // whose cause has canceled_failure_info. Any other failure is FAILED.
+    temporal.api.failure.v1.Failure failure = 5;
+    // Only the server reads these. They are the run's task facts, as on the append.
+    temporal.api.stream.v1.WorkflowTaskEpoch previous_completed_task = 6;
+    repeated int64 failed_tasks = 7;
+    // Only the server reads it. The previous run on a retry run's close, to withdraw its Records.
+    string withdraw_run = 8;
+    reserved 9;
+    reserved "status";
+    // Only the server reads it. It checks the token as on the append.
+    bytes task_token = 10;
+}
+
+// Experimental. Might change in the future.
+message CloseStreamResponse {
+}
+
+// Experimental. Might change in the future.
+message ReadRecordsRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // Start at this offset. Zero uses start. OUT_OF_RANGE if past the newest offset + 1.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" mark the ends of a range of offsets. --)
+    int64 from_offset = 3;
+    temporal.api.enums.v1.StreamReadStart start = 4;
+    reserved 5, 10;
+    reserved "topics", "topic_prefixes";
+    // The most items in one page, Superseded items included. Zero is 1000. A Superseded item and
+    // the Record after it stay in one page, so a page of one Record can hold two items.
+    int32 max_records = 6;
+    google.protobuf.Duration wait = 7;
+    // How long to wait for a Stream that nobody created yet. Empty fails at once with
+    // NOT_FOUND. At most 60 s.
+    google.protobuf.Duration create_wait = 8;
+    // The exclusive end of the read. The read scans no entry at or after it, the close Record
+    // included, so a replay reads the same range. Zero means no end. Only the server serves it,
+    // and a Store refuses it.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" and "to" mark the ends of a range of offsets. --)
+    int64 to_offset = 11;
+    // Park as a normal read, then answer with no Records and next_offset = from_offset, when a
+    // Record at or after from_offset exists, when the Stream closes (done), or when wait ends. Its
+    // wait may be days, since a parked read adds nothing to History while it waits. Only the
+    // server serves it, and a Store refuses it.
+    bool wake_only = 12;
+    // Read the newest `last` Records, oldest first. It needs no from_offset and no start. Not with
+    // wake_only, and not in Workflow code, where replay needs a fixed range.
+    int32 last = 13;
+    // The most Record bytes in one page, so a page fits the caller's limit, such as a History
+    // marker. A larger Record still comes alone, so the read always moves on. Zero is no cap.
+    int64 max_bytes = 14;
+    // The lowest offset this run read on replay. A reset run copies the earlier run's reads into
+    // its History, so its floor must cover them too, not only its first live page. Only the
+    // server reads it.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: The floor is the lowest from_offset of the run's reads. --)
+    int64 floor_from = 15;
+}
+
+// Experimental. Might change in the future.
+message ReadRecordsResponse {
+    repeated temporal.api.stream.v1.StreamRecord records = 1;
+    // The from_offset of the next read, which is the newest offset read + 1.
+    int64 next_offset = 2;
+    bool done = 3;
+    // This reader's floor keeps more than half of the Stream's byte cap. The writer fails when the
+    // cap fills, and only the reader's continue-as-new frees it. Only the server sets it.
+    bool continue_as_new_suggested = 4;
+}
+
+// Experimental. Might change in the future.
+message DescribeStreamRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+}
+
+// Experimental. Might change in the future.
+message DescribeStreamResponse {
+    reserved 4;
+    reserved "auto_close";
+    temporal.api.enums.v1.StreamStatus status = 1;
+    // The newest offset, of a Record, a Superseded item or the close. Zero when the Stream has
+    // none.
+    int64 last_offset = 2;
+    google.protobuf.Duration retention = 3;
+}
