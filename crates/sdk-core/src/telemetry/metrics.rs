@@ -22,6 +22,61 @@ pub(super) const TASK_SLOTS_AVAILABLE_NAME: &str = "worker_task_slots_available"
 pub(super) const TASK_SLOTS_USED_NAME: &str = "worker_task_slots_used";
 pub(super) const STICKY_CACHE_SIZE_NAME: &str = "sticky_cache_size";
 
+pub(crate) struct WorkerCommandCacheMetrics {
+    buffered: Counter,
+    expired: Counter,
+    evicted: Counter,
+}
+
+impl WorkerCommandCacheMetrics {
+    pub(crate) fn new(
+        namespace: &str,
+        command_type: &'static str,
+        meter: Option<TemporalMeter>,
+    ) -> Self {
+        let meter = meter.unwrap_or_else(TemporalMeter::no_op);
+        let counter = meter.counter(MetricParameters {
+            name: "worker_command_cache_events".into(),
+            description: "Count of worker command cache entry lifecycle events".into(),
+            unit: "".into(),
+        });
+        let for_event = |event: &'static str| {
+            let mut counter = counter.clone();
+            counter.update_attributes(
+                meter.extend_attributes(
+                    meter.get_default_attributes().clone(),
+                    vec![
+                        MetricKeyValue::new(KEY_NAMESPACE, namespace.to_owned()),
+                        MetricKeyValue::new("command_type", command_type),
+                        MetricKeyValue::new("event", event),
+                    ]
+                    .into(),
+                ),
+            );
+            counter
+        };
+        Self {
+            buffered: for_event("buffered"),
+            expired: for_event("expired"),
+            evicted: for_event("evicted"),
+        }
+    }
+
+    pub(crate) fn buffered(&self) {
+        self.buffered.adds(1);
+    }
+
+    pub(crate) fn expired(&self, count: u64) {
+        if count > 0 {
+            self.expired.adds(count);
+        }
+    }
+
+    pub(crate) fn evicted(&self) {
+        self.evicted.adds(1);
+    }
+}
+
 /// Used to track context associated with metrics, and record/update them
 #[derive(Clone)]
 pub(crate) struct MetricsContext {

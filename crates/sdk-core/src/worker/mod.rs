@@ -4,6 +4,7 @@ pub(crate) mod heartbeat;
 mod nexus;
 mod slot_provider;
 pub(crate) mod tuner;
+mod worker_command_cache;
 mod workflow;
 
 /// The failure `type` set on the task failures workers synthesize when an outbound payload exceeds
@@ -1065,6 +1066,7 @@ impl Worker {
                 }
                 let at_task_mgr = act_poller.map(|ap| {
                     WorkerActivityTasks::new(
+                        config.namespace.clone(),
                         act_slots.clone(),
                         ap,
                         client.clone(),

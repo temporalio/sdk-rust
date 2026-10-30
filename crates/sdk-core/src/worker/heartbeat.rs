@@ -2,7 +2,7 @@ use crate::{
     WorkerClient, WorkerConfig,
     worker::{
         PollError, PollerBehavior, TaskPollers, Worker, WorkerTelemetry, WorkerVersioningStrategy,
-        worker_control_task_queue,
+        worker_command_cache::WorkerCommandCache, worker_control_task_queue,
     },
 };
 use parking_lot::RwLock;
@@ -46,6 +46,7 @@ pub(crate) struct SharedNamespaceWorker {
     namespace: String,
     cancel: CancellationToken,
     worker_control_task_queue_enabled: Arc<AtomicBool>,
+    worker_command_cache: Arc<WorkerCommandCache>,
 }
 
 impl SharedNamespaceWorker {
@@ -56,6 +57,12 @@ impl SharedNamespaceWorker {
         telemetry: Option<WorkerTelemetry>,
         namespace_description: Arc<NamespaceDescriptionSource>,
     ) -> Result<Self, anyhow::Error> {
+        let worker_command_cache = WorkerCommandCache::new(
+            &namespace,
+            telemetry
+                .as_ref()
+                .and_then(|t| t.temporal_metric_meter.clone()),
+        );
         let reset_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let callbacks_map = Arc::new(RwLock::new(HashMap::<Uuid, WorkerCallbacks>::new()));
@@ -64,6 +71,7 @@ impl SharedNamespaceWorker {
         tokio::spawn({
             let client = client.clone();
             let namespace = namespace.clone();
+            let worker_command_cache = worker_command_cache.clone();
             let callbacks_map = callbacks_map.clone();
             let cancel = cancel.clone();
             let worker_control_task_queue_enabled = worker_control_task_queue_enabled.clone();
@@ -139,11 +147,18 @@ impl SharedNamespaceWorker {
                 async fn handle_nexus_poll(
                     worker: &Worker,
                     callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+                    worker_command_cache: &WorkerCommandCache,
                     nexus_result: Result<NexusTask, PollError>,
                 ) -> bool {
                     match nexus_result {
                         Ok(task) => {
-                            handle_worker_command_task(worker, callbacks_map, task).await;
+                            handle_worker_command_task(
+                                worker,
+                                callbacks_map,
+                                worker_command_cache,
+                                task,
+                            )
+                            .await;
                             false
                         }
                         Err(PollError::ShutDown) => true,
@@ -189,7 +204,7 @@ impl SharedNamespaceWorker {
                                     loop {
                                         tokio::select! {
                                             nexus_result = worker.poll_nexus_task() => {
-                                                if handle_nexus_poll(&worker, &cm, nexus_result).await {
+                                                if handle_nexus_poll(&worker, &cm, &worker_command_cache, nexus_result).await {
                                                     break;
                                                 }
                                             }
@@ -230,7 +245,14 @@ impl SharedNamespaceWorker {
             namespace,
             cancel,
             worker_control_task_queue_enabled,
+            worker_command_cache,
         })
+    }
+}
+
+impl Drop for SharedNamespaceWorker {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -248,10 +270,12 @@ impl SharedNamespaceWorkerTrait for SharedNamespaceWorker {
     fn unregister_callback(&self, worker_instance_key: Uuid) -> (Option<WorkerCallbacks>, bool) {
         let mut callbacks_map = self.callbacks_map.write();
         let callbacks = callbacks_map.remove(&worker_instance_key);
-        if callbacks_map.is_empty() {
+        let is_empty = callbacks_map.is_empty();
+        drop(callbacks_map);
+        if is_empty {
             self.cancel.cancel();
         }
-        (callbacks, callbacks_map.is_empty())
+        (callbacks, is_empty)
     }
 
     fn num_workers(&self) -> usize {
@@ -262,11 +286,18 @@ impl SharedNamespaceWorkerTrait for SharedNamespaceWorker {
         self.worker_control_task_queue_enabled
             .load(Ordering::Relaxed)
     }
+
+    fn worker_command_cache(
+        &self,
+    ) -> Option<Arc<dyn temporalio_client::worker::WorkerCommandCache>> {
+        Some(self.worker_command_cache.clone())
+    }
 }
 
 async fn handle_worker_command_task(
     worker: &Worker,
     callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+    worker_command_cache: &WorkerCommandCache,
     task: NexusTask,
 ) {
     let Some(nexus_task::Variant::Task(poll_resp)) = task.variant else {
@@ -304,16 +335,14 @@ async fn handle_worker_command_task(
         let result_type = match &command.r#type {
             Some(WorkerCommandType::CancelActivity(cancel_cmd)) => {
                 let tt: TaskToken = cancel_cmd.task_token.clone().into();
-                let cancel_callbacks: Vec<_> = callbacks_map
-                    .read()
-                    .values()
-                    .filter_map(|cb| cb.cancel_activity.clone())
-                    .collect();
-                for cb in cancel_callbacks {
-                    if cb(tt.clone()) {
-                        break;
-                    }
-                }
+                worker_command_cache.cancel_activity(tt, |tt| {
+                    let cancel_callbacks: Vec<_> = callbacks_map
+                        .read()
+                        .values()
+                        .filter_map(|cb| cb.cancel_activity.clone())
+                        .collect();
+                    cancel_callbacks.into_iter().any(|cb| cb(tt.clone()))
+                });
                 Some(WorkerCommandResultType::CancelActivity(
                     temporalio_common::protos::temporal::api::worker::v1::CancelActivityResult {},
                 ))
@@ -361,7 +390,8 @@ async fn handle_worker_command_task(
 mod tests {
     use crate::{
         WorkerClient,
-        test_help::{WorkerExt, test_worker_cfg},
+        pollers::TrackedPermittedTqResp,
+        test_help::{CounterRecordingMeter, WorkerExt, test_worker_cfg},
         worker,
         worker::{PollerBehavior, client::mocks::mock_worker_client},
     };
@@ -373,27 +403,153 @@ mod tests {
         },
         time::Duration,
     };
-    use temporalio_client::worker::{SharedNamespaceWorkerTrait, WorkerCallbacks};
+    use temporalio_client::worker::{
+        NamespaceDescriptionSource, SharedNamespaceWorkerTrait, WorkerCallbacks,
+    };
     use temporalio_common::{
-        protos::temporal::api::{
-            common::v1::Payload,
-            namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
-            nexus::v1::{
-                Request, StartOperationRequest, request, response, start_operation_response,
+        protos::{
+            coresdk::{
+                ActivityTaskCompletion, activity_result::ActivityExecutionResult,
+                activity_task::activity_task,
             },
-            nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
-            worker::v1::{
-                CancelActivityCommand, EnvironmentInfo, WorkerCommand, WorkerHeartbeat,
-                worker_command, worker_command_result,
-            },
-            workflowservice::v1::{
-                DescribeNamespaceResponse, PollNexusTaskQueueResponse,
-                RecordWorkerHeartbeatResponse, RespondNexusTaskCompletedResponse,
+            temporal::api::{
+                common::v1::Payload,
+                namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
+                nexus::v1::{
+                    Request, StartOperationRequest, request, response, start_operation_response,
+                },
+                nexusservices::workerservice::v1::{
+                    ExecuteCommandsRequest, ExecuteCommandsResponse,
+                },
+                worker::v1::{
+                    CancelActivityCommand, EnvironmentInfo, WorkerCommand, WorkerHeartbeat,
+                    worker_command, worker_command_result,
+                },
+                workflowservice::v1::{
+                    DescribeNamespaceResponse, PollActivityTaskQueueResponse,
+                    PollNexusTaskQueueResponse, RecordWorkerHeartbeatResponse,
+                    RespondNexusTaskCompletedResponse,
+                },
             },
         },
+        telemetry::{TelemetryOptions, metrics::CoreMeter, telemetry_init},
         worker::WorkerTaskTypes,
     };
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn cancellation_cache_is_shared_by_namespace_worker() {
+        let mut mock = mock_worker_client();
+        mock.expect_describe_namespace()
+            .returning(|| Ok(DescribeNamespaceResponse::default()));
+        let shared = super::SharedNamespaceWorker::new(
+            Arc::new(mock),
+            "ns".to_owned(),
+            Duration::from_secs(30),
+            None,
+            Arc::new(NamespaceDescriptionSource::unresolved()),
+        )
+        .unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        for key in [first, second] {
+            shared.register_callback(key, WorkerCallbacks::new(Arc::new(|| None), None, None));
+        }
+        let token: crate::TaskToken = vec![1].into();
+        shared
+            .worker_command_cache
+            .cancel_activity(token.clone(), |_| false);
+        let first_manager = shared.worker_command_cache().unwrap();
+        let second_manager = shared.worker_command_cache().unwrap();
+        assert!(Arc::ptr_eq(&first_manager, &second_manager));
+        assert!(!shared.unregister_callback(first).1);
+        let mut registrations = 0;
+        assert!(second_manager.register_activity(&token, &mut || registrations += 1));
+        assert_eq!(registrations, 1);
+        assert!(!first_manager.register_activity(&token, &mut || registrations += 1));
+        assert_eq!(registrations, 2);
+        assert!(shared.unregister_callback(second).1);
+    }
+
+    #[tokio::test]
+    async fn command_cache_ownership_is_scoped_to_client_and_namespace() {
+        let mut mock = mock_worker_client();
+        mock.expect_describe_namespace()
+            .returning(|| Ok(DescribeNamespaceResponse::default()));
+        let client: Arc<dyn WorkerClient> = Arc::new(mock);
+        let mut other_mock = mock_worker_client();
+        other_mock
+            .expect_describe_namespace()
+            .returning(|| Ok(DescribeNamespaceResponse::default()));
+        let other_client: Arc<dyn WorkerClient> = Arc::new(other_mock);
+        let make_worker = |client: Arc<dyn WorkerClient>, namespace: &str, queue: &str| {
+            let mut config = test_worker_cfg().build().unwrap();
+            config.namespace = namespace.to_owned();
+            config.task_queue = queue.to_owned();
+            config.task_types = WorkerTaskTypes::activity_only();
+            worker::Worker::new(
+                config,
+                None,
+                client,
+                None,
+                Some(Duration::from_secs(30)),
+                None,
+            )
+            .unwrap()
+        };
+        let unregister = |worker: &worker::Worker| {
+            worker
+                .client
+                .workers()
+                .unregister_slot_provider(worker.worker_instance_key)
+                .unwrap();
+            worker
+                .client
+                .workers()
+                .finalize_unregister(worker.worker_instance_key)
+                .unwrap();
+        };
+        let first = make_worker(client.clone(), "ns", "first");
+        let second = make_worker(client.clone(), "ns", "second");
+        let other_namespace = make_worker(client.clone(), "other-ns", "first");
+        let other_group = make_worker(other_client.clone(), "ns", "first");
+        let cache = client.workers().worker_command_cache("ns").unwrap();
+        assert!(Arc::ptr_eq(
+            &cache,
+            &client.workers().worker_command_cache("ns").unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &cache,
+            &client.workers().worker_command_cache("other-ns").unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &cache,
+            &other_client.workers().worker_command_cache("ns").unwrap()
+        ));
+        unregister(&first);
+        assert!(Arc::ptr_eq(
+            &cache,
+            &client.workers().worker_command_cache("ns").unwrap()
+        ));
+        unregister(&second);
+        assert!(client.workers().worker_command_cache("ns").is_none());
+        let replacement = make_worker(client.clone(), "ns", "replacement");
+        let replacement_cache = client.workers().worker_command_cache("ns").unwrap();
+        assert!(!Arc::ptr_eq(&cache, &replacement_cache));
+        drop(first);
+        drop(second);
+        drop(cache);
+        assert!(Arc::ptr_eq(
+            &replacement_cache,
+            &client.workers().worker_command_cache("ns").unwrap()
+        ));
+        unregister(&replacement);
+        unregister(&other_namespace);
+        unregister(&other_group);
+        assert!(client.workers().worker_command_cache("ns").is_none());
+        assert!(client.workers().worker_command_cache("other-ns").is_none());
+        assert!(other_client.workers().worker_command_cache("ns").is_none());
+    }
 
     #[tokio::test]
     async fn heartbeat_only_includes_started_workers() {
@@ -686,12 +842,30 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::polled(false)]
+    #[case::eager(true)]
     #[tokio::test]
-    async fn worker_command_cancel_activity() {
+    async fn worker_command_cancel_activity_before_start(#[case] eager: bool) {
         let mut mock = mock_worker_client();
         let namespace = format!("{}-{}", crate::test_help::NAMESPACE, Uuid::new_v4());
 
         let activity_task_token = vec![1, 2, 3, 4];
+        let activity = PollActivityTaskQueueResponse {
+            task_token: activity_task_token.clone(),
+            ..Default::default()
+        };
+        if !eager {
+            let activity = activity.clone();
+            mock.expect_poll_activity_task()
+                .times(1)
+                .return_once(move |_, _| Ok(activity));
+        }
+        mock.expect_poll_activity_task()
+            .returning(|_, _| Ok(Default::default()));
+        mock.expect_cancel_activity_task()
+            .times(1)
+            .returning(|_, _| Ok(Default::default()));
 
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let completion_tx = Mutex::new(Some(completion_tx));
@@ -785,11 +959,18 @@ mod tests {
         config.task_types = WorkerTaskTypes::activity_only();
 
         let client = Arc::new(mock);
+        let meter = Arc::new(CounterRecordingMeter::default());
+        let telemetry = telemetry_init(
+            TelemetryOptions::builder()
+                .metrics(meter.clone() as Arc<dyn CoreMeter>)
+                .build(),
+        )
+        .unwrap();
         let worker = worker::Worker::new(
             config,
             None,
             client.clone(),
-            None,
+            Some(&telemetry),
             Some(Duration::from_millis(100)),
             None,
         )
@@ -806,6 +987,50 @@ mod tests {
                 .worker_control_task_queue_enabled(&namespace),
             "control task queue must be enabled while the command worker is polling"
         );
+        assert_eq!(
+            meter.counter_total(
+                "temporal_worker_command_cache_events",
+                &[
+                    ("namespace", &namespace),
+                    ("command_type", "activity_cancel"),
+                    ("event", "buffered"),
+                ]
+            ),
+            1
+        );
+        if eager {
+            let handle = worker
+                .task_subsystems
+                .at_task_mgr
+                .as_ref()
+                .unwrap()
+                .get_handle_for_workflows();
+            handle.add_tasks([TrackedPermittedTqResp {
+                permit: handle.reserve_slot().unwrap(),
+                resp: activity,
+            }]);
+        }
+        let start = worker.poll_activity_task().await.unwrap();
+        assert!(matches!(
+            start.variant,
+            Some(activity_task::Variant::Start(_))
+        ));
+        let cancel = tokio::time::timeout(Duration::from_secs(1), worker.poll_activity_task())
+            .await
+            .expect("cancellation received before registration must be delivered after Start")
+            .unwrap();
+        assert_eq!(cancel.task_token, activity_task_token);
+        assert!(matches!(
+            cancel.variant,
+            Some(activity_task::Variant::Cancel(_))
+        ));
+        worker
+            .complete_activity_task(ActivityTaskCompletion {
+                task_token: activity_task_token,
+                result: Some(ActivityExecutionResult::cancel_from_details(None)),
+            })
+            .await
+            .unwrap();
         worker.drain_pollers_and_shutdown().await;
         assert!(
             !client
