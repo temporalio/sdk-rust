@@ -33,6 +33,12 @@ relevant information.
 
 ## Unreleased
 
+## [1.1.1] - 2026-10-30
+
+### Security
+* Local test-server downloads use `zip` 9.0 instead of the yanked 8.x dependency. This affects
+  the `testing` feature only.
+
 ## [1.1.0] - 2026-10-06
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk-core"
-version = "0.10.0"
+version = "0.10.1"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 edition = "2024"
 license-file = { workspace = true }
@@ -124,7 +124,7 @@ tracing = "0.1"
 url = "2.5"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
 # Only need specific features to decompress zip files for ephemeral server download
-zip = { version = "8.4", optional = true, default-features = false, features = [
+zip = { version = "9.0", optional = true, default-features = false, features = [
   "deflate",
   "bzip2",
   "zstd",
@@ -133,19 +133,19 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 # 1st party local deps
 [dependencies.temporalio-common]
 path = "../common"
-version = "~1.1.0"
+version = "~1.1.1"
 default-features = false
 features = ["core-telemetry-bridge", "serde_serialize"]
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "~1.1.0"
+version = "~1.1.1"
 default-features = false
 features = ["core-based-sdk"]
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "~1.1.0"
+version = "~1.1.1"
 
 [dev-dependencies]
 assert_matches = "1.5"
@@ -174,8 +174,8 @@ temporalio-sdk = { path = "../sdk", features = [
   "testing",
   "wasm-workflows",
 ] }
-temporalio-common = { path = "../common", version = "~1.1.0", default-features = false }
-temporalio-workflow = { path = "../workflow", version = "~1.1.0", features = [
+temporalio-common = { path = "../common", version = "~1.1.1", default-features = false }
+temporalio-workflow = { path = "../workflow", version = "~1.1.1", features = [
   "experimental",
 ] }
 tokio = { version = "1.47", default-features = false, features = [
