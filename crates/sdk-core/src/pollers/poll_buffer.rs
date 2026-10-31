@@ -1393,6 +1393,59 @@ mod tests {
     }
 
     #[rstest]
+    #[case::scale_up_one(5, 1, true, 6)]
+    #[case::scale_up_multiple(5, 3, true, 8)]
+    #[case::scale_down_one(5, -1, true, 4)]
+    #[case::scale_down_multiple(6, -3, true, 3)]
+    #[case::scale_up_one_blocked(5, 1, false, 5)]
+    #[case::scale_up_multiple_blocked(5, 3, false, 5)]
+    #[case::scale_down_one_when_scale_up_blocked(5, -1, false, 4)]
+    #[case::scale_down_multiple_when_scale_up_blocked(6, -3, false, 3)]
+    #[case::clamp_to_maximum(5, 20, true, 10)]
+    #[case::clamp_to_minimum(5, -20, true, 2)]
+    #[case::at_maximum(10, 1, true, 10)]
+    #[case::at_minimum(2, -1, true, 2)]
+    #[case::zero(5, 0, true, 5)]
+    #[test]
+    fn scaling_decision_updates_target(
+        #[case] initial: usize,
+        #[case] delta: i32,
+        #[case] scale_up_allowed: bool,
+        #[case] expected: usize,
+    ) {
+        let handle = PollScalerReportHandle {
+            max: 10,
+            min: 2,
+            target: watch::channel(initial).0,
+            ever_saw_scaling_decision: AtomicBool::new(false),
+            capabilities: Arc::new(NamespaceCapabilities::default()),
+            behavior: PollerBehavior::Autoscaling {
+                minimum: 2,
+                maximum: 10,
+                initial,
+            },
+            ingested_this_period: Default::default(),
+            ingested_last_period: Default::default(),
+            scale_up_allowed: AtomicBool::new(scale_up_allowed),
+            last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            persistent_error_warning_state: Default::default(),
+            exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
+            resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
+        };
+        let response = Ok(PollWorkflowTaskQueueResponse {
+            task_token: vec![1],
+            poller_scaling_decision: Some(PollerScalingDecision {
+                poll_request_delta_suggestion: delta,
+            }),
+            ..Default::default()
+        });
+
+        handle.poll_result(&response);
+
+        assert_eq!(*handle.target.borrow(), expected);
+    }
+
+    #[rstest]
     #[case::with_capability(true, 1, 1)]
     #[case::without_capability(false, 1, 10)]
     #[case::clamps_to_nonone_min(true, 3, 3)]
