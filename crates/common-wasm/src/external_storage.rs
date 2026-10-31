@@ -316,7 +316,6 @@ pub trait StorageDriverSelector: Send + Sync {
 ///
 /// This API is experimental and may change without notice. For now:
 ///
-/// - Heartbeat details recorded from inside an activity are not offloaded.
 /// - Storage requests are not limited, so every request a message needs runs at once.
 /// - References are not passed through the payload codec, so the
 ///   [`claim_data`](StorageDriverClaim::claim_data) they carry is written to history unencrypted,

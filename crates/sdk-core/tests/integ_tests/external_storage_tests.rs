@@ -27,7 +27,11 @@ use temporalio_common::{
         StorageDriverRetrieveContext, StorageDriverStoreContext, StorageDriverTargetInfo,
         StorageDriverWorkflowInfo,
     },
-    protos::temporal::api::{common::v1::Payload, history::v1::history_event::Attributes},
+    protos::temporal::api::{
+        common::v1::{Payload, RetryPolicy},
+        failure::v1::failure::FailureInfo,
+        history::v1::history_event::Attributes,
+    },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -294,6 +298,45 @@ impl TargetsChildWorkflow {
     #[signal]
     fn deliver(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _value: String) {
         self.delivered = true;
+    }
+}
+
+struct HeartbeatActivities;
+#[activities]
+impl HeartbeatActivities {
+    #[activity]
+    async fn heartbeat_until_timeout(ctx: ActivityContext) -> Result<(), ActivityError> {
+        ctx.record_heartbeat("h".repeat(10_000)).await?;
+        ctx.cancelled().await;
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct HeartbeatDetailsWorkflow;
+#[workflow_methods]
+impl HeartbeatDetailsWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let err = ctx
+            .execute_activity(
+                HeartbeatActivities::heartbeat_until_timeout,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+                    .heartbeat_timeout(Duration::from_secs(1))
+                    .retry_policy(RetryPolicy {
+                        maximum_attempts: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .expect_err("activity should time out");
+        let timeout = err.as_timeout().expect("activity should time out");
+        Ok(timeout
+            .last_heartbeat_details()?
+            .expect("heartbeat details should be present"))
     }
 }
 
@@ -800,5 +843,69 @@ async fn drivers_are_told_which_standalone_activity_a_payload_is_stored_for() {
     assert_same_targets(
         driver.targets.lock().unwrap().clone(),
         vec![activity(None), activity(Some(&run_id))],
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_details_round_trip_through_external_storage() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let client = client_with_storage(driver.clone()).await;
+
+    let mut starter = CoreWfStarter::new_with_overrides(
+        HeartbeatDetailsWorkflow::name(),
+        None,
+        Some(client.clone()),
+    );
+    starter.sdk_config.register_activities(HeartbeatActivities);
+    starter
+        .sdk_config
+        .register_workflow::<HeartbeatDetailsWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            HeartbeatDetailsWorkflow::run,
+            (),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert_eq!(
+        handle.get_result(Default::default()).await.unwrap(),
+        "h".repeat(10_000)
+    );
+
+    let history = starter.get_history().await;
+    let last_heartbeat_details = history
+        .events
+        .into_iter()
+        .find_map(|event| match event.attributes {
+            Some(Attributes::ActivityTaskTimedOutEventAttributes(attrs)) => {
+                match attrs.failure.and_then(|failure| failure.failure_info) {
+                    Some(FailureInfo::TimeoutFailureInfo(info)) => info.last_heartbeat_details,
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("the activity's timeout should carry its last heartbeat details");
+    assert!(is_reference(&last_heartbeat_details.payloads[0]));
+
+    let workflow_target = Some(StorageDriverTargetInfo::Workflow(
+        StorageDriverWorkflowInfo::builder()
+            .namespace(integ_namespace())
+            .id(workflow_id)
+            .run_id(handle.run_id().unwrap().to_owned())
+            .workflow_type(HeartbeatDetailsWorkflow::name().to_owned())
+            .build(),
+    ));
+    // The heartbeat details, and the workflow's result that repeats them.
+    assert_same_targets(
+        driver.targets.lock().unwrap().clone(),
+        vec![workflow_target.clone(), workflow_target],
     );
 }

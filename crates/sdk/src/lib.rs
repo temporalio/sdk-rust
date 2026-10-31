@@ -1796,6 +1796,7 @@ impl ActivityHalf {
                     task_queue,
                     task_token.clone(),
                     start,
+                    store_target.clone(),
                 );
                 let codec_data_converter = data_converter.clone();
 
