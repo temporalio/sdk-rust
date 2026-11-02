@@ -3,6 +3,12 @@
 //! This module is public for use by `temporalio-sdk-core` and is not intended to be used directly
 //! by SDK users.
 
+mod workflow_heartbeat_notifications;
+#[doc(hidden)]
+pub use workflow_heartbeat_notifications::{
+    WorkflowHeartbeatNotifications, WorkflowHeartbeatRegistration,
+};
+
 use anyhow::bail;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
@@ -388,6 +394,11 @@ pub trait SharedNamespaceWorkerTrait {
     fn worker_control_task_queue_enabled(&self) -> bool {
         false
     }
+
+    /// Internal routing shared by workflow workers in this namespace.
+    fn workflow_heartbeat_notifications(&self) -> Option<Arc<WorkflowHeartbeatNotifications>> {
+        None
+    }
 }
 
 /// Enables local workers to make themselves visible to a shared client instance.
@@ -421,6 +432,30 @@ impl ClientWorkerSet {
         self.worker_manager
             .write()
             .namespace_description_source(namespace)
+    }
+
+    #[doc(hidden)]
+    pub fn workflow_heartbeat_notifications(
+        &self,
+        namespace: &str,
+    ) -> Option<Arc<WorkflowHeartbeatNotifications>> {
+        self.worker_manager
+            .read()
+            .shared_worker
+            .get(namespace)
+            .and_then(|worker| worker.workflow_heartbeat_notifications())
+    }
+
+    #[doc(hidden)]
+    pub fn worker_control_task_queue(&self, namespace: &str) -> String {
+        if self.worker_control_task_queue_enabled(namespace) {
+            format!(
+                "temporal-sys/worker-commands/{namespace}/{}",
+                self.worker_grouping_key()
+            )
+        } else {
+            String::new()
+        }
     }
 
     /// Try to reserve a compatible processing slot in any of the registered workers.
@@ -977,6 +1012,7 @@ mod tests {
         let namespace = "test_namespace";
 
         assert!(!manager.worker_control_task_queue_enabled(namespace));
+        assert!(manager.worker_control_task_queue(namespace).is_empty());
 
         manager.worker_manager.write().shared_worker.insert(
             namespace.to_string(),
@@ -987,7 +1023,19 @@ mod tests {
         );
 
         assert!(manager.worker_control_task_queue_enabled(namespace));
+        assert_eq!(
+            manager.worker_control_task_queue(namespace),
+            format!(
+                "temporal-sys/worker-commands/{namespace}/{}",
+                manager.worker_grouping_key()
+            )
+        );
         assert!(!manager.worker_control_task_queue_enabled("other_namespace"));
+        assert!(
+            manager
+                .worker_control_task_queue("other_namespace")
+                .is_empty()
+        );
     }
 
     fn new_mock_provider_with_heartbeat(

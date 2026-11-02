@@ -36,6 +36,11 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Support best-effort Workflow Heartbeat Notifications on the worker control queue, allowing early
+  Workflow Task heartbeats at safe yield points while Local Activity work remains pending. Ready
+  notifications take priority over queued Local Activity completions.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

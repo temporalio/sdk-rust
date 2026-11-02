@@ -1,0 +1,1 @@
+Workers can respond to server Workflow Heartbeat Notifications by delivering pending workflow inputs sooner while Local Activities remain pending. Timed Workflow Task heartbeats remain the fallback. When a notification and Local Activity completion are both queued, the notification is processed first.

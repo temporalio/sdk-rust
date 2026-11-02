@@ -66,6 +66,7 @@ impl WFStream {
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        heartbeat_registrar: WorkflowHeartbeatRegistrar,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let all_inputs = stream::select_with_strategy(
             local_rx.map(Into::into),
@@ -77,13 +78,19 @@ impl WFStream {
             // Priority always goes to the local stream
             |_: &mut ()| PollNext::Left,
         );
-        Self::build_internal(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(
+            all_inputs,
+            basics,
+            local_activity_request_sink,
+            heartbeat_registrar,
+        )
     }
 
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        heartbeat_registrar: WorkflowHeartbeatRegistrar,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
@@ -93,6 +100,7 @@ impl WFStream {
                 basics.server_capabilities,
                 local_activity_request_sink,
                 basics.metrics.clone(),
+                heartbeat_registrar,
             ),
             shutdown_token: basics.shutdown_token,
             metrics: basics.metrics,
@@ -135,6 +143,10 @@ impl WFStream {
                                 state.process_post_activation(*report)
                             }
                             LocalInputs::LocalResolution(res) => state.local_resolution(res),
+                            LocalInputs::HeartbeatNotification { run_id, task_token } => state
+                                .runs
+                                .get_mut(&run_id)
+                                .and_then(|run| run.heartbeat_notification(&task_token)),
                             LocalInputs::HeartbeatTimeout(hbt) => {
                                 state.process_heartbeat_timeout(hbt)
                             }
@@ -691,6 +703,10 @@ pub(super) enum LocalInputs {
     PostActivation(Box<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
+    HeartbeatNotification {
+        run_id: String,
+        task_token: TaskToken,
+    },
     /// A queued cancel was handed to lang, so the run may be ready to evict
     #[from(ignore)]
     LocalActivityCancelProcessed(String),
@@ -705,6 +721,7 @@ impl LocalInputs {
             LocalInputs::LocalResolution(lr) => &lr.run_id,
             LocalInputs::PostActivation(pa) => &pa.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
+            LocalInputs::HeartbeatNotification { run_id, .. } => run_id,
             LocalInputs::HeartbeatTimeout(run_id)
             | LocalInputs::LocalActivityCancelProcessed(run_id) => run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,

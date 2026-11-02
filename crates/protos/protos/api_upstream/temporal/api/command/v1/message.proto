@@ -68,6 +68,12 @@ message ScheduleActivityTaskCommandAttributes {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 14;
+    // Experimental. Request a Workflow Task heartbeat notification when this Activity reaches a
+    // terminal result, so the result can be delivered in the next Workflow Task as early as possible.
+    // Set this to true when the Workflow may be running a Local Activity while waiting for this
+    // Activity result.
+    // This field is experimental and may be removed if this behavior becomes the default.
+    bool request_eager_result_delivery = 15;
 }
 
 message RequestCancelActivityTaskCommandAttributes {

@@ -1900,6 +1900,7 @@ pub mod temporal {
                     ) -> command::Attributes {
                         command::Attributes::ScheduleActivityTaskCommandAttributes(
                             ScheduleActivityTaskCommandAttributes {
+                                request_eager_result_delivery: false,
                                 activity_id: s.activity_id,
                                 activity_type: Some(ActivityType {
                                     name: s.activity_type,

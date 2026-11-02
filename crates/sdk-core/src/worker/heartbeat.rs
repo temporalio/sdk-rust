@@ -17,6 +17,7 @@ use std::{
 };
 use temporalio_client::worker::{
     NamespaceDescriptionSource, SharedNamespaceWorkerTrait, WorkerCallbacks,
+    WorkflowHeartbeatNotifications,
 };
 use temporalio_common::{
     protos::{
@@ -46,6 +47,7 @@ pub(crate) struct SharedNamespaceWorker {
     namespace: String,
     cancel: CancellationToken,
     worker_control_task_queue_enabled: Arc<AtomicBool>,
+    workflow_heartbeat_notifications: Arc<WorkflowHeartbeatNotifications>,
 }
 
 impl SharedNamespaceWorker {
@@ -56,12 +58,14 @@ impl SharedNamespaceWorker {
         telemetry: Option<WorkerTelemetry>,
         namespace_description: Arc<NamespaceDescriptionSource>,
     ) -> Result<Self, anyhow::Error> {
+        let workflow_heartbeat_notifications = Arc::new(WorkflowHeartbeatNotifications::default());
         let reset_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let callbacks_map = Arc::new(RwLock::new(HashMap::<Uuid, WorkerCallbacks>::new()));
         let worker_control_task_queue_enabled = Arc::new(AtomicBool::new(false));
 
         tokio::spawn({
+            let workflow_heartbeat_notifications = workflow_heartbeat_notifications.clone();
             let client = client.clone();
             let namespace = namespace.clone();
             let callbacks_map = callbacks_map.clone();
@@ -139,11 +143,13 @@ impl SharedNamespaceWorker {
                 async fn handle_nexus_poll(
                     worker: &Worker,
                     callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+                    notifications: &WorkflowHeartbeatNotifications,
                     nexus_result: Result<NexusTask, PollError>,
                 ) -> bool {
                     match nexus_result {
                         Ok(task) => {
-                            handle_worker_command_task(worker, callbacks_map, task).await;
+                            handle_worker_command_task(worker, callbacks_map, notifications, task)
+                                .await;
                             false
                         }
                         Err(PollError::ShutDown) => true,
@@ -189,7 +195,7 @@ impl SharedNamespaceWorker {
                                     loop {
                                         tokio::select! {
                                             nexus_result = worker.poll_nexus_task() => {
-                                                if handle_nexus_poll(&worker, &cm, nexus_result).await {
+                                                if handle_nexus_poll(&worker, &cm, &workflow_heartbeat_notifications, nexus_result).await {
                                                     break;
                                                 }
                                             }
@@ -230,6 +236,7 @@ impl SharedNamespaceWorker {
             namespace,
             cancel,
             worker_control_task_queue_enabled,
+            workflow_heartbeat_notifications,
         })
     }
 }
@@ -258,6 +265,10 @@ impl SharedNamespaceWorkerTrait for SharedNamespaceWorker {
         self.callbacks_map.read().len()
     }
 
+    fn workflow_heartbeat_notifications(&self) -> Option<Arc<WorkflowHeartbeatNotifications>> {
+        Some(self.workflow_heartbeat_notifications.clone())
+    }
+
     fn worker_control_task_queue_enabled(&self) -> bool {
         self.worker_control_task_queue_enabled
             .load(Ordering::Relaxed)
@@ -267,6 +278,7 @@ impl SharedNamespaceWorkerTrait for SharedNamespaceWorker {
 async fn handle_worker_command_task(
     worker: &Worker,
     callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+    notifications: &WorkflowHeartbeatNotifications,
     task: NexusTask,
 ) {
     let Some(nexus_task::Variant::Task(poll_resp)) = task.variant else {
@@ -316,6 +328,13 @@ async fn handle_worker_command_task(
                 }
                 Some(WorkerCommandResultType::CancelActivity(
                     temporalio_common::protos::temporal::api::worker::v1::CancelActivityResult {},
+                ))
+            }
+            Some(WorkerCommandType::WorkflowTaskHeartbeatNotification(command)) => {
+                Some(WorkerCommandResultType::WorkflowTaskHeartbeatNotification(
+                    temporalio_common::protos::temporal::api::worker::v1::WorkflowTaskHeartbeatNotificationResult {
+                        outcome: notifications.notify(&command.task_token.clone().into()) as i32,
+                    },
                 ))
             }
             None => {
@@ -384,7 +403,8 @@ mod tests {
             nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
             worker::v1::{
                 CancelActivityCommand, EnvironmentInfo, WorkerCommand, WorkerHeartbeat,
-                worker_command, worker_command_result,
+                WorkflowTaskHeartbeatNotificationCommand, worker_command, worker_command_result,
+                workflow_task_heartbeat_notification_result::Outcome,
             },
             workflowservice::v1::{
                 DescribeNamespaceResponse, PollNexusTaskQueueResponse,
@@ -714,13 +734,24 @@ mod tests {
                     .expect("control task queue must include worker grouping key");
                 if !poll_returned_command_clone.swap(true, Ordering::SeqCst) {
                     let exec_req = ExecuteCommandsRequest {
-                        commands: vec![WorkerCommand {
-                            r#type: Some(worker_command::Type::CancelActivity(
-                                CancelActivityCommand {
-                                    task_token: at_clone.clone(),
-                                },
-                            )),
-                        }],
+                        commands: vec![
+                            WorkerCommand {
+                                r#type: Some(worker_command::Type::CancelActivity(
+                                    CancelActivityCommand {
+                                        task_token: at_clone.clone(),
+                                    },
+                                )),
+                            },
+                            WorkerCommand {
+                                r#type: Some(
+                                    worker_command::Type::WorkflowTaskHeartbeatNotification(
+                                        WorkflowTaskHeartbeatNotificationCommand {
+                                            task_token: vec![42],
+                                        },
+                                    ),
+                                ),
+                            },
+                        ],
                     };
                     Ok(PollNexusTaskQueueResponse {
                         task_token: vec![99],
@@ -825,7 +856,10 @@ mod tests {
         let payload_data = sync_resp.payload.expect("Should have payload").data;
         let exec_resp = ExecuteCommandsResponse::decode(payload_data.as_slice())
             .expect("Should decode ExecuteCommandsResponse");
-        assert_eq!(exec_resp.results.len(), 1, "Should have one result");
+        assert_eq!(exec_resp.results.len(), 2);
+        assert_matches!(exec_resp.results[1].r#type.as_ref(),
+            Some(worker_command_result::Type::WorkflowTaskHeartbeatNotification(result)) =>
+                assert_eq!(result.outcome, Outcome::NoWorkflowTask as i32));
         assert!(
             matches!(
                 exec_resp.results[0].r#type,
@@ -835,3 +869,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod workflow_heartbeat_tests;

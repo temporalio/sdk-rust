@@ -770,8 +770,9 @@ proxier! {
                     let namespace = req_mut.namespace.clone();
                     let task_queue = req_mut.task_queue.as_ref()
                                         .map(|tq| tq.name.clone()).unwrap_or_default();
-                    match workers.try_reserve_wft_slot(namespace, task_queue) {
+                    match workers.try_reserve_wft_slot(namespace.clone(), task_queue) {
                         Some(reservation) => {
+                            req_mut.worker_control_task_queue = workers.worker_control_task_queue(&namespace);
                             // Populate eager_worker_deployment_options from the slot reservation
                             if let Some(opts) = reservation.deployment_options {
                                 req_mut.eager_worker_deployment_options = Some(temporalio_common::protos::temporal::api::deployment::v1::WorkerDeploymentOptions {
@@ -2052,7 +2053,10 @@ proxier! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClientOptions, ConnectionOptions};
+    use crate::{
+        ClientOptions, ConnectionOptions,
+        worker::{SharedNamespaceWorkerTrait, WorkerCallbacks},
+    };
     use std::collections::HashSet;
     use temporalio_common::{
         protos::temporal::api::{
@@ -2063,6 +2067,24 @@ mod tests {
     use tonic::IntoRequest;
     use url::Url;
     use uuid::Uuid;
+
+    struct CommandReceiver(bool);
+
+    impl SharedNamespaceWorkerTrait for CommandReceiver {
+        fn namespace(&self) -> String {
+            "test-namespace".to_owned()
+        }
+        fn register_callback(&self, _: Uuid, _: WorkerCallbacks) {}
+        fn unregister_callback(&self, _: Uuid) -> (Option<WorkerCallbacks>, bool) {
+            (None, true)
+        }
+        fn num_workers(&self) -> usize {
+            1
+        }
+        fn worker_control_task_queue_enabled(&self) -> bool {
+            self.0
+        }
+    }
 
     #[test]
     fn payload_limits_warn_only_vs_error() {
@@ -2305,7 +2327,10 @@ mod tests {
     #[case::with_versioning(true)]
     #[case::without_versioning(false)]
     #[tokio::test]
-    async fn eager_reservations_attach_deployment_options(#[case] use_worker_versioning: bool) {
+    async fn eager_reservations_attach_deployment_options(
+        #[case] use_worker_versioning: bool,
+        #[values(false, true)] commands_enabled: bool,
+    ) {
         use crate::worker::{MockClientWorker, MockSlot};
         use temporalio_common::{
             protos::temporal::api::enums::v1::WorkerVersioningMode,
@@ -2322,6 +2347,7 @@ mod tests {
         struct MyFakeServices {
             client_worker_set: Arc<ClientWorkerSet>,
             expected_mode: WorkerVersioningMode,
+            expected_control_queue: String,
         }
         impl RawGrpcCaller for MyFakeServices {}
         impl RawClientProducer for MyFakeServices {
@@ -2331,6 +2357,7 @@ mod tests {
             fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
                 Box::new(MyFakeWfClient {
                     expected_mode: self.expected_mode,
+                    expected_control_queue: self.expected_control_queue.clone(),
                 })
             }
             fn operator_client(&mut self) -> Box<dyn OperatorService> {
@@ -2371,7 +2398,19 @@ mod tests {
         mock_provider
             .expect_deployment_options()
             .return_const(Some(deployment_opts.clone()));
-        mock_provider.expect_heartbeat_enabled().return_const(false);
+        mock_provider.expect_heartbeat_enabled().return_const(true);
+        mock_provider
+            .expect_heartbeat_callback()
+            .returning(|| Some(Arc::new(|| None)));
+        mock_provider
+            .expect_heartbeat_success_callback()
+            .returning(|| None);
+        mock_provider
+            .expect_cancel_activity_callback()
+            .returning(|| None);
+        mock_provider
+            .expect_new_shared_namespace_worker()
+            .returning(move || Ok(Box::new(CommandReceiver(commands_enabled))));
         let uuid = Uuid::new_v4();
         mock_provider
             .expect_worker_instance_key()
@@ -2393,6 +2432,7 @@ mod tests {
         #[derive(Clone)]
         struct MyFakeWfClient {
             expected_mode: WorkerVersioningMode,
+            expected_control_queue: String,
         }
         impl WorkflowService for MyFakeWfClient {
             fn start_workflow_execution(
@@ -2402,6 +2442,7 @@ mod tests {
             {
                 let req = request.into_inner();
                 let expected_mode = self.expected_mode;
+                assert_eq!(req.worker_control_task_queue, self.expected_control_queue);
 
                 assert!(
                     req.eager_worker_deployment_options.is_some(),
@@ -2417,9 +2458,12 @@ mod tests {
             }
         }
 
+        let expected_control_queue = client_worker_set.worker_control_task_queue("test-namespace");
+        assert_eq!(!expected_control_queue.is_empty(), commands_enabled);
         let mut mfs = MyFakeServices {
             client_worker_set,
             expected_mode,
+            expected_control_queue,
         };
 
         // Create a request with eager execution enabled

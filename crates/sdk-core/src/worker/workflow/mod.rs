@@ -64,7 +64,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_client::MESSAGE_TOO_LARGE_KEY;
+use temporalio_client::{MESSAGE_TOO_LARGE_KEY, worker::WorkflowHeartbeatRegistration};
 use temporalio_common::{
     payload_limits::PayloadLimitViolation,
     protos::{
@@ -125,6 +125,7 @@ type InternalFlagsRef = Rc<RefCell<InternalFlags>>;
 /// Centralizes all state related to workflows and workflow tasks
 pub(crate) struct Workflows {
     task_queue: String,
+    namespace: String,
     local_tx: UnboundedSender<LocalInput>,
     processing_task: TakeCell<thread::JoinHandle<()>>,
     activation_stream: tokio::sync::Mutex<(
@@ -147,6 +148,35 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+}
+
+// Keeps Core's workflow input types out of the client-side notification router.
+#[derive(Clone)]
+struct WorkflowHeartbeatRegistrar {
+    client: Arc<dyn WorkerClient>,
+    namespace: String,
+    notification_tx: UnboundedSender<LocalInput>,
+}
+
+impl WorkflowHeartbeatRegistrar {
+    fn register(&self, token: TaskToken, run_id: String) -> Option<WorkflowHeartbeatRegistration> {
+        let router = self
+            .client
+            .workers()
+            .workflow_heartbeat_notifications(&self.namespace)?;
+        let notification_tx = self.notification_tx.clone();
+        Some(router.register(token.clone(), move || {
+            notification_tx
+                .send(LocalInput {
+                    input: LocalInputs::HeartbeatNotification {
+                        run_id: run_id.clone(),
+                        task_token: token.clone(),
+                    },
+                    span: Span::current(),
+                })
+                .is_ok()
+        }))
+    }
 }
 
 pub(crate) struct WorkflowBasics {
@@ -172,6 +202,31 @@ pub(crate) struct RunBasics<'a> {
     pub(crate) sdk_version: &'a str,
 }
 
+fn workflow_inputs(
+    heartbeat_rx: UnboundedReceiver<LocalInput>,
+    local_rx: UnboundedReceiver<LocalInput>,
+    la_notify_rx: Option<UnboundedReceiver<LocalActivityNotification>>,
+) -> impl Stream<Item = LocalInput> {
+    let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
+        // LA manager notifications go first so that one is never processed after an input lang
+        // could only have produced in reaction to it, such as the resolution of an attempt
+        // whose cancel delivery the notification announces
+        Either::Left(stream::select_with_strategy(
+            UnboundedReceiverStream::new(la_notify_rx).map(Into::into),
+            UnboundedReceiverStream::new(local_rx),
+            |_: &mut ()| PollNext::Left,
+        ))
+    } else {
+        Either::Right(UnboundedReceiverStream::new(local_rx))
+    };
+    // Start a ready WHN before a queued LA result can remove the need for a heartbeat.
+    stream::select_with_strategy(
+        UnboundedReceiverStream::new(heartbeat_rx),
+        locals_stream,
+        |_: &mut ()| PollNext::Left,
+    )
+}
+
 impl Workflows {
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
     pub(super) fn new(
@@ -187,9 +242,16 @@ impl Workflows {
         tracing_sub: Option<Arc<dyn Subscriber + Send + Sync>>,
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
+        let (heartbeat_tx, heartbeat_rx) = unbounded_channel();
+        let heartbeat_registrar = WorkflowHeartbeatRegistrar {
+            client: client.clone(),
+            namespace: basics.worker_config.namespace.clone(),
+            notification_tx: heartbeat_tx,
+        };
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
+        let namespace = basics.worker_config.namespace.clone();
         let max_eager_activity_reservations_per_workflow_task = basics
             .worker_config
             .max_eager_activity_reservations_per_workflow_task;
@@ -202,18 +264,7 @@ impl Workflows {
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
         );
-        let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
-            // LA manager notifications go first so that one is never processed after an input lang
-            // could only have produced in reaction to it, such as the resolution of an attempt
-            // whose cancel delivery the notification announces
-            Either::Left(stream::select_with_strategy(
-                UnboundedReceiverStream::new(la_notify_rx).map(Into::into),
-                UnboundedReceiverStream::new(local_rx),
-                |_: &mut ()| PollNext::Left,
-            ))
-        } else {
-            Either::Right(UnboundedReceiverStream::new(local_rx))
-        };
+        let locals_stream = workflow_inputs(heartbeat_rx, local_rx, la_notify_rx);
         let (activation_tx, activation_rx) = unbounded_channel();
         let (start_polling_tx, start_polling_rx) = oneshot::channel();
         // We must spawn a task to constantly poll the activation stream, because otherwise
@@ -249,6 +300,7 @@ impl Workflows {
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
+                        heartbeat_registrar,
                     );
 
                     while let Some(output) = stream.next().await {
@@ -277,6 +329,7 @@ impl Workflows {
             .expect("Must be able to spawn workflow processing thread");
         Self {
             task_queue,
+            namespace,
             local_tx,
             processing_task: TakeCell::new(processing_task),
             activation_stream: tokio::sync::Mutex::new((
@@ -585,6 +638,21 @@ impl Workflows {
         completion_outcome: ActivationCompleteResult,
     ) -> WFTReportStatus {
         let completion_time = Instant::now();
+        // Stop accepting WHN before sending the WFT response.
+        // OutstandingTask remains alive until the RPC result is processed.
+        let token = match &completion_outcome.outcome {
+            ActivationCompleteOutcome::ReportWFTSuccess(report) => Some(&report.task_token),
+            ActivationCompleteOutcome::ReportWFTFail(report) => Some(&report.task_token),
+            ActivationCompleteOutcome::DoNothing => None,
+        };
+        if let Some(token) = token
+            && let Some(router) = self
+                .client
+                .workers()
+                .workflow_heartbeat_notifications(&self.namespace)
+        {
+            router.retire(token);
+        }
 
         match completion_outcome.outcome {
             ActivationCompleteOutcome::ReportWFTSuccess(report) => {
@@ -1071,6 +1139,8 @@ impl PreparedWFT {
 #[derive(Debug)]
 struct OutstandingTask {
     info: WorkflowTaskInfo,
+    heartbeat_registration: Option<WorkflowHeartbeatRegistration>,
+    heartbeat_notification_pending: bool,
     /// Set if the outstanding task has quer(ies) which must be fulfilled upon finishing replay
     pending_queries: Vec<QueryWorkflow>,
     start_time: Instant,
@@ -2008,6 +2078,74 @@ mod tests {
             temporal::api::enums::v1::EventType,
         },
     };
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn ready_whn_precedes_local_activity_completion(
+        #[values(false, true)] with_la_notifications: bool,
+    ) {
+        let (local_tx, local_rx) = unbounded_channel();
+        let (heartbeat_tx, heartbeat_rx) = unbounded_channel();
+        let (la_tx, la_rx) = unbounded_channel();
+        let run_id = "run".to_owned();
+        local_tx
+            .send(LocalInput {
+                input: LocalInputs::LocalResolution(LocalResolutionMsg {
+                    run_id: run_id.clone(),
+                    res: LocalResolution::LocalActivity(LocalActivityResolution {
+                        seq: 1,
+                        result: LocalActivityExecutionResult::Completed(Default::default()),
+                        runtime: Duration::ZERO,
+                        attempt: 1,
+                        backoff: None,
+                        original_schedule_time: None,
+                    }),
+                }),
+                span: Span::none(),
+            })
+            .unwrap();
+        if with_la_notifications {
+            la_tx
+                .send(LocalActivityNotification::CancelProcessed {
+                    run_id: run_id.clone(),
+                    span: Span::none(),
+                })
+                .unwrap();
+        }
+        heartbeat_tx
+            .send(LocalInput {
+                input: LocalInputs::HeartbeatNotification {
+                    run_id,
+                    task_token: vec![1].into(),
+                },
+                span: Span::none(),
+            })
+            .unwrap();
+        drop(local_tx);
+        drop(heartbeat_tx);
+        drop(la_tx);
+        let inputs = workflow_inputs(
+            heartbeat_rx,
+            local_rx,
+            with_la_notifications.then_some(la_rx),
+        );
+        tokio::pin!(inputs);
+        assert_matches!(
+            inputs.next().await.unwrap().input,
+            LocalInputs::HeartbeatNotification { .. }
+        );
+        if with_la_notifications {
+            assert_matches!(
+                inputs.next().await.unwrap().input,
+                LocalInputs::LocalActivityCancelProcessed(_)
+            );
+        }
+        assert_matches!(
+            inputs.next().await.unwrap().input,
+            LocalInputs::LocalResolution(_)
+        );
+        assert!(inputs.next().await.is_none());
+    }
 
     #[test]
     fn task_storage_metrics_from_completion_keeps_directions_distinct() {

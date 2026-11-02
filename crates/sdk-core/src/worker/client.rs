@@ -1,10 +1,7 @@
 //! Worker-specific client needs
 
 pub(crate) mod mocks;
-use crate::{
-    protosext::legacy_query_failure,
-    worker::{WorkerVersioningStrategy, worker_control_task_queue},
-};
+use crate::{protosext::legacy_query_failure, worker::WorkerVersioningStrategy};
 use backon::{BackoffBuilder, ExponentialBuilder};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
@@ -289,12 +286,10 @@ impl WorkerClientBag {
     }
 
     fn worker_control_task_queue(&self) -> String {
-        let workers = self.connection.inner_cow().workers();
-        if workers.worker_control_task_queue_enabled(&self.namespace) {
-            worker_control_task_queue(&self.namespace, &workers.worker_grouping_key().to_string())
-        } else {
-            String::new()
-        }
+        self.connection
+            .inner_cow()
+            .workers()
+            .worker_control_task_queue(&self.namespace)
     }
 }
 
@@ -494,8 +489,10 @@ impl WorkerClient for WorkerClientBag {
                 normal_name: "".to_string(),
             }
         };
+        let control_queue = self.worker_control_task_queue();
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollWorkflowTaskQueueRequest {
+            supports_workflow_task_heartbeat_notification: !control_queue.is_empty(),
             namespace: self.namespace.clone(),
             task_queue: Some(task_queue),
             identity: self.identity(),
@@ -503,7 +500,7 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
-            worker_control_task_queue: self.worker_control_task_queue(),
+            worker_control_task_queue: control_queue,
             poller_group_id: Default::default(),
             poller_pool_info: poll_options
                 .target_pollers

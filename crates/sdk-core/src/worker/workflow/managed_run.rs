@@ -12,7 +12,7 @@ use crate::{
             NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, RequestEvictMsg,
             RunBasics, ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand,
             WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
-            WftFailureKind, WorkflowTaskInfo,
+            WftFailureKind, WorkflowHeartbeatRegistrar, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -101,12 +101,14 @@ pub(super) struct ManagedRun {
     paginator: Option<HistoryPaginator>,
     completion_waiting_on_page_fetch: Option<RunActivationCompletion>,
     config: Arc<WorkerConfig>,
+    heartbeat_registrar: WorkflowHeartbeatRegistrar,
 }
 impl ManagedRun {
     pub(super) fn new(
         basics: RunBasics,
         wft: PermittedWFT,
         local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+        heartbeat_registrar: WorkflowHeartbeatRegistrar,
     ) -> (Self, RunUpdateAct) {
         let metrics = basics.metrics.clone();
         let config = basics.worker_config.clone();
@@ -125,6 +127,7 @@ impl ManagedRun {
             paginator: None,
             completion_waiting_on_page_fetch: None,
             config,
+            heartbeat_registrar,
         };
         let rua = me.incoming_wft(wft);
         (me, rua)
@@ -224,8 +227,16 @@ impl ManagedRun {
         }
 
         self.paginator = Some(pwft.paginator);
+        let heartbeat_registration = if was_legacy_query {
+            None
+        } else {
+            self.heartbeat_registrar
+                .register(wft_info.task_token.clone(), self.run_id().to_owned())
+        };
         self.wft = Some(OutstandingTask {
             info: wft_info,
+            heartbeat_registration,
+            heartbeat_notification_pending: false,
             pending_queries,
             start_time,
             permit: pwft.permit,
@@ -776,6 +787,10 @@ impl ManagedRun {
                 && self.waiting_on_la.is_some();
         let completing_la_heartbeat = completing_heartbeat_autocomplete
             || self
+                .wft
+                .as_ref()
+                .is_some_and(|task| task.heartbeat_notification_pending)
+            || self
                 .waiting_on_la
                 .as_ref()
                 .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
@@ -924,6 +939,18 @@ impl ManagedRun {
         } else {
             Ok(None)
         }
+    }
+
+    pub(super) fn heartbeat_notification(&mut self, token: &TaskToken) -> RunUpdateAct {
+        let task = self.wft.as_mut().filter(|task| {
+            &task.info.task_token == token
+                && task
+                    .heartbeat_registration
+                    .as_ref()
+                    .is_some_and(|registration| registration.is_active())
+        })?;
+        task.heartbeat_notification_pending = true;
+        self.heartbeat_timeout()
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
