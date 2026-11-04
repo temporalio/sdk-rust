@@ -2492,7 +2492,7 @@ mod tests {
 
             history.add_workflow_task_scheduled_and_started();
             let activation = live
-                .new_work_from_server(history.get_one_wft(2).unwrap().into(), vec![])
+                .new_work_from_server(history.get_one_wft(2).unwrap().into(), vec![], false)
                 .unwrap();
             assert!(activation.jobs.is_empty());
             let mut workflow = FanoutWorkflow::default();
@@ -2503,7 +2503,7 @@ mod tests {
 
             history.add_workflow_task_scheduled_and_started();
             let activation = live
-                .new_work_from_server(history.get_one_wft(3).unwrap().into(), vec![])
+                .new_work_from_server(history.get_one_wft(3).unwrap().into(), vec![], false)
                 .unwrap();
             assert!(activation.jobs.is_empty());
             live.push_commands_and_iterate(vec![]).unwrap();
