@@ -66,12 +66,15 @@ relevant information.
   name the run's last completed workflow task, and `failed_tasks`, the started event ids of the
   run's last 100 failed or timed out workflow tasks. Retries that Core runs locally keep the
   value. Core leaves it unset for other activities.
+* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
+  including for running workflows. The transition is recorded in history and defaults to off.
+  Language SDKs must execute empty activations, including applying their clock and metadata,
+  running the workflow scheduler and condition checks, and returning a completion; see
+  [Workflow task boundaries](README.md#workflow-task-boundaries).
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
   [yanked upstream for security issues](https://github.com/zip-rs/zip2/issues/1075#issuecomment-6209381974).
-* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
-  including for running workflows. The transition is recorded in history and defaults to off.
 
 ### Breaking Changes
 * Core now rejects activation responses with a nondeterminism error if the activation contained

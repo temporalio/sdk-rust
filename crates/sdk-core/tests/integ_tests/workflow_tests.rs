@@ -2,6 +2,7 @@ mod activities;
 mod cancel_external;
 mod cancel_wf;
 mod child_workflows;
+mod chunking;
 mod client_interactions;
 mod continue_as_new;
 mod determinism;

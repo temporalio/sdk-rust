@@ -1091,10 +1091,11 @@ where
         let base_ctx = self.base_ctx.clone();
         let _waker_guard = base_ctx.enter_runtime_poll(waker);
         let is_replaying_history_events = activation.is_replaying
-            && activation
-                .jobs
-                .iter()
-                .any(|job| !matches!(job.variant, Some(ActivationVariant::QueryWorkflow(_))));
+            && (activation.jobs.is_empty()
+                || activation
+                    .jobs
+                    .iter()
+                    .any(|job| !matches!(job.variant, Some(ActivationVariant::QueryWorkflow(_)))));
         self.base_ctx
             .apply_activation_context(&activation, is_replaying_history_events);
         let mut job_results = Vec::with_capacity(activation.jobs.len());
