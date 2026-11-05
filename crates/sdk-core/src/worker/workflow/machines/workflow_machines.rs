@@ -27,7 +27,7 @@ use crate::{
             CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
             LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
             WFMachinesError, WorkflowStartedInfo, fatal,
-            history_update::NextWFT,
+            history_update::{NextWFT, WorkflowTaskChunking},
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
@@ -371,7 +371,9 @@ impl WorkflowMachines {
 
     pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
-        update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
+        if self.last_history_from_server.chunking.is_disabled() {
+            update.chunking = WorkflowTaskChunking::Disabled;
+        }
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
@@ -622,7 +624,7 @@ impl WorkflowMachines {
         let mut flags = (*self.observed_internal_flags).borrow_mut();
         let record_transition = cfg!(feature = "disable_workflow_task_chunking")
             && !self.replaying
-            && !self.last_history_from_server.chunking_disabled
+            && !self.last_history_from_server.chunking.is_disabled()
             && self.outstanding_local_activity_count() == 0
             && self.local_activity_data.current_activation_index() > 0
             && flags.try_use(CoreInternalFlags::DisableWorkflowTaskChunking, true);
@@ -914,7 +916,7 @@ impl WorkflowMachines {
             self.last_processed_event = eid;
         }
 
-        if self.last_history_from_server.chunking_disabled
+        if self.last_history_from_server.chunking.is_disabled()
             && self.current_started_event_id > last_handled_wft_started_id
             && !self.have_seen_terminal_event
         {
