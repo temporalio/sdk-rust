@@ -519,7 +519,7 @@ impl WorkflowMachines {
     pub(crate) fn prepare_for_wft_response(&mut self) -> MachinesWFTResponseContent<'_> {
         MachinesWFTResponseContent {
             replaying: self.replaying,
-            has_pending_jobs: self.has_pending_jobs(),
+            activation_needed: self.activation_needed(),
             have_seen_terminal_event: self.have_seen_terminal_event,
             have_pending_la_resolutions: self.has_pending_la_resolutions(),
             me: self,
@@ -598,7 +598,7 @@ impl WorkflowMachines {
         }
     }
 
-    pub(crate) fn has_pending_jobs(&self) -> bool {
+    pub(crate) fn activation_needed(&self) -> bool {
         self.pending_wft_activation || !self.drive_me.peek_pending_jobs().is_empty()
     }
 
@@ -916,6 +916,8 @@ impl WorkflowMachines {
             self.last_processed_event = eid;
         }
 
+        // Even a task with no jobs must activate lang to advance its clock and run conditions,
+        // preserving the workflow behavior at this task boundary during replay.
         if self.last_history_from_server.chunking.is_disabled()
             && self.current_started_event_id > last_handled_wft_started_id
             && !self.have_seen_terminal_event
@@ -1872,12 +1874,12 @@ impl WorkflowMachines {
         }
     }
 
-    /// Held resolutions wait for a later activation, but with no pending jobs there won't be one.
+    /// Held resolutions wait for a later activation, but if none is needed there won't be one.
     /// That only happens if replay produced different activations than the original execution,
     /// in which case the resolutions are delivered the way ungrouped markers are, rather than
     /// never.
     fn release_held_local_activity_resolutions_if_idle(&mut self) -> Result<()> {
-        if !self.has_pending_jobs() {
+        if !self.activation_needed() {
             self.apply_local_activity_peeked_resolutions(true)?;
         }
         Ok(())
@@ -1919,7 +1921,7 @@ impl WorkflowMachines {
 pub(crate) struct MachinesWFTResponseContent<'a> {
     me: &'a mut WorkflowMachines,
     pub(crate) replaying: bool,
-    pub(crate) has_pending_jobs: bool,
+    pub(crate) activation_needed: bool,
     pub(crate) have_seen_terminal_event: bool,
     pub(crate) have_pending_la_resolutions: bool,
 }

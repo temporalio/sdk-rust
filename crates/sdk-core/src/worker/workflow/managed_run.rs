@@ -131,14 +131,14 @@ impl ManagedRun {
         (me, rua)
     }
 
-    /// Returns true if there are pending jobs that need to be sent to lang.
+    /// Returns true if lang needs another activation.
     pub(super) fn more_pending_work(&self) -> bool {
         // We don't want to consider there to be more local-only work to be done if there is
         // no workflow task associated with the run right now. This can happen if, ex, we
         // complete a local activity while waiting for server to send us the next WFT.
         // Activating lang would be harmful at this stage, as there might be work returned
         // in that next WFT which should be part of the next activation.
-        self.wft.is_some() && self.wfm.machines.has_pending_jobs()
+        self.wft.is_some() && self.wfm.machines.activation_needed()
     }
 
     pub(super) fn waiting_on_local_activities(&self) -> bool {
@@ -358,7 +358,7 @@ impl ManagedRun {
             return Ok(None);
         }
 
-        if self.wfm.machines.has_pending_jobs() && !self.am_broken {
+        if self.wfm.machines.activation_needed() && !self.am_broken {
             Ok(Some(ActivationOrAuto::LangActivation(
                 self.wfm.get_next_activation()?,
             )))
@@ -1217,7 +1217,7 @@ impl ManagedRun {
         // activations and we are caught up on replay. We don't want to complete a wft if we already
         // saw the final event in the workflow, or if we are playing back for the express purpose of
         // fulfilling a query. Eviction only reports output buffered by prior normal activations.
-        let should_respond = !(machines_wft_response.has_pending_jobs
+        let should_respond = !(machines_wft_response.activation_needed
             || (machines_wft_response.replaying && !data.is_forced_failure)
             || is_query_playback
             || (data.activation_was_eviction && !eviction_has_output)
@@ -1566,11 +1566,11 @@ impl WorkflowManager {
     /// Callers may also need to call [get_server_commands] after this to issue any pending commands
     /// to the server.
     fn get_next_activation(&mut self) -> Result<WorkflowActivation> {
-        // First check if there are already some pending jobs, which can be a result of replay.
-        if !self.machines.has_pending_jobs() {
+        // Replay may require another activation even without new history from the server.
+        if !self.machines.activation_needed() {
             self.machines.apply_next_wft_from_history()?;
         }
-        self.awaiting_activation_completion = self.machines.has_pending_jobs();
+        self.awaiting_activation_completion = self.machines.activation_needed();
         Ok(self.machines.get_wf_activation())
     }
 
@@ -1580,19 +1580,19 @@ impl WorkflowManager {
         self.machines.ready_to_apply_next_wft()
     }
 
-    /// If there are no pending jobs for the workflow apply the next workflow task and check again
-    /// if there are any jobs. Importantly, does not *drain* jobs.
+    /// If no activation is needed, apply the next workflow task and check again.
+    /// Importantly, does not *drain* jobs.
     fn apply_next_task_if_ready(&mut self) -> Result<()> {
-        if self.machines.has_pending_jobs() {
+        if self.machines.activation_needed() {
             return Ok(());
         }
         loop {
             let consumed_events = self.machines.apply_next_wft_from_history()?;
 
-            if consumed_events == 0 || !self.machines.replaying || self.machines.has_pending_jobs()
+            if consumed_events == 0 || !self.machines.replaying || self.machines.activation_needed()
             {
-                // Keep applying tasks while there are events, we are still replaying, and there are
-                // no jobs
+                // Keep applying tasks while there are events, we are still replaying, and no
+                // activation is needed
                 break;
             }
         }

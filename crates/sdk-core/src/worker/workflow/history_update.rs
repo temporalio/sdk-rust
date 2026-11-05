@@ -768,8 +768,8 @@ fn find_end_index_of_next_wft_seq(
             return find_end_index_of_next_wft_seq_unchunked(events, from_event_id, has_last_wft);
         }
     };
-    // Keep the transition task's completion and update-acceptance lookahead available, but
-    // prevent legacy heartbeat coalescing from reaching tasks after the transition.
+    // Keep using legacy chunking before the transition point so earlier history replays
+    // with the same activation boundaries it had before chunking was disabled.
     if let Ok(transition_index) = events.binary_search_by_key(&(transition_id - 1), |e| e.event_id)
     {
         return match find_end_index_of_next_wft_seq_chunked(
