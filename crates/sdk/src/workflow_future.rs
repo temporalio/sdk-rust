@@ -255,11 +255,6 @@ impl WorkflowFuture {
                 )
             });
         let mut job_contexts = Vec::with_capacity(activation.jobs.len());
-        macro_rules! push_context {
-            ($context:expr $(,)?) => {{
-                job_contexts.push($context);
-            }};
-        }
         for job in &mut activation.jobs {
             match job
                 .variant
@@ -267,57 +262,57 @@ impl WorkflowFuture {
                 .context("Empty activation job variant")?
             {
                 Variant::InitializeWorkflow(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::FireTimer(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveActivity(attrs) => {
                     attrs.result.as_ref().context("Activity must have result")?;
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveChildWorkflowExecutionStart(attrs) => {
                     attrs
                         .status
                         .as_ref()
                         .context("Workflow start must have status")?;
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveChildWorkflowExecution(attrs) => {
                     attrs
                         .result
                         .as_ref()
                         .context("Child Workflow execution must have a result")?;
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::UpdateRandomSeed(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::QueryWorkflow(q) => {
                     debug!(query_type = %q.query_type, "Query received");
                     let query_id = q.query_id.clone();
-                    push_context!(ActivationJobContext::Query { query_id });
+                    job_contexts.push(ActivationJobContext::Query { query_id });
                 }
                 Variant::CancelWorkflow(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::SignalWorkflow(sig) => {
                     debug!(signal_name = %sig.signal_name, "Signal received");
-                    push_context!(ActivationJobContext::Signal);
+                    job_contexts.push(ActivationJobContext::Signal);
                 }
                 Variant::NotifyHasPatch(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveSignalExternalWorkflow(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveRequestCancelExternalWorkflow(_) => {
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 // Whether an update can change state is only known once its validator has run
                 Variant::DoUpdate(u) => {
                     let protocol_instance_id = u.protocol_instance_id.clone();
-                    push_context!(ActivationJobContext::Update {
+                    job_contexts.push(ActivationJobContext::Update {
                         protocol_instance_id,
                     });
                 }
@@ -326,14 +321,14 @@ impl WorkflowFuture {
                         .status
                         .as_ref()
                         .context("Nexus operation start must have status")?;
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveNexusOperation(attrs) => {
                     attrs
                         .result
                         .as_ref()
                         .context("Nexus operation must have result")?;
-                    push_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
