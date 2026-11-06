@@ -194,7 +194,6 @@ pub(crate) struct WorkflowMachines {
     /// Metrics context
     pub(crate) metrics: MetricsContext,
     worker_config: Arc<WorkerConfig>,
-    pending_wft_activation: bool,
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -335,7 +334,6 @@ impl WorkflowMachines {
             local_activity_data: LocalActivityData::default(),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
-            pending_wft_activation: false,
         }
     }
 
@@ -548,21 +546,23 @@ impl WorkflowMachines {
     /// The job list may be empty, in which case it is expected the caller handles what to do in a
     /// "no work" situation. Possibly, it may know about some work the machines don't, like queries.
     pub(crate) fn get_wf_activation(&mut self) -> WorkflowActivation {
-        let jobs = self.drive_me.drain_jobs();
+        let jobs = if self.activation_needed() {
+            self.drive_me.drain_jobs()
+        } else {
+            vec![]
+        };
         // Deferred LA results can add ordinary workflow work after history application.
         if Self::has_non_update_jobs(&jobs) {
             self.update_only_task = false;
         }
         // Even though technically we may have satisfied all the criteria to be done with replay,
         // query only activations are always "replaying" to keep things sane.
-        let is_wft_activation = std::mem::take(&mut self.pending_wft_activation);
-        let all_query = !is_wft_activation
-            && jobs.iter().all(|j| {
-                matches!(
-                    j.variant,
-                    workflow_activation_job::Variant::QueryWorkflow(_)
-                )
-            });
+        let all_query = jobs.iter().all(|j| {
+            matches!(
+                j.variant,
+                workflow_activation_job::Variant::QueryWorkflow(_)
+            )
+        });
         // Query-only activations are never recorded in history, so replay can't count them.
         if !all_query {
             self.local_activity_data.activation_dispatched();
@@ -599,7 +599,16 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn activation_needed(&self) -> bool {
-        self.pending_wft_activation || !self.drive_me.peek_pending_jobs().is_empty()
+        self.drive_me.peek_pending_jobs().iter().any(|job| {
+            // Avoid sending activations containing only patch notifications: they exist only on
+            // replay and would poll workflow routines when live execution did not. Keep them
+            // queued until another job, such as an LA resolution, needs to activate lang.
+            !self.last_history_from_server.chunking.is_disabled()
+                || !matches!(
+                    job.variant,
+                    workflow_activation_job::Variant::NotifyHasPatch(_)
+                )
+        })
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
@@ -914,15 +923,6 @@ impl WorkflowMachines {
                 do_handle_event = true;
             }
             self.last_processed_event = eid;
-        }
-
-        // Even a task with no jobs must activate lang to advance its clock and run conditions,
-        // preserving the workflow behavior at this task boundary during replay.
-        if self.last_history_from_server.chunking.is_disabled()
-            && self.current_started_event_id > last_handled_wft_started_id
-            && !self.have_seen_terminal_event
-        {
-            self.pending_wft_activation = true;
         }
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
@@ -1874,13 +1874,24 @@ impl WorkflowMachines {
         }
     }
 
-    /// Held resolutions wait for a later activation, but if none is needed there won't be one.
-    /// That only happens if replay produced different activations than the original execution,
-    /// in which case the resolutions are delivered the way ungrouped markers are, rather than
-    /// never.
+    /// Held LA resolutions can have a recorded activation index beyond the current one.
+    /// If replay has no other jobs, no activation can advance that index; release the next
+    /// recorded resolutions so the task can make progress.
     fn release_held_local_activity_resolutions_if_idle(&mut self) -> Result<()> {
         if !self.activation_needed() {
-            self.apply_local_activity_peeked_resolutions(true)?;
+            if self.last_history_from_server.chunking.is_disabled() {
+                // Advance to the next marker's activation index without sending an empty activation.
+                // Stop there so resolutions recorded in later activations remain separate.
+                if let Some(seq) = self.local_activity_data.peek_preresolution_seq(true)
+                    && self.get_machine_key(CommandID::LocalActivity(seq)).is_ok()
+                {
+                    self.local_activity_data
+                        .advance_to_next_resolution_activation();
+                    self.apply_local_activity_peeked_resolutions(false)?;
+                }
+            } else {
+                self.apply_local_activity_peeked_resolutions(true)?;
+            }
         }
         Ok(())
     }

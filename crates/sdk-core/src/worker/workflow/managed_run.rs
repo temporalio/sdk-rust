@@ -267,7 +267,7 @@ impl ManagedRun {
             r
         };
 
-        if activation.jobs.is_empty() && !self.wfm.awaiting_activation_completion {
+        if activation.jobs.is_empty() {
             if self.wfm.machines.outstanding_local_activity_count() > 0 {
                 // If the activation has no jobs but there are outstanding LAs, we need to restart
                 // the WFT heartbeat.
@@ -1049,8 +1049,8 @@ impl ManagedRun {
                 }
                 let r = match maybe_act {
                     Some(ActivationOrAuto::LangActivation(activation)) => {
-                        if activation.jobs.is_empty() && !self.wfm.awaiting_activation_completion {
-                            dbg_panic!("Should not send lang activation without pending work");
+                        if activation.jobs.is_empty() {
+                            dbg_panic!("Should not send lang activation with no jobs");
                         }
                         Some(ActivationOrAuto::LangActivation(activation))
                     }
@@ -2044,7 +2044,7 @@ mod tests {
         use super::super::WorkflowManager;
         use crate::{
             internal_flags::CoreInternalFlags,
-            replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+            replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
             telemetry::metrics::MetricsContext,
             test_help::{
                 PollWFTRespExt, schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg,
@@ -2479,8 +2479,10 @@ mod tests {
             }
         }
 
-        #[test]
-        fn local_activity_after_chunking_transition_replays_empty_heartbeat() {
+        #[rstest]
+        fn local_activity_after_chunking_transition_replays_empty_heartbeat(
+            #[values(false, true)] legacy_query_before_heartbeat: bool,
+        ) {
             let mut history = TestHistoryBuilder::default();
             history.add_by_type(EventType::WorkflowExecutionStarted);
             history.add_workflow_task_scheduled_and_started();
@@ -2490,11 +2492,12 @@ mod tests {
             history.add_workflow_task_completed();
             history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
 
+            history.add_we_signaled("start", vec![]);
             history.add_workflow_task_scheduled_and_started();
             let activation = live
                 .new_work_from_server(history.get_one_wft(2).unwrap().into(), vec![], false)
                 .unwrap();
-            assert!(activation.jobs.is_empty());
+            assert_matches!(activation.jobs[0].variant, Some(Variant::SignalWorkflow(_)));
             let mut workflow = FanoutWorkflow::default();
             live.push_commands_and_iterate(vec![workflow.schedule(Activity::Work(1))])
                 .unwrap();
@@ -2502,10 +2505,18 @@ mod tests {
             history.add_workflow_task_completed();
 
             history.add_workflow_task_scheduled_and_started();
+            if legacy_query_before_heartbeat {
+                let activation = live
+                    .new_work_from_server(history.get_one_wft(3).unwrap().into(), vec![], true)
+                    .unwrap();
+                assert!(activation.jobs.is_empty());
+                live.push_commands_and_iterate(vec![]).unwrap();
+            }
             let activation = live
                 .new_work_from_server(history.get_one_wft(3).unwrap().into(), vec![], false)
                 .unwrap();
             assert!(activation.jobs.is_empty());
+            assert!(!live.awaiting_activation_completion);
             live.push_commands_and_iterate(vec![]).unwrap();
             live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
                 seq: 1,
@@ -2526,6 +2537,7 @@ mod tests {
             live.push_commands_and_iterate(vec![]).unwrap();
 
             history.add_workflow_task_completed();
+            let completed_event_id = history.current_event_id();
             for command in live.machines.get_commands() {
                 let command::Attributes::RecordMarkerCommandAttributes(marker) =
                     command.attributes.unwrap()
@@ -2536,7 +2548,7 @@ mod tests {
                     marker_name: marker.marker_name,
                     details: marker.details,
                     failure: marker.failure,
-                    workflow_task_completed_event_id: 10,
+                    workflow_task_completed_event_id: completed_event_id,
                     ..Default::default()
                 });
             }
@@ -2546,20 +2558,69 @@ mod tests {
             replay.get_next_activation().unwrap();
             replay.push_commands_and_iterate(vec![]).unwrap();
             let activation = replay.get_next_activation().unwrap();
-            assert!(activation.jobs.is_empty());
+            assert_matches!(activation.jobs[0].variant, Some(Variant::SignalWorkflow(_)));
             let mut workflow = FanoutWorkflow::default();
             replay
                 .push_commands_and_iterate(vec![workflow.schedule(Activity::Work(1))])
                 .unwrap();
-            let activation = replay.get_next_activation().unwrap();
-            assert!(activation.jobs.is_empty());
-            replay.push_commands_and_iterate(vec![]).unwrap();
             let replay_resolution = replay.get_next_activation().unwrap();
             assert_eq!(replay_resolution.jobs, live_resolution.jobs);
             replay.push_commands_and_iterate(vec![]).unwrap();
             let activation = replay.get_next_activation().unwrap();
             assert!(activation.jobs.is_empty());
-            assert!(!activation.is_replaying);
+            assert!(!replay.awaiting_activation_completion);
+        }
+
+        #[test]
+        fn unchunked_held_la_resolutions_preserve_separate_activations() {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_full_wf_task();
+            history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+            history.add_we_signaled("start", vec![]);
+            history.add_full_wf_task();
+            history.add_full_wf_task();
+            for seq in 1..=2 {
+                history.add_local_activity_marker(
+                    seq,
+                    &seq.to_string(),
+                    Some("done".as_json_payload().unwrap()),
+                    None,
+                    |marker| marker.activation_index = Some(u64::from(seq)),
+                );
+            }
+            history.add_workflow_task_scheduled_and_started();
+
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            replay.push_commands_and_iterate(vec![]).unwrap();
+            let activation = replay.get_next_activation().unwrap();
+            assert_matches!(activation.jobs[0].variant, Some(Variant::SignalWorkflow(_)));
+            let commands = (1..=2)
+                .map(|seq| {
+                    let workflow_command::Variant::ScheduleLocalActivity(command) =
+                        schedule_local_activity_cmd(
+                            seq,
+                            DEFAULT_ACTIVITY_TYPE,
+                            ActivityCancellationType::TryCancel,
+                            Duration::from_secs(10),
+                        )
+                    else {
+                        unreachable!()
+                    };
+                    WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+                })
+                .collect();
+            replay.push_commands_and_iterate(commands).unwrap();
+            for seq in 1..=2 {
+                let activation = replay.get_next_activation().unwrap();
+                assert_eq!(activation.jobs.len(), 1);
+                assert_matches!(
+                    &activation.jobs[0].variant,
+                    Some(Variant::ResolveActivity(resolution)) if resolution.seq == seq
+                );
+                replay.push_commands_and_iterate(vec![]).unwrap();
+            }
         }
 
         #[test]

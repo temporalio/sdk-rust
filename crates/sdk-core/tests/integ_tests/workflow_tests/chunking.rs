@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use temporalio_common::protos::{
     coresdk::{AsJsonPayloadExt, workflow_activation::WorkflowActivation},
     temporal::api::history::v1::{
@@ -55,23 +49,20 @@ impl HeartbeatWorkflow {
     }
 }
 
-#[derive(Clone, Default)]
-struct EmptyActivations(Arc<AtomicUsize>);
+struct NoEmptyActivations;
 
 #[async_trait::async_trait(?Send)]
-impl WorkerInterceptor for EmptyActivations {
+impl WorkerInterceptor for NoEmptyActivations {
     async fn on_workflow_activation(&self, activation: &WorkflowActivation) -> anyhow::Result<()> {
-        if activation.jobs.is_empty() {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
+        assert!(!activation.jobs.is_empty());
         Ok(())
     }
 }
 
 // Derived from a live run with adoption disabled: two timers, two LA heartbeat completions,
-// then the LA marker and workflow result in the fifth task. A separate feature-enabled live run
-// confirmed the same event/command sequence with flag 5 on task 1 and LA activation index 1
-// instead of 0. The activity was released only after task 4's completion appeared in history.
+// then the LA marker and workflow result in the fifth task. The activity was released only after
+// task 4's completion appeared in history. Jobless heartbeats must not activate lang or shift
+// the LA's activation index when the chunking flag is added.
 fn heartbeat_history(flag_task: Option<usize>) -> History {
     let mut history = TestHistoryBuilder::default();
     history.add_wfe_started_with_wft_timeout(Duration::from_secs(2));
@@ -116,7 +107,7 @@ fn heartbeat_history(flag_task: Option<usize>) -> History {
                 seconds: 13,
                 nanos: 0,
             });
-            marker.activation_index = Some(u64::from(flag_task.is_some()));
+            marker.activation_index = Some(0);
         },
     );
     history.add(WorkflowExecutionCompletedEventAttributes {
@@ -142,12 +133,11 @@ fn heartbeat_history(flag_task: Option<usize>) -> History {
 #[case::flag_before_heartbeats(Some(2))]
 #[tokio::test]
 async fn workflow_task_chunking_replays_compatible_histories(#[case] flag_task: Option<usize>) {
-    let empty_activations = EmptyActivations::default();
     let replayer = WorkflowReplayer::new(
         WorkflowReplayerOptions::new()
             .register_workflow::<HeartbeatWorkflow>()
             .unwrap()
-            .worker_interceptor(empty_activations.clone())
+            .worker_interceptor(NoEmptyActivations)
             .build(),
     )
     .unwrap();
@@ -155,8 +145,4 @@ async fn workflow_task_chunking_replays_compatible_histories(#[case] flag_task: 
         .replay_workflow(heartbeat_history(flag_task).into())
         .await
         .unwrap();
-    assert_eq!(
-        empty_activations.0.load(Ordering::Relaxed),
-        if flag_task.is_some() { 2 } else { 0 },
-    );
 }

@@ -60,10 +60,7 @@ import "temporal/sdk/core/nexus/nexus.proto";
 // (which must be stable based on lang implementation or convention), rather than the order jobs are
 // processed.
 //
-// An activation may have no jobs when a workflow task boundary must be preserved for replay.
-// Lang must still apply its timestamp and metadata, drive the workflow scheduler (including
-// conditions that depend on the clock), and return a completion. Skipping such activations can
-// change workflow behavior between live execution and replay.
+// Workflow tasks with no activation jobs are handled internally by Core, without activating lang.
 //
 // ## Evictions
 //

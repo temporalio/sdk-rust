@@ -245,15 +245,12 @@ impl WorkflowFuture {
         &self,
         mut activation: CoreWorkflowActivation,
     ) -> Result<(WorkflowActivation, Vec<ActivationJobContext>, bool), Error> {
-        // Empty activations preserve task boundaries. Only query/update-only activations defer
-        // polling: queries cannot advance workflow state, and updates must pass validation first.
-        let should_poll_routines = activation.jobs.is_empty()
-            || !activation.jobs.iter().all(|job| {
-                matches!(
-                    job.variant,
-                    Some(Variant::QueryWorkflow(_) | Variant::DoUpdate(_))
-                )
-            });
+        let should_poll_routines = activation.jobs.iter().any(|job| {
+            !matches!(
+                job.variant,
+                Some(Variant::QueryWorkflow(_) | Variant::DoUpdate(_))
+            )
+        });
         let mut job_contexts = Vec::with_capacity(activation.jobs.len());
         for job in &mut activation.jobs {
             match job
@@ -755,11 +752,11 @@ fn update_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{WorkflowContext, workflow_registry::WorkflowDefinitions};
+    use crate::{SyncWorkflowContext, WorkflowContext, workflow_registry::WorkflowDefinitions};
     use futures_util::FutureExt;
     use std::time::{Duration, UNIX_EPOCH};
     use temporalio_common::protos::coresdk::{
-        workflow_activation::{QueryWorkflow, WorkflowActivationJob},
+        workflow_activation::{QueryWorkflow, SignalWorkflow, WorkflowActivationJob},
         workflow_completion::workflow_activation_completion::Status,
     };
     use temporalio_macros::{workflow, workflow_methods};
@@ -787,11 +784,16 @@ mod tests {
         fn ready(&self, _ctx: &WorkflowContextView) -> bool {
             true
         }
+
+        #[signal]
+        fn tick(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {}
     }
 
     #[rstest::rstest]
     #[tokio::test]
-    async fn empty_activation_drives_clock_conditions(#[values(false, true)] replaying: bool) {
+    async fn jobless_activations_do_not_drive_clock_conditions(
+        #[values(false, true)] replaying: bool,
+    ) {
         let mut definitions = WorkflowDefinitions::new();
         definitions
             .register_workflow::<ClockConditionWorkflow>()
@@ -822,7 +824,7 @@ mod tests {
         .unwrap();
         let mut workflow = Box::pin(workflow);
 
-        for seconds in [1, 2] {
+        for seconds in [1, 3] {
             activations
                 .send(CoreWorkflowActivation {
                     run_id: "run".to_owned(),
@@ -887,6 +889,12 @@ mod tests {
                 }),
                 history_length: 3,
                 is_replaying: replaying,
+                jobs: vec![WorkflowActivationJob {
+                    variant: Some(Variant::SignalWorkflow(SignalWorkflow {
+                        signal_name: "tick".to_owned(),
+                        ..Default::default()
+                    })),
+                }],
                 ..Default::default()
             })
             .unwrap();
