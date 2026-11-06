@@ -36,7 +36,7 @@ pub enum CoreInternalFlags {
     /// Detects service and operation changes when replaying Nexus operation schedules.
     NexusOperationDeterminismChecks = 4,
     /// Preserves workflow task boundaries so replay observes the same clock advances as live
-    /// execution, including tasks that have no activation jobs.
+    /// execution, without activating lang for tasks that have no jobs.
     DisableWorkflowTaskChunking = 5,
     /// We received a value higher than this code can understand.
     TooHigh = u32::MAX,

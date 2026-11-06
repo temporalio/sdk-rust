@@ -16,6 +16,7 @@ mod nexus_typed;
 mod patches;
 mod priority;
 mod queries;
+mod rejected_update_persistence;
 mod replay;
 mod resets;
 mod signals;

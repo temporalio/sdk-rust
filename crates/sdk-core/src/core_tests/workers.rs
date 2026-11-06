@@ -71,21 +71,25 @@ use uuid::Uuid;
 
 #[rstest::rstest]
 #[tokio::test]
-async fn unchunked_history_delivers_empty_task_ticks(
-    #[values(false, true)] incremental: bool,
-    #[values(false, true)] command_from_empty_tick: bool,
-) {
+async fn unchunked_history_skips_jobless_tasks(#[values(false, true)] incremental: bool) {
     let mut history = TestHistoryBuilder::default();
     history.add_by_type(EventType::WorkflowExecutionStarted);
     history.add_full_wf_task();
-    history.add_timer_started("1".to_owned());
+    let timer = history.add_timer_started("1".to_owned());
     history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
     history.add_full_wf_task();
-    if command_from_empty_tick {
-        history.add_timer_started("2".to_owned());
-    }
     history.add_full_wf_task();
+    history.add_timer_fired(timer, "1".to_owned());
     history.add_workflow_task_scheduled_and_started();
+    let final_started_id = history.current_event_id();
+    let mut events = history.get_full_history_info().unwrap().into_events();
+    for event in &mut events {
+        event.event_time = Some(prost_types::Timestamp {
+            seconds: 100 + event.event_id,
+            nanos: 0,
+        });
+    }
+    let history = TestHistoryBuilder::from_history(events);
     let tasks = if incremental {
         vec![1, 2, 3, 4]
     } else {
@@ -103,27 +107,21 @@ async fn unchunked_history_delivers_empty_task_ticks(
     ))
     .await
     .unwrap();
-    let offset = i64::from(command_from_empty_tick);
-    for (index, (event_id, replaying)) in [(7, true), (10 + offset, true), (13 + offset, false)]
-        .into_iter()
-        .enumerate()
-    {
-        let activation = core.poll_workflow_activation().await.unwrap();
-        assert!(activation.jobs.is_empty(), "{activation:?}");
-        assert_eq!(i64::from(activation.history_length), event_id);
-        assert_eq!(activation.is_replaying, replaying && !incremental);
-        let commands = if index == 0 && command_from_empty_tick {
-            vec![start_timer_cmd(2, Duration::from_secs(1))]
-        } else {
-            vec![]
-        };
-        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            run_id.clone(),
-            commands,
-        ))
-        .await
-        .unwrap();
-    }
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(activation.jobs.len(), 1);
+    assert_matches!(
+        activation.jobs[0].variant,
+        Some(workflow_activation_job::Variant::FireTimer(_))
+    );
+    assert_eq!(i64::from(activation.history_length), final_started_id);
+    assert_eq!(
+        activation.timestamp,
+        Some(prost_types::Timestamp {
+            seconds: 100 + final_started_id,
+            nanos: 0,
+        })
+    );
+    core.complete_execution(&run_id).await;
     core.request_workflow_eviction(&run_id);
     let eviction = core.poll_workflow_activation().await.unwrap();
     assert!(eviction.is_only_eviction());

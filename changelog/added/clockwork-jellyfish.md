@@ -1,1 +1,1 @@
-Workflow replay supports histories that preserve every successful workflow task boundary, including tasks with no jobs, so workflow clocks advance consistently with live execution. Empty activations update workflow metadata and run the scheduler, allowing clock-dependent conditions to unblock.
+Workflow replay supports histories that preserve every successful workflow task boundary, so activations retain their original timestamps and job grouping. Tasks without activation jobs are handled internally without polling workflow routines.
