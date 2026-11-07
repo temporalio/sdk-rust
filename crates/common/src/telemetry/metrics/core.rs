@@ -4,7 +4,10 @@ use crate::telemetry::metrics::{MetricKeyValue, MetricParameters};
 use std::{
     any::Any,
     fmt::Debug,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -102,13 +105,30 @@ pub type LazyBufferInstrument<T> = LazyRef<Arc<T>>;
 #[derive(Debug, Clone)]
 pub struct LazyRef<T> {
     to_be_initted: Arc<OnceLock<T>>,
+    /// Whether the buffer accepted the event that asks lang to call [`set`](Self::set).
+    /// Lang never initializes a hole whose create was dropped, so a later recording that
+    /// still referenced it would panic in [`get`](Self::get) on the next drain.
+    create_queued: Arc<AtomicBool>,
 }
 impl<T> LazyRef<T> {
     /// Create an uninitialized hole that must be filled with [`set`](Self::set) before use.
     pub fn hole() -> Self {
         Self {
             to_be_initted: Arc::new(OnceLock::new()),
+            create_queued: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record that the create event for this hole was accepted into the buffer.
+    pub fn mark_create_queued(&self) {
+        self.create_queued.store(true, Ordering::Release);
+    }
+
+    /// Whether lang will initialize this hole.
+    ///
+    /// False when the create event was dropped because the buffer was full.
+    pub fn create_was_queued(&self) -> bool {
+        self.create_queued.load(Ordering::Acquire)
     }
 
     /// Get the reference you previously initialized

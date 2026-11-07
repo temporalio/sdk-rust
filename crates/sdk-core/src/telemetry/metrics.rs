@@ -861,12 +861,19 @@ where
 #[derive(Clone, Debug)]
 struct LogErrOnFullSender<I>(crossbeam_channel::Sender<I>);
 impl<I> LogErrOnFullSender<I> {
-    fn send(&self, v: I) {
-        if let Err(crossbeam_channel::TrySendError::Full(_)) = self.0.try_send(v) {
-            error!(
-                "Core's metrics buffer is full! Dropping call to record metrics. \
-                 Make sure you drain the metric buffer often!"
-            );
+    /// Returns whether the event was accepted into the buffer.
+    fn send(&self, v: I) -> bool {
+        match self.0.try_send(v) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                error!(
+                    "Core's metrics buffer is full! Dropping call to record metrics. \
+                     Make sure you drain the metric buffer often!"
+                );
+                false
+            }
+            // The receiver is gone with the runtime. Nothing is left to drain.
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
         }
     }
 }
@@ -885,11 +892,13 @@ where
     }
     fn new_instrument(&self, params: MetricParameters, kind: MetricKind) -> BufferInstrument<I> {
         let hole = LazyBufferInstrument::hole();
-        self.calls_tx.send(MetricEvent::Create {
+        if self.calls_tx.send(MetricEvent::Create {
             params,
             kind,
             populate_into: hole.clone(),
-        });
+        }) {
+            hole.mark_create_queued();
+        }
         BufferInstrument {
             instrument_ref: hole,
             tx: self.calls_tx.clone(),
@@ -903,11 +912,13 @@ where
 {
     fn new_attributes(&self, opts: NewAttributes) -> MetricAttributes {
         let ba = BufferAttributes::hole();
-        self.calls_tx.send(MetricEvent::CreateAttributes {
+        if self.calls_tx.send(MetricEvent::CreateAttributes {
             populate_into: ba.clone(),
             append_from: None,
             attributes: opts.attributes,
-        });
+        }) {
+            ba.mark_create_queued();
+        }
         MetricAttributes::Buffer(ba)
     }
 
@@ -917,12 +928,19 @@ where
         attribs: NewAttributes,
     ) -> MetricAttributes {
         if let MetricAttributes::Buffer(ol) = existing {
+            // Drain copies append_from via get(). Queueing the extension when that
+            // create never reached lang panics the next retrieve.
+            if !ol.create_was_queued() {
+                return MetricAttributes::Buffer(ol);
+            }
             let ba = BufferAttributes::hole();
-            self.calls_tx.send(MetricEvent::CreateAttributes {
+            if self.calls_tx.send(MetricEvent::CreateAttributes {
                 populate_into: ba.clone(),
                 append_from: Some(ol),
                 attributes: attribs.attributes,
-            });
+            }) {
+                ba.mark_create_queued();
+            }
             MetricAttributes::Buffer(ba)
         } else {
             dbg_panic!("Must use buffer attributes with a buffer metric implementation");
@@ -983,8 +1001,14 @@ where
     I: Clone + BufferInstrumentRef,
 {
     fn send(&self, value: MetricUpdateVal, attributes: &MetricAttributes) {
+        // Lang calls set() only while handling the create event. Recording against
+        // a create the buffer dropped panics on get() during the next drain.
+        if !self.instrument_ref.create_was_queued() {
+            return;
+        }
         let attributes = match attributes {
-            MetricAttributes::Buffer(l) => l.clone(),
+            MetricAttributes::Buffer(l) if l.create_was_queued() => l.clone(),
+            MetricAttributes::Buffer(_) => return,
             e => panic!(
                 "MetricsCallBuffer only works with MetricAttributes::Buffer, but used: {:?}",
                 e
@@ -993,7 +1017,7 @@ where
         self.tx.send(MetricEvent::Update {
             instrument: self.instrument_ref.clone(),
             update: value,
-            attributes: attributes.clone(),
+            attributes,
         });
     }
 }
@@ -1633,5 +1657,86 @@ mod tests {
             })
             if DummyCustomAttrs::as_id(&attributes) == 2 && instrument.get().0 == 5
         );
+    }
+
+    /// Overflow drops the create, but the instrument and attribute holes stay live.
+    /// A later recording must not enqueue an update lang cannot initialize: the
+    /// bridge calls `get()` while draining, which panics if `set` never ran.
+    #[test]
+    fn full_buffer_does_not_panic_when_draining_later_updates() {
+        let params = |name: &'static str| MetricParameters {
+            name: name.into(),
+            description: "".into(),
+            unit: "".into(),
+        };
+        let attrs = |key: &'static str, value: &'static str| NewAttributes {
+            attributes: vec![MetricKeyValue::new(key, value)],
+        };
+        let apply = |events: Vec<MetricEvent<DummyInstrumentRef>>| {
+            let mut updates = Vec::new();
+            for event in events {
+                match event {
+                    MetricEvent::Create { populate_into, .. } => {
+                        populate_into.set(Arc::new(DummyInstrumentRef(1))).unwrap();
+                    }
+                    MetricEvent::CreateAttributes {
+                        populate_into,
+                        append_from,
+                        ..
+                    } => {
+                        if let Some(existing) = append_from.as_ref() {
+                            // Same read the bridge does when appending. Panics if that
+                            // create was dropped and this event was queued anyway.
+                            let _ = DummyCustomAttrs::as_id(existing);
+                        }
+                        populate_into.set(Arc::new(DummyCustomAttrs(1))).unwrap();
+                    }
+                    MetricEvent::Update {
+                        instrument,
+                        attributes,
+                        update,
+                    } => {
+                        let _ = instrument.get().0;
+                        let _ = DummyCustomAttrs::as_id(&attributes);
+                        updates.push(update);
+                    }
+                }
+            }
+            updates
+        };
+
+        let call_buffer = MetricsCallBuffer::<DummyInstrumentRef>::new(1);
+        let kept = call_buffer.counter(params("kept"));
+        // The only slot is taken, so these creates are discarded.
+        let dropped = call_buffer.counter(params("dropped"));
+        let dropped_attrs = call_buffer.new_attributes(attrs("k", "dropped"));
+        let first = apply(call_buffer.retrieve());
+        assert!(first.is_empty());
+
+        let kept_attrs = call_buffer.new_attributes(attrs("k", "kept"));
+        let second = apply(call_buffer.retrieve());
+        assert!(second.is_empty());
+
+        // Buffer is empty and the dropped holes were never initialized.
+        dropped.add(7, &kept_attrs);
+        let dropped_instrument = apply(call_buffer.retrieve());
+        assert!(dropped_instrument.is_empty());
+
+        kept.add(1, &kept_attrs);
+        let kept_update = apply(call_buffer.retrieve());
+        assert_matches!(kept_update.as_slice(), [MetricUpdateVal::Delta(1)]);
+
+        kept.add(8, &dropped_attrs);
+        let dropped_attributes = apply(call_buffer.retrieve());
+        assert!(dropped_attributes.is_empty());
+
+        let extended = call_buffer.extend_attributes(dropped_attrs, attrs("k2", "x"));
+        kept.add(9, &extended);
+        let extended_updates = apply(call_buffer.retrieve());
+        assert!(extended_updates.is_empty());
+
+        kept.add(2, &kept_attrs);
+        let later = apply(call_buffer.retrieve());
+        assert_matches!(later.as_slice(), [MetricUpdateVal::Delta(2)]);
     }
 }
