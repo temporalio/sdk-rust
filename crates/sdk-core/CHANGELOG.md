@@ -103,6 +103,12 @@ relevant information.
   series it replaces. It cannot be combined with histogram bucket overrides. Explicit buckets
   remain the default.
 
+### Changed
+* Poller pools now report their poller target to the server on each poll and in the worker
+  heartbeat: the current target for autoscaling pools, the configured maximum for fixed-size
+  pools. (We'll use this count on the server side for now for load balancing pollers between
+  workers, and for creating a per-worker poller count metric.)
+
 ## [0.10.0] - 2026-10-06
 
 ### Added
