@@ -1,1 +1,0 @@
-Update Wasmtime to 48.0.7 to fix a potential sandbox escape on aarch64 when running Wasm workflows (GHSA-mghf-wjfp-p5xm). Only the experimental `wasm-workflows` feature now requires Rust 1.95 or later; the SDK's MSRV remains Rust 1.92.

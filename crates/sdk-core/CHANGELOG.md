@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.11.0] - 2026-11-09
+
 ### Added
 * A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. `workflow_task`
