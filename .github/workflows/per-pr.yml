@@ -101,7 +101,7 @@ jobs:
       matrix:
         include:
           - group: rust-1.88
-            crates: client common common-wasm macros protos sdk-core workflow
+            crates: aws-s3driver client common common-wasm macros protos sdk-core workflow
             feature-args: --all-features
           - group: rust-1.92
             crates: sdk
