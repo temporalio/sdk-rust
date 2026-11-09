@@ -1,8 +1,6 @@
 [package]
 name = "temporalio-aws-s3driver"
 version = "0.1.0"
-# Temporary skip publishing until we have a manual publish setup.
-publish = false
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
