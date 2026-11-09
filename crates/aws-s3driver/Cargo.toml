@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-aws-s3driver"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
@@ -23,7 +23,9 @@ aws-sdk = ["dep:aws-sdk-s3"]
 # The application configures the S3 client, including its TLS stack and async runtime.
 aws-sdk-s3 = { version = "1", default-features = false, optional = true }
 bon = { workspace = true }
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = [
+  "alloc",
+] }
 prost = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
@@ -35,7 +37,9 @@ default-features = false
 features = ["experimental"]
 
 [dev-dependencies]
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "rt-tokio",
+] }
 aws-smithy-http-client = { version = "1", features = ["test-util"] }
 aws-smithy-types = "1"
 http = "1"
