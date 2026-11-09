@@ -963,15 +963,19 @@ impl Worker {
                             // Some replay tests combine a mock client with real pollers, and they
                             // don't need to use the external stream
                             let stream = if !client.is_mock() {
-                                //let external_wft_slots = external_wft_slots.clone();
                                 stream::select(
-                                    stream,
+                                    // Delay PollerStopped error until after external_wft_rx
+                                    // stopped as well to avoid a shutdown race condition
+                                    stream, /*.filter(|r| {
+                                                future::ready(!matches!(r, Err(PollerError::PollerStopped)))
+                                            })*/
                                     UnboundedReceiverStream::new(external_wft_rx)
                                         .map(|(t, p)| Ok((t, Either::Right(p))))
                                         .take_until(async move {
                                             external_wft_slots.close_complete().await
                                         }),
                                 )
+                                //.chain(stream::once(future::ready(Err(PollerError::PollerStopped))))
                                 .left_stream()
                             } else {
                                 external_wft_slots.close();

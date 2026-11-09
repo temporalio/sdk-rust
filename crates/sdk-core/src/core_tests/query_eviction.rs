@@ -74,6 +74,7 @@ async fn preserves_queries_buffered_during_same_run_eviction(
         cfg.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mocks);
+    let initial_permits = core.available_wft_permits();
     let task = core.poll_workflow_activation().await.unwrap();
     let run_id = task.run_id.clone();
     core.complete_execution(&run_id).await;
@@ -165,5 +166,6 @@ async fn preserves_queries_buffered_during_same_run_eviction(
     tokio::time::timeout(Duration::from_secs(5), drain_pollers_and_shutdown(&core))
         .await
         .expect("serviced queries must not prevent shutdown");
+    assert_eq!(core.available_wft_permits(), initial_permits);
     core.finalize_shutdown().await;
 }

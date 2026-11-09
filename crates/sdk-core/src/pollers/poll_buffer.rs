@@ -33,7 +33,7 @@ use temporalio_common::protos::temporal::api::{
 };
 use tokio::{
     sync::{
-        Mutex, broadcast,
+        Mutex, Semaphore, broadcast,
         mpsc::{UnboundedReceiver, unbounded_channel},
         watch,
     },
@@ -43,10 +43,6 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tracing::Instrument;
-
-#[cfg(test)]
-use std::cell::RefCell;
-use tokio::sync::Semaphore;
 
 // Mirror the retry client's `RetryOptions::task_poll_retry_policy` and
 // `throttle_retry_policy` so poller autoscaling backs off on the same schedule.
@@ -327,6 +323,8 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
 }
 
 // Simple way to test this w/o plumbing options through.
+#[cfg(test)]
+use std::cell::RefCell;
 #[cfg(test)]
 thread_local! {
     static POLL_SHUTDOWN_INTERRUPT: RefCell<Option<Duration>> = RefCell::default();
@@ -943,14 +941,13 @@ mod tests {
                 .boxed()
             });
 
-        let shutdown_token = CancellationToken::new();
         let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
             None,
             PollerBehavior::SimpleMaximum(1),
             fixed_size_permit_dealer(10),
-            shutdown_token.clone(),
+            CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
@@ -975,7 +972,6 @@ mod tests {
         // Now we grab the buffered poll response, the poll task will go again but we don't grab it,
         // therefore we will have only polled twice.
         pb.poll().await.unwrap().unwrap();
-        //shutdown_token.cancel();
         pb.shutdown().await;
     }
 
@@ -998,7 +994,6 @@ mod tests {
             .expect_poll_workflow_task()
             .returning(move |_, _| async { Ok(Default::default()) }.boxed());
 
-        let shutdown_token = CancellationToken::new();
         let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
@@ -1009,7 +1004,7 @@ mod tests {
                 initial: 1,
             },
             fixed_size_permit_dealer(1),
-            shutdown_token.clone(),
+            CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
@@ -1020,7 +1015,6 @@ mod tests {
 
         // Should not see error, unwraps should get empty response
         pb.poll().await.unwrap().unwrap();
-        shutdown_token.cancel();
         pb.shutdown().await;
     }
 
@@ -1192,7 +1186,6 @@ mod tests {
                 .boxed()
             });
 
-        let shutdown_token = CancellationToken::new();
         let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
@@ -1203,7 +1196,7 @@ mod tests {
                 initial: INITIAL_POLLERS,
             },
             fixed_size_permit_dealer(INITIAL_POLLERS),
-            shutdown_token.clone(),
+            CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
@@ -1232,7 +1225,6 @@ mod tests {
             hot_loop_calls
         );
 
-        shutdown_token.cancel();
         join_handle.await.unwrap().shutdown().await;
     }
 
@@ -1270,7 +1262,6 @@ mod tests {
             });
 
         let (active_tx, mut active_rx) = watch::channel(0);
-        let shutdown_token = CancellationToken::new();
         let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "normal".to_string(),
@@ -1281,7 +1272,7 @@ mod tests {
                 initial: INITIAL_POLLERS,
             },
             fixed_size_permit_dealer(INITIAL_POLLERS),
-            shutdown_token.clone(),
+            CancellationToken::new(),
             Some(move |active| {
                 active_tx.send_replace(active);
             }),
@@ -1313,7 +1304,6 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), REPLACEMENT_CALLS);
         assert_eq!(*active_rx.borrow_and_update(), INITIAL_POLLERS);
 
-        shutdown_token.cancel();
         pb.shutdown().await;
     }
 

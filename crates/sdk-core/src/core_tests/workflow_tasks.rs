@@ -1643,8 +1643,7 @@ fn la_cancel_test_cmd(
 
 #[tokio::test]
 async fn la_cancel_delivered_before_eviction_activation() {
-    let mock_cfg = la_cancel_mock_cfg();
-    let core = la_cancel_test_worker(mock_cfg, None);
+    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -1952,8 +1951,7 @@ async fn abandoned_la_cancel_delivered_before_workflow_completion_eviction() {
 async fn la_results_during_withheld_eviction_do_not_surface(
     #[case] result: ActivityExecutionResult,
 ) {
-    let mock_cfg = la_cancel_mock_cfg();
-    let core = la_cancel_test_worker(mock_cfg, None);
+    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2056,8 +2054,7 @@ async fn la_results_during_withheld_eviction_do_not_surface(
 
 #[tokio::test]
 async fn la_result_before_its_cancel_is_polled_releases_withheld_eviction() {
-    let mock_cfg = la_cancel_mock_cfg();
-    let core = la_cancel_test_worker(mock_cfg, None);
+    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2109,8 +2106,7 @@ async fn la_result_before_its_cancel_is_polled_releases_withheld_eviction() {
 async fn la_success_after_its_cancel_is_polled_does_not_surface(
     #[case] complete_after_eviction_ack: bool,
 ) {
-    let mock_cfg = la_cancel_mock_cfg();
-    let core = la_cancel_test_worker(mock_cfg, None);
+    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2179,8 +2175,7 @@ async fn la_success_after_its_cancel_is_polled_does_not_surface(
 #[tokio::test]
 async fn queued_la_cancelled_by_eviction_does_not_surface() {
     // A single slot keeps the second LA waiting for dispatch behind the first.
-    let mock_cfg = la_cancel_mock_cfg();
-    let core = la_cancel_test_worker(mock_cfg, None);
+    let core = la_cancel_test_worker(la_cancel_mock_cfg(), Some(1));
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2232,8 +2227,7 @@ async fn queued_la_cancelled_by_eviction_does_not_surface() {
 
 #[tokio::test]
 async fn backing_off_la_cancelled_by_eviction_does_not_surface() {
-    let mock_cfg = la_cancel_mock_cfg();
-    let core = la_cancel_test_worker(mock_cfg, None);
+    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;

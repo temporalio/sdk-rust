@@ -132,7 +132,7 @@ where
 impl<T, SK> Poller<(T, OwnedMeteredSemPermit<SK>)> for StickyTaskPoller<T, SK>
 where
     T: Send + Sync + Debug + 'static,
-    SK: SlotKind + 'static,
+    SK: SlotKind,
 {
     async fn poll(&mut self) -> Option<PollerResult<(T, OwnedMeteredSemPermit<SK>)>> {
         self.stream.get_mut().next().await
@@ -307,7 +307,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::normal_ends_first(false)]
-    #[case::sticky_ends_first(false)]
+    #[case::sticky_ends_first(true)]
     #[tokio::test]
     async fn drains_both_normal_and_sticky_pollers_before_returning_none(
         #[case] sticky_ends_first: bool,
