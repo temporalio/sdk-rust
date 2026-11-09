@@ -1,0 +1,1 @@
+An update received by a worker that does not have the workflow cached, after a first workflow task that issued no commands, now reaches the workflow after the replayed first task, as it does on later replays, instead of together with workflow initialization.

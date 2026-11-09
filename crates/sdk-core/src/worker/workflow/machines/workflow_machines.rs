@@ -367,8 +367,15 @@ impl WorkflowMachines {
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
+    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
+        update.set_update_request_sequencing_ids(
+            self.protocol_msgs
+                .iter()
+                .filter(|m| matches!(m.body, IncomingProtocolMessageBody::UpdateRequest(_)))
+                .filter_map(|m| m.processable_after_event_id())
+                .collect(),
+        );
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;

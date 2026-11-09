@@ -46,6 +46,10 @@ pub(crate) struct HistoryUpdate {
     /// additional updates should be made.
     has_last_wft: bool,
     wft_count: usize,
+    /// Sequencing event IDs of the update requests delivered as protocol messages with the WFT
+    /// this update is tied to. Live, those updates have no `UpdateAccepted` event yet, so these
+    /// IDs stand in for it when deciding where a WFT sequence ends.
+    update_request_sequencing_ids: Vec<i64>,
 }
 
 impl Debug for HistoryUpdate {
@@ -69,6 +73,10 @@ impl Debug for HistoryUpdate {
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
+    }
+
+    pub(crate) fn set_update_request_sequencing_ids(&mut self, ids: Vec<i64>) {
+        self.update_request_sequencing_ids = ids;
     }
 }
 
@@ -441,6 +449,7 @@ impl HistoryUpdate {
             wft_started_id: -1,
             has_last_wft: false,
             wft_count: 0,
+            update_request_sequencing_ids: vec![],
         }
     }
 
@@ -484,6 +493,7 @@ impl HistoryUpdate {
             all_events.as_slice(),
             previous_wft_started_id,
             has_last_wft,
+            &[],
         );
         if matches!(last_end, NextWFTSeqEndIndex::Incomplete(_)) {
             return if has_last_wft {
@@ -494,6 +504,7 @@ impl HistoryUpdate {
                         wft_started_id,
                         has_last_wft,
                         wft_count: 1,
+                        update_request_sequencing_ids: vec![],
                     },
                     vec![],
                 )
@@ -505,6 +516,7 @@ impl HistoryUpdate {
                         wft_started_id,
                         has_last_wft,
                         wft_count: 0,
+                        update_request_sequencing_ids: vec![],
                     },
                     all_events,
                 )
@@ -520,6 +532,7 @@ impl HistoryUpdate {
                 &all_events[next_end_ix..],
                 next_end_eid,
                 has_last_wft,
+                &[],
             )
             .add(next_end_ix);
             if matches!(next_end, NextWFTSeqEndIndex::Incomplete(_)) {
@@ -542,6 +555,7 @@ impl HistoryUpdate {
                 wft_started_id,
                 has_last_wft,
                 wft_count,
+                update_request_sequencing_ids: vec![],
             },
             remaining_events,
         )
@@ -565,6 +579,7 @@ impl HistoryUpdate {
             wft_started_id,
             has_last_wft: true,
             wft_count: 0,
+            update_request_sequencing_ids: vec![],
         }
     }
 
@@ -580,8 +595,12 @@ impl HistoryUpdate {
         if let Some(ix_first_relevant) = self.starting_index_after_skipping(from_wft_started_id) {
             self.events.drain(0..ix_first_relevant);
         }
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            &self.update_request_sequencing_ids,
+        );
         match next_wft_ix {
             NextWFTSeqEndIndex::Incomplete(siz) => {
                 if self.has_last_wft {
@@ -622,17 +641,25 @@ impl HistoryUpdate {
         if relevant_events.is_empty() {
             return relevant_events;
         }
-        let ix_end =
-            find_end_index_of_next_wft_seq(relevant_events, from_wft_started_id, self.has_last_wft)
-                .index();
+        let ix_end = find_end_index_of_next_wft_seq(
+            relevant_events,
+            from_wft_started_id,
+            self.has_last_wft,
+            &self.update_request_sequencing_ids,
+        )
+        .index();
         &relevant_events[0..=ix_end]
     }
 
     /// Returns true if this update has the next needed WFT sequence, false if events will need to
     /// be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            &self.update_request_sequencing_ids,
+        );
         if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
             && !self.has_last_wft
         {
@@ -692,6 +719,7 @@ fn find_end_index_of_next_wft_seq(
     events: &[HistoryEvent],
     from_event_id: i64,
     has_last_wft: bool,
+    update_request_sequencing_ids: &[i64],
 ) -> NextWFTSeqEndIndex {
     if events.is_empty() {
         return NextWFTSeqEndIndex::Incomplete(0);
@@ -740,7 +768,15 @@ fn find_end_index_of_next_wft_seq(
                     continue;
                 } else if next_event_type == EventType::WorkflowTaskCompleted {
                     if let Some(next_next_event) = events.get(ix + 2) {
+                        // A pending update request sequenced after this WFT will be accepted
+                        // into the next one, and on replay its accepted event ends the sequence
+                        // here. Do the same live, so lang sees the same activations either way.
+                        let update_sequenced_after_this_wft =
+                            update_request_sequencing_ids.iter().any(|&seq_id| {
+                                e.event_id < seq_id && seq_id <= next_next_event.event_id + 1
+                            });
                         if !saw_command
+                            && !update_sequenced_after_this_wft
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
                         {
                             // If we've never seen an interesting event and the next two events are
@@ -1670,5 +1706,47 @@ mod tests {
         assert_eq!(seq.len(), 3);
         let seq = next_check_peek(&mut update, 3);
         assert_eq!(seq.len(), 3);
+    }
+
+    #[test]
+    fn update_request_after_empty_wft() {
+        // Live counterpart of `update_accepted_after_empty_wft`: the request is still a protocol
+        // message on the newest WFT, so there is no accepted event to end the first sequence.
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        t.add_workflow_task_scheduled_and_started();
+
+        let mut update = t.as_history_update();
+        update.set_update_request_sequencing_ids(vec![5]);
+        let seq = next_check_peek(&mut update, 0);
+        assert_eq!(seq.last().unwrap().event_id, 3);
+        let seq = next_check_peek(&mut update, 3);
+        assert_eq!(seq.last().unwrap().event_id, 6);
+    }
+
+    #[test]
+    fn update_request_after_heartbeats_ends_at_closest_wft() {
+        // Same cut as replay: the closest WFT started before the sequencing event, so earlier
+        // heartbeats stay grouped with the first task.
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task(); // started 3
+        t.add_full_wf_task(); // started 6
+        t.add_full_wf_task(); // started 9
+        t.add_workflow_task_scheduled_and_started(); // scheduled 11, started 12
+
+        let mut no_update = t.as_history_update();
+        assert_eq!(
+            next_check_peek(&mut no_update, 0).last().unwrap().event_id,
+            12
+        );
+
+        let mut update = t.as_history_update();
+        update.set_update_request_sequencing_ids(vec![11]);
+        let seq = next_check_peek(&mut update, 0);
+        assert_eq!(seq.last().unwrap().event_id, 9);
+        let seq = next_check_peek(&mut update, 9);
+        assert_eq!(seq.last().unwrap().event_id, 12);
     }
 }

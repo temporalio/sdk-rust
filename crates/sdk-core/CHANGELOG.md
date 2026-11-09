@@ -53,6 +53,11 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* An update delivered to a worker without the workflow in its cache, after a first workflow
+  task that issued no commands, is now dispatched in its own activation after the replayed
+  first task, as it is on later replays. It was previously dispatched together with workflow
+  initialization, so SDKs that run update handlers before the main workflow function ran them
+  in a different order than on replay and failed with a nondeterminism error.
 * A workflow task failure reported with the cause `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`
   is now counted on `workflow_task_execution_failed` with `failure_reason="ExternalStorageError"`,
   matching activity failures with the storage cause. It was previously counted as `WorkflowError`.

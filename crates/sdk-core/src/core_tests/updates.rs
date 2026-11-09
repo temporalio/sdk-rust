@@ -421,3 +421,63 @@ async fn update_activation_has_propagated_nexus_serialization_context() {
     .await
     .unwrap();
 }
+
+/// Live counterpart of `replay_with_empty_first_task`: an uncached worker receives the whole
+/// history plus an update request sequenced after a first task that issued no commands. The first
+/// task must be replayed on its own, as it will be once the update is accepted (see
+/// `update_accepted_after_empty_wft`), so lang runs init and the update handler in the same order
+/// live and on replay.
+#[tokio::test]
+async fn update_after_empty_first_task_on_uncached_worker() {
+    let wfid = "fakeid";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+
+    let update_id = "upd-1";
+    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
+    // The server sequences the request after the second task's scheduled event.
+    poll_resp.add_update_request(update_id, 5);
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_client);
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(task.is_replaying);
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert!(!task.is_replaying);
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::DoUpdate(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        UpdateResponse {
+            protocol_instance_id: update_id.to_string(),
+            response: Some(Response::Accepted(())),
+        }
+        .into(),
+    ))
+    .await
+    .unwrap();
+}
