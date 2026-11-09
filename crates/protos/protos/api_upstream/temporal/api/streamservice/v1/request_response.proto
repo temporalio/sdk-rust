@@ -20,31 +20,19 @@ import "temporal/api/stream/v1/message.proto";
 // Experimental. Might change in the future.
 // Creates the Stream. When the Stream exists, FAIL fails with ALREADY_EXISTS, and USE_EXISTING
 // gets it with created false and its own Retention. A retry of the create that made the Stream,
-// with the same request_id, gets created true. Each policy fails with CLOSED on a closed Stream,
-// EXPIRED on an expired one, and NOT_OWNER on one with another owner.
+// with the same request_id, gets created true. Each policy fails with CLOSED on a closed Stream
+// and EXPIRED on an expired one.
 // (-- api-linter: core::0133=disabled
 //     aip.dev/not-precedent: The request identifies a Stream by namespace and ref. --)
 message CreateStreamRequest {
     string namespace = 1;
-    // The ref of the Stream to create. Its id is the Stream id, and is never empty. A bound
-    // Stream's ref has the owner's run chain as its owner.
+    // The ref of the Stream to create. Its id is the Stream id, and is never empty.
     temporal.api.stream.v1.StreamRef stream_ref = 2;
     // The age after which a Record is dropped. Empty is the Store default.
     google.protobuf.Duration retention = 3;
-    // Workflow only. The previous run on a retry run's first create, to withdraw its Records.
-    string withdraw_run = 4;
-    // The Workflow run that owns a bound Stream, with its run_id and a Workflow epoch. It needs a
-    // ref whose owner is the run's chain. Unset for a standalone Stream.
-    temporal.api.stream.v1.Producer owner = 5;
-    // Only read by the server. When set, the server closes the Stream when the owner's run chain
-    // ends, also on a terminate or a timeout. It needs owner, and a ref with a Workflow owner.
-    // (-- api-linter: core::0140::prepositions=disabled
-    //     aip.dev/not-precedent: "with" ties the close to the owner's run chain. --)
-    bool close_with_run = 6;
     // Only read by the server, for a Stream bound to a Standalone Activity. The server checks that
     // the token is the Activity's current attempt, so a caller can't bind a Stream to a Standalone
-    // Activity that it isn't. The server knows the run of a Workflow's call, and a standalone
-    // Stream has no owner, so neither needs a token.
+    // Activity that it isn't.
     bytes task_token = 7;
     // What the create does when the Stream exists. Unspecified is FAIL.
     temporal.api.enums.v1.StreamIdConflictPolicy id_conflict_policy = 8;
@@ -56,7 +44,7 @@ message CreateStreamRequest {
 // Experimental. Might change in the future.
 // The Stream that a create made or got.
 message CreateStreamResponse {
-    // The ref, with the owner of a bound Stream.
+    // The ref of the Stream.
     temporal.api.stream.v1.StreamRef ref = 1;
     // False when USE_EXISTING got a Stream that existed.
     bool created = 2;
@@ -74,9 +62,6 @@ message AppendRecordsRequest {
     // the next number of the epoch. Such a batch has no dedupe, so a retry writes it again.
     int64 sequence = 4;
     repeated temporal.api.stream.v1.AppendRecord records = 5;
-    // Only read by the server, on a Workflow Producer's batch. The batch withdraws no Workflow
-    // Task and keeps no task facts, but the writer's withdrawal withdraw_run still applies.
-    bool defer_withdrawal = 6;
     // Only read by the server. The server checks the Producer against the Activity's current
     // attempt, so nobody else writes as that Activity.
     bytes task_token = 7;
@@ -92,13 +77,10 @@ message AppendRecordsResponse {
 // Experimental. Might change in the future.
 // Closes a Stream. Readers drain what is left, then end, and later appends fail with CLOSED. A
 // close writes no Record and carries no value, so code that has a last value publishes it first.
-// Only the owner's run chain closes a bound Stream. Only a Workflow or a client closes a
-// standalone Stream.
 message CloseStreamRequest {
     string namespace = 1;
     temporal.api.stream.v1.StreamRef ref = 2;
-    // The writer that closes the Stream. An SDK Store reads only its Producer, and the server
-    // also reads its withdrawal fields.
+    // The writer that closes the Stream. A Store reads only its Producer.
     temporal.api.stream.v1.StreamWriter writer = 3;
     // Only read by the server. It checks the token as on the append.
     bytes task_token = 4;
@@ -122,8 +104,7 @@ message ReadRecordsRequest {
     int64 from_offset = 3;
     // Where to start when from_offset is zero. Unspecified is the beginning.
     temporal.api.enums.v1.StreamReadStart start = 4;
-    // The most items in one page, Superseded items included. Zero is 1000. A Superseded item and
-    // the Record after it stay in one page, so a page of one Record can hold two items.
+    // The most Records in one page. Zero is 1000.
     int32 max_records = 5;
     // How long the read waits for a new Record before it answers with an empty page. Empty answers
     // at once, and a wait longer than 60 s waits 60 s.
@@ -180,7 +161,7 @@ message DescribeStreamRequest {
 // The state of a Stream.
 message DescribeStreamResponse {
     temporal.api.enums.v1.StreamStatus status = 1;
-    // The newest offset, of a Record or a Superseded item. Zero when the Stream has none.
+    // The newest offset, of a Record. Zero when the Stream has none.
     int64 last_offset = 2;
     google.protobuf.Duration retention = 3;
 }

@@ -21,6 +21,16 @@ enum StreamStatus {
 }
 
 // Experimental. Might change in the future.
+// How a Stream closed. CLOSED comes from a Producer that called close(). Native Streams add their
+// own close statuses later.
+// (-- api-linter: core::0216::synonyms=disabled
+//     aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
+enum StreamCloseStatus {
+    STREAM_CLOSE_STATUS_UNSPECIFIED = 0;
+    STREAM_CLOSE_STATUS_CLOSED = 1;
+}
+
+// Experimental. Might change in the future.
 // Where a read starts when it has no from_offset.
 enum StreamReadStart {
     STREAM_READ_START_UNSPECIFIED = 0;
@@ -49,16 +59,14 @@ enum StreamErrorReason {
     STREAM_ERROR_REASON_EXPIRED = 2;
     // The Stream is closed. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_CLOSED = 3;
-    // The Producer's epoch is lower than the newest one, its Workflow Task was withdrawn, or a
-    // Workflow retry withdrew its run. FAILED_PRECONDITION.
+    // The Producer's epoch is lower than the newest one. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_FENCED = 4;
     // The batch has a lower `sequence` than the last one of its epoch. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_SEQUENCE_TOO_LOW = 5;
     // The batch has the `sequence` of the last one of its epoch, and other content.
     // FAILED_PRECONDITION.
     STREAM_ERROR_REASON_SEQ_DIVERGENT = 6;
-    // A create gives another owner than the Stream has, or the owner doesn't allow this close.
-    // FAILED_PRECONDITION.
+    // The caller may not create or close this Stream. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_NOT_OWNER = 7;
     // A newer format version wrote the Stream. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_FORMAT_TOO_NEW = 8;
