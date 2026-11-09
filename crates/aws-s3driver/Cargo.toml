@@ -34,7 +34,7 @@ thiserror = { workspace = true }
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "~1.1.0"
+version = "~1.2.0"
 default-features = false
 features = ["experimental"]
 
