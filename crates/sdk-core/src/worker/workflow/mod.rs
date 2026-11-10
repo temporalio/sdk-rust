@@ -343,7 +343,7 @@ impl Workflows {
                             .activation_completed(
                                 WorkflowActivationCompletion {
                                     run_id,
-                                    status: Some(machines_err.as_failure().into()),
+                                    status: Some(Box::new(machines_err.as_failure()).into()),
                                     ..Default::default()
                                 },
                                 true,
@@ -445,7 +445,7 @@ impl Workflows {
                                 reset_last_started_to = Some(response.reset_history_event_id);
                             }
                             if let Some(wft) = response.workflow_task {
-                                *wft_from_complete = Some(validate_wft(wft)?);
+                                *wft_from_complete = Some(validate_wft(*wft)?);
                             }
                             self.handle_eager_activities(
                                 reserved_act_permits,
@@ -1464,7 +1464,7 @@ fn validate_completion(
         Some(workflow_activation_completion::Status::Failed(failure)) => {
             Ok(ValidatedCompletion::Fail {
                 run_id: completion.run_id,
-                failure,
+                failure: *failure,
                 is_autocomplete,
             })
         }
@@ -1615,7 +1615,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
         let variant = match c.variant.ok_or(EmptyWorkflowCommandErr)? {
             workflow_command::Variant::StartTimer(s) => WFCommandVariant::AddTimer(s),
             workflow_command::Variant::CancelTimer(s) => WFCommandVariant::CancelTimer(s),
-            workflow_command::Variant::ScheduleActivity(s) => WFCommandVariant::AddActivity(s),
+            workflow_command::Variant::ScheduleActivity(s) => WFCommandVariant::AddActivity(*s),
             workflow_command::Variant::RequestCancelActivity(s) => {
                 WFCommandVariant::RequestCancelActivity(s)
             }
@@ -1623,24 +1623,24 @@ impl TryFrom<WorkflowCommand> for WFCommand {
                 WFCommandVariant::CompleteWorkflow(c)
             }
             workflow_command::Variant::FailWorkflowExecution(s) => {
-                WFCommandVariant::FailWorkflow(s)
+                WFCommandVariant::FailWorkflow(*s)
             }
-            workflow_command::Variant::RespondToQuery(s) => WFCommandVariant::QueryResponse(s),
+            workflow_command::Variant::RespondToQuery(s) => WFCommandVariant::QueryResponse(*s),
             workflow_command::Variant::ContinueAsNewWorkflowExecution(s) => {
-                WFCommandVariant::ContinueAsNew(s)
+                WFCommandVariant::ContinueAsNew(*s)
             }
             workflow_command::Variant::CancelWorkflowExecution(s) => {
                 WFCommandVariant::CancelWorkflow(s)
             }
             workflow_command::Variant::SetPatchMarker(s) => WFCommandVariant::SetPatchMarker(s),
             workflow_command::Variant::StartChildWorkflowExecution(s) => {
-                WFCommandVariant::AddChildWorkflow(s)
+                WFCommandVariant::AddChildWorkflow(*s)
             }
             workflow_command::Variant::RequestCancelExternalWorkflowExecution(s) => {
                 WFCommandVariant::RequestCancelExternalWorkflow(s)
             }
             workflow_command::Variant::SignalExternalWorkflowExecution(s) => {
-                WFCommandVariant::SignalExternalWorkflow(s)
+                WFCommandVariant::SignalExternalWorkflow(*s)
             }
             workflow_command::Variant::CancelSignalWorkflow(s) => {
                 WFCommandVariant::CancelSignalWorkflow(s)
@@ -1649,7 +1649,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
                 WFCommandVariant::CancelChild(s)
             }
             workflow_command::Variant::ScheduleLocalActivity(s) => {
-                WFCommandVariant::AddLocalActivity(s)
+                WFCommandVariant::AddLocalActivity(*s)
             }
             workflow_command::Variant::RequestCancelLocalActivity(s) => {
                 WFCommandVariant::RequestCancelLocalActivity(s)
@@ -1662,7 +1662,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::UpdateResponse(s) => WFCommandVariant::UpdateResponse(s),
             workflow_command::Variant::ScheduleNexusOperation(s) => {
-                WFCommandVariant::ScheduleNexusOperation(s)
+                WFCommandVariant::ScheduleNexusOperation(*s)
             }
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)

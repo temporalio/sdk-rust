@@ -619,7 +619,7 @@ impl LocalActivityManager {
                 .la_executed();
             return Some(NextPendingLAAction::Dispatch(ActivityTask {
                 task_token: tt.into_inner(),
-                variant: Some(activity_task::Variant::Start(Start {
+                variant: Some(activity_task::Variant::Start(Box::new(Start {
                     workflow_namespace: self.namespace.clone(),
                     workflow_type: new_la.workflow_type,
                     workflow_execution: Some(new_la.workflow_exec_info),
@@ -646,7 +646,7 @@ impl LocalActivityManager {
                     run_id: String::new(),
                     propagated_nexus_serialization_context: None,
                     workflow_task: new_la.workflow_task,
-                })),
+                }))),
             }));
         }
     }

@@ -37,12 +37,7 @@ use temporalio_common::protos::{
             CommandType, EventType, RetryState, StartChildWorkflowExecutionFailedCause, TimeoutType,
         },
         failure::v1::{self as failure, Failure, failure::FailureInfo},
-        history::v1::{
-            ChildWorkflowExecutionCompletedEventAttributes,
-            ChildWorkflowExecutionFailedEventAttributes,
-            ChildWorkflowExecutionStartedEventAttributes,
-            StartChildWorkflowExecutionFailedEventAttributes, history_event,
-        },
+        history::v1::{ChildWorkflowExecutionFailedEventAttributes, history_event},
     },
 };
 
@@ -511,9 +506,11 @@ impl ChildWorkflowMachine {
         ResolveChildWorkflowExecution {
             seq: self.shared_state.lang_sequence_number,
             result: Some(ChildWorkflowResult {
-                status: Some(ChildWorkflowStatus::Cancelled(wfr::Cancellation {
-                    failure: Some(failure),
-                })),
+                status: Some(ChildWorkflowStatus::Cancelled(Box::new(
+                    wfr::Cancellation {
+                        failure: Some(failure),
+                    },
+                ))),
             }),
         }
     }
@@ -577,14 +574,14 @@ impl TryFrom<HistEventData> for ChildWorkflowMachineEvents {
             Ok(EventType::StartChildWorkflowExecutionFailed) => {
                 if let Some(
                     history_event::Attributes::StartChildWorkflowExecutionFailedEventAttributes(
-                        StartChildWorkflowExecutionFailedEventAttributes { cause, .. },
+                        attrs,
                     ),
                 ) = e.attributes
                 {
                     Self::StartChildWorkflowExecutionFailed(
-                        StartChildWorkflowExecutionFailedCause::try_from(cause).map_err(|_| {
-                            fatal!("Invalid StartChildWorkflowExecutionFailedCause")
-                        })?,
+                        StartChildWorkflowExecutionFailedCause::try_from(attrs.cause).map_err(
+                            |_| fatal!("Invalid StartChildWorkflowExecutionFailedCause"),
+                        )?,
                     )
                 } else {
                     return Err(fatal!(
@@ -594,16 +591,15 @@ impl TryFrom<HistEventData> for ChildWorkflowMachineEvents {
             }
             Ok(EventType::ChildWorkflowExecutionStarted) => {
                 if let Some(
-                    history_event::Attributes::ChildWorkflowExecutionStartedEventAttributes(
-                        ChildWorkflowExecutionStartedEventAttributes {
-                            workflow_execution: Some(we),
-                            ..
-                        },
-                    ),
+                    history_event::Attributes::ChildWorkflowExecutionStartedEventAttributes(attrs),
                 ) = e.attributes
                 {
                     Self::ChildWorkflowExecutionStarted(ChildWorkflowExecutionStartedEvent {
-                        workflow_execution: we,
+                        workflow_execution: attrs.workflow_execution.ok_or_else(|| {
+                            fatal!(
+                                "ChildWorkflowExecutionStarted attributes were unset or malformed"
+                            )
+                        })?,
                         started_event_id: e.event_id,
                     })
                 } else {
@@ -615,11 +611,11 @@ impl TryFrom<HistEventData> for ChildWorkflowMachineEvents {
             Ok(EventType::ChildWorkflowExecutionCompleted) => {
                 if let Some(
                     history_event::Attributes::ChildWorkflowExecutionCompletedEventAttributes(
-                        ChildWorkflowExecutionCompletedEventAttributes { result, .. },
+                        attrs,
                     ),
                 ) = e.attributes
                 {
-                    Self::ChildWorkflowExecutionCompleted(result)
+                    Self::ChildWorkflowExecutionCompleted(attrs.result)
                 } else {
                     return Err(fatal!(
                         "ChildWorkflowExecutionCompleted attributes were unset or malformed"
@@ -631,7 +627,7 @@ impl TryFrom<HistEventData> for ChildWorkflowMachineEvents {
                     history_event::Attributes::ChildWorkflowExecutionFailedEventAttributes(attrs),
                 ) = e.attributes
                 {
-                    Self::ChildWorkflowExecutionFailed(attrs)
+                    Self::ChildWorkflowExecutionFailed(*attrs)
                 } else {
                     return Err(fatal!("ChildWorkflowExecutionFailed attributes were unset"));
                 }
@@ -713,9 +709,9 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                     ResolveChildWorkflowExecutionStart {
                         seq: self.shared_state.lang_sequence_number,
                         status: Some(resolve_child_workflow_execution_start::Status::Cancelled(
-                            ResolveChildWorkflowExecutionStartCancelled {
+                            Box::new(ResolveChildWorkflowExecutionStartCancelled {
                                 failure: Some(failure),
-                            },
+                            }),
                         )),
                     }
                     .into(),
@@ -739,9 +735,9 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                     ResolveChildWorkflowExecution {
                         seq: self.shared_state.lang_sequence_number,
                         result: Some(ChildWorkflowResult {
-                            status: Some(ChildWorkflowStatus::Failed(wfr::Failure {
+                            status: Some(ChildWorkflowStatus::Failed(Box::new(wfr::Failure {
                                 failure: Some(failure),
-                            })),
+                            }))),
                         }),
                     }
                     .into(),
@@ -828,7 +824,10 @@ mod test {
         temporal::api::{
             command::v1::command,
             deployment::v1::WorkerDeploymentVersion,
-            history::v1::{HistoryEvent, StartChildWorkflowExecutionInitiatedEventAttributes},
+            history::v1::{
+                HistoryEvent, StartChildWorkflowExecutionFailedEventAttributes,
+                StartChildWorkflowExecutionInitiatedEventAttributes,
+            },
             workflow::v1::{VersioningOverride, versioning_override},
         },
     };

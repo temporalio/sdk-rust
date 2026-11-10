@@ -477,7 +477,8 @@ impl WorkerActivityTasks {
                             .await
                             .err()
                     }
-                    aer::Status::Cancelled(ar::Cancellation { failure }) => {
+                    aer::Status::Cancelled(cancellation) => {
+                        let ar::Cancellation { failure } = *cancellation;
                         if matches!(
                             act_info.issued_cancel_to_lang,
                             Some(ActivityCancelReason::WorkerShutdown),

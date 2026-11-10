@@ -214,7 +214,7 @@ impl ScheduleAction {
                 };
                 Ok(schedule_proto::ScheduleAction {
                     action: Some(schedule_proto::schedule_action::Action::StartWorkflow(
-                        workflow_proto::NewWorkflowExecutionInfo {
+                        Box::new(workflow_proto::NewWorkflowExecutionInfo {
                             workflow_id,
                             workflow_type: Some(common_proto::WorkflowType {
                                 name: workflow_type,
@@ -225,7 +225,7 @@ impl ScheduleAction {
                             }),
                             input,
                             ..Default::default()
-                        },
+                        }),
                     )),
                 })
             }
@@ -781,7 +781,7 @@ impl ScheduleDescription {
     }
 
     fn info(&self) -> Option<&schedule_proto::ScheduleInfo> {
-        self.raw.info.as_ref()
+        self.raw.info.as_deref()
     }
 
     /// Convert this description into a [`ScheduleUpdate`] for use with
@@ -790,7 +790,7 @@ impl ScheduleDescription {
     /// Extracts the schedule definition from the description.
     pub fn into_update(self) -> ScheduleUpdate {
         ScheduleUpdate {
-            schedule: self.raw.schedule.unwrap_or_default(),
+            schedule: *self.raw.schedule.unwrap_or_default(),
             pending_action: None,
         }
     }
@@ -1034,7 +1034,7 @@ impl ScheduleSummary {
     }
 
     fn info(&self) -> Option<&schedule_proto::ScheduleListInfo> {
-        self.raw.info.as_ref()
+        self.raw.info.as_deref()
     }
 }
 
@@ -1258,7 +1258,7 @@ where
         let mut request = UpdateScheduleRequest {
             namespace: self.namespace.clone(),
             schedule_id,
-            schedule: Some(update.schedule),
+            schedule: Some(Box::new(update.schedule)),
             identity: self.client.identity(),
             request_id: Uuid::new_v4().to_string(),
             ..Default::default()
@@ -1536,7 +1536,7 @@ impl Client {
                         let mut request = CreateScheduleRequest {
                             namespace: client.namespace(),
                             schedule_id: input.schedule_id.clone(),
-                            schedule: Some(schedule),
+                            schedule: Some(Box::new(schedule)),
                             initial_patch,
                             identity: client.identity(),
                             request_id: Uuid::new_v4().to_string(),

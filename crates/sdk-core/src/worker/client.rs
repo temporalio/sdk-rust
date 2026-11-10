@@ -867,7 +867,7 @@ impl WorkerClient for WorkerClientBag {
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskFailedRequest {
                     task_token: task_token.into_inner(),
-                    failure,
+                    failure: failure.map(Box::new),
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
                     last_heartbeat_details,
@@ -894,7 +894,7 @@ impl WorkerClient for WorkerClientBag {
         let request = RespondWorkflowTaskFailedRequest {
             task_token: task_token.into_inner(),
             cause: cause as i32,
-            failure,
+            failure: failure.map(Box::new),
             identity: self.identity(),
             binary_checksum: self.binary_checksum(),
             namespace: self.namespace.clone(),
@@ -932,7 +932,7 @@ impl WorkerClient for WorkerClientBag {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
                     task_token: task_token.into_inner(),
-                    failure,
+                    failure: failure.map(Box::new),
                     error,
                     poller_group_id: Default::default(),
                 }
@@ -1035,7 +1035,7 @@ impl WorkerClient for WorkerClientBag {
             identity: self.identity(),
             sticky_task_queue,
             reason: "graceful shutdown".to_string(),
-            worker_heartbeat: final_heartbeat,
+            worker_heartbeat: final_heartbeat.map(Box::new),
             worker_instance_key: self.worker_instance_key.to_string(),
             task_queue,
             task_queue_types: task_queue_types.into_iter().map(|t| t as i32).collect(),

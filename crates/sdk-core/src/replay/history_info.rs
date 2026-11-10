@@ -85,7 +85,7 @@ impl HistoryInfo {
                             events,
                             wf_task_count,
                             wf_type,
-                            wf_exe_started_attrs: started_attrs,
+                            wf_exe_started_attrs: *started_attrs,
                         });
                     }
                 } else if next_event.is_some() && !next_is_failed_or_timeout_or_term {
@@ -107,7 +107,7 @@ impl HistoryInfo {
                         events,
                         wf_task_count,
                         wf_type,
-                        wf_exe_started_attrs: started_attrs,
+                        wf_exe_started_attrs: *started_attrs,
                     });
                 }
                 // No more events

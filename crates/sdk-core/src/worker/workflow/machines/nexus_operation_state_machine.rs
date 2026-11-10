@@ -517,7 +517,7 @@ impl TryFrom<HistEventData> for NexusOperationMachineEvents {
                 if let Some(history_event::Attributes::NexusOperationCompletedEventAttributes(ca)) =
                     e.attributes
                 {
-                    Self::NexusOperationCompleted(ca)
+                    Self::NexusOperationCompleted(*ca)
                 } else {
                     return Err(nondeterminism!(
                         "NexusOperationCompleted attributes were unset or malformed"
@@ -528,7 +528,7 @@ impl TryFrom<HistEventData> for NexusOperationMachineEvents {
                 if let Some(history_event::Attributes::NexusOperationFailedEventAttributes(fa)) =
                     e.attributes
                 {
-                    Self::NexusOperationFailed(fa)
+                    Self::NexusOperationFailed(*fa)
                 } else {
                     return Err(nondeterminism!(
                         "NexusOperationFailed attributes were unset or malformed"
@@ -539,7 +539,7 @@ impl TryFrom<HistEventData> for NexusOperationMachineEvents {
                 if let Some(history_event::Attributes::NexusOperationCanceledEventAttributes(ca)) =
                     e.attributes
                 {
-                    Self::NexusOperationCanceled(ca)
+                    Self::NexusOperationCanceled(*ca)
                 } else {
                     return Err(nondeterminism!(
                         "NexusOperationCanceled attributes were unset or malformed"
@@ -550,7 +550,7 @@ impl TryFrom<HistEventData> for NexusOperationMachineEvents {
                 if let Some(history_event::Attributes::NexusOperationTimedOutEventAttributes(toa)) =
                     e.attributes
                 {
-                    Self::NexusOperationTimedOut(toa)
+                    Self::NexusOperationTimedOut(*toa)
                 } else {
                     return Err(nondeterminism!(
                         "NexusOperationTimedOut attributes were unset or malformed"
@@ -579,7 +579,7 @@ impl TryFrom<HistEventData> for NexusOperationMachineEvents {
                     ),
                 ) = e.attributes
                 {
-                    Self::NexusOperationCancelRequestFailed(attrs)
+                    Self::NexusOperationCancelRequestFailed(*attrs)
                 } else {
                     return Err(nondeterminism!(
                         "NexusOperationCancelRequestFailed attributes were unset or malformed"
@@ -626,9 +626,9 @@ impl WFMachinesAdapter for NexusOperationMachine {
                 vec![
                     ResolveNexusOperationStart {
                         seq: self.shared_state.lang_seq_num,
-                        status: Some(resolve_nexus_operation_start::Status::Failed(
+                        status: Some(resolve_nexus_operation_start::Status::Failed(Box::new(
                             failure.clone(),
-                        )),
+                        ))),
                     }
                     .into(),
                 ]
@@ -651,7 +651,7 @@ impl WFMachinesAdapter for NexusOperationMachine {
                     ResolveNexusOperation {
                         seq: self.shared_state.lang_seq_num,
                         result: Some(NexusOperationResult {
-                            status: Some(nexus_operation_result::Status::Failed(f)),
+                            status: Some(nexus_operation_result::Status::Failed(Box::new(f))),
                         }),
                     }
                     .into(),
@@ -662,7 +662,7 @@ impl WFMachinesAdapter for NexusOperationMachine {
                     ResolveNexusOperation {
                         seq: self.shared_state.lang_seq_num,
                         result: Some(NexusOperationResult {
-                            status: Some(nexus_operation_result::Status::Cancelled(f)),
+                            status: Some(nexus_operation_result::Status::Cancelled(Box::new(f))),
                         }),
                     }
                     .into(),
@@ -673,7 +673,7 @@ impl WFMachinesAdapter for NexusOperationMachine {
                     ResolveNexusOperation {
                         seq: self.shared_state.lang_seq_num,
                         result: Some(NexusOperationResult {
-                            status: Some(nexus_operation_result::Status::TimedOut(f)),
+                            status: Some(nexus_operation_result::Status::TimedOut(Box::new(f))),
                         }),
                     }
                     .into(),
@@ -701,11 +701,11 @@ impl WFMachinesAdapter for NexusOperationMachine {
                         ResolveNexusOperation {
                             seq: self.shared_state.lang_seq_num,
                             result: Some(NexusOperationResult {
-                                status: Some(nexus_operation_result::Status::Cancelled(
+                                status: Some(nexus_operation_result::Status::Cancelled(Box::new(
                                     self.shared_state.cancelled_failure(
                                         "Nexus operation cancelled after starting".to_owned(),
                                     ),
-                                )),
+                                ))),
                             }),
                         }
                         .into(),

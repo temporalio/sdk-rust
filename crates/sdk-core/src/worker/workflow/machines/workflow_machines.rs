@@ -1176,7 +1176,7 @@ impl WorkflowMachines {
                         self.workflow_id.clone(),
                         str_to_randomness_seed(&attrs.original_execution_run_id),
                         event_dat.event.event_time.unwrap_or_default(),
-                        attrs,
+                        *attrs,
                     );
                 } else {
                     return Err(fatal!(
@@ -1196,7 +1196,7 @@ impl WorkflowMachines {
                 )) = event_dat.event.attributes
                 {
                     self.drive_me.send_job(
-                        workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
+                        workflow_activation::SignalWorkflow::from((*attrs, event_id)).into(),
                     );
                 } else {
                     // err

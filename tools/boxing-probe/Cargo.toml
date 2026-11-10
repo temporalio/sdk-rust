@@ -1,0 +1,16 @@
+[package]
+name = "protobuf-boxing-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+prost = "0.14"
+prost_descriptor = { package = "prost-types", version = "0.14" }
+
+[build-dependencies]
+prost-build = "0.14"
+prost_descriptor = { package = "prost-types", version = "0.14" }
+protox = "0.9.1"

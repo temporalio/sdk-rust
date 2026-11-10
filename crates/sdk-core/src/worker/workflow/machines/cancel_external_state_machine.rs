@@ -177,11 +177,11 @@ impl WFMachinesAdapter for CancelExternalMachine {
         Ok(match my_command {
             CancelExternalCommand::Requested => {
                 vec![
-                    ResolveRequestCancelExternalWorkflow {
+                    Box::new(ResolveRequestCancelExternalWorkflow {
                         seq: self.shared_state.seq,
                         failure: None,
                         cause: CancelExternalWorkflowExecutionFailedCause::Unspecified as i32,
-                    }
+                    })
                     .into(),
                 ]
             }
@@ -192,7 +192,7 @@ impl WFMachinesAdapter for CancelExternalMachine {
                     | CancelExternalWorkflowExecutionFailedCause::NamespaceNotFound  => "not found"
                 };
                 vec![
-                    ResolveRequestCancelExternalWorkflow {
+                    Box::new(ResolveRequestCancelExternalWorkflow {
                         seq: self.shared_state.seq,
                         failure: Some(Failure {
                             message: format!("Unable to cancel external workflow because {reason}"),
@@ -205,7 +205,7 @@ impl WFMachinesAdapter for CancelExternalMachine {
                             ..Default::default()
                         }),
                         cause: f as i32,
-                    }
+                    })
                     .into(),
                 ]
             }

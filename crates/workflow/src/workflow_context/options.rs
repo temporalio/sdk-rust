@@ -336,7 +336,7 @@ impl ActivityOptions {
         #[cfg(not(feature = "experimental"))]
         let event_group_markers = Vec::new();
         command_with_metadata(
-            workflow_command::Variant::ScheduleActivity(ScheduleActivity {
+            workflow_command::Variant::ScheduleActivity(Box::new(ScheduleActivity {
                 seq,
                 activity_type,
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
@@ -363,7 +363,7 @@ impl ActivityOptions {
                 priority: self.priority.map(Into::into),
                 do_not_eagerly_execute: self.do_not_eagerly_execute,
                 ..Default::default()
-            }),
+            })),
             self.summary,
             None,
             event_group_markers,
@@ -452,7 +452,7 @@ impl LocalActivityOptions {
         #[cfg(not(feature = "experimental"))]
         let event_group_markers = Vec::new();
         command_with_metadata(
-            workflow_command::Variant::ScheduleLocalActivity(ScheduleLocalActivity {
+            workflow_command::Variant::ScheduleLocalActivity(Box::new(ScheduleLocalActivity {
                 seq,
                 activity_type,
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
@@ -475,7 +475,7 @@ impl LocalActivityOptions {
                 start_to_close_timeout: self
                     .start_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
-            }),
+            })),
             self.summary,
             None,
             event_group_markers,
@@ -559,40 +559,47 @@ impl ChildWorkflowOptions {
         #[cfg(not(feature = "experimental"))]
         let event_group_markers = Vec::new();
         command_with_metadata(
-            workflow_command::Variant::StartChildWorkflowExecution(StartChildWorkflowExecution {
-                seq,
-                workflow_type,
-                workflow_id,
-                task_queue: self.task_queue.unwrap_or_default(),
-                input: args,
-                headers,
-                cancellation_type: ProtoChildWorkflowCancellationType::from(self.cancel_type)
+            workflow_command::Variant::StartChildWorkflowExecution(Box::new(
+                StartChildWorkflowExecution {
+                    seq,
+                    workflow_type,
+                    workflow_id,
+                    task_queue: self.task_queue.unwrap_or_default(),
+                    input: args,
+                    headers,
+                    cancellation_type: ProtoChildWorkflowCancellationType::from(self.cancel_type)
+                        .into(),
+                    parent_close_policy: ProtoParentClosePolicy::from(self.parent_close_policy)
+                        .into(),
+                    workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(
+                        match self.id_reuse_policy {
+                            WorkflowIdReusePolicy::Unspecified => {
+                                WorkflowIdReusePolicy::AllowDuplicate
+                            }
+                            policy => policy,
+                        },
+                    )
                     .into(),
-                parent_close_policy: ProtoParentClosePolicy::from(self.parent_close_policy).into(),
-                workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(
-                    match self.id_reuse_policy {
-                        WorkflowIdReusePolicy::Unspecified => WorkflowIdReusePolicy::AllowDuplicate,
-                        policy => policy,
-                    },
-                )
-                .into(),
-                workflow_execution_timeout: self
-                    .execution_timeout
-                    .and_then(|duration| duration.try_into().ok()),
-                workflow_run_timeout: self
-                    .run_timeout
-                    .and_then(|duration| duration.try_into().ok()),
-                workflow_task_timeout: self
-                    .task_timeout
-                    .and_then(|duration| duration.try_into().ok()),
-                cron_schedule: self.cron_schedule.unwrap_or_default(),
-                retry_policy: self.retry_policy.map(Into::into),
-                search_attributes: self.search_attributes.map(|t| t.into_proto()),
-                priority: self.priority.map(Into::into),
-                #[cfg(feature = "experimental")]
-                versioning_override: self.versioning_override.map(Into::into),
-                ..Default::default()
-            }),
+                    workflow_execution_timeout: self
+                        .execution_timeout
+                        .and_then(|duration| duration.try_into().ok()),
+                    workflow_run_timeout: self
+                        .run_timeout
+                        .and_then(|duration| duration.try_into().ok()),
+                    workflow_task_timeout: self
+                        .task_timeout
+                        .and_then(|duration| duration.try_into().ok()),
+                    cron_schedule: self.cron_schedule.unwrap_or_default(),
+                    retry_policy: self.retry_policy.map(Into::into),
+                    search_attributes: self.search_attributes.map(|t| t.into_proto()),
+                    priority: self.priority.map(Into::into),
+                    #[cfg(feature = "experimental")]
+                    versioning_override: self
+                        .versioning_override
+                        .map(|value| Box::new(value.into())),
+                    ..Default::default()
+                },
+            )),
             self.static_summary,
             self.static_details,
             event_group_markers,
@@ -732,7 +739,7 @@ impl SignalWorkflowOptions {
         #[cfg(not(feature = "experimental"))]
         let event_group_markers = Vec::new();
         command_with_metadata(
-            workflow_command::Variant::SignalExternalWorkflowExecution(
+            workflow_command::Variant::SignalExternalWorkflowExecution(Box::new(
                 SignalExternalWorkflowExecution {
                     seq,
                     signal_name,
@@ -740,7 +747,7 @@ impl SignalWorkflowOptions {
                     target: Some(target),
                     headers,
                 },
-            ),
+            )),
             self.summary,
             None,
             event_group_markers,

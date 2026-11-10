@@ -1541,7 +1541,7 @@ where
                 .await
                 .map_err(WorkflowUpdateError::from),
             Some(update::v1::outcome::Value::Failure(failure)) => {
-                Err(WorkflowUpdateError::Failed(Box::new(failure)))
+                Err(WorkflowUpdateError::Failed(failure))
             }
             None => Err(WorkflowUpdateError::Other(
                 "Update returned no outcome value".into(),

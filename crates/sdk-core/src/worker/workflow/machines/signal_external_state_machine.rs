@@ -91,7 +91,7 @@ pub(super) fn new_external_signal(
         .expect("Scheduling signal external wf command doesn't fail");
     #[allow(deprecated)]
     let cmd_attrs = command::Attributes::SignalExternalWorkflowExecutionCommandAttributes(
-        SignalExternalWorkflowExecutionCommandAttributes {
+        Box::new(SignalExternalWorkflowExecutionCommandAttributes {
             namespace: workflow_execution.namespace,
             execution: Some(UpstreamWE {
                 workflow_id: workflow_execution.workflow_id,
@@ -106,7 +106,7 @@ pub(super) fn new_external_signal(
             input: attrs.args.into_payloads(),
             child_workflow_only: only_child,
             ..Default::default()
-        },
+        }),
     );
     Ok(NewMachineWithCommand {
         command: cmd_attrs,
@@ -217,11 +217,11 @@ impl WFMachinesAdapter for SignalExternalMachine {
         Ok(match my_command {
             SignalExternalCommand::Signaled => {
                 vec![
-                    ResolveSignalExternalWorkflow {
+                    Box::new(ResolveSignalExternalWorkflow {
                         seq: self.shared_state.seq,
                         failure: None,
                         cause: SignalExternalWorkflowExecutionFailedCause::Unspecified as i32,
-                    }
+                    })
                     .into(),
                 ]
             }
@@ -236,7 +236,7 @@ impl WFMachinesAdapter for SignalExternalMachine {
                     }
                 };
                 vec![
-                    ResolveSignalExternalWorkflow {
+                    Box::new(ResolveSignalExternalWorkflow {
                         seq: self.shared_state.seq,
                         // TODO: Create new failure type upstream for this
                         failure: Some(Failure {
@@ -250,7 +250,7 @@ impl WFMachinesAdapter for SignalExternalMachine {
                             ..Default::default()
                         }),
                         cause: f as i32,
-                    }
+                    })
                     .into(),
                 ]
             }
@@ -268,7 +268,7 @@ impl SignalExternalMachine {
         match res.first() {
             Some(SignalExternalCommand::Cancelled) => {
                 ret = vec![
-                    ResolveSignalExternalWorkflow {
+                    Box::new(ResolveSignalExternalWorkflow {
                         seq: self.shared_state.seq,
                         failure: Some(Failure {
                             message: SIG_CANCEL_MSG.to_string(),
@@ -281,7 +281,7 @@ impl SignalExternalMachine {
                             ..Default::default()
                         }),
                         cause: SignalExternalWorkflowExecutionFailedCause::Unspecified as i32,
-                    }
+                    })
                     .into(),
                 ];
             }

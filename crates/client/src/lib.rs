@@ -1850,10 +1850,10 @@ fn build_start_workflow_request(
         links: options.links,
         completion_callbacks: options.completion_callbacks,
         priority: Some(options.priority.into()),
-        versioning_override: options.versioning_override.map(Into::into),
+        versioning_override: options.versioning_override.map(|v| Box::new(v.into())),
         memo,
         header: options.header,
-        user_metadata,
+        user_metadata: user_metadata.map(Box::new),
         ..Default::default()
     }
 }
@@ -2212,12 +2212,12 @@ where
                             operations: vec![
                                 execute_multi_operation_request::Operation {
                                     operation: Some(MultiOperationRequest::StartWorkflow(
-                                        start_request,
+                                        Box::new(start_request),
                                     )),
                                 },
                                 execute_multi_operation_request::Operation {
                                     operation: Some(MultiOperationRequest::UpdateWorkflow(
-                                        update_request,
+                                        Box::new(update_request),
                                     )),
                                 },
                             ],
@@ -2584,7 +2584,7 @@ where
                 .into(),
             search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
             header: options.header,
-            user_metadata,
+            user_metadata: user_metadata.map(Box::new),
             priority: Some(options.priority.into()),
             start_delay: try_into_or_box_err(options.start_delay, StartActivityError::Other)?,
             ..Default::default()

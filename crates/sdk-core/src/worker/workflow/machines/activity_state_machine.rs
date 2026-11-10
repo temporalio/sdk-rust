@@ -147,7 +147,7 @@ impl ActivityMachine {
             != ActivityCancellationType::WaitCancellationCompleted
         {
             r.push(MachineResponse::PushWFJob(
-                self.create_cancelation_resolve(None).into(),
+                Box::new(self.create_cancelation_resolve(None)).into(),
             ));
         }
         r
@@ -161,9 +161,11 @@ impl ActivityMachine {
         ResolveActivity {
             seq: self.shared_state.attrs.seq,
             result: Some(ActivityResolution {
-                status: Some(activity_resolution::Status::Cancelled(Cancellation {
-                    failure: Some(new_cancel_failure(&self.shared_state, attrs)),
-                })),
+                status: Some(activity_resolution::Status::Cancelled(Box::new(
+                    Cancellation {
+                        failure: Some(new_cancel_failure(&self.shared_state, attrs)),
+                    },
+                ))),
             }),
             is_local: false,
         }
@@ -200,7 +202,7 @@ impl ActivityMachine {
                     self.machine_responses_from_cancel_request(cmd)
                 }
                 ActivityMachineCommand::Cancel(details) => {
-                    vec![self.create_cancelation_resolve(details).into()]
+                    vec![Box::new(self.create_cancelation_resolve(details)).into()]
                 }
                 x => {
                     dbg_panic!("Invalid cancel event response {x:?}");
@@ -253,7 +255,7 @@ impl TryFrom<HistEventData> for ActivityMachineEvents {
                 if let Some(history_event::Attributes::ActivityTaskFailedEventAttributes(attrs)) =
                     e.attributes
                 {
-                    Self::ActivityTaskFailed(attrs)
+                    Self::ActivityTaskFailed(*attrs)
                 } else {
                     return Err(fatal!("Activity failure attributes were unset: {e}"));
                 }
@@ -262,7 +264,7 @@ impl TryFrom<HistEventData> for ActivityMachineEvents {
                 if let Some(history_event::Attributes::ActivityTaskTimedOutEventAttributes(attrs)) =
                     e.attributes
                 {
-                    Self::ActivityTaskTimedOut(attrs)
+                    Self::ActivityTaskTimedOut(*attrs)
                 } else {
                     return Err(fatal!("Activity timeout attributes were unset: {e}"));
                 }
@@ -295,7 +297,7 @@ impl WFMachinesAdapter for ActivityMachine {
         Ok(match my_command {
             ActivityMachineCommand::Complete(result) => {
                 vec![
-                    ResolveActivity {
+                    Box::new(ResolveActivity {
                         seq: self.shared_state.attrs.seq,
                         result: Some(ActivityResolution {
                             status: Some(activity_resolution::Status::Completed(ar::Success {
@@ -303,22 +305,24 @@ impl WFMachinesAdapter for ActivityMachine {
                             })),
                         }),
                         is_local: false,
-                    }
+                    })
                     .into(),
                 ]
             }
             ActivityMachineCommand::Fail(failure) => {
                 vec![
-                    ResolveActivity {
+                    Box::new(ResolveActivity {
                         seq: self.shared_state.attrs.seq,
                         result: Some(ActivityResolution {
-                            status: Some(activity_resolution::Status::Failed(ar::Failure {
-                                failure: Some(failure),
-                                ..Default::default()
-                            })),
+                            status: Some(activity_resolution::Status::Failed(Box::new(
+                                ar::Failure {
+                                    failure: Some(failure),
+                                    ..Default::default()
+                                },
+                            ))),
                         }),
                         is_local: false,
-                    }
+                    })
                     .into(),
                 ]
             }
@@ -326,7 +330,7 @@ impl WFMachinesAdapter for ActivityMachine {
                 self.machine_responses_from_cancel_request(c)
             }
             ActivityMachineCommand::Cancel(attrs) => {
-                vec![self.create_cancelation_resolve(attrs).into()]
+                vec![Box::new(self.create_cancelation_resolve(attrs)).into()]
             }
         })
     }

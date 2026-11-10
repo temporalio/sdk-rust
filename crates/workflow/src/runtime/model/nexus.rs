@@ -30,7 +30,7 @@ impl Unblockable for NexusStartResult {
                         base_ctx,
                     })
                 }
-                resolve_nexus_operation_start::Status::Failed(f) => Err(f),
+                resolve_nexus_operation_start::Status::Failed(f) => Err(*f),
             },
             _ => panic!("Invalid unblock event for nexus operation"),
         }

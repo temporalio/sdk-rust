@@ -55,7 +55,13 @@ impl DrivenWorkflow {
             retry_policy: attribs.retry_policy.clone(),
         };
         self.send_job(
-            start_workflow_from_attribs(attribs, workflow_id, randomness_seed, start_time).into(),
+            Box::new(start_workflow_from_attribs(
+                attribs,
+                workflow_id,
+                randomness_seed,
+                start_time,
+            ))
+            .into(),
         );
         self.started_attrs = Some(started_info);
     }

@@ -126,7 +126,7 @@ where
                         }
                         _ => ActivityResultError::ActivityFailed(dc.to_error(
                             &ctx,
-                            failure,
+                            *failure,
                             NoopDecodeHint,
                         )?),
                     })

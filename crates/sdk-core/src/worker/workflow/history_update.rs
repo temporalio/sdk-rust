@@ -654,6 +654,7 @@ impl HistoryUpdate {
                 Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some(a),
                 _ => None,
             })
+            .map(|v| &**v)
     }
 
     fn starting_index_after_skipping(&self, from_wft_started_id: i64) -> Option<usize> {

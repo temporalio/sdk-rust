@@ -207,7 +207,7 @@ where
             decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
         }
         Ok(Self {
-            raw_info,
+            raw_info: *raw_info,
             raw_input: response.input,
             raw_outcome,
             data_converter,
