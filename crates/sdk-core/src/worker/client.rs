@@ -115,6 +115,7 @@ fn paginate_wft_completion(
         task_token: request.task_token.clone(),
         identity: request.identity.clone(),
         namespace: request.namespace.clone(),
+        resource_id: request.resource_id.clone(),
         intermediate_page: true,
         ..Default::default()
     };
@@ -660,7 +661,7 @@ impl WorkerClient for WorkerClientBag {
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
-            resource_id: Default::default(),
+            resource_id: request.resource_id,
             page_number: 0,
             intermediate_page: false,
         };
@@ -1205,6 +1206,10 @@ pub struct WorkflowTaskCompletion {
     /// advertises one. A paginated completion larger than this is rejected server-side with
     /// `REQUEST_TOO_LARGE`, so the worker fails it proactively instead of sending doomed pages.
     pub wft_completion_size_limit: Option<usize>,
+    /// The workflow this task belongs to, as `workflow:<workflow_id>`. Sent on every page of a
+    /// paginated completion so proxies can route or authorize by workflow without decoding the
+    /// opaque task token.
+    pub resource_id: String,
 }
 
 #[derive(Clone, Default)]
@@ -1485,6 +1490,7 @@ mod tests {
                 task_token: b"task-token".to_vec(),
                 identity: "identity".to_string(),
                 namespace: "namespace".to_string(),
+                resource_id: "workflow:wf-id".to_string(),
                 commands,
                 ..Default::default()
             }
@@ -1524,12 +1530,14 @@ mod tests {
             assert_eq!(final_page.page_number as usize, intermediate.len());
             assert!(final_page.encoded_len() <= max);
             assert_eq!(final_page.task_token, b"task-token");
+            assert_eq!(final_page.resource_id, "workflow:wf-id");
 
             let mut total_commands = 0;
             for (idx, page) in intermediate.iter().enumerate() {
                 assert!(page.intermediate_page);
                 assert_eq!(page.page_number as usize, idx);
                 assert_eq!(page.task_token, b"task-token");
+                assert_eq!(page.resource_id, "workflow:wf-id");
                 assert!(
                     page.encoded_len() <= max,
                     "intermediate page {idx} over limit"
@@ -1646,6 +1654,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: "workflow:shared-wf".to_string(),
             };
             client
                 .complete_workflow_task(completion, CancellationToken::new())
@@ -1658,8 +1667,9 @@ mod tests {
                 "expected multiple pages, got {}",
                 sent.len()
             );
-            // Every page shares the one task token.
+            // Every page shares the one task token and resource ID.
             assert!(sent.iter().all(|r| r.task_token == b"shared-token"));
+            assert!(sent.iter().all(|r| r.resource_id == "workflow:shared-wf"));
             // Exactly one final page, numbered after all the intermediate ones.
             let finals: Vec<_> = sent.iter().filter(|r| !r.intermediate_page).collect();
             assert_eq!(finals.len(), 1);
@@ -1747,6 +1757,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
 
             // Without cancellation this would hang on the never-completing page; the timeout guards
@@ -1823,6 +1834,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: Some(1024 * 1024),
+                resource_id: String::new(),
             };
             let err = client
                 .complete_workflow_task(completion, CancellationToken::new())
@@ -1909,6 +1921,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
             client
                 .complete_workflow_task(completion, CancellationToken::new())
@@ -1998,6 +2011,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
 
             let err = tokio::time::timeout(
@@ -2083,6 +2097,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
 
             client

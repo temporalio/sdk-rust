@@ -49,6 +49,9 @@ relevant information.
   `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
   late completions of abandoned activities already were.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+### Changed
+* Workflow task completions set `resource_id` to `workflow:<workflow_id>`, on every page of a
+  paginated completion, so proxies can identify the workflow without decoding the task token.
 
 ## [0.11.0] - 2026-11-09
 

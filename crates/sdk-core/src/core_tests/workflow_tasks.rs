@@ -1294,6 +1294,38 @@ async fn sends_appropriate_sticky_task_queue_responses() {
 }
 
 #[tokio::test]
+async fn completions_carry_workflow_resource_id() {
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("resource-wf", t, [1, 2], mock_worker_client());
+    mock_cfg.num_expected_completions = Some(2.into());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts
+            .then(|wft| assert_eq!(wft.resource_id, "workflow:resource-wf"))
+            .then(|wft| assert_eq!(wft.resource_id, "workflow:resource-wf"));
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        CompleteWorkflowExecution { result: None }.into(),
+    ))
+    .await
+    .unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn new_server_work_while_eviction_outstanding_doesnt_overwrite_activation() {
     let wfid = "fake_wf_id";
     let t = canned_histories::single_timer("1");

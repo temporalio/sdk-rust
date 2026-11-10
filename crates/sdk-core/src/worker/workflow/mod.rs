@@ -373,6 +373,7 @@ impl Workflows {
         match report {
             ServerCommandsWithWorkflowInfo {
                 task_token,
+                workflow_id,
                 action:
                     ActivationAction::WftComplete {
                         mut commands,
@@ -421,6 +422,7 @@ impl Workflows {
                     wft_completion_size_limit: self
                         .namespace_capabilities
                         .workflow_task_completion_size_limit(),
+                    resource_id: format!("workflow:{workflow_id}"),
                 };
                 let sticky_attrs = self.sticky_attrs.clone();
                 // Do not return new WFT if we would not cache, because returned new WFTs are
@@ -1161,6 +1163,7 @@ struct UnstoredWftFailInfo {
 
 struct ServerCommandsWithWorkflowInfo {
     task_token: TaskToken,
+    workflow_id: String,
     action: ActivationAction,
     metrics: MetricsContext,
 }
@@ -1168,6 +1171,7 @@ impl Debug for ServerCommandsWithWorkflowInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerCommandsWithWorkflowInfo")
             .field("task_token", &self.task_token)
+            .field("workflow_id", &self.workflow_id)
             .field("action", &self.action)
             .finish()
     }
