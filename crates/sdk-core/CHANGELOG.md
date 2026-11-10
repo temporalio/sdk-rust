@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.11.0] - 2026-11-09
+
 ### Added
 * A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. `workflow_task`
@@ -54,6 +56,7 @@ relevant information.
 
 ### Fixed
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+* Slot gauges now reflect the current number of used and available slots after concurrent worker updates.
 * A workflow task failure reported with the cause `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`
   is now counted on `workflow_task_execution_failed` with `failure_reason="ExternalStorageError"`,
   matching activity failures with the storage cause. It was previously counted as `WorkflowError`.
@@ -103,6 +106,12 @@ relevant information.
   each series with a suffix, `_native` by default, so it never shares a name with the fixed-bucket
   series it replaces. It cannot be combined with histogram bucket overrides. Explicit buckets
   remain the default.
+
+### Changed
+* Poller pools now report their poller target to the server on each poll and in the worker
+  heartbeat: the current target for autoscaling pools, the configured maximum for fixed-size
+  pools. (We'll use this count on the server side for now for load balancing pollers between
+  workers, and for creating a per-worker poller count metric.)
 
 ## [0.10.0] - 2026-10-06
 
