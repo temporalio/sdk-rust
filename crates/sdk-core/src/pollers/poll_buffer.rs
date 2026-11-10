@@ -178,7 +178,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override: opts.timeout_override,
-                            attempt_semaphore: opts.attempt_semaphore,
+                            retry_semaphore: opts.retry_semaphore,
                         },
                         PollWorkflowOptions { sticky_queue_name },
                     )
@@ -236,7 +236,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override: opts.timeout_override,
-                            attempt_semaphore: opts.attempt_semaphore,
+                            retry_semaphore: opts.retry_semaphore,
                         },
                         PollActivityOptions {
                             max_tasks_per_sec: options.max_tps,
@@ -295,7 +295,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override: opts.timeout_override,
-                            attempt_semaphore: opts.attempt_semaphore,
+                            retry_semaphore: opts.retry_semaphore,
                         },
                         PollNexusOptions {
                             worker_commands_queue,
@@ -332,7 +332,7 @@ thread_local! {
 
 struct PollFnOptions {
     timeout_override: Option<Duration>,
-    attempt_semaphore: Option<Arc<Semaphore>>,
+    retry_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl<T, SK> LongPollBuffer<T, SK>
@@ -423,17 +423,17 @@ where
                         let capabilities = capabilities.clone();
                         let poll_task = tokio::spawn(
                         async move {
-                            let (attempt_semaphore, poll_interruptor) = {
+                            let (retry_semaphore, poll_interruptor) = {
                                 if capabilities.graceful_poll_shutdown() {
-                                    let sem = Arc::new(Semaphore::new(1));
+                                    let sem = Arc::new(Semaphore::new(0));
                                     (Some(sem.clone()), async move {
                                         match sem.acquire().await {
                                             Ok(permit) =>
                                                 // prevent further polls
                                                 permit.forget(),
-                                            Err(e) =>
+                                            Err(_) =>
                                                 // should never happen, but even then it's safe to ignore
-                                                debug!(error=?e, "Poll semaphore error")
+                                                dbg_panic!("Poll semaphore closed")
                                         }
                                     }.left_future())
                                 } else {
@@ -451,7 +451,7 @@ where
                                     shutdown.cancelled().await;
                                     poll_interruptor.await;
                                 } => return,
-                                r = pf(PollFnOptions { timeout_override, attempt_semaphore }) => r,
+                                r = pf(PollFnOptions { timeout_override, retry_semaphore }) => r,
                             };
                             if let Ok(r) = &r
                                 && let Some(ppf) = post_pf.as_ref()
@@ -1326,14 +1326,7 @@ mod tests {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 let started = task_started_clone.clone();
                 let complete = task_complete_clone.clone();
-                if graceful {
-                    // Locking semaphore for graceful shutdown. Should succeed immediately.
-                    let sem = opts.attempt_semaphore.unwrap();
-                    sem.try_acquire().unwrap().forget();
-                } else {
-                    // There should be no semaphore with legacy shutdown.
-                    assert!(opts.attempt_semaphore.is_none());
-                }
+                assert_eq!(opts.retry_semaphore.is_some(), graceful);
                 async move {
                     match count {
                         0 => Ok(PollWorkflowTaskQueueResponse {

@@ -1015,19 +1015,29 @@ pub fn hist_to_poll_resp(
 
 /// Forcibly drive a future a number of times, enforcing it is always returning Pending. This is
 /// useful for ensuring some future has proceeded "enough" before racing it against another future.
+/// This macro pins the provided future, which changes the static type of the variable. To avoid it,
+/// call `pin_mut!` on it first then use [`advance_fut_pinned`].
 #[macro_export]
 macro_rules! advance_fut {
     ($fut:ident) => {
         ::futures_util::pin_mut!($fut);
-        {
-            let waker = ::futures_util::task::noop_waker();
-            let mut cx = core::task::Context::from_waker(&waker);
-            for _ in 0..10 {
-                assert_matches!($fut.poll_unpin(&mut cx), core::task::Poll::Pending);
-                ::tokio::task::yield_now().await;
-            }
-        }
+        $crate::advance_fut_pinned!($fut);
     };
+}
+
+/// Forcibly drive a pinned future a number of times, enforcing it is always returning Pending. This
+/// is useful for ensuring some future has proceeded "enough" before racing it against another
+/// future. For unpinned futures, use [`advance_fut`].
+#[macro_export]
+macro_rules! advance_fut_pinned {
+    ($fut:ident) => {{
+        let waker = ::futures_util::task::noop_waker();
+        let mut cx = core::task::Context::from_waker(&waker);
+        for _ in 0..10 {
+            assert_matches!($fut.poll_unpin(&mut cx), core::task::Poll::Pending);
+            ::tokio::task::yield_now().await;
+        }
+    }};
 }
 
 /// Helps easily construct prost proto durations from stdlib duration constructors

@@ -4,12 +4,7 @@
 //! request handling logic.
 
 use crate::RetryOptions;
-use dyn_clone::DynClone;
-use std::{
-    fmt::{Debug, Formatter},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 /// A request extension that, when set, should make the retry behavior consider this call to be a
@@ -35,42 +30,12 @@ pub struct RetryConfigForCall(pub RetryOptions);
 #[derive(Clone, Debug)]
 pub struct ThrottleRetryConfigForCall(pub RetryOptions);
 
-/// A request extension that calls a callback after a request failed if it's going to be retried.
-#[derive(Clone)]
-pub struct RetryCallback(Box<dyn RetryCallbackTrait>);
-
-impl RetryCallback {
-    /// Make a new instance from the provided closure.
-    pub fn new(callback: impl FnMut(&tonic::Status) + Clone + Send + Sync + 'static) -> Self {
-        Self(Box::new(callback))
-    }
-
-    /// Call the callback.
-    pub fn call(&mut self, status: &tonic::Status) {
-        self.0(status);
-    }
-}
-
-impl Debug for RetryCallback {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RetryCallback")
-    }
-}
-
-/// Internal. Closure type for [`RetryCallback`].
-pub(crate) trait RetryCallbackTrait:
-    FnMut(&tonic::Status) + DynClone + Send + Sync + 'static
-{
-}
-impl<T> RetryCallbackTrait for T where T: FnMut(&tonic::Status) + Clone + Send + Sync + 'static {}
-dyn_clone::clone_trait_object!(RetryCallbackTrait);
-
-/// A request extension that obtains a permit from the provided semaphore before every attempt.
-/// On a retryable error, the permit is released until next attempt. On the final response, whether
-/// successful or an error, the permit is leaked (this can be used to implement cancellation logic
-/// that only runs between attempts and not during a request and not after completion).
+/// A request extension that signals a semaphore between retries. Semaphore must be initialized with
+/// 0 permits. When a retry is scheduled, one permit is released. Before retry, the request blocks
+/// until it can acquire one permit. Effectively, if other code blocks on the same semaphore, it
+/// will only be run between attempts, not during an attempt and not after the call completes.
 #[derive(Clone, Debug)]
-pub struct AttemptSemaphore(pub Arc<Semaphore>);
+pub struct RetrySemaphore(pub Arc<Semaphore>);
 
 /// Per-call payload/memo size error limits, attached to a request's extensions by a caller that
 /// wants error-level enforcement on this call.

@@ -195,7 +195,7 @@ mockall::mock! {
             task_queue: String,
             task_queue_types: Vec<TaskQueueType>,
             worker_heartbeat: Option<WorkerHeartbeat>,
-            retry_callback: Option<RetryCallback>,
+            retry_semaphore: Option<Arc<Semaphore>>,
         ) -> impl Future<Output = Result<ShutdownWorkerResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 

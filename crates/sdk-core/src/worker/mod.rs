@@ -82,12 +82,9 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-use temporalio_client::{
-    request_extensions::RetryCallback,
-    worker::{
-        CancelActivityCallback, ClientWorker, HeartbeatCallback, HeartbeatSuccessCallback,
-        SharedNamespaceWorkerTrait, Slot as SlotTrait,
-    },
+use temporalio_client::worker::{
+    CancelActivityCallback, ClientWorker, HeartbeatCallback, HeartbeatSuccessCallback,
+    SharedNamespaceWorkerTrait, Slot as SlotTrait,
 };
 #[cfg(test)]
 use temporalio_common::protos::temporal::api::namespace::v1::NamespaceInfo as ApiNamespaceInfo;
@@ -117,8 +114,8 @@ use temporalio_common::{
 };
 use tokio::{
     select,
-    sync::{mpsc::unbounded_channel, watch},
-    task::{JoinError, JoinHandle},
+    sync::{Semaphore, mpsc::unbounded_channel, watch},
+    task::JoinHandle,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -562,7 +559,7 @@ impl NamespaceCapabilities {
 
 struct ShutdownRpcContext {
     join_handle: JoinHandle<()>,
-    first_attempt_done_token: CancellationToken,
+    cancel_shutdown_rpc: CancellationToken,
 }
 
 /// Resolve the effective poller behavior. When no behavior was configured (`None`), pollers are
@@ -1248,31 +1245,19 @@ impl Worker {
         // Normally, shutdown RPC should finish at about the same time pollers are stopped. However,
         // it's not strictly guaranteed. When pollers are active, we want to keep retrying this RPC
         // in hope the server cancels the polls early. After pollers are stopped, we don't want to
-        // delay shutdown on this RPC, so we abort it, but we want to ensure we finished at least
-        // one attempt before doing so. RPC error handling is done inside the task itself.
+        // delay shutdown on this RPC, so we cancel it. Cancellation is only delivered after one RPC
+        // attempt has completed - see `initiate_shutdown`.
         let rpc_context = self.shutdown_rpc_context.lock().take();
-        if let Some(mut rpc_context) = rpc_context {
-            fn handle_join(result: Result<(), JoinError>) {
-                if let Err(e) = result
-                    && let Ok(e) = e.try_into_panic()
-                {
-                    // In debug build, propagate panics.
-                    if cfg!(debug_assertions) {
-                        std::panic::resume_unwind(e);
-                    } else {
-                        warn!(error=?e, "Panic when reporting worker shutdown")
-                    }
-                }
-            }
-
-            select! {
-                res = &mut rpc_context.join_handle => handle_join(res),
-                _ = rpc_context.first_attempt_done_token.cancelled() => {
-                    rpc_context.join_handle.abort();
-                    // In debug build, join to propagate panics.
-                    // In release build, detach as to not slow down the shutdown.
-                    #[cfg(debug_assertions)]
-                    handle_join(rpc_context.join_handle.await);
+        if let Some(rpc_context) = rpc_context {
+            rpc_context.cancel_shutdown_rpc.cancel();
+            if let Err(e) = rpc_context.join_handle.await
+                && let Ok(e) = e.try_into_panic()
+            {
+                // In debug build, propagate panics.
+                if cfg!(debug_assertions) {
+                    std::panic::resume_unwind(e);
+                } else {
+                    warn!(error=?e, "Panic when reporting worker shutdown")
                 }
             }
         }
@@ -1759,34 +1744,44 @@ impl Worker {
             .as_ref()
             .and_then(|hm| (hm.heartbeat_callback)());
 
-        let first_attempt_done_token = CancellationToken::new();
-        let first_attempt_done_token_clone = first_attempt_done_token.clone();
-        let join_handle = tokio::spawn(
+        let cancel_shutdown_rpc = CancellationToken::new();
+        let join_handle = tokio::spawn({
+            let cancel_shutdown_rpc = cancel_shutdown_rpc.clone();
             async move {
-                if let Err(e) = client.shutdown_worker(
+                let retry_semaphore = Arc::new(Semaphore::new(0));
+                let shutdown = client.shutdown_worker(
                     sticky_name,
                     task_queue,
                     task_queue_types,
                     heartbeat,
-                    Some(RetryCallback::new(move |e| {
-                        if !first_attempt_done_token_clone.is_cancelled() {
-                            warn!(error=?e, "Failed to report worker shutdown on first attempt");
-                            first_attempt_done_token_clone.cancel();
+                    Some(retry_semaphore.clone()),
+                );
+                let cancel = async {
+                    // delay cancel until RPC needs to be retried (= request finished at least once)
+                    let _ = retry_semaphore.acquire().await; // release immediately
+                    cancel_shutdown_rpc.cancelled().await;
+                };
+
+                select! {
+                    biased;
+                    r = shutdown => if let Err(e) = r {
+                        if e.code() == tonic::Code::Unimplemented {
+                            info!("Reporting worker shutdown unsupported by server");
+                        } else {
+                            warn!(error=?e, "Failed to report worker shutdown");
                         }
-                    }))
-                ).await {
-                    if e.code() == tonic::Code::Unimplemented {
-                        info!("Reporting worker shutdown unsupported by server");
-                    } else {
-                        warn!(error=?e, "Failed to report worker shutdown");
+                    },
+                    _ = cancel => {
+                        warn!("Failed to report worker shutdown (unknown retryable error)");
                     }
                 }
             }
-            .in_current_span(),
-        );
+            .in_current_span()
+        });
+
         *guard = Some(ShutdownRpcContext {
             join_handle,
-            first_attempt_done_token,
+            cancel_shutdown_rpc,
         });
     }
 
@@ -2620,7 +2615,7 @@ fn worker_control_task_queue(namespace: &str, grouping_key: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        advance_fut,
+        advance_fut, advance_fut_pinned,
         test_help::test_worker_cfg,
         worker::{
             PollerBehavior,
@@ -2917,7 +2912,7 @@ mod tests {
     async fn shutdown_blocks_until_shutdown_rpc_first_attempt_done(
         #[values(true, false)] success: bool,
     ) {
-        let (shutdown_retry_cb_tx, shutdown_retry_cb_rx) = oneshot::channel();
+        let (retry_sem_tx, retry_sem_rx) = oneshot::channel();
         let poll_rpc_started = Arc::new(Notify::new());
         let finish_shutdown_rpc = Arc::new(Notify::new());
         let finish_poll_rpc = Arc::new(Notify::new());
@@ -2947,12 +2942,8 @@ mod tests {
             mock_client
                 .expect_poll_activity_task()
                 .times(1)
-                .return_once(move |opts, _| {
+                .return_once(move |_, _| {
                     async move {
-                        // Hold the semaphore so that shutdown waits for the poll. Because we're not
-                        // shutting down yet, it should be possible to acquire the permit immediately.
-                        let sem = opts.attempt_semaphore.unwrap();
-                        let _permit = sem.try_acquire().unwrap();
                         poll_rpc_started.notify_one();
                         finish_poll_rpc.notified().await;
                         Ok(PollActivityTaskQueueResponse::default())
@@ -2965,7 +2956,7 @@ mod tests {
                 .times(1)
                 .return_once(move |_, _, _, _, cb| {
                     async move {
-                        shutdown_retry_cb_tx.send(cb.unwrap()).unwrap();
+                        retry_sem_tx.send(cb.unwrap()).unwrap();
                         finish_shutdown_rpc.notified().await;
                         Ok(Default::default())
                     }
@@ -2993,7 +2984,7 @@ mod tests {
         let shutdown_fut = worker.shutdown();
         advance_fut!(shutdown_fut);
 
-        let mut shutdown_retry_cb = shutdown_retry_cb_rx.await.unwrap();
+        let retry_sem = retry_sem_rx.await.unwrap();
         advance_fut!(poll_fut);
 
         finish_poll_rpc.notify_one();
@@ -3003,15 +2994,23 @@ mod tests {
         if success {
             finish_shutdown_rpc.notify_one();
         } else {
-            shutdown_retry_cb.call(&tonic::Status::new(tonic::Code::Internal, "boom"));
+            retry_sem.add_permits(1);
         }
 
         shutdown_fut.await;
     }
 
+    #[rstest::rstest]
+    #[case::final_attempt_ok(true, false)]
+    #[case::final_attempt_non_retryable_err(false, false)]
+    #[case::final_attempt_retryable_err(false, true)]
     #[tokio::test]
-    async fn shutdown_proceeds_on_poll_retryable_error() {
+    async fn graceful_shutdown_waits_for_poll_in_progress(
+        #[case] final_attempt_succeeds: bool,
+        #[case] final_attempt_retryable_err: bool,
+    ) {
         let (attempt_sem_tx, attempt_sem_rx) = oneshot::channel();
+        let (complete_rpc_tx, complete_rpc_rx) = oneshot::channel();
 
         let mut mock_client = MockManualWorkerClient::new();
         mock_client.expect_describe_namespace().returning(|| {
@@ -3035,10 +3034,13 @@ mod tests {
             .times(1)
             .return_once(move |opts, _| {
                 async move {
-                    attempt_sem_tx
-                        .send(opts.attempt_semaphore.unwrap())
-                        .unwrap();
-                    future::pending().await
+                    attempt_sem_tx.send(opts.retry_semaphore.unwrap()).unwrap();
+                    complete_rpc_rx.await.unwrap();
+                    if final_attempt_succeeds {
+                        Ok(Default::default())
+                    } else {
+                        Err(tonic::Status::internal("boom"))
+                    }
                 }
                 .boxed()
             });
@@ -3052,30 +3054,43 @@ mod tests {
         let worker = Worker::new_test(cfg, mock_client);
         worker.validate().await.unwrap();
 
-        let poll_fut = worker.poll_activity_task();
-        advance_fut!(poll_fut); // necessary to populate the channel
+        let mut poll_fut = Box::pin(worker.poll_activity_task());
+        advance_fut_pinned!(poll_fut); // necessary to populate the channel
         let sem = attempt_sem_rx.await.unwrap();
 
-        // By acquiring and releasing the semaphore, we are simulating RPC attempts. Before
+        // By releasing and reacquiring semaphore permits, we are simulating RPC attempts. Before
         // shutdown, acquiring should always succeed immediately and the future should stay blocked.
-        let permit = sem.try_acquire().unwrap();
-        advance_fut!(poll_fut);
-        drop(permit);
-        advance_fut!(poll_fut);
-        let permit = sem.try_acquire().unwrap();
-        advance_fut!(poll_fut);
-        drop(permit);
-        advance_fut!(poll_fut);
-        let permit = sem.try_acquire().unwrap();
+        assert_eq!(sem.available_permits(), 0); // first attempt, semaphore begins at 0
+        sem.add_permits(1); // first failure releases permit
+        advance_fut_pinned!(poll_fut);
+        let permit = sem.try_acquire().unwrap(); // second attempt acquires permit
+        advance_fut_pinned!(poll_fut);
+        drop(permit); // second failure releases permit
+        advance_fut_pinned!(poll_fut);
+        let permit = sem.try_acquire().unwrap(); // third attempt acquires permit
 
-        // Shutting down - both futures should stay blocked until we release the permit.
+        // Shutting down - both futures should stay blocked
         let shutdown_fut = worker.shutdown();
         advance_fut!(shutdown_fut);
-        advance_fut!(poll_fut);
+        advance_fut_pinned!(poll_fut);
         advance_fut!(shutdown_fut);
 
-        drop(permit);
-        let (poll_result, _) = join!(poll_fut, shutdown_fut);
+        if final_attempt_retryable_err {
+            // Releasing permit, shutdown should interrupt another retry
+            drop(permit);
+        } else {
+            // Poll completes, shutdown should proceed without another poll
+            permit.forget();
+            complete_rpc_tx.send(()).unwrap();
+            if !final_attempt_succeeds {
+                // Worker needs to forward the error response for shutdown to proceed
+                assert_matches!(poll_fut.await,
+                    Err(PollError::TonicError(e)) if e.message() == "boom");
+                poll_fut = Box::pin(worker.poll_activity_task());
+            }
+        }
+
+        let (poll_result, ()) = join!(poll_fut, shutdown_fut);
         assert_matches!(poll_result, Err(PollError::ShutDown));
     }
 }

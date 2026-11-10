@@ -2,8 +2,8 @@ use crate::{
     ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, MESSAGE_TOO_LARGE_KEY,
     grpc::IsUserLongPoll,
     request_extensions::{
-        AttemptSemaphore, IsWorkerTaskLongPoll, NoRetryOnMatching, RetryCallback,
-        RetryConfigForCall, ThrottleRetryConfigForCall,
+        IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall, RetrySemaphore,
+        ThrottleRetryConfigForCall,
     },
 };
 use backon::{BackoffBuilder, ExponentialBuilder};
@@ -115,8 +115,7 @@ impl RetryOptions {
         let retry_short_circuit = ext.get::<NoRetryOnMatching>().cloned();
         let retry_cfg_override = ext.get::<RetryConfigForCall>().cloned();
         let throttle_retry_cfg_override = ext.get::<ThrottleRetryConfigForCall>().cloned();
-        let retry_callback = ext.get::<RetryCallback>().cloned();
-        let attempt_semaphore = ext.get::<AttemptSemaphore>().cloned().map(|s| s.0);
+        let retry_semaphore = ext.get::<RetrySemaphore>().cloned().map(|s| s.0);
 
         let retry_cfg = if let Some(ovr) = retry_cfg_override {
             ovr.0
@@ -138,8 +137,7 @@ impl RetryOptions {
             retry_cfg,
             retry_short_circuit,
             throttle_retry_cfg,
-            retry_callback,
-            attempt_semaphore,
+            retry_semaphore,
         }
     }
 
@@ -219,8 +217,7 @@ pub(crate) struct TonicErrorHandler {
     call_type: CallType,
     call_name: &'static str,
     retry_short_circuit: Option<NoRetryOnMatching>,
-    retry_callback: Option<RetryCallback>,
-    attempt_semaphore: Option<Arc<Semaphore>>,
+    retry_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl TonicErrorHandler {
@@ -234,8 +231,7 @@ impl TonicErrorHandler {
             throttle_backoff: call_info.throttle_retry_cfg.jittered_backoff(),
             retry_started_at: Instant::now(),
             retry_short_circuit: call_info.retry_short_circuit,
-            retry_callback: call_info.retry_callback,
-            attempt_semaphore: call_info.attempt_semaphore,
+            retry_semaphore: call_info.retry_semaphore,
         }
     }
 
@@ -260,15 +256,8 @@ impl TonicErrorHandler {
         }
     }
 
-    fn wait_retry(
-        &mut self,
-        duration: Duration,
-        err: &tonic::Status,
-    ) -> RetryPolicy<tonic::Status> {
-        if let Some(cb) = &mut self.retry_callback {
-            cb.call(err);
-        }
-        if let Some(sem) = &self.attempt_semaphore {
+    fn wait_retry(&mut self, duration: Duration) -> RetryPolicy<tonic::Status> {
+        if let Some(sem) = &self.retry_semaphore {
             // release permit leaked by Connection::call
             sem.add_permits(1);
         }
@@ -283,8 +272,7 @@ pub(crate) struct CallInfo {
     retry_cfg: RetryOptions,
     retry_short_circuit: Option<NoRetryOnMatching>,
     throttle_retry_cfg: RetryOptions,
-    retry_callback: Option<RetryCallback>,
-    attempt_semaphore: Option<Arc<Semaphore>>,
+    retry_semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -373,9 +361,9 @@ impl ErrorHandler<tonic::Status> for TonicErrorHandler {
                     if e.code() == Code::ResourceExhausted {
                         let extended_backoff =
                             backoff.max(self.throttle_backoff.next_backoff().unwrap_or_default());
-                        self.wait_retry(extended_backoff, &e)
+                        self.wait_retry(extended_backoff)
                     } else {
-                        self.wait_retry(backoff, &e)
+                        self.wait_retry(backoff)
                     }
                 }
             }
@@ -384,7 +372,7 @@ impl ErrorHandler<tonic::Status> for TonicErrorHandler {
         {
             // We permit "fatal" errors while long polling for a while, because some proxies return
             // stupid error codes while getting ready, among other weird infra issues
-            self.wait_retry(self.max_interval, &e)
+            self.wait_retry(self.max_interval)
         } else {
             RetryPolicy::ForwardError(e)
         }
@@ -410,7 +398,6 @@ mod tests {
     use crate::{
         Client, ClientOptions, Connection, ConnectionOptions,
         callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
-        grpc::WorkflowService,
     };
     use assert_matches::assert_matches;
     use prost::Message;
@@ -423,9 +410,9 @@ mod tests {
     };
     use temporalio_common::protos::temporal::api::workflowservice::v1::{
         CountWorkflowExecutionsResponse, PollActivityTaskQueueRequest, PollNexusTaskQueueRequest,
-        PollWorkflowTaskQueueRequest, ShutdownWorkerResponse,
+        PollWorkflowTaskQueueRequest,
     };
-    use tonic::{IntoRequest, Request, Status};
+    use tonic::{IntoRequest, Status};
     use url::Url;
 
     /// Predefined retry configs with low durations to make unit tests faster
@@ -503,8 +490,7 @@ mod tests {
                     retry_cfg: TEST_RETRY_CONFIG,
                     retry_short_circuit: None,
                     throttle_retry_cfg: TEST_RETRY_CONFIG,
-                    retry_callback: None,
-                    attempt_semaphore: None,
+                    retry_semaphore: None,
                 });
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
@@ -526,8 +512,7 @@ mod tests {
                     retry_cfg: TEST_RETRY_CONFIG,
                     retry_short_circuit: None,
                     throttle_retry_cfg: TEST_RETRY_CONFIG,
-                    retry_callback: None,
-                    attempt_semaphore: None,
+                    retry_semaphore: None,
                 });
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
@@ -554,8 +539,7 @@ mod tests {
                 max_elapsed_time: None,
                 max_retries: 10,
             },
-            retry_callback: None,
-            attempt_semaphore: None,
+            retry_semaphore: None,
         });
         let result = err_handler.handle(1, Status::new(Code::ResourceExhausted, "leave me alone"));
         match result {
@@ -579,8 +563,7 @@ mod tests {
                 predicate: |s: &Status| s.code() == Code::ResourceExhausted,
             }),
             throttle_retry_cfg: TEST_RETRY_CONFIG,
-            retry_callback: None,
-            attempt_semaphore: None,
+            retry_semaphore: None,
         });
         let result = err_handler.handle(1, Status::new(Code::ResourceExhausted, "leave me alone"));
         let e = assert_matches!(result, RetryPolicy::ForwardError(e) => e);
@@ -599,8 +582,7 @@ mod tests {
             retry_cfg: TEST_RETRY_CONFIG,
             retry_short_circuit: None,
             throttle_retry_cfg: TEST_RETRY_CONFIG,
-            retry_callback: None,
-            attempt_semaphore: None,
+            retry_semaphore: None,
         });
         let result = err_handler.handle(
             1,
@@ -703,8 +685,7 @@ mod tests {
             retry_cfg: TEST_RETRY_CONFIG,
             retry_short_circuit: None,
             throttle_retry_cfg: TEST_RETRY_CONFIG,
-            retry_callback: None,
-            attempt_semaphore: None,
+            retry_semaphore: None,
         });
         let result = err_handler.handle(1, Status::new(Code::Cancelled, "caller cancelled"));
         assert_matches!(result, RetryPolicy::ForwardError(_));
@@ -736,8 +717,7 @@ mod tests {
             retry_cfg: TEST_RETRY_CONFIG,
             retry_short_circuit: None,
             throttle_retry_cfg: TEST_RETRY_CONFIG,
-            retry_callback: None,
-            attempt_semaphore: None,
+            retry_semaphore: None,
         });
 
         // Code::Unknown with a transport source IS retried (it's in RETRYABLE_ERROR_CODES)
@@ -758,106 +738,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_callback_not_called_on_success() {
-        let service_override = CallbackBasedGrpcService {
-            callback: Arc::new(move |request| {
-                assert_eq!(request.rpc, "ShutdownWorker");
-                Box::pin(async move {
-                    Ok(GrpcSuccessResponse {
-                        headers: Default::default(),
-                        proto: ShutdownWorkerResponse::default().encode_to_vec(),
-                    })
-                })
-            }),
-        };
-        let connection_options =
-            ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
-                .retry_options(TEST_RETRY_CONFIG)
-                .skip_get_system_info(true)
-                .service_override(service_override)
-                .dns_load_balancing(None)
-                .build();
-        let connection = Connection::connect(connection_options).await.unwrap();
-        let mut client = Client::new(connection, ClientOptions::new("ns").build()).unwrap();
-
-        let mut req = Request::new(Default::default());
-        req.extensions_mut().insert(RetryCallback::new(|_| {
-            panic!("Retry callback should not be called")
-        }));
-        client.shutdown_worker(req).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn retry_callback_called_only_before_retry_attempts() {
-        let cb_counter = Arc::new(AtomicUsize::new(0));
-        let retry_cfg = RetryOptions {
-            max_retries: 3,
-            ..TEST_RETRY_CONFIG
-        };
-        let mut err_handler = TonicErrorHandler::new(CallInfo {
-            call_type: CallType::Normal,
-            call_name: "shutdown_worker",
-            retry_cfg: retry_cfg.clone(),
-            retry_short_circuit: None,
-            throttle_retry_cfg: retry_cfg,
-            retry_callback: Some({
-                let cb_counter = cb_counter.clone();
-                RetryCallback::new(move |_| {
-                    cb_counter.fetch_add(1, Ordering::SeqCst);
-                })
-            }),
-            attempt_semaphore: None,
-        });
-
-        let status = Status::new(Code::Internal, "boom");
-
-        let result = err_handler.handle(1, status.clone());
-        assert_matches!(result, RetryPolicy::WaitRetry(_));
-        assert_eq!(cb_counter.load(Ordering::SeqCst), 1);
-
-        let result = err_handler.handle(2, status.clone());
-        assert_matches!(result, RetryPolicy::WaitRetry(_));
-        assert_eq!(cb_counter.load(Ordering::SeqCst), 2);
-
-        let result = err_handler.handle(3, status);
-        assert_matches!(result, RetryPolicy::ForwardError(_));
-        assert_eq!(cb_counter.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn retry_callback_called_on_long_poll_non_retryable_errors() {
-        let cb_counter = Arc::new(AtomicUsize::new(0));
-        let mut err_handler = TonicErrorHandler::new(CallInfo {
-            call_type: CallType::TaskLongPoll,
-            call_name: POLL_WORKFLOW_METH_NAME,
-            retry_cfg: TEST_RETRY_CONFIG,
-            retry_short_circuit: None,
-            throttle_retry_cfg: TEST_RETRY_CONFIG,
-            retry_callback: Some({
-                let cb_counter = cb_counter.clone();
-                RetryCallback::new(move |_| {
-                    cb_counter.fetch_add(1, Ordering::SeqCst);
-                })
-            }),
-            attempt_semaphore: None,
-        });
-
-        let status = Status::new(Code::NotFound, "test error");
-
-        let result = err_handler.handle(1, status.clone());
-        assert_matches!(result, RetryPolicy::WaitRetry(_));
-        assert_eq!(cb_counter.load(Ordering::SeqCst), 1);
-
-        err_handler.retry_started_at =
-            Instant::now() - LONG_POLL_FATAL_GRACE - Duration::from_secs(1);
-        let result = err_handler.handle(2, status);
-        assert_matches!(result, RetryPolicy::ForwardError(_));
-        assert_eq!(cb_counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn attempt_semaphore_released_on_retry_only() {
-        let attempt_semaphore = Arc::new(Semaphore::new(0));
+    async fn retry_semaphore_released_on_retry_only() {
+        let retry_semaphore = Arc::new(Semaphore::new(0));
         let retry_cfg = RetryOptions {
             max_retries: 3,
             ..TEST_RETRY_CONFIG
@@ -868,22 +750,21 @@ mod tests {
             retry_cfg: retry_cfg.clone(),
             retry_short_circuit: None,
             throttle_retry_cfg: retry_cfg,
-            retry_callback: None,
-            attempt_semaphore: Some(attempt_semaphore.clone()),
+            retry_semaphore: Some(retry_semaphore.clone()),
         });
 
         let status = Status::new(Code::Internal, "boom");
 
         let result = err_handler.handle(1, status.clone());
         assert_matches!(result, RetryPolicy::WaitRetry(_));
-        assert_eq!(attempt_semaphore.available_permits(), 1);
+        assert_eq!(retry_semaphore.available_permits(), 1);
 
         let result = err_handler.handle(2, status.clone());
         assert_matches!(result, RetryPolicy::WaitRetry(_));
-        assert_eq!(attempt_semaphore.available_permits(), 2);
+        assert_eq!(retry_semaphore.available_permits(), 2);
 
         let result = err_handler.handle(3, status);
         assert_matches!(result, RetryPolicy::ForwardError(_));
-        assert_eq!(attempt_semaphore.available_permits(), 2);
+        assert_eq!(retry_semaphore.available_permits(), 2);
     }
 }

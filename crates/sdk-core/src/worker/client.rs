@@ -19,8 +19,8 @@ use temporalio_client::{
     Connection, NamespacedClient, PayloadErrorLimits, RetryOptions, SharedReplaceableClient,
     grpc::{PayloadLimitsClient, WorkflowService},
     request_extensions::{
-        AttemptSemaphore, IsWorkerTaskLongPoll, NoRetryOnMatching, RetryCallback,
-        RetryConfigForCall, ThrottleRetryConfigForCall,
+        IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall, RetrySemaphore,
+        ThrottleRetryConfigForCall,
     },
     worker::ClientWorkerSet,
 };
@@ -321,8 +321,8 @@ impl WorkerClientBag {
         if let Some(to) = poll_options.timeout_override {
             req.set_timeout(to);
         }
-        if let Some(sem) = poll_options.attempt_semaphore {
-            req.extensions_mut().insert(AttemptSemaphore(sem));
+        if let Some(sem) = poll_options.retry_semaphore {
+            req.extensions_mut().insert(RetrySemaphore(sem));
         }
 
         Ok(poll_fn(&mut self.client.clone(), req).await?.into_inner())
@@ -425,7 +425,7 @@ pub trait WorkerClient: Sync + Send {
         task_queue: String,
         task_queue_types: Vec<TaskQueueType>,
         final_heartbeat: Option<WorkerHeartbeat>,
-        retry_callback: Option<RetryCallback>,
+        retry_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<ShutdownWorkerResponse>;
     /// Record a worker heartbeat
     async fn record_worker_heartbeat(
@@ -474,12 +474,10 @@ pub struct PollOptions {
     pub no_retry: Option<NoRetryOnMatching>,
     /// Overrides the default RPC timeout for the poll request
     pub timeout_override: Option<Duration>,
-    /// If set, acquire a permit from the provided semaphore before the poll RPC call. The permit is
-    /// released when it's safe to cancel the poll (between retries), and reacquired before the next
-    /// RPC attempt. The permit is always leaked when the poll future resolves (on either
-    /// a successful response or non-retryable error). Blocking cancellation on this semaphore
-    /// ensures no server tasks are lost.
-    pub attempt_semaphore: Option<Arc<Semaphore>>,
+    /// Retry semaphore to use. See [`RetrySemaphore`]. Must be initialized with 0 permits. Blocking
+    /// cancellation on this semaphore ensures in-flight polls can only be cancelled between
+    /// retries, which avoids losing tasks in transit.
+    pub retry_semaphore: Option<Arc<Semaphore>>,
 }
 /// Additional options specific to workflow task polling
 #[derive(Debug, Clone)]
@@ -1028,7 +1026,7 @@ impl WorkerClient for WorkerClientBag {
         task_queue: String,
         task_queue_types: Vec<TaskQueueType>,
         final_heartbeat: Option<WorkerHeartbeat>,
-        retry_callback: Option<RetryCallback>,
+        retry_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<ShutdownWorkerResponse> {
         let mut final_heartbeat = final_heartbeat;
         if let Some(w) = final_heartbeat.as_mut() {
@@ -1061,8 +1059,8 @@ impl WorkerClient for WorkerClientBag {
         request
             .extensions_mut()
             .insert(ThrottleRetryConfigForCall(retry_options));
-        if let Some(rcb) = retry_callback {
-            request.extensions_mut().insert(rcb);
+        if let Some(sem) = retry_semaphore {
+            request.extensions_mut().insert(RetrySemaphore(sem));
         }
 
         Ok(
@@ -1411,7 +1409,7 @@ mod tests {
                         task_queue: "application-queue".to_string(),
                         no_retry: None,
                         timeout_override: None,
-                        attempt_semaphore: None,
+                        retry_semaphore: None,
                     },
                     PollNexusOptions {
                         worker_commands_queue: false,
@@ -1425,7 +1423,7 @@ mod tests {
                         task_queue: "worker-command-queue".to_string(),
                         no_retry: None,
                         timeout_override: None,
-                        attempt_semaphore: None,
+                        retry_semaphore: None,
                     },
                     PollNexusOptions {
                         worker_commands_queue: true,

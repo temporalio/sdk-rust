@@ -6,16 +6,16 @@
 
 use crate::{
     Client, Connection, LONG_POLL_TIMEOUT, PayloadErrorLimits, RequestExt, SharedReplaceableClient,
-    TEMPORAL_NAMESPACE_HEADER_KEY, TemporalServiceClient,
+    TEMPORAL_NAMESPACE_HEADER_KEY, TemporalServiceClient, dbg_panic,
     metrics::namespace_kv,
-    request_extensions::AttemptSemaphore,
+    request_extensions::RetrySemaphore,
     retry::make_future_retry,
     worker::{ClientWorkerSet, Slot},
 };
 use dyn_clone::DynClone;
 use futures_util::{FutureExt, TryFutureExt, future::BoxFuture};
 use parking_lot::RwLock;
-use std::{any::Any, marker::PhantomData, sync::Arc};
+use std::{any::Any, future, marker::PhantomData, sync::Arc};
 use temporalio_common::{
     payload_limits::{PayloadLimits, validate_known_payload_limits},
     protos::{
@@ -160,21 +160,34 @@ impl RawGrpcCaller for Connection {
             req.set_default_timeout(LONG_POLL_TIMEOUT);
         }
 
-        let maybe_sem = req.extensions().get::<AttemptSemaphore>();
+        let maybe_sem = req.extensions().get::<RetrySemaphore>().map(|rs| &rs.0);
+        if let Some(sem) = &maybe_sem
+            && sem.available_permits() > 0
+        {
+            dbg_panic!(
+                "invalid grpc call config: RetrySemaphore must be initialized with 0 permits"
+            );
+        }
+        let mut first_attempt_made = false;
 
         let fact = || {
             let req_clone = req_cloner(&req);
             let call_fut = callfn(req_clone);
-            async {
-                if let Some(sem) = maybe_sem {
-                    let permit = sem
-                        .0
-                        .acquire()
-                        .await
-                        .expect("AttemptSemaphore must not be closed");
-                    // Leaking the permit. If there's a retry, the permit will be restored by
-                    // TonicErrorHandler.
-                    permit.forget();
+            let is_retry = first_attempt_made;
+            first_attempt_made = true;
+            async move {
+                if is_retry && let Some(sem) = &maybe_sem {
+                    match sem.acquire().await {
+                        Ok(permit) => {
+                            // Leaking the permit. If there's a retry, the permit will be restored by
+                            // TonicErrorHandler.
+                            permit.forget()
+                        }
+                        Err(_) => {
+                            dbg_panic!("RetrySemaphore was closed, request cannot continue");
+                            future::pending::<()>().await;
+                        }
+                    }
                 }
                 call_fut.await
             }
@@ -2037,7 +2050,7 @@ mod tests {
     use prost::Message;
     use std::{
         collections::HashSet,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::{Context, Poll},
     };
     use temporalio_common::{
@@ -2540,21 +2553,35 @@ mod tests {
 
     #[tokio::test]
     async fn call_blocks_on_attempt_semaphore() {
-        let can_proceed = Arc::new(AtomicBool::new(false));
-        let can_proceed_clone = can_proceed.clone();
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let expecting_retry = Arc::new(AtomicBool::new(false));
 
         // Create a callback-based service that returns an eager_workflow_task in the response
         let service_override = CallbackBasedGrpcService {
-            callback: Arc::new(move |req| {
-                assert_eq!(req.rpc, "PollWorkflowTaskQueue");
-                PollWorkflowTaskQueueRequest::decode(req.proto).unwrap();
-                assert!(can_proceed_clone.load(Ordering::Acquire));
-                Box::pin(async {
-                    Ok(GrpcSuccessResponse {
-                        headers: Default::default(),
-                        proto: PollWorkflowTaskQueueResponse::default().encode_to_vec(),
-                    })
-                })
+            callback: Arc::new({
+                let call_counter = call_counter.clone();
+                let expecting_retry = expecting_retry.clone();
+                move |req| {
+                    assert_eq!(req.rpc, "PollWorkflowTaskQueue");
+                    PollWorkflowTaskQueueRequest::decode(req.proto).unwrap();
+                    match call_counter.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            assert!(!expecting_retry.load(Ordering::SeqCst));
+                            async { Err(tonic::Status::internal("please retry")) }.boxed()
+                        }
+                        1 => {
+                            assert!(expecting_retry.load(Ordering::SeqCst));
+                            async {
+                                Ok(GrpcSuccessResponse {
+                                    headers: Default::default(),
+                                    proto: PollWorkflowTaskQueueResponse::default().encode_to_vec(),
+                                })
+                            }
+                            .boxed()
+                        }
+                        i => panic!("Expected attempt < 2, got {i}"),
+                    }
+                }
             }),
         };
 
@@ -2567,7 +2594,7 @@ mod tests {
 
         let sem = Arc::new(Semaphore::new(0));
         let mut req = PollWorkflowTaskQueueRequest::default().into_request();
-        req.extensions_mut().insert(AttemptSemaphore(sem.clone()));
+        req.extensions_mut().insert(RetrySemaphore(sem.clone()));
 
         let mut req_fut = connection.poll_workflow_task_queue(req);
 
@@ -2581,8 +2608,10 @@ mod tests {
             );
         }
 
-        can_proceed.store(true, Ordering::Release);
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+        expecting_retry.store(true, Ordering::SeqCst);
         sem.add_permits(1);
         req_fut.await.unwrap();
+        assert_eq!(call_counter.load(Ordering::SeqCst), 2);
     }
 }
