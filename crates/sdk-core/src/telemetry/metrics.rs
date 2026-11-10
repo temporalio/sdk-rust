@@ -891,7 +891,7 @@ where
         }
     }
     fn new_instrument(&self, params: MetricParameters, kind: MetricKind) -> BufferInstrument<I> {
-        let hole = LazyBufferInstrument::hole();
+        let hole = LazyRefInner::hole();
         if self.calls_tx.send(MetricEvent::Create {
             params,
             kind,
@@ -911,7 +911,7 @@ where
     I: BufferInstrumentRef + Debug + Send + Sync + Clone + 'static,
 {
     fn new_attributes(&self, opts: NewAttributes) -> MetricAttributes {
-        let ba = BufferAttributes::hole();
+        let ba = LazyRefInner::hole();
         if self.calls_tx.send(MetricEvent::CreateAttributes {
             populate_into: ba.clone(),
             append_from: None,
@@ -933,7 +933,7 @@ where
             if !ol.create_was_queued() {
                 return MetricAttributes::Buffer(ol);
             }
-            let ba = BufferAttributes::hole();
+            let ba = LazyRefInner::hole();
             if self.calls_tx.send(MetricEvent::CreateAttributes {
                 populate_into: ba.clone(),
                 append_from: Some(ol),

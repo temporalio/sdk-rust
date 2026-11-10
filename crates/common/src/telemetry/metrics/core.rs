@@ -101,22 +101,26 @@ pub trait BufferInstrumentRef {}
 /// A lazy reference to a metrics buffer instrument
 pub type LazyBufferInstrument<T> = LazyRef<Arc<T>>;
 
-/// A shared, lazily-initialized reference. Created as an empty "hole" and filled later via [`set`](Self::set).
-#[derive(Debug, Clone)]
-pub struct LazyRef<T> {
-    to_be_initted: Arc<OnceLock<T>>,
+/// A shared, lazily-initialized reference. Created as an empty "hole" via
+/// [`LazyRefInner::hole`] and filled later via [`set`](LazyRefInner::set).
+pub type LazyRef<T> = Arc<LazyRefInner<T>>;
+
+/// The shared state behind a [`LazyRef`].
+#[derive(Debug)]
+pub struct LazyRefInner<T> {
+    to_be_initted: OnceLock<T>,
     /// Whether the buffer accepted the event that asks lang to call [`set`](Self::set).
     /// Lang never initializes a hole whose create was dropped, so a later recording that
     /// still referenced it would panic in [`get`](Self::get) on the next drain.
-    create_queued: Arc<AtomicBool>,
+    create_queued: AtomicBool,
 }
-impl<T> LazyRef<T> {
+impl<T> LazyRefInner<T> {
     /// Create an uninitialized hole that must be filled with [`set`](Self::set) before use.
-    pub fn hole() -> Self {
-        Self {
-            to_be_initted: Arc::new(OnceLock::new()),
-            create_queued: Arc::new(AtomicBool::new(false)),
-        }
+    pub fn hole() -> LazyRef<T> {
+        Arc::new(Self {
+            to_be_initted: OnceLock::new(),
+            create_queued: AtomicBool::new(false),
+        })
     }
 
     /// Record that the create event for this hole was accepted into the buffer.
