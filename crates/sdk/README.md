@@ -140,7 +140,7 @@ graph can disable defaults and opt back into the integrations they use.
 - `experimental`: Rust SDK, client, and Workflow APIs that are still under development and may change or be removed. |
 - `testing`: The `testing` module, direct activity test support, and local Temporal CLI dev-server lifecycle management. |
 - `dynamic-tls`: Dynamic mTLS client-certificate resolution for transparent certificate rotation. |
-- `wasm-workflows`: Support WebAssembly workflow components through Wasmtime for workers and workflow replay. |
+- `wasm-workflows`: Experimental support for WebAssembly workflow components through Wasmtime for workers and workflow replay. Requires Rust 1.95 or later; the SDK otherwise supports Rust 1.92. |
 
 ### OpenTelemetry tracing
 

@@ -584,6 +584,19 @@ async fn test_task_type_combinations_unified(
                 ))
                 .await
                 .unwrap();
+            match worker.poll_workflow_activation().await {
+                Ok(activation) => {
+                    assert!(activation.is_only_eviction());
+                    worker
+                        .complete_workflow_activation(WorkflowActivationCompletion::empty(
+                            activation.run_id,
+                        ))
+                        .await
+                        .unwrap();
+                }
+                Err(PollError::ShutDown) => {}
+                Err(err) => panic!("unexpected workflow poll error: {err:?}"),
+            }
         }
 
         if enable_remote_activities {

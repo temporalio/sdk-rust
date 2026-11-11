@@ -29,6 +29,11 @@
 //!
 //! The plugin also propagates context through Continue-as-New.
 //!
+//! Client tracing headers can opt into the configured client's codec with
+//! [`crate::opentelemetry::OpenTelemetryPluginBuilder::encode_client_headers`]. Only this plugin's
+//! tracing carrier is encoded; user-provided client headers are unchanged. Workflow header codecs
+//! are unchanged.
+//!
 //! During replay, the plugin does not export Workflow spans. Use
 //! [`crate::opentelemetry::WorkflowIdGenerator`] in the tracer provider for Workflow spans. If
 //! application code creates Workflow spans, also wrap each span processor in
@@ -74,8 +79,8 @@ use temporalio_client::{
 };
 use temporalio_common::{
     data_converters::{
-        GenericPayloadConverter, PayloadConverter, SerializationContext, SerializationContextData,
-        WorkflowSerializationContext,
+        DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
+        SerializationContext, SerializationContextData, WorkflowSerializationContext,
     },
     protos::temporal::api::common::v1::{Header, Payload},
 };
@@ -339,6 +344,7 @@ impl OpenTelemetryPlugin {
 #[derive(Clone)]
 pub struct OpenTelemetryPluginBuilder {
     config: Config,
+    encode_client_headers: bool,
 }
 
 impl Default for OpenTelemetryPluginBuilder {
@@ -354,11 +360,21 @@ impl Default for OpenTelemetryPluginBuilder {
                 )),
                 header_key: TRACE_HEADER_KEY.into(),
             },
+            encode_client_headers: false,
         }
     }
 }
 
 impl OpenTelemetryPluginBuilder {
+    /// Apply the configured client's codec only to tracing headers produced by this plugin.
+    ///
+    /// Defaults to false. User-provided client headers are unchanged, and workflow header processing
+    /// is unchanged. Register this plugin after plugins that configure the client's data converter.
+    pub fn encode_client_headers(mut self, enabled: bool) -> Self {
+        self.encode_client_headers = enabled;
+        self
+    }
+
     /// Sets the tracer that the plugin uses.
     ///
     /// The tracer provider must use [`WorkflowIdGenerator`] for replay-safe Workflow spans.
@@ -399,10 +415,8 @@ impl OpenTelemetryPluginBuilder {
     /// Creates a plugin that shares this configuration across all its interceptors.
     pub fn build(self) -> SimplePlugin {
         let config = Arc::new(self.config);
-        SimplePlugin::builder("opentelemetry")
-            .client_interceptors(vec![Arc::new(OpenTelemetryClientInterceptor {
-                config: config.clone(),
-            }) as Arc<dyn ClientInterceptor>])
+        let client_config = config.clone();
+        let mut plugin = SimplePlugin::builder("opentelemetry")
             .activity_inbound_interceptors(vec![Arc::new(OpenTelemetryActivityInboundInterceptor {
                 config: config.clone(),
             })
@@ -410,7 +424,19 @@ impl OpenTelemetryPluginBuilder {
             .workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
                 OpenTelemetryWorkflowInterceptor::new(config.clone())
             })])
-            .build()
+            .build();
+        plugin.client_configurator = Some(Arc::new(move |options| {
+            options
+                .client_interceptors
+                .push(Arc::new(OpenTelemetryClientInterceptor {
+                    config: client_config.clone(),
+                    header_converter: self
+                        .encode_client_headers
+                        .then(|| options.data_converter.clone()),
+                }));
+            Ok(())
+        }));
+        plugin
     }
 }
 
@@ -462,10 +488,6 @@ fn inject_into_fields(config: &Config, context: &Context, fields: &mut HashMap<S
     if !carrier.0.is_empty() {
         fields.insert(config.header_key.to_string(), carrier_payload(&carrier));
     }
-}
-
-fn inject_into_header(config: &Config, context: &Context, header: &mut Option<Header>) {
-    inject_into_fields(config, context, &mut header.get_or_insert_default().fields);
 }
 
 fn extract_from_fields(config: &Config, fields: &HashMap<String, Payload>) -> Context {
@@ -576,15 +598,59 @@ fn workflow_attributes(workflow_id: &str, run_id: Option<&str>) -> Vec<KeyValue>
 
 struct OpenTelemetryClientInterceptor {
     config: Arc<Config>,
+    header_converter: Option<DataConverter>,
+}
+
+impl OpenTelemetryClientInterceptor {
+    async fn inject_into_header(
+        &self,
+        context: &Context,
+        header: &mut Option<Header>,
+    ) -> Result<(), PayloadConversionError> {
+        let mut carrier = Carrier::default();
+        self.config.inject(context, &mut carrier);
+        if carrier.0.is_empty() {
+            return Ok(());
+        }
+        let mut payload = carrier_payload(&carrier);
+        if let Some(converter) = &self.header_converter {
+            let mut encoded = converter
+                .codec()
+                .encode(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    vec![payload],
+                )
+                .await?;
+            if encoded.len() != 1 {
+                return Err(PayloadConversionError::EncodingError(
+                    format!(
+                        "Tracing header codec must return exactly one payload, got {}",
+                        encoded.len()
+                    )
+                    .into(),
+                ));
+            }
+            payload = encoded.remove(0);
+        }
+        header
+            .get_or_insert_default()
+            .fields
+            .insert(self.config.header_key.to_string(), payload);
+        Ok(())
+    }
 }
 
 macro_rules! client_operation {
     ($self:ident, $input:ident, $next:ident, $name:expr, $attrs:expr, $context:ident, $headers:block) => {{
         let parent = Context::current();
         let $context = start_span(&$self.config, &parent, $name, SpanKind::Client, $attrs);
-        $headers
         Box::pin(async move {
-            let result = $next.run($input).with_context($context.clone()).await;
+            let result = async {
+                $headers
+                $next.run($input).await
+            }
+            .with_context($context.clone())
+            .await;
             finish_span(&$context, &result);
             result
         })
@@ -604,7 +670,8 @@ impl ClientInterceptor for OpenTelemetryClientInterceptor {
         let name = format!("StartWorkflow:{}", input.workflow_type);
         let attrs = workflow_attributes(&input.options.workflow_id, None);
         client_operation!(self, input, next, name, attrs, context, {
-            inject_into_header(&self.config, &context, &mut input.options.header);
+            self.inject_into_header(&context, &mut input.options.header)
+                .await?;
         })
     }
 
@@ -620,7 +687,8 @@ impl ClientInterceptor for OpenTelemetryClientInterceptor {
         let name = format!("SignalWithStartWorkflow:{}", input.workflow_type);
         let attrs = workflow_attributes(&input.options.workflow_id, None);
         client_operation!(self, input, next, name, attrs, context, {
-            inject_into_header(&self.config, &context, &mut input.options.header);
+            self.inject_into_header(&context, &mut input.options.header)
+                .await?;
         })
     }
 
@@ -636,7 +704,8 @@ impl ClientInterceptor for OpenTelemetryClientInterceptor {
         let name = format!("SignalWorkflow:{}", input.signal_name);
         let attrs = workflow_attributes(&input.workflow_id, Some(&input.run_id));
         client_operation!(self, input, next, name, attrs, context, {
-            inject_into_header(&self.config, &context, &mut input.options.header);
+            self.inject_into_header(&context, &mut input.options.header)
+                .await?;
         })
     }
 
@@ -677,7 +746,8 @@ impl ClientInterceptor for OpenTelemetryClientInterceptor {
         let name = format!("QueryWorkflow:{}", input.query_name);
         let attrs = workflow_attributes(&input.workflow_id, Some(&input.run_id));
         client_operation!(self, input, next, name, attrs, context, {
-            inject_into_header(&self.config, &context, &mut input.options.header);
+            self.inject_into_header(&context, &mut input.options.header)
+                .await?;
         })
     }
 
@@ -700,7 +770,8 @@ impl ClientInterceptor for OpenTelemetryClientInterceptor {
             attrs.push(KeyValue::new(UPDATE_ID_ATTRIBUTE, update_id.clone()));
         }
         client_operation!(self, input, next, name, attrs, context, {
-            inject_into_header(&self.config, &context, &mut input.options.header);
+            self.inject_into_header(&context, &mut input.options.header)
+                .await?;
         })
     }
 
@@ -725,8 +796,10 @@ impl ClientInterceptor for OpenTelemetryClientInterceptor {
             attrs.push(KeyValue::new(UPDATE_ID_ATTRIBUTE, update_id.clone()));
         }
         client_operation!(self, input, next, name, attrs, context, {
-            inject_into_header(&self.config, &context, &mut input.options.start_header);
-            inject_into_header(&self.config, &context, &mut input.options.update_header);
+            self.inject_into_header(&context, &mut input.options.start_header)
+                .await?;
+            self.inject_into_header(&context, &mut input.options.update_header)
+                .await?;
         })
     }
 
@@ -1171,6 +1244,120 @@ mod tests {
     };
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor};
     use temporalio_client::{ClientOptions, ClientPlugin};
+    use temporalio_common::data_converters::{DefaultFailureConverter, PayloadCodec};
+
+    struct HeaderCodec {
+        calls: Arc<Mutex<Vec<Payload>>>,
+        outcome: Result<usize, &'static str>,
+    }
+
+    impl PayloadCodec for HeaderCodec {
+        fn encode(
+            &self,
+            context: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> futures_util::future::BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>
+        {
+            assert!(matches!(context, SerializationContextData::Workflow(_)));
+            self.calls.lock().extend(payloads.clone());
+            let outcome = self.outcome;
+            Box::pin(async move {
+                let count =
+                    outcome.map_err(|err| PayloadConversionError::EncodingError(err.into()))?;
+                let mut payload = payloads.into_iter().next().unwrap();
+                payload
+                    .metadata
+                    .insert("encoding".to_owned(), b"binary/test".to_vec());
+                Ok(std::iter::repeat_n(payload, count).collect())
+            })
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> futures_util::future::BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>
+        {
+            Box::pin(async move { Ok(payloads) })
+        }
+    }
+
+    #[tokio::test]
+    async fn client_header_encoding_only_processes_the_tracing_carrier() {
+        let raw = Payload {
+            metadata: HashMap::from([("encoding".to_owned(), b"binary/manual".to_vec())]),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        for enabled in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter::default(),
+                HeaderCodec {
+                    calls: calls.clone(),
+                    outcome: Ok(1),
+                },
+            );
+            let interceptor = OpenTelemetryClientInterceptor {
+                config: Arc::new(OpenTelemetryPlugin::builder().config),
+                header_converter: enabled.then_some(converter),
+            };
+            let mut header = Some(Header {
+                fields: HashMap::from([("raw".to_owned(), raw.clone())]),
+            });
+            interceptor
+                .inject_into_header(&test_context(1), &mut header)
+                .await
+                .unwrap();
+            let header = header.unwrap();
+            assert_eq!(header.fields["raw"], raw);
+            assert_eq!(
+                header.fields[TRACE_HEADER_KEY].metadata["encoding"],
+                if enabled {
+                    b"binary/test".as_slice()
+                } else {
+                    b"json/plain".as_slice()
+                }
+            );
+            let calls = calls.lock();
+            assert_eq!(calls.len(), usize::from(enabled));
+            if enabled {
+                assert!(
+                    payload_carrier(&calls[0])
+                        .unwrap()
+                        .0
+                        .contains_key("traceparent")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_header_codec_errors_preserve_existing_headers() {
+        for outcome in [Err("codec failed"), Ok(0), Ok(2)] {
+            let interceptor = OpenTelemetryClientInterceptor {
+                config: Arc::new(OpenTelemetryPlugin::builder().config),
+                header_converter: Some(DataConverter::new(
+                    PayloadConverter::default(),
+                    DefaultFailureConverter::default(),
+                    HeaderCodec {
+                        calls: Default::default(),
+                        outcome,
+                    },
+                )),
+            };
+            let original = Some(Header::default());
+            let mut header = original.clone();
+            assert!(
+                interceptor
+                    .inject_into_header(&test_context(1), &mut header)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(header, original);
+        }
+    }
 
     fn test_context(span_id: u64) -> Context {
         Context::new().with_remote_span_context(SpanContext::new(

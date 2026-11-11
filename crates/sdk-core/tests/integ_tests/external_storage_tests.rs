@@ -1,5 +1,9 @@
-use crate::common::{
-    CoreWfStarter, eventually, get_integ_connection, integ_namespace, rand_6_chars,
+use crate::{
+    common::{
+        CoreWfStarter, eventually, get_integ_connection, get_integ_runtime_options,
+        integ_namespace, prom_metrics, rand_6_chars,
+    },
+    integ_tests::metrics_tests::get_text,
 };
 use anyhow::anyhow;
 use futures::{
@@ -9,32 +13,48 @@ use futures::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use temporalio_client::{
     ActivityIdentifier, ActivityStartOptions, Client, ClientOptions, WorkflowDescribeOptions,
     WorkflowExecuteUpdateOptions, WorkflowListOptions, WorkflowQueryOptions, WorkflowSignalOptions,
-    WorkflowStartOptions,
+    WorkflowStartOptions, WorkflowTerminateOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
     schedules::{CreateScheduleOptions, ScheduleAction, ScheduleDescriptionAction, ScheduleSpec},
 };
 use temporalio_common::{
     MemoValues,
     data_converters::{
-        DataConverter, ExternalStorage, ExternalStorageError, PayloadConversionError,
+        DataConverter, DefaultFailureConverter, ExternalStorage, ExternalStorageError,
+        PayloadCodec, PayloadConversionError, PayloadConverter, SerializationContextData,
         StorageDriver, StorageDriverActivityInfo, StorageDriverClaim, StorageDriverError,
         StorageDriverRetrieveContext, StorageDriverStoreContext, StorageDriverTargetInfo,
         StorageDriverWorkflowInfo,
     },
-    protos::temporal::api::{common::v1::Payload, history::v1::history_event::Attributes},
+    protos::{
+        coresdk::{
+            common::ExternalStorageMetrics, workflow_completion::WorkflowActivationCompletion,
+        },
+        temporal::api::{
+            common::v1::{Payload, RetryPolicy},
+            enums::v1::WorkflowTaskFailedCause,
+            failure::v1::failure::FailureInfo,
+            history::v1::history_event::Attributes,
+        },
+    },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions, Runtime, SyncWorkflowContext,
     WorkerOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    interceptors::WorkerInterceptor,
 };
+use temporalio_sdk_core::CoreRuntime;
 use tokio::sync::mpsc;
 
 const REFERENCE_MESSAGE_TYPE: &[u8] = b"temporal.api.sdk.v1.ExternalStorageReference";
@@ -121,6 +141,53 @@ impl StorageDriver for UnreachableDriver {
         _claims: Vec<StorageDriverClaim>,
     ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
         Box::pin(future::ready(Err(anyhow!("bucket unreachable").into())))
+    }
+}
+
+const INJECTED_FAILURE: &str = "injected storage failure";
+
+/// Fails the store or retrieve call with the given 1-based number, once. Every other call is
+/// served from memory.
+#[derive(Default)]
+struct FailingDriver {
+    inner: InMemoryDriver,
+    fail_store: Option<usize>,
+    fail_retrieve: Option<usize>,
+    stores: AtomicUsize,
+    retrieves: AtomicUsize,
+}
+
+impl StorageDriver for FailingDriver {
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    fn driver_type(&self) -> &str {
+        "test.failing"
+    }
+
+    fn store(
+        &self,
+        context: &StorageDriverStoreContext,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
+        let call = self.stores.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_store == Some(call) {
+            return Box::pin(future::ready(Err(anyhow!(INJECTED_FAILURE).into())));
+        }
+        self.inner.store(context, payloads)
+    }
+
+    fn retrieve(
+        &self,
+        context: &StorageDriverRetrieveContext,
+        claims: Vec<StorageDriverClaim>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
+        let call = self.retrieves.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_retrieve == Some(call) {
+            return Box::pin(future::ready(Err(anyhow!(INJECTED_FAILURE).into())));
+        }
+        self.inner.retrieve(context, claims)
     }
 }
 
@@ -297,6 +364,70 @@ impl TargetsChildWorkflow {
     }
 }
 
+struct HeartbeatActivities;
+#[activities]
+impl HeartbeatActivities {
+    #[activity]
+    async fn heartbeat_until_timeout(ctx: ActivityContext) -> Result<(), ActivityError> {
+        ctx.record_heartbeat("h".repeat(10_000)).await?;
+        ctx.cancelled().await;
+        Ok(())
+    }
+
+    #[activity]
+    async fn report_heartbeat_failure(ctx: ActivityContext) -> Result<String, ActivityError> {
+        Ok(match ctx.record_heartbeat("h".repeat(10_000)).await {
+            Ok(()) => String::new(),
+            Err(err) => err.to_string(),
+        })
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct HeartbeatFailureWorkflow;
+#[workflow_methods]
+impl HeartbeatFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        Ok(ctx
+            .execute_activity(
+                HeartbeatActivities::report_heartbeat_failure,
+                (),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?)
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct HeartbeatDetailsWorkflow;
+#[workflow_methods]
+impl HeartbeatDetailsWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let err = ctx
+            .execute_activity(
+                HeartbeatActivities::heartbeat_until_timeout,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+                    .heartbeat_timeout(Duration::from_secs(1))
+                    .retry_policy(RetryPolicy {
+                        maximum_attempts: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .expect_err("activity should time out");
+        let timeout = err.as_timeout().expect("activity should time out");
+        Ok(timeout
+            .last_heartbeat_details()?
+            .expect("heartbeat details should be present"))
+    }
+}
+
 /// Fails unless `recorded` holds exactly the `expected` targets, in any order.
 fn assert_same_targets(
     recorded: Vec<Option<StorageDriverTargetInfo>>,
@@ -316,7 +447,7 @@ fn is_reference(payload: &Payload) -> bool {
     payload.metadata.get("messageType").map(Vec::as_slice) == Some(REFERENCE_MESSAGE_TYPE)
 }
 
-async fn client_with_storage(driver: Arc<InMemoryDriver>) -> Client {
+async fn client_with_storage(driver: Arc<dyn StorageDriver>) -> Client {
     let storage = ExternalStorage::new(driver)
         .unwrap()
         .with_payload_size_threshold(1024);
@@ -618,6 +749,32 @@ async fn schedule_arguments_round_trip_through_external_storage() {
         .expect("input should be present");
     assert_eq!(stored, input);
 
+    handle
+        .update(
+            |update| {
+                update.set_note("updated");
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    handle
+        .send_update(description.into_update(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(driver.stored.lock().unwrap().len(), 1);
+
+    let description = handle.describe(Default::default()).await.unwrap();
+    let ScheduleDescriptionAction::StartWorkflow(action) = description.action() else {
+        panic!("expected a start workflow action");
+    };
+    let stored: String = action
+        .args()
+        .await
+        .unwrap()
+        .expect("input should be present");
+    assert_eq!(stored, input);
+
     handle.delete(Default::default()).await.unwrap();
 }
 
@@ -672,6 +829,189 @@ async fn async_activity_results_round_trip_through_external_storage() {
         _ => None,
     });
     assert!(is_reference(&activity_result.unwrap()));
+}
+
+type RecordedStorageMetrics = Vec<(
+    Option<ExternalStorageMetrics>,
+    Option<ExternalStorageMetrics>,
+)>;
+
+struct StorageMetricsRecorder(Arc<Mutex<RecordedStorageMetrics>>);
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for StorageMetricsRecorder {
+    async fn on_workflow_activation_completion(&self, completion: &WorkflowActivationCompletion) {
+        self.0.lock().unwrap().push((
+            completion.payload_download_metrics.clone(),
+            completion.payload_upload_metrics.clone(),
+        ));
+    }
+}
+
+#[tokio::test]
+async fn workflow_completions_report_what_external_storage_moved() {
+    let client = client_with_storage(Arc::new(InMemoryDriver::default())).await;
+
+    let mut starter =
+        CoreWfStarter::new_with_overrides(LargePayloadWorkflow::name(), None, Some(client.clone()));
+    starter
+        .sdk_config
+        .register_activities(LargePayloadActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LargePayloadWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    worker
+        .submit_workflow(
+            LargePayloadWorkflow::run,
+            "m".repeat(10_000),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+    let recorded = Arc::new(Mutex::new(vec![]));
+    worker
+        .run_until_done_intercepted(Some(StorageMetricsRecorder(Arc::clone(&recorded))))
+        .await
+        .unwrap();
+
+    let recorded = recorded.lock().unwrap();
+    // The workflow's input and the activity's result were retrieved, and the activity's input and
+    // the workflow's result were stored.
+    for (direction, reported) in [
+        (
+            "download",
+            recorded
+                .iter()
+                .filter_map(|(d, _)| d.as_ref())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "upload",
+            recorded
+                .iter()
+                .filter_map(|(_, u)| u.as_ref())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let payload_count: u64 = reported.iter().map(|m| m.payload_count).sum();
+        assert_eq!(payload_count, 2, "{direction}: {reported:?}");
+        for metrics in reported {
+            assert_eq!(
+                metrics.driver_names,
+                vec!["memory".to_owned()],
+                "{direction}"
+            );
+            assert!(
+                metrics.total_size_bytes > 10_000,
+                "{direction}: {metrics:?}"
+            );
+            assert!(metrics.total_duration.is_some(), "{direction}: {metrics:?}");
+        }
+    }
+}
+
+/// Fails the first decode of a workflow's payloads, after they have been retrieved.
+#[derive(Default)]
+struct FailFirstWorkflowDecode(AtomicBool);
+
+impl PayloadCodec for FailFirstWorkflowDecode {
+    fn encode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        Box::pin(future::ready(Ok(payloads)))
+    }
+
+    fn decode(
+        &self,
+        context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        let fail = matches!(context, SerializationContextData::Workflow(_))
+            && !payloads.is_empty()
+            && !self.0.swap(true, Ordering::SeqCst);
+        Box::pin(future::ready(if fail {
+            Err(PayloadConversionError::EncodingError(
+                "intentional decode failure".into(),
+            ))
+        } else {
+            Ok(payloads)
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_failed_activation_decode_reports_what_was_retrieved() {
+    let storage = ExternalStorage::new(Arc::new(InMemoryDriver::default()))
+        .unwrap()
+        .with_payload_size_threshold(1024);
+    let data_converter = DataConverter::new(
+        PayloadConverter::default(),
+        DefaultFailureConverter::default(),
+        FailFirstWorkflowDecode::default(),
+    )
+    .with_external_storage(storage);
+    let client = Client::new(
+        get_integ_connection(None).await,
+        ClientOptions::new(integ_namespace())
+            .data_converter(data_converter)
+            .build(),
+    )
+    .unwrap();
+
+    let mut starter =
+        CoreWfStarter::new_with_overrides("failed_activation_decode", None, Some(client.clone()));
+    starter
+        .sdk_config
+        .register_activities(LargePayloadActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LargePayloadWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    worker
+        .submit_workflow(
+            LargePayloadWorkflow::run,
+            "d".repeat(10_000),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+    let recorded = Arc::new(Mutex::new(vec![]));
+    worker
+        .run_until_done_intercepted(Some(StorageMetricsRecorder(Arc::clone(&recorded))))
+        .await
+        .unwrap();
+
+    assert!(
+        starter
+            .get_history()
+            .await
+            .events
+            .iter()
+            .any(|event| matches!(
+                event.attributes,
+                Some(Attributes::WorkflowTaskFailedEventAttributes(_))
+            )),
+        "the first workflow task should have failed"
+    );
+    // The failed completion stores nothing, which tells it apart from the retry's, which stores
+    // the activity's input.
+    let recorded = recorded.lock().unwrap();
+    let (download, upload) = &recorded[0];
+    assert_eq!(
+        download.as_ref().map(|m| m.payload_count),
+        Some(1),
+        "{recorded:?}"
+    );
+    assert_eq!(upload, &None, "{recorded:?}");
 }
 
 #[tokio::test]
@@ -801,4 +1141,302 @@ async fn drivers_are_told_which_standalone_activity_a_payload_is_stored_for() {
         driver.targets.lock().unwrap().clone(),
         vec![activity(None), activity(Some(&run_id))],
     );
+}
+
+#[tokio::test]
+async fn heartbeat_details_round_trip_through_external_storage() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let client = client_with_storage(driver.clone()).await;
+
+    let mut starter = CoreWfStarter::new_with_overrides(
+        HeartbeatDetailsWorkflow::name(),
+        None,
+        Some(client.clone()),
+    );
+    starter.sdk_config.register_activities(HeartbeatActivities);
+    starter
+        .sdk_config
+        .register_workflow::<HeartbeatDetailsWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            HeartbeatDetailsWorkflow::run,
+            (),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert_eq!(
+        handle.get_result(Default::default()).await.unwrap(),
+        "h".repeat(10_000)
+    );
+
+    let history = starter.get_history().await;
+    let last_heartbeat_details = history
+        .events
+        .into_iter()
+        .find_map(|event| match event.attributes {
+            Some(Attributes::ActivityTaskTimedOutEventAttributes(attrs)) => {
+                match attrs.failure.and_then(|failure| failure.failure_info) {
+                    Some(FailureInfo::TimeoutFailureInfo(info)) => info.last_heartbeat_details,
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("the activity's timeout should carry its last heartbeat details");
+    assert!(is_reference(&last_heartbeat_details.payloads[0]));
+
+    let workflow_target = Some(StorageDriverTargetInfo::Workflow(
+        StorageDriverWorkflowInfo::builder()
+            .namespace(integ_namespace())
+            .id(workflow_id)
+            .run_id(handle.run_id().unwrap().to_owned())
+            .workflow_type(HeartbeatDetailsWorkflow::name().to_owned())
+            .build(),
+    ));
+    // The heartbeat details, and the workflow's result that repeats them.
+    assert_same_targets(
+        driver.targets.lock().unwrap().clone(),
+        vec![workflow_target.clone(), workflow_target],
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FailedTask {
+    Workflow,
+    Activity,
+}
+
+// The client stores the workflow's input, the workflow stores the activity's input, the
+// activity stores its result and the workflow stores its own. Retrieval follows the same
+// order, so a call number picks out exactly one task path.
+#[rstest::rstest]
+#[case::workflow_task_retrieve(None, Some(1), FailedTask::Workflow)]
+#[case::workflow_task_store(Some(2), None, FailedTask::Workflow)]
+#[case::activity_task_retrieve(None, Some(2), FailedTask::Activity)]
+#[case::activity_task_store(Some(3), None, FailedTask::Activity)]
+#[tokio::test]
+async fn a_storage_failure_fails_the_task_which_is_retried(
+    #[case] fail_store: Option<usize>,
+    #[case] fail_retrieve: Option<usize>,
+    #[case] failed_task: FailedTask,
+) {
+    let driver = Arc::new(FailingDriver {
+        fail_store,
+        fail_retrieve,
+        ..Default::default()
+    });
+    let client = client_with_storage(driver).await;
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let runtime = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+
+    let mut starter = CoreWfStarter::new_with_overrides(
+        &format!("storage_failure_{failed_task:?}"),
+        Some(runtime),
+        Some(client.clone()),
+    );
+    starter
+        .sdk_config
+        .register_activities(LargePayloadActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LargePayloadWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let input = "f".repeat(10_000);
+    let handle = worker
+        .submit_workflow(
+            LargePayloadWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    assert_eq!(handle.get_result(Default::default()).await.unwrap(), input);
+
+    let events = starter.get_history().await.events;
+    match failed_task {
+        FailedTask::Workflow => {
+            let failed = events
+                .iter()
+                .find_map(|event| match &event.attributes {
+                    Some(Attributes::WorkflowTaskFailedEventAttributes(attrs)) => Some(attrs),
+                    _ => None,
+                })
+                .expect("the workflow task should have failed");
+            assert!(
+                failed
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains(INJECTED_FAILURE),
+                "{failed:?}"
+            );
+            assert_eq!(
+                failed.cause(),
+                WorkflowTaskFailedCause::ExternalStorageFailure
+            );
+        }
+        FailedTask::Activity => {
+            let started = events
+                .iter()
+                .find_map(|event| match &event.attributes {
+                    Some(Attributes::ActivityTaskStartedEventAttributes(attrs)) => Some(attrs),
+                    _ => None,
+                })
+                .expect("the activity should have started");
+            assert_eq!(started.attempt, 2, "the failed attempt should be retried");
+            assert!(
+                started
+                    .last_failure
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains(INJECTED_FAILURE),
+                "{started:?}"
+            );
+        }
+    }
+
+    let failure_metric = match failed_task {
+        FailedTask::Workflow => "temporal_workflow_task_execution_failed{",
+        FailedTask::Activity => "temporal_activity_execution_failed{",
+    };
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                get_text(endpoint)
+                    .await
+                    .lines()
+                    .find(|l| l.starts_with(failure_metric))
+                    .map(ToString::to_string)
+                    .ok_or("the task failure has not been counted")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert!(
+        metric_line.contains("failure_reason=\"ExternalStorageError\""),
+        "{metric_line}"
+    );
+}
+
+#[tokio::test]
+async fn a_reference_reaching_a_worker_without_storage_fails_the_workflow_task() {
+    let client = client_with_storage(Arc::new(InMemoryDriver::default())).await;
+    let worker_client = Client::new(
+        get_integ_connection(None).await,
+        ClientOptions::new(integ_namespace()).build(),
+    )
+    .unwrap();
+    let task_queue = format!("storage_not_configured_{}", rand_6_chars());
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_workflow::<LargePayloadWorkflow>()
+        .unwrap()
+        .register_activities(LargePayloadActivities)
+        .build();
+    let worker = temporalio_sdk::Worker::new(&runtime, worker_client, worker_options).unwrap();
+
+    worker
+        .run_until(async {
+            let handle = client
+                .start_workflow(
+                    LargePayloadWorkflow::run,
+                    "n".repeat(10_000),
+                    WorkflowStartOptions::new(task_queue.clone(), task_queue.clone()).build(),
+                )
+                .await
+                .unwrap();
+            let failed = eventually(
+                || {
+                    let handle = &handle;
+                    async move {
+                        handle
+                            .fetch_history(Default::default())
+                            .into_events()
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .find_map(|event| match event.attributes {
+                                Some(Attributes::WorkflowTaskFailedEventAttributes(attrs)) => {
+                                    Some(attrs)
+                                }
+                                _ => None,
+                            })
+                            .ok_or("the workflow task has not failed")
+                    }
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert!(
+                failed
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("TMPRL1105"),
+                "{failed:?}"
+            );
+            assert_eq!(
+                failed.cause(),
+                WorkflowTaskFailedCause::ExternalStorageFailure
+            );
+            handle
+                .terminate(WorkflowTerminateOptions::default())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_heartbeat_store_is_returned_to_the_activity() {
+    let driver = Arc::new(FailingDriver {
+        fail_store: Some(1),
+        ..Default::default()
+    });
+    let client = client_with_storage(driver).await;
+
+    let mut starter = CoreWfStarter::new_with_overrides(
+        HeartbeatFailureWorkflow::name(),
+        None,
+        Some(client.clone()),
+    );
+    starter.sdk_config.register_activities(HeartbeatActivities);
+    starter
+        .sdk_config
+        .register_workflow::<HeartbeatFailureWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            HeartbeatFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let reported = handle.get_result(Default::default()).await.unwrap();
+    assert!(reported.contains(INJECTED_FAILURE), "{reported}");
 }

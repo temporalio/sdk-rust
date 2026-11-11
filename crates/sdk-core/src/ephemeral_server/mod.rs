@@ -512,16 +512,12 @@ impl EphemeralExe {
                 // The download client resolves its rustls provider from the process default.
                 temporalio_common::telemetry::ensure_default_crypto_provider();
                 let client = reqwest::Client::new();
-                let resp = client
+                let request = client
                     .get(format!(
                         "https://temporal.download/{artifact_name}/{version_name}"
                     ))
-                    .query(&get_info_params)
-                    .send()
-                    .await
-                    .map_err(EphemeralServerError::download_error)?
-                    .error_for_status()
-                    .map_err(EphemeralServerError::download_error)?;
+                    .query(&get_info_params);
+                let resp = send_download_request(request).await?;
                 let info: DownloadInfo = resp
                     .json()
                     .await
@@ -575,25 +571,63 @@ fn get_free_port(bind_ip: &str) -> io::Result<u16> {
     // that port number for bind(:0) syscalls, yet we are not prevented from
     // explicitly binding to it (thanks to SO_REUSEADDR).
     //
-    // On macOS and Windows, the above technique is not necessary, as the OS
-    // allocates ephemeral ports sequentially, meaning a port number will only
-    // be reused after the entire range has been exhausted. Quite the opposite,
-    // given that these OSes use a significantly smaller range for ephemeral
-    // ports, making an extra connection just to reserve a port might actually
-    // be harmful (by hastening ephemeral port exhaustion).
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    // Windows is excluded because SO_REUSEADDR has different semantics there.
+    // macOS allocates ephemeral ports sequentially, but a busy host can still
+    // claim the selected port before the caller binds, so reserve it there too.
+    #[cfg(not(target_os = "windows"))]
     {
         // Establish a connection to the bind_ip:port
-        let _stream = std::net::TcpStream::connect(addr)?;
+        let mut stream = std::net::TcpStream::connect(addr)?;
 
         // Accept the connection from the listening side
-        let (socket, _addr) = listen.accept()?;
+        let (mut socket, _addr) = listen.accept()?;
 
-        // Explicitly drop the socket to close the connection from the listening side first
+        // Wait for both FINs so the server side reaches TIME_WAIT before the port is returned.
+        // Merely dropping the sockets can race the caller's next bind with TCP teardown.
+        socket.shutdown(std::net::Shutdown::Write)?;
+        io::copy(&mut stream, &mut io::sink())?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+        io::copy(&mut socket, &mut io::sink())?;
         drop(socket);
     }
 
     Ok(addr.port())
+}
+
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 4;
+
+/// Retries transient download failures. `temporal.download` can answer `503` during a
+/// release deploy, and a short connection failure should not fail a worker's download.
+/// A plain `GET` is safe to replay.
+async fn send_download_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, EphemeralServerError> {
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        let send = request
+            .try_clone()
+            .expect("download request has no streaming body");
+        let err = match send
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(resp) => return Ok(resp),
+            Err(err) => err,
+        };
+        let transient = err.is_timeout()
+            || err.is_connect()
+            || matches!(
+                err.status(),
+                Some(status)
+                    if status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            );
+        if attempt == DOWNLOAD_MAX_ATTEMPTS || !transient {
+            return Err(EphemeralServerError::download_error(err));
+        }
+        sleep(Duration::from_millis(200 * 2u64.pow(attempt - 1))).await;
+    }
+    unreachable!("download retry loop returns on its final attempt");
 }
 
 /// Returns false if we successfully waited for another download to complete, or
@@ -709,13 +743,7 @@ async fn download_and_extract(
 ) -> Result<(), EphemeralServerError> {
     // Start download. We are using streaming here to extract the file from the
     // tarball or zip instead of loading into memory for Cursor/Seek.
-    let resp = client
-        .get(uri)
-        .send()
-        .await
-        .map_err(EphemeralServerError::download_error)?
-        .error_for_status()
-        .map_err(EphemeralServerError::download_error)?;
+    let resp = send_download_request(client.get(uri)).await?;
     // We have to map the error type to an io error
     let stream = resp
         .bytes_stream()
@@ -1021,7 +1049,9 @@ mod tests {
     fn get_free_port_can_bind_immediately() {
         let host = "127.0.0.1";
 
-        for _ in 0..500 {
+        // Each iteration leaves sockets in TIME_WAIT. Keep the count low, since this runs in
+        // the shared test process and could exhaust the small loopback ephemeral port range.
+        for _ in 0..50 {
             let port = get_free_port(host).unwrap();
             try_listen_and_dial_on(host, port).expect("Failed to bind to port");
         }

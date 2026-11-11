@@ -316,8 +316,8 @@ pub trait StorageDriverSelector: Send + Sync {
 ///
 /// This API is experimental and may change without notice. For now:
 ///
-/// - Heartbeat details recorded from inside an activity are not offloaded.
-/// - Storage requests are not limited, so every request a message needs runs at once.
+/// - Up to 8 of a message's payload fields are stored or retrieved at once. Storage requests are not
+///   otherwise limited.
 /// - References are not passed through the payload codec, so the
 ///   [`claim_data`](StorageDriverClaim::claim_data) they carry is written to history unencrypted,
 ///   and a reference that another SDK encoded with a codec is not recognized.
@@ -408,6 +408,14 @@ impl ExternalStorage {
     #[allow(dead_code)]
     pub(crate) fn concurrency(&self) -> &ExternalStorageConcurrency {
         &self.concurrency
+    }
+
+    /// How many of one message's payload fields may be stored or retrieved at once.
+    // Hidden rather than crate-private because the SDK applies it from another crate. Remove once
+    // the concurrency configuration is public.
+    #[doc(hidden)]
+    pub fn max_operations_per_message(&self) -> usize {
+        self.concurrency.max_operations_per_message
     }
 
     /// The registered drivers.

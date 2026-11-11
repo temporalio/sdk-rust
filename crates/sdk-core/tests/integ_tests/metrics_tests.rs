@@ -2224,6 +2224,77 @@ async fn lang_reported_activity_failure_cause_reaches_metric() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn lang_reported_workflow_task_failure_cause_reaches_metric() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(
+        temporalio_common::protos::temporal::api::enums::v1::EventType::WorkflowExecutionStarted,
+    );
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    mh.num_expected_completions = Some(0.into());
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        act.run_id,
+        "storage exploded".into(),
+        Some(WorkflowTaskFailedCause::ExternalStorageFailure),
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+
+    // The reported WFT failure evicts the run. Consume the replayed activation so the worker can
+    // shut down cleanly without an outstanding workflow task.
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        act.run_id,
+        "storage exploded".into(),
+        Some(WorkflowTaskFailedCause::ExternalStorageFailure),
+    ))
+    .await
+    .unwrap();
+    core.drain_pollers_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| l.starts_with("temporal_workflow_task_execution_failed{"))
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("wf_task_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("failure_reason=\"ExternalStorageError\""),
+        "Expected ExternalStorageError failure reason on metric, got: {metric_line}"
+    );
+}
+
 /// A payload-limit violation detected while reporting an activity result is core's own doing, so it
 /// must reach the metric as its own reason rather than the generic activity one.
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]

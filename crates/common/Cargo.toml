@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-common"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
@@ -109,13 +109,13 @@ uuid = { version = "1.18", default-features = false, features = ["v4"] }
 
 [dependencies.temporalio-protos]
 path = "../protos"
-version = "~0.10.0"
+version = "~0.11.0"
 # External storage reads and writes proto JSON, whose impls live behind serde_serialize.
 features = ["grpc-clients", "serde_serialize"]
 
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
-version = "~1.1.0"
+version = "~1.2.0"
 
 [build-dependencies]
 prost = { workspace = true }
@@ -127,6 +127,6 @@ workspace = true
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
-rstest = "0.27"
+rstest = "0.28"
 tempfile = "3.21"
 tokio = { version = "1.47", features = ["macros", "rt", "sync", "time"] }

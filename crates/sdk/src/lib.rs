@@ -148,18 +148,20 @@ use temporalio_common::protos::temporal::api::worker::v1::{PluginInfo, StorageDr
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
     data_converters::{
-        ActivitySerializationContext, DataConverter, SerializationContext,
+        ActivitySerializationContext, DataConverter, PayloadConversionError, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    external_storage::{StoreTarget, retrieve_external_payloads, store_external_payloads},
+    external_storage::{
+        StorageOperationMetrics, StoreTarget, retrieve_external_payloads, store_external_payloads,
+    },
     payload_visitor::{decode_payloads, encode_payloads},
     protos::{
         TaskToken,
         coresdk::{
             ActivityTaskCompletion,
-            activity_result::ActivityExecutionResult,
+            activity_result::{self, ActivityExecutionResult, activity_execution_result},
             activity_task::{ActivityTask, activity_task},
-            common::NamespacedWorkflowExecution,
+            common::{ExternalStorageMetrics, NamespacedWorkflowExecution},
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
             workflow_commands::{
                 WorkflowCommand, signal_external_workflow_execution, workflow_command,
@@ -167,7 +169,9 @@ use temporalio_common::{
             workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion},
         },
         temporal::api::{
-            common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
+            common::v1::Payload,
+            enums::v1::{ActivityTaskFailedCause, WorkflowTaskFailedCause},
+            failure::v1::Failure,
         },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
@@ -818,6 +822,9 @@ struct CommonWorker {
 struct WorkflowHalf {
     /// Maps run id to cached workflow state
     workflows: RefCell<HashMap<String, WorkflowData>>,
+    /// Retrieval metrics for each run's current activation, sent with its completion. Not part of
+    /// `workflows` because a run's first activation is retrieved before the run has an entry there.
+    download_metrics: RefCell<HashMap<String, ExternalStorageMetrics>>,
     workflow_definitions: WorkflowDefinitions,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
@@ -989,6 +996,7 @@ async fn encode_workflow_completion(
     run: Option<&RunStoreTargets>,
 ) {
     let run_id = completion.run_id.clone();
+    let mut uploads = Vec::new();
     let encoded = async {
         encode_payloads(
             completion,
@@ -1000,16 +1008,16 @@ async fn encode_workflow_completion(
             Some(workflow_activation_completion::Status::Successful(success)) => {
                 for command in &mut success.commands {
                     let target = run.and_then(|run| run.for_command(command));
-                    store_external_payloads(command, data_converter, target).await?;
+                    uploads.push(store_external_payloads(command, data_converter, target).await?);
                 }
             }
             Some(workflow_activation_completion::Status::Failed(failed)) => {
                 let target = run.map(RunStoreTargets::current);
-                store_external_payloads(failed, data_converter, target).await?;
+                uploads.push(store_external_payloads(failed, data_converter, target).await?);
             }
             None => {}
         }
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, PayloadConversionError>(())
     }
     .await;
     if let Err(err) = encoded {
@@ -1020,8 +1028,43 @@ async fn encode_workflow_completion(
                 message: format!("Failed encoding completion: {err}"),
                 ..Default::default()
             },
-            Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+            Some(workflow_task_failed_cause(&err)),
         );
+    }
+    // Also reported for a failed completion, since stores that succeeded still took time.
+    completion.payload_upload_metrics = uploads
+        .into_iter()
+        .flatten()
+        .reduce(StorageOperationMetrics::merge)
+        .map(StorageOperationMetrics::into_proto);
+}
+
+fn workflow_task_failed_cause(err: &PayloadConversionError) -> WorkflowTaskFailedCause {
+    match err {
+        PayloadConversionError::ExternalStorage(_) => {
+            WorkflowTaskFailedCause::ExternalStorageFailure
+        }
+        _ => WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+    }
+}
+
+fn activity_processing_failure(
+    message: String,
+    err: &PayloadConversionError,
+) -> ActivityExecutionResult {
+    let cause = match err {
+        PayloadConversionError::ExternalStorage(_) => {
+            ActivityTaskFailedCause::ExternalStorageFailure
+        }
+        _ => ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
+    };
+    ActivityExecutionResult {
+        status: Some(activity_execution_result::Status::Failed(
+            activity_result::Failure {
+                failure: Some(Failure::application_failure(message, false)),
+                cause: cause as i32,
+            },
+        )),
     }
 }
 
@@ -1038,15 +1081,15 @@ async fn encode_activity_completion(
         )
         .await?;
         store_external_payloads(completion, data_converter, target).await?;
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, PayloadConversionError>(())
     }
     .await;
     if let Err(err) = encoded {
         error!(error = %err, "Failed encoding activity task completion");
-        completion.result = Some(ActivityExecutionResult::fail(Failure::application_failure(
+        completion.result = Some(activity_processing_failure(
             format!("Failed encoding activity completion: {err}"),
-            false,
-        )));
+            &err,
+        ));
     }
 }
 
@@ -1167,6 +1210,7 @@ impl Worker {
             },
             workflow_half: WorkflowHalf {
                 workflows: Default::default(),
+                download_metrics: Default::default(),
                 workflow_definitions: workflows,
                 workflow_removed_from_map: Default::default(),
                 detect_nondeterministic_futures: false,
@@ -1322,12 +1366,17 @@ impl Worker {
                             .borrow()
                             .get(&completion.run_id)
                             .map(|data| Arc::clone(&data.store_targets));
+                        let download = wf_half
+                            .download_metrics
+                            .borrow_mut()
+                            .remove(&completion.run_id);
                         encode_workflow_completion(
                             &mut completion,
                             &common.data_converter,
                             run.as_deref(),
                         )
                         .await;
+                        completion.payload_download_metrics = download;
                         for i in &common.worker_interceptors {
                             i.on_workflow_activation_completion(&completion).await;
                         }
@@ -1358,18 +1407,30 @@ impl Worker {
                                         source: Box::new(source),
                                     })?,
                                 };
+                            let mut download = None;
                             let decoded = async {
-                                retrieve_external_payloads(&mut activation, &common.data_converter)
-                                    .await?;
+                                download = retrieve_external_payloads(
+                                    &mut activation,
+                                    &common.data_converter,
+                                )
+                                .await?;
                                 decode_payloads(
                                     &mut activation,
                                     common.data_converter.codec(),
                                     &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                                 )
                                 .await?;
-                                Ok::<_, anyhow::Error>(())
+                                Ok::<_, PayloadConversionError>(())
                             }
                             .await;
+                            // Recorded before a decoding failure is reported, since retrieval that
+                            // succeeded still took time.
+                            if let Some(download) = download {
+                                wf_half
+                                    .download_metrics
+                                    .borrow_mut()
+                                    .insert(activation.run_id.clone(), download.into_proto());
+                            }
                             if let Err(err) = decoded {
                                 let run_id = activation.run_id;
                                 error!(run_id, error = %err, "Failed decoding workflow activation");
@@ -1380,9 +1441,7 @@ impl Worker {
                                             message: format!("Failed decoding activation: {err}"),
                                             ..Default::default()
                                         },
-                                        Some(
-                                            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                        ),
+                                        Some(workflow_task_failed_cause(&err)),
                                     ))
                                     .expect("Completion channel intact");
                                 continue;
@@ -1483,18 +1542,16 @@ impl Worker {
                                 ),
                             )
                             .await?;
-                            Ok::<_, anyhow::Error>(())
+                            Ok::<_, PayloadConversionError>(())
                         }
                         .await;
                         if let Err(err) = decoded {
                             error!(error = %err, "Failed decoding activity task");
                             let mut completion = ActivityTaskCompletion {
                                 task_token: activity.task_token,
-                                result: Some(ActivityExecutionResult::fail(
-                                    Failure::application_failure(
-                                        format!("Failed decoding activity task: {err}"),
-                                        false,
-                                    ),
+                                result: Some(activity_processing_failure(
+                                    format!("Failed decoding activity task: {err}"),
+                                    &err,
                                 )),
                             };
                             encode_activity_completion(
@@ -1796,6 +1853,7 @@ impl ActivityHalf {
                     task_queue,
                     task_token.clone(),
                     start,
+                    store_target.clone(),
                 );
                 let codec_data_converter = data_converter.clone();
 

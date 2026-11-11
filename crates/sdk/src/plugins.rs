@@ -188,6 +188,8 @@ fn apply_appending<T: Clone>(
     }
 }
 
+type ClientConfigurator = Arc<dyn Fn(&mut ClientOptions) -> Result<(), PluginError> + Send + Sync>;
+
 /// A plugin assembled from declarative values or functions of existing values.
 ///
 /// Scalar values replace the corresponding option, while collection values append. Functions
@@ -219,6 +221,9 @@ pub struct SimplePlugin {
     data_converter: Option<SimplePluginOption<DataConverter>>,
     #[builder(into)]
     client_interceptors: Option<SimplePluginOption<Vec<Arc<dyn ClientInterceptor>>>>,
+    // Interceptors bound to a target's converter cannot be shared across differently configured clients.
+    #[builder(skip)]
+    pub(crate) client_configurator: Option<ClientConfigurator>,
     #[builder(into)]
     worker_interceptors: Option<SimplePluginOption<Vec<Arc<dyn WorkerInterceptor>>>>,
     #[builder(into)]
@@ -253,6 +258,9 @@ impl ClientPlugin for SimplePlugin {
             self.client_interceptors.as_ref(),
             |existing, value| existing.extend(value.iter().cloned()),
         );
+        if let Some(configure) = &self.client_configurator {
+            configure(options)?;
+        }
         Ok(())
     }
 }

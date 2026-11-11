@@ -823,6 +823,7 @@ impl From<WorkflowTaskFailedCause> for FailureReason {
             WorkflowTaskFailedCause::GrpcMessageTooLarge => FailureReason::GrpcMessageTooLarge,
             WorkflowTaskFailedCause::PayloadsTooLarge => FailureReason::PayloadsTooLarge,
             WorkflowTaskFailedCause::RequestTooLarge => FailureReason::RequestTooLarge,
+            WorkflowTaskFailedCause::ExternalStorageFailure => FailureReason::ExternalStorageError,
             _ => FailureReason::Workflow,
         }
     }

@@ -10,7 +10,7 @@ help: the trait `From<Two>` is not implemented for `One`
 13 | pub struct One {}
    | ^^^^^^^^^^^^^^
    = note: required for `Two` to implement `Into<One>`
-note: required by a bound in `TransitionResult::<Sm, Ds>::from`
+note: required by a bound in `temporalio_common::fsm_trait::TransitionResult::<Sm, Ds>::from`
   --> $WORKSPACE/crates/common/src/fsm_trait.rs
    |
    |     pub fn from<CurrentState>(current_state: CurrentState) -> Self

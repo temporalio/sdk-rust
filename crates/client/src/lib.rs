@@ -1219,6 +1219,7 @@ impl Client {
             update,
             update_input,
             options,
+            UpdateWorkflowExecutionLifecycleStage::Accepted,
         )
         .await
     }
@@ -1442,6 +1443,7 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         update: U,
         update_input: U::Input,
         options: WorkflowUpdateWithStartOptions,
+        wait_stage: UpdateWorkflowExecutionLifecycleStage,
     ) -> impl Future<Output = Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>>
     where
         Self: Sized,
@@ -1809,9 +1811,9 @@ fn build_start_workflow_request(
     workflow_type: String,
     input: Option<Payloads>,
     memo: Option<ProtoMemo>,
+    user_metadata: Option<UserMetadata>,
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
-    let user_metadata = options.user_metadata();
     let request_eager_execution = options.enable_eager_workflow_start;
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
@@ -1901,11 +1903,13 @@ where
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
+                        let user_metadata = options.encoded_user_metadata(&data_converter).await?;
                         let mut request = build_start_workflow_request(
                             &client,
                             workflow_type,
                             payloads.into_payloads(),
                             memo,
+                            user_metadata,
                             options,
                         );
                         let target = StoreTarget::workflow(
@@ -2009,11 +2013,13 @@ where
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
+                        let user_metadata = options.encoded_user_metadata(&data_converter).await?;
                         let mut start_request = build_start_workflow_request(
                             &client,
                             workflow_type,
                             workflow_payloads.into_payloads(),
                             memo,
+                            user_metadata,
                             options,
                         );
                         if let Some(task_queue) = &mut start_request.task_queue {
@@ -2097,6 +2103,7 @@ where
         update: U,
         update_input: U::Input,
         options: WorkflowUpdateWithStartOptions,
+        wait_stage: UpdateWorkflowExecutionLifecycleStage,
     ) -> Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>
     where
         W: HasWorkflowDefinition,
@@ -2167,11 +2174,14 @@ where
                         let namespace = client.namespace();
                         let workflow_id = start_options.workflow_id.clone();
                         let memo = start_options.encoded_memo(&data_converter).await?;
+                        let user_metadata =
+                            start_options.encoded_user_metadata(&data_converter).await?;
                         let start_request = build_start_workflow_request(
                             &client,
                             workflow_type,
                             workflow_payloads.into_payloads(),
                             memo,
+                            user_metadata,
                             start_options,
                         );
                         let target = StoreTarget::workflow(
@@ -2194,6 +2204,7 @@ where
                             update_name,
                             update_header,
                             update_payloads,
+                            wait_stage,
                         );
 
                         let mut request = ExecuteMultiOperationRequest {
@@ -2305,6 +2316,7 @@ where
             update,
             update_input,
             options,
+            UpdateWorkflowExecutionLifecycleStage::Completed,
         )
         .await?;
         let result = update_handle
@@ -3359,6 +3371,7 @@ mod tests {
             calls: usize,
             workflow_type: String,
             memo: Option<ProtoMemo>,
+            user_metadata: Option<UserMetadata>,
             payloads: Vec<Payload>,
             signal_name: String,
             signal_payloads: Vec<Payload>,
@@ -3450,6 +3463,7 @@ mod tests {
                 recorded.calls += 1;
                 recorded.workflow_type = request.workflow_type.unwrap().name;
                 recorded.memo = request.memo;
+                recorded.user_metadata = request.user_metadata;
                 recorded.payloads = request.input.unwrap_or_default().payloads;
                 recorded.identity = request.identity;
                 recorded.links = request.links;
@@ -3496,6 +3510,7 @@ mod tests {
                 recorded.calls += 1;
                 recorded.workflow_type = request.workflow_type.unwrap().name;
                 recorded.memo = request.memo;
+                recorded.user_metadata = request.user_metadata;
                 recorded.payloads = request.input.unwrap_or_default().payloads;
                 recorded.signal_name = request.signal_name;
                 recorded.signal_payloads = request.signal_input.unwrap_or_default().payloads;
@@ -3841,6 +3856,57 @@ mod tests {
             assert_eq!(
                 read_back(sent).await.get::<String>("memo-key").unwrap(),
                 Some("memo-value".to_owned())
+            );
+        }
+
+        #[rstest::rstest]
+        #[tokio::test]
+        async fn start_workflow_encodes_user_metadata_with_codec(
+            #[values(false, true)] signal_with_start: bool,
+        ) {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let options = WorkflowStartOptions::new("task-queue", "workflow-id")
+                .static_summary("workflow summary".to_owned())
+                .static_details("workflow details".to_owned())
+                .build();
+            if signal_with_start {
+                client
+                    .signal_with_start_workflow(
+                        TestWorkflow::run,
+                        vec!["initial".to_owned()],
+                        TestWorkflow::test_signal,
+                        vec!["signal".to_owned()],
+                        options,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .start_workflow(TestWorkflow::run, vec!["initial".to_owned()], options)
+                    .await
+                    .unwrap();
+            }
+
+            let sent = recorded
+                .lock()
+                .user_metadata
+                .clone()
+                .expect("user metadata should be sent");
+            let converter = client.data_converter();
+            let context = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            assert_eq!(
+                converter
+                    .from_payload::<String>(&context, sent.summary.unwrap())
+                    .await
+                    .unwrap(),
+                "workflow summary"
+            );
+            assert_eq!(
+                converter
+                    .from_payload::<String>(&context, sent.details.unwrap())
+                    .await
+                    .unwrap(),
+                "workflow details"
             );
         }
 
@@ -4392,6 +4458,16 @@ mod tests {
         }
 
         impl WorkflowService for MockMultiOperationClient {
+            fn poll_workflow_execution_update(
+                &mut self,
+                _: Request<PollWorkflowExecutionUpdateRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<PollWorkflowExecutionUpdateResponse>, tonic::Status>,
+            > {
+                panic!("unexpected poll RPC: outcome was returned by execute_multi_operation");
+            }
+
             fn execute_multi_operation(
                 &mut self,
                 request: Request<ExecuteMultiOperationRequest>,
@@ -4455,6 +4531,7 @@ mod tests {
                     .update_header(update_header.clone())
                     .maybe_versioning_override(versioning_override.clone())
                     .build(),
+                    UpdateWorkflowExecutionLifecycleStage::Accepted,
                 )
                 .await
                 .unwrap();
@@ -4555,6 +4632,34 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn execute_update_with_start_requests_completion() {
+            let client = MockMultiOperationClient::new(Vec::new(), []);
+            let result = client
+                .execute_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result, "update-result");
+            assert_eq!(*client.call_count.lock(), 1);
+            let recorded = client.recorded.lock();
+            let Some(MultiOperationRequest::UpdateWorkflow(request)) =
+                &recorded.as_ref().unwrap().operations[1].operation
+            else {
+                panic!("expected update operation");
+            };
+            assert_eq!(
+                request.wait_policy.as_ref().unwrap().lifecycle_stage,
+                UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            );
+        }
+
+        #[tokio::test]
         async fn update_with_start_retries_until_update_is_accepted() {
             let client = MockMultiOperationClient::new(
                 Vec::new(),
@@ -4576,6 +4681,7 @@ mod tests {
                     TestUpdate,
                     "update-input".to_owned(),
                     update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                    UpdateWorkflowExecutionLifecycleStage::Accepted,
                 )
                 .await
                 .unwrap();
@@ -4610,6 +4716,7 @@ mod tests {
                         TestUpdate,
                         "update-input".to_owned(),
                         update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                        UpdateWorkflowExecutionLifecycleStage::Accepted,
                     )
                     .await;
                 assert!(matches!(
@@ -4660,6 +4767,7 @@ mod tests {
                     TestUpdate,
                     "update-input".to_owned(),
                     update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                    UpdateWorkflowExecutionLifecycleStage::Accepted,
                 )
                 .await
                 .unwrap();

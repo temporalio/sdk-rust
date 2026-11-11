@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::{
     data_converters::ExternalStorageError,
-    payload_visitor::{PayloadVisitable, payload_visitor},
+    payload_visitor::{PayloadFieldCollectable, transformable_fields},
     protos::temporal::api::{
         common::v1::{Payload, payload::ExternalPayloadDetails},
         sdk::v1::ExternalStorageReference,
@@ -42,28 +42,16 @@ pub(crate) fn is_plain_reference(payload: &Payload) -> bool {
 
 /// Fail if any payload in the message is a reference, for a caller with no external storage to
 /// retrieve it with.
-pub(crate) async fn reject_references_in<M: PayloadVisitable + Send>(
+pub(crate) fn reject_references_in<M: PayloadFieldCollectable + Send>(
     message: &mut M,
 ) -> Result<(), ExternalStorageError> {
-    let mut finder = ReferenceFinder { found: false };
-    message
-        .visit_payloads_mut(&mut finder)
-        .await
-        .map_err(|e| ExternalStorageError::Walk(Box::new(e)))?;
-    if finder.found {
+    if transformable_fields(message)
+        .any(|field| field.into_payloads_mut().iter().any(is_plain_reference))
+    {
         return Err(ExternalStorageError::NotConfigured);
     }
     Ok(())
 }
-
-struct ReferenceFinder {
-    found: bool,
-}
-
-payload_visitor!(ReferenceFinder, |this, payloads| {
-    this.found |= payloads.iter().any(is_plain_reference);
-    payloads
-});
 
 /// Parse the reference from the given payload, which must be a plain reference.
 pub(crate) fn parse_reference(
@@ -226,8 +214,8 @@ mod tests {
         assert!(is_plain_reference(&payload));
     }
 
-    #[tokio::test]
-    async fn a_reference_with_no_storage_to_retrieve_it_is_tmprl1105() {
+    #[test]
+    fn a_reference_with_no_storage_to_retrieve_it_is_tmprl1105() {
         let ordinary = Payload {
             data: b"fine".to_vec(),
             ..Default::default()
@@ -242,14 +230,13 @@ mod tests {
             payloads: vec![ordinary.clone(), reference],
         };
 
-        let err = reject_references_in(&mut message).await.unwrap_err();
+        let err = reject_references_in(&mut message).unwrap_err();
 
         assert!(matches!(err, ExternalStorageError::NotConfigured));
         assert!(err.to_string().contains("TMPRL1105"));
         reject_references_in(&mut Payloads {
             payloads: vec![ordinary],
         })
-        .await
         .unwrap();
     }
 

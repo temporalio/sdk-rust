@@ -47,11 +47,23 @@
 //!
 //! [profile.default.grpc_meta]
 //! custom_header = "value"
+//!
+//! [profile.default.ext.my_extension]
+//! some_field = "value"
 //! ```
+//!
+//! ## Extensions
+//!
+//! Tables under `profile.<profile>.ext` hold config for separately packaged extensions, keyed by
+//! extension name. They are not interpreted here, only exposed as raw TOML tables on
+//! [ClientConfigProfile::ext], and strict mode never rejects keys inside them. Extensions are
+//! recommended to use a `TEMPORAL_EXT_<NAME>_` prefix for any environment variables they read.
 
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 use thiserror::Error;
+
+pub use toml;
 
 /// Default profile name when none is specified
 pub const DEFAULT_PROFILE: &str = "default";
@@ -144,6 +156,11 @@ pub struct ClientConfigProfile {
     /// set values that are not normalized may not get overridden when applying environment variables.
     #[builder(default)]
     pub grpc_meta: HashMap<String, String>,
+
+    /// Raw extension config from `profile.<profile>.ext`, keyed by extension name. Each extension
+    /// decodes its own table. Not modified by environment variables.
+    #[builder(default)]
+    pub ext: HashMap<String, toml::Table>,
 }
 
 /// ClientConfigTLS is TLS configuration for a client.
@@ -702,6 +719,9 @@ struct TomlClientConfigProfile {
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     grpc_meta: HashMap<String, String>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    ext: HashMap<String, toml::Table>,
 }
 
 impl TomlClientConfigProfile {
@@ -713,6 +733,7 @@ impl TomlClientConfigProfile {
             tls: None,
             codec: None,
             grpc_meta: HashMap::new(),
+            ext: HashMap::new(),
         }
     }
     fn to_client_config(&self) -> Result<ClientConfigProfile, ConfigError> {
@@ -727,6 +748,7 @@ impl TomlClientConfigProfile {
                 .transpose()?,
             codec: self.codec.as_ref().map(|codec| codec.to_client_config()),
             grpc_meta: HashMap::new(),
+            ext: self.ext.clone(),
         };
 
         if !self.grpc_meta.is_empty() {
@@ -767,6 +789,8 @@ impl TomlClientConfigProfile {
         } else {
             self.grpc_meta.clear();
         }
+
+        self.ext = conf.ext.clone();
     }
 }
 
@@ -967,6 +991,10 @@ mod strict {
         codec: Option<StrictTomlClientConfigCodec>,
         #[serde(default)]
         grpc_meta: HashMap<String, String>,
+        // Extensions own validation of their tables, and a shared config file may hold tables for
+        // extensions this process doesn't load, so strict mode accepts anything under `ext`.
+        #[serde(default)]
+        ext: HashMap<String, toml::Table>,
     }
 
     impl StrictTomlClientConfigProfile {
@@ -978,6 +1006,7 @@ mod strict {
                 tls: self.tls.map(|tls| tls.into_client_config()).transpose()?,
                 codec: self.codec.map(|codec| codec.into_client_config()),
                 grpc_meta: HashMap::new(),
+                ext: self.ext,
             };
 
             if !self.grpc_meta.is_empty() {
@@ -1469,6 +1498,70 @@ foo = "bar"
         .unwrap_err();
         let err_str = err.to_string();
         assert!(err_str.contains("unrecognized_table"));
+    }
+
+    #[test]
+    fn test_client_config_toml_ext() {
+        let toml_str = r#"
+[profile.default]
+address = "localhost:7233"
+
+[profile.default.ext.foo]
+some_field = "value"
+nested = { unknown_key = 1 }
+
+[profile.default.ext.bar]
+list = [1, 2]
+
+[profile.other.ext.foo]
+some_field = "other"
+"#;
+        for strict in [false, true] {
+            let config = ClientConfig::from_toml(
+                toml_str.as_bytes(),
+                ClientConfigFromTOMLOptions::builder()
+                    .strict(strict)
+                    .build(),
+            )
+            .unwrap();
+
+            let default_ext = &config.profiles["default"].ext;
+            assert_eq!(default_ext.len(), 2);
+            assert_eq!(default_ext["foo"]["some_field"].as_str(), Some("value"));
+            assert_eq!(
+                default_ext["foo"]["nested"]["unknown_key"].as_integer(),
+                Some(1)
+            );
+            assert_eq!(default_ext["bar"]["list"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                config.profiles["other"].ext["foo"]["some_field"].as_str(),
+                Some("other")
+            );
+
+            let toml_out = config.to_toml().unwrap();
+            let config2 = ClientConfig::from_toml(&toml_out, Default::default()).unwrap();
+            assert_eq!(config, config2);
+        }
+    }
+
+    #[test]
+    fn test_load_client_config_profile_ext_with_env() {
+        let toml_str = r#"
+[profile.default.ext.foo]
+some_field = "value"
+"#;
+        let mut vars = HashMap::new();
+        vars.insert(
+            "TEMPORAL_EXT_FOO_SOME_FIELD".to_string(),
+            "env-value".to_string(),
+        );
+        let options = LoadClientConfigProfileOptions {
+            config_source: Some(DataSource::Data(toml_str.as_bytes().to_vec())),
+            ..Default::default()
+        };
+        // Extensions apply their own env vars, so core leaves ext as it was in the file
+        let profile = load_client_config_profile(options, Some(&vars)).unwrap();
+        assert_eq!(profile.ext["foo"]["some_field"].as_str(), Some("value"));
     }
 
     #[test]

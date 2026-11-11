@@ -1253,7 +1253,8 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
             .map(|value| value.0.data),
         Some("codec-describe".to_owned())
     );
-    // Making sure codec isn't used when decoding user metadata
+    // The ungated codec garbles any payload it did not encode, so this only round-trips if start
+    // and describe both apply the codec to user metadata.
     assert_eq!(desc.static_summary(), Some("codec summary"));
     assert_eq!(desc.static_details(), Some("codec details"));
 }

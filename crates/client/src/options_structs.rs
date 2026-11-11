@@ -8,8 +8,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
     ActivityCloseTimeouts, MemoValues, RetryPolicy, VersioningOverride,
     data_converters::{
-        DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
-        SerializationContext, SerializationContextData, WorkflowSerializationContext,
+        DataConverter, GenericPayloadConverter, PayloadConversionError, SerializationContext,
+        SerializationContextData, WorkflowSerializationContext,
     },
     payload_visitor::encode_payloads,
     protos::temporal::api::{
@@ -597,25 +597,20 @@ impl WorkflowStartOptions {
         Ok(Some(memo))
     }
 
-    pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
-        (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
-            let payload_converter = PayloadConverter::default();
-            let context_data =
-                SerializationContextData::Workflow(WorkflowSerializationContext::new());
-            let context = SerializationContext::new(&context_data, &payload_converter);
-            UserMetadata {
-                summary: self.static_summary.as_ref().map(|summary| {
-                    payload_converter
-                        .to_payload(&context, summary)
-                        .expect("String-to-JSON payload serialization is infallible")
-                }),
-                details: self.static_details.as_ref().map(|details| {
-                    payload_converter
-                        .to_payload(&context, details)
-                        .expect("String-to-JSON payload serialization is infallible")
-                }),
-            }
-        })
+    pub(crate) async fn encoded_user_metadata(
+        &self,
+        data_converter: &DataConverter,
+    ) -> Result<Option<UserMetadata>, PayloadConversionError> {
+        let context = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let summary = match &self.static_summary {
+            Some(summary) => Some(data_converter.to_payload(&context, summary).await?),
+            None => None,
+        };
+        let details = match &self.static_details {
+            Some(details) => Some(data_converter.to_payload(&context, details).await?),
+            None => None,
+        };
+        Ok((summary.is_some() || details.is_some()).then_some(UserMetadata { summary, details }))
     }
 }
 

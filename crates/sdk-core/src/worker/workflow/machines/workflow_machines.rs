@@ -461,14 +461,13 @@ impl WorkflowMachines {
                         ..Default::default()
                     };
                 }
-                Some(history_event::Attributes::WorkflowTaskStartedEventAttributes(a)) => {
-                    if a.scheduled_event_id == self.last_wft.scheduled_event_id {
-                        self.last_wft.started_event_id = event.event_id;
-                        // This is the conversion of the poll response's started time, so the two
-                        // are equal.
-                        self.last_wft.started_time =
-                            event.event_time.and_then(|t| t.try_into().ok());
-                    }
+                Some(history_event::Attributes::WorkflowTaskStartedEventAttributes(a))
+                    if a.scheduled_event_id == self.last_wft.scheduled_event_id =>
+                {
+                    self.last_wft.started_event_id = event.event_id;
+                    // This is the conversion of the poll response's started time, so the two
+                    // are equal.
+                    self.last_wft.started_time = event.event_time.and_then(|t| t.try_into().ok());
                 }
                 Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(a)) => {
                     let wft = self.last_wft;

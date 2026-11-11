@@ -2,15 +2,44 @@
 //!
 //! This module bridges the environment/file-based configuration in `temporalio-common` with
 //! the client connection types.
+//!
+//! ## Extensions
+//!
+//! With the `experimental` feature, separately packaged extensions can add their own
+//! configuration and client behavior by implementing `ClientConfigExtension`. Each extension owns
+//! a TOML table under `ext` in each profile:
+//!
+//! ```toml
+//! [profile.default.ext.my_extension]
+//! some_field = "value"
+//! ```
+//!
+//! Pass extensions to `ClientOptions::load_from_config_with_extensions`. Each is called in order
+//! with the loaded profile and environment, and any client plugin it returns is registered on the
+//! returned `ClientOptions`. Pass the returned options to `Client::connect`; building a
+//! `Connection` yourself and calling `Client::new` skips plugins' connection hooks:
+//!
+//! ```rust,ignore
+//! let (conn_options, client_options) = ClientOptions::load_from_config_with_extensions(
+//!     LoadClientConfigProfileOptions::default(),
+//!     &[&MyExtension],
+//! )?;
+//! let client = Client::connect(conn_options, client_options).await?;
+//! ```
+//!
+//! Extensions are recommended to use a `TEMPORAL_EXT_<NAME>_` prefix for their environment
+//! variables. See the `ClientConfigExtension` docs for a complete example.
 
 use std::{collections::HashMap, fs};
 use url::Url;
 
 pub use temporalio_common::envconfig::{
-    ClientConfigProfile, ConfigError, DataSource, LoadClientConfigProfileOptions,
+    ClientConfigProfile, ConfigError, DataSource, LoadClientConfigProfileOptions, toml,
 };
 use temporalio_common::envconfig::{ClientConfigTLS, load_client_config_profile};
 
+#[cfg(feature = "experimental")]
+use crate::ErasedClientPlugin;
 use crate::{ClientOptions, ClientTlsOptions, ConnectionOptions, TlsOptions};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
@@ -23,6 +52,187 @@ impl ClientOptions {
     ) -> Result<(ConnectionOptions, ClientOptions), ConfigError> {
         load_from_config_with_env(options, None)
     }
+
+    /// Load client and connection options like [`ClientOptions::load_from_config`], then apply
+    /// `extensions`.
+    ///
+    /// Each extension is called in order with the loaded profile, and any plugin it returns is
+    /// registered on the returned [`ClientOptions`]. Extension names must be non-empty and unique.
+    /// Errors returned by an extension are wrapped in a [`ClientConfigExtensionError`].
+    ///
+    /// Pass the returned options to [`Client::connect`](crate::Client::connect) so that plugin
+    /// connection option hooks are applied. [`Client::new`](crate::Client::new) only applies
+    /// client option hooks.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
+    pub fn load_from_config_with_extensions(
+        options: LoadClientConfigProfileOptions,
+        extensions: &[&dyn ClientConfigExtension],
+    ) -> Result<(ConnectionOptions, ClientOptions), ConfigError> {
+        load_from_config_with_extensions_and_env(options, extensions, None)
+    }
+}
+
+/// Reads extension config from a loaded profile and the environment, and returns a client plugin
+/// that applies it. Passed to [`ClientOptions::load_from_config_with_extensions`].
+///
+/// An extension's TOML config lives in the `profile.<profile>.ext.<name>` table, available as
+/// `profile.ext[name]`. Extensions are recommended to use a `TEMPORAL_EXT_<NAME>_` prefix for their
+/// environment variables.
+///
+/// **Experimental:** This API may change or be removed.
+#[cfg(feature = "experimental")]
+pub trait ClientConfigExtension: Send + Sync {
+    /// The extension's table key under `profile.<profile>.ext`. Must be non-empty and unique among
+    /// loaded extensions.
+    fn name(&self) -> &str;
+
+    /// Read this extension's config from the profile and env, and return a plugin that applies it,
+    /// or `None` if there's nothing to apply.
+    fn client_plugin(
+        &self,
+        req: ClientConfigExtensionRequest<'_>,
+    ) -> Result<Option<ErasedClientPlugin>, ConfigError>;
+}
+
+/// Input to [`ClientConfigExtension::client_plugin`].
+///
+/// **Experimental:** This API may change or be removed.
+#[cfg(feature = "experimental")]
+#[derive(Debug, Clone, Copy, bon::Builder)]
+#[non_exhaustive]
+pub struct ClientConfigExtensionRequest<'a> {
+    /// Profile that was loaded, after environment variables have been applied (unless disabled).
+    pub profile: &'a ClientConfigProfile,
+    /// Environment variables to read extension env vars from, or `None` if env loading is
+    /// disabled. This is the env override map if one was given, otherwise the process
+    /// environment.
+    pub env: Option<ClientConfigEnv<'a>>,
+}
+
+/// Environment variables available to a [`ClientConfigExtension`], backed by either an override
+/// map or the process environment. Process environment variables are read when requested rather
+/// than copied up front.
+///
+/// **Experimental:** This API may change or be removed.
+#[cfg(feature = "experimental")]
+#[derive(Debug, Clone, Copy)]
+pub struct ClientConfigEnv<'a>(EnvSource<'a>);
+
+#[cfg(feature = "experimental")]
+#[derive(Debug, Clone, Copy)]
+enum EnvSource<'a> {
+    Map(&'a HashMap<String, String>),
+    Process,
+}
+
+#[cfg(feature = "experimental")]
+impl<'a> ClientConfigEnv<'a> {
+    /// Environment backed by the given map.
+    pub fn from_map(map: &'a HashMap<String, String>) -> Self {
+        Self(EnvSource::Map(map))
+    }
+
+    /// Environment backed by the process environment.
+    pub fn process() -> Self {
+        Self(EnvSource::Process)
+    }
+
+    /// Get a single environment variable, or `None` if it isn't set. Fails if a process
+    /// environment variable's value isn't valid UTF-8.
+    pub fn get(&self, key: &str) -> Result<Option<String>, ConfigError> {
+        match self.0 {
+            EnvSource::Map(map) => Ok(map.get(key).cloned()),
+            EnvSource::Process => match std::env::var(key) {
+                Ok(v) => Ok(Some(v)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(e) => Err(e.into()),
+            },
+        }
+    }
+
+    /// Iterate over all environment variables, e.g. to find those with a given prefix. Process
+    /// environment variables whose name or value isn't valid UTF-8 are skipped.
+    pub fn vars(&self) -> Box<dyn Iterator<Item = (String, String)> + 'a> {
+        match self.0 {
+            EnvSource::Map(map) => Box::new(map.iter().map(|(k, v)| (k.clone(), v.clone()))),
+            EnvSource::Process => Box::new(
+                std::env::vars_os()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+            ),
+        }
+    }
+}
+
+/// An error returned by a [`ClientConfigExtension`], wrapped in [`ConfigError::LoadError`].
+///
+/// **Experimental:** This API may change or be removed.
+#[cfg(feature = "experimental")]
+#[derive(Debug, thiserror::Error)]
+#[error("client config extension '{extension_name}': {source}")]
+#[non_exhaustive]
+pub struct ClientConfigExtensionError {
+    /// Name of the extension that failed.
+    pub extension_name: String,
+    /// The error returned by the extension.
+    #[source]
+    pub source: ConfigError,
+}
+
+#[cfg(feature = "experimental")]
+fn load_from_config_with_extensions_and_env(
+    options: LoadClientConfigProfileOptions,
+    extensions: &[&dyn ClientConfigExtension],
+    env_vars: Option<&HashMap<String, String>>,
+) -> Result<(ConnectionOptions, ClientOptions), ConfigError> {
+    let mut seen = std::collections::HashSet::with_capacity(extensions.len());
+    for (i, ext) in extensions.iter().enumerate() {
+        let name = ext.name();
+        if name.is_empty() {
+            return Err(ConfigError::InvalidConfig(format!(
+                "client config extension at index {i} has empty name"
+            )));
+        }
+        if !seen.insert(name) {
+            return Err(ConfigError::InvalidConfig(format!(
+                "duplicate client config extension name '{name}'"
+            )));
+        }
+    }
+
+    let disable_env = options.disable_env;
+    let profile = load_client_config_profile(options, env_vars)?;
+    let namespace = profile
+        .namespace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
+    // Convert before calling extensions so invalid core config fails before any extension work,
+    // which may be expensive (e.g. fetching secrets).
+    let conn_opts = ConnectionOptions::try_from(profile.clone())?;
+
+    let env = match (disable_env, env_vars) {
+        (true, _) => None,
+        (false, Some(env_vars)) => Some(ClientConfigEnv::from_map(env_vars)),
+        (false, None) => Some(ClientConfigEnv::process()),
+    };
+    let req = ClientConfigExtensionRequest {
+        profile: &profile,
+        env,
+    };
+    let mut plugins = Vec::new();
+    for ext in extensions {
+        let plugin = ext.client_plugin(req).map_err(|source| {
+            ConfigError::LoadError(Box::new(ClientConfigExtensionError {
+                extension_name: ext.name().to_owned(),
+                source,
+            }))
+        })?;
+        plugins.extend(plugin);
+    }
+
+    let client_opts = ClientOptions::new(namespace).plugins(plugins).build();
+    Ok((conn_opts, client_opts))
 }
 
 // Separate function allows injecting env vars for testing.
@@ -400,5 +610,203 @@ namespace = "custom-ns"
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "http://custom-server:9090/");
         assert_eq!(client.namespace, "custom-ns");
+    }
+
+    #[cfg(feature = "experimental")]
+    mod extensions {
+        use super::*;
+        use crate::{ClientPlugin, ErasedClientPlugin};
+        use std::sync::Mutex;
+
+        type ClientPluginResult = Result<Option<ErasedClientPlugin>, ConfigError>;
+
+        struct TestExtension<F> {
+            name: &'static str,
+            client_plugin: F,
+        }
+
+        impl<F> ClientConfigExtension for TestExtension<F>
+        where
+            F: Fn(ClientConfigExtensionRequest<'_>) -> ClientPluginResult + Send + Sync,
+        {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn client_plugin(&self, req: ClientConfigExtensionRequest<'_>) -> ClientPluginResult {
+                (self.client_plugin)(req)
+            }
+        }
+
+        // Closures in a `TestExtension { .. }` literal would be inferred to take a request with one
+        // specific lifetime, rather than any lifetime as the trait impl requires. Passing them
+        // through a function with the `Fn` bound gives them the right signature where they're
+        // written.
+        fn test_ext<F>(name: &'static str, client_plugin: F) -> TestExtension<F>
+        where
+            F: Fn(ClientConfigExtensionRequest<'_>) -> ClientPluginResult + Send + Sync,
+        {
+            TestExtension {
+                name,
+                client_plugin,
+            }
+        }
+
+        fn plugin_ext(name: &'static str) -> impl ClientConfigExtension {
+            test_ext(name, move |_| {
+                Ok(Some(ErasedClientPlugin::new(NamedPlugin(name))))
+            })
+        }
+
+        struct NamedPlugin(&'static str);
+
+        impl ClientPlugin for NamedPlugin {
+            fn name(&self) -> &str {
+                self.0
+            }
+        }
+
+        fn env_only_options() -> LoadClientConfigProfileOptions {
+            LoadClientConfigProfileOptions::builder()
+                .disable_file(true)
+                .build()
+        }
+
+        #[test]
+        fn plugins_appended_in_order() {
+            let skipped = test_ext("skipped", |_| Ok(None));
+            let env = HashMap::new();
+            let (_, client) = load_from_config_with_extensions_and_env(
+                env_only_options(),
+                &[&plugin_ext("first"), &skipped, &plugin_ext("second")],
+                Some(&env),
+            )
+            .unwrap();
+            let names: Vec<_> = client.plugins().iter().map(|p| p.name()).collect();
+            assert_eq!(names, ["first", "second"]);
+        }
+
+        #[rstest]
+        #[case::duplicate(&["foo", "bar", "foo"], "duplicate client config extension name 'foo'")]
+        #[case::empty(&["foo", ""], "client config extension at index 1 has empty name")]
+        fn invalid_names(#[case] names: &[&'static str], #[case] expected: &str) {
+            let called = Mutex::new(false);
+            let exts: Vec<_> = names
+                .iter()
+                .map(|&name| {
+                    test_ext(name, |_| {
+                        *called.lock().unwrap() = true;
+                        Ok(None)
+                    })
+                })
+                .collect();
+            let ext_refs: Vec<&dyn ClientConfigExtension> = exts
+                .iter()
+                .map(|e| e as &dyn ClientConfigExtension)
+                .collect();
+            let env = HashMap::new();
+            let err =
+                load_from_config_with_extensions_and_env(env_only_options(), &ext_refs, Some(&env))
+                    .unwrap_err();
+            assert!(matches!(&err, ConfigError::InvalidConfig(msg) if msg == expected));
+            assert!(!*called.lock().unwrap());
+        }
+
+        #[test]
+        fn extension_error_wrapped_with_name() {
+            let after_called = Mutex::new(false);
+            let failing = test_ext("failing", |_| {
+                Err(ConfigError::InvalidConfig("bad field".to_owned()))
+            });
+            let after = test_ext("after", |_| {
+                *after_called.lock().unwrap() = true;
+                Ok(None)
+            });
+            let env = HashMap::new();
+            let err = load_from_config_with_extensions_and_env(
+                env_only_options(),
+                &[&failing, &after],
+                Some(&env),
+            )
+            .unwrap_err();
+            let ConfigError::LoadError(err) = err else {
+                panic!("unexpected error: {err}");
+            };
+            let err = err.downcast_ref::<ClientConfigExtensionError>().unwrap();
+            assert_eq!(err.extension_name, "failing");
+            assert!(matches!(&err.source, ConfigError::InvalidConfig(msg) if msg == "bad field"));
+            assert_eq!(
+                err.to_string(),
+                "client config extension 'failing': Invalid configuration: bad field"
+            );
+            assert!(!*after_called.lock().unwrap());
+        }
+
+        #[rstest]
+        fn extension_receives_profile_and_env(config_dir: TempDir) {
+            let config_path = write_config(
+                &config_dir,
+                r#"
+[profile.default]
+namespace = "toml-ns"
+
+[profile.default.ext.foo]
+some_field = "toml-value"
+"#,
+            );
+            let seen = Mutex::new(None);
+            let ext = test_ext("foo", |req| {
+                let env = req.env.unwrap();
+                *seen.lock().unwrap() = Some((
+                    req.profile.clone(),
+                    env.get("TEMPORAL_EXT_FOO_SOME_FIELD").unwrap(),
+                    env.vars().collect::<HashMap<_, _>>(),
+                ));
+                Ok(None)
+            });
+            let env = HashMap::from([
+                ("TEMPORAL_NAMESPACE".to_owned(), "env-ns".to_owned()),
+                (
+                    "TEMPORAL_EXT_FOO_SOME_FIELD".to_owned(),
+                    "env-value".to_owned(),
+                ),
+            ]);
+            let opts = LoadClientConfigProfileOptions::builder()
+                .config_source(DataSource::Path(config_path.to_str().unwrap().to_owned()))
+                .build();
+            load_from_config_with_extensions_and_env(opts, &[&ext], Some(&env)).unwrap();
+
+            let (profile, ext_value, ext_vars) = seen.into_inner().unwrap().unwrap();
+            // Core env vars are applied to the profile before extensions see it
+            assert_eq!(profile.namespace.as_deref(), Some("env-ns"));
+            assert_eq!(
+                profile.ext["foo"]["some_field"].as_str(),
+                Some("toml-value")
+            );
+            assert_eq!(ext_value.as_deref(), Some("env-value"));
+            assert_eq!(ext_vars, env);
+        }
+
+        #[test]
+        fn extension_env_from_process_or_disabled() {
+            let saw_env = Mutex::new(None);
+            let ext = test_ext("foo", |req| {
+                *saw_env.lock().unwrap() = Some(req.env.map(|env| env.get("PATH").unwrap()));
+                Ok(None)
+            });
+
+            ClientOptions::load_from_config_with_extensions(env_only_options(), &[&ext]).unwrap();
+            assert_eq!(
+                *saw_env.lock().unwrap(),
+                Some(Some(std::env::var("PATH").ok()))
+            );
+
+            let opts = LoadClientConfigProfileOptions::builder()
+                .config_source(DataSource::Data(Vec::new()))
+                .disable_env(true)
+                .build();
+            ClientOptions::load_from_config_with_extensions(opts, &[&ext]).unwrap();
+            assert_eq!(*saw_env.lock().unwrap(), Some(None));
+        }
     }
 }

@@ -11,34 +11,87 @@ use crate::data_converters::{
 };
 use crate::{
     data_converters::{DataConverter, PayloadConversionError},
-    payload_visitor::PayloadVisitable,
+    payload_visitor::PayloadFieldCollectable,
+    protos::coresdk::common::ExternalStorageMetrics,
 };
+use std::{collections::BTreeSet, time::Instant};
 
 mod references;
 #[cfg(feature = "experimental")]
 mod runner;
 
+/// What one or more store or retrieve passes moved, and the time they took, reported to Core on a
+/// workflow completion. Only a pass that moved at least one payload has metrics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageOperationMetrics {
+    totals: StorageOperationTotals,
+    /// From the earliest pass's start to the latest pass's end, so merging is correct whether the
+    /// passes ran one after another or concurrently.
+    start: Instant,
+    end: Instant,
+}
+
+/// What a pass moved, summed over the fields it visited.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StorageOperationTotals {
+    payload_count: u64,
+    total_size_bytes: u64,
+    driver_names: BTreeSet<String>,
+}
+
+impl StorageOperationTotals {
+    fn add(&mut self, other: Self) {
+        self.payload_count += other.payload_count;
+        self.total_size_bytes += other.total_size_bytes;
+        self.driver_names.extend(other.driver_names);
+    }
+}
+
+impl StorageOperationMetrics {
+    /// Combine two passes' metrics, in any order.
+    pub fn merge(mut self, other: Self) -> Self {
+        self.totals.add(other.totals);
+        self.start = self.start.min(other.start);
+        self.end = self.end.max(other.end);
+        self
+    }
+
+    /// The metrics in Core's form.
+    pub fn into_proto(self) -> ExternalStorageMetrics {
+        ExternalStorageMetrics {
+            payload_count: self.totals.payload_count,
+            total_size_bytes: self.totals.total_size_bytes,
+            total_duration: (self.end - self.start).try_into().ok(),
+            driver_names: self.totals.driver_names.into_iter().collect(),
+        }
+    }
+}
+
 /// Offload every eligible payload in an outbound message to the data converter's external storage.
 /// Runs after [`encode_payloads`](crate::payload_visitor::encode_payloads), since the size
-/// threshold applies to encoded payloads. Does nothing without the `experimental` feature.
+/// threshold applies to encoded payloads. Does nothing without the `experimental` feature. Returns
+/// metrics only when a payload was offloaded.
 ///
 /// On error, reported as [`PayloadConversionError::ExternalStorage`], the message is left partly
 /// processed and must not be sent.
-pub async fn store_external_payloads<M: PayloadVisitable + Send>(
+pub async fn store_external_payloads<M: PayloadFieldCollectable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
     target: Option<StoreTarget>,
-) -> Result<(), PayloadConversionError> {
+) -> Result<Option<StorageOperationMetrics>, PayloadConversionError> {
     #[cfg(feature = "experimental")]
-    runner::store_in(
+    let metrics = runner::store_in(
         data_converter.external_storage(),
         msg,
         target.as_ref().map(|t| &t.info),
     )
     .await?;
     #[cfg(not(feature = "experimental"))]
-    let _ = (msg, data_converter, target);
-    Ok(())
+    let metrics = {
+        let _ = (msg, data_converter, target);
+        None
+    };
+    Ok(metrics)
 }
 
 /// The execution an outbound message's payloads are stored on behalf of, given to
@@ -119,21 +172,23 @@ fn non_empty(value: &str) -> Option<String> {
 /// Runs before [`decode_payloads`](crate::payload_visitor::decode_payloads), since a driver returns
 /// a payload as it was before offloading. Without external storage to retrieve them, which includes
 /// every build without the `experimental` feature, a reference is an error instead. Failures are
-/// reported as [`PayloadConversionError::ExternalStorage`].
+/// reported as [`PayloadConversionError::ExternalStorage`]. Returns metrics only when a payload was
+/// retrieved.
 ///
 /// On error the message is left partly processed and must not be used.
-pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
+pub async fn retrieve_external_payloads<M: PayloadFieldCollectable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
-) -> Result<(), PayloadConversionError> {
+) -> Result<Option<StorageOperationMetrics>, PayloadConversionError> {
     #[cfg(feature = "experimental")]
-    runner::retrieve_in(data_converter.external_storage(), msg).await?;
+    let metrics = runner::retrieve_in(data_converter.external_storage(), msg).await?;
     #[cfg(not(feature = "experimental"))]
-    {
+    let metrics = {
         let _ = data_converter;
-        references::reject_references_in(msg).await?;
-    }
-    Ok(())
+        references::reject_references_in(msg)?;
+        None
+    };
+    Ok(metrics)
 }
 
 #[cfg(test)]
@@ -142,7 +197,27 @@ mod tests {
     use crate::{
         data_converters::ExternalStorageError, protos::temporal::api::common::v1::Payloads,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
+
+    #[test]
+    fn merged_passes_report_the_time_they_spanned() {
+        let start = Instant::now();
+        let pass = |from: u64, to: u64| StorageOperationMetrics {
+            totals: StorageOperationTotals {
+                payload_count: 1,
+                ..Default::default()
+            },
+            start: start + Duration::from_millis(from),
+            end: start + Duration::from_millis(to),
+        };
+
+        let proto = pass(50, 150).merge(pass(0, 100)).into_proto();
+        assert_eq!(proto.payload_count, 2);
+        assert_eq!(
+            proto.total_duration,
+            Duration::from_millis(150).try_into().ok()
+        );
+    }
 
     #[tokio::test]
     async fn unretrievable_reference_is_a_payload_conversion_error() {

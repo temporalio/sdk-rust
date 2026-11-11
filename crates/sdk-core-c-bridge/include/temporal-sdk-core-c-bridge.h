@@ -886,6 +886,22 @@ typedef struct TemporalCorePollerBehavior {
   const struct TemporalCorePollerBehaviorAutoscaling *autoscaling;
 } TemporalCorePollerBehavior;
 
+typedef struct TemporalCorePluginInfo {
+  struct TemporalCoreByteArrayRef name;
+  /**
+   * Empty if the plugin does not report a version.
+   */
+  struct TemporalCoreByteArrayRef version;
+} TemporalCorePluginInfo;
+
+typedef struct TemporalCorePluginInfoArray {
+  /**
+   * Plugin entries read during worker construction; ownership remains with the caller.
+   */
+  const struct TemporalCorePluginInfo *data;
+  size_t size;
+} TemporalCorePluginInfoArray;
+
 typedef struct TemporalCoreWorkerOptions {
   struct TemporalCoreByteArrayRef namespace_;
   struct TemporalCoreByteArrayRef task_queue;
@@ -906,7 +922,7 @@ typedef struct TemporalCoreWorkerOptions {
   struct TemporalCorePollerBehavior nexus_task_poller_behavior;
   bool nondeterminism_as_workflow_fail;
   struct TemporalCoreByteArrayRefArray nondeterminism_as_workflow_fail_for_types;
-  struct TemporalCoreByteArrayRefArray plugins;
+  struct TemporalCorePluginInfoArray plugins;
   struct TemporalCoreByteArrayRefArray storage_drivers;
   /**
    * If set, the worker won't proactively fail completions whose payloads exceed the namespace

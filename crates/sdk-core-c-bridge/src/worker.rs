@@ -52,7 +52,7 @@ pub struct WorkerOptions {
     pub nexus_task_poller_behavior: PollerBehavior,
     pub nondeterminism_as_workflow_fail: bool,
     pub nondeterminism_as_workflow_fail_for_types: ByteArrayRefArray,
-    pub plugins: ByteArrayRefArray,
+    pub plugins: PluginInfoArray,
     pub storage_drivers: ByteArrayRefArray,
     /// If set, the worker won't proactively fail completions whose payloads exceed the namespace
     /// error limits; oversized payloads are sent and the server enforces the limit.
@@ -61,6 +61,38 @@ pub struct WorkerOptions {
     /// Maximum number of activity slots that may be reserved for eager execution when completing
     /// a workflow task. Zero disables eager activity execution.
     pub max_eager_activity_reservations_per_workflow_task: u32,
+}
+
+#[repr(C)]
+pub struct PluginInfo {
+    pub name: ByteArrayRef,
+    /// Empty if the plugin does not report a version.
+    pub version: ByteArrayRef,
+}
+
+#[repr(C)]
+pub struct PluginInfoArray {
+    /// Plugin entries read during worker construction; ownership remains with the caller.
+    pub data: *const PluginInfo,
+    pub size: libc::size_t,
+}
+
+impl PluginInfoArray {
+    pub fn empty() -> PluginInfoArray {
+        PluginInfoArray {
+            data: std::ptr::null(),
+            size: 0,
+        }
+    }
+
+    fn to_slice(&self) -> &[PluginInfo] {
+        // A null pointer is not a valid slice pointer even for a zero length.
+        if self.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.data, self.size) }
+        }
+    }
 }
 
 #[repr(C)]
@@ -1278,16 +1310,14 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
             )
             .plugins(
                 opt.plugins
-                    .to_str_vec()
-                    .into_iter()
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .map(
-                        |name| temporalio_common::protos::temporal::api::worker::v1::PluginInfo {
-                            name: name.to_owned(),
-                            version: String::new(),
-                        },
-                    )
+                    .to_slice()
+                    .iter()
+                    .map(|plugin| {
+                        temporalio_common::protos::temporal::api::worker::v1::PluginInfo {
+                            name: plugin.name.to_string(),
+                            version: plugin.version.to_option_string().unwrap_or_default(),
+                        }
+                    })
                     .collect::<HashSet<_>>(),
             )
             .storage_drivers(
@@ -1506,7 +1536,7 @@ mod tests {
             nexus_task_poller_behavior: simple_poller_behavior(2),
             nondeterminism_as_workflow_fail: false,
             nondeterminism_as_workflow_fail_for_types: crate::ByteArrayRefArray::empty(),
-            plugins: crate::ByteArrayRefArray::empty(),
+            plugins: PluginInfoArray::empty(),
             storage_drivers: crate::ByteArrayRefArray::empty(),
             disable_payload_error_limit: false,
             max_eager_activity_reservations_per_workflow_task: 3,

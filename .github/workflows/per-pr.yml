@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-arm, macos-intel, macos-arm, windows-latest]
+        os: [ubuntu-latest, ubuntu-arm, macos-arm, windows-latest]
         include:
           - os: windows-latest
             timeoutMinutes: 30
@@ -54,10 +54,7 @@ jobs:
             runsOn: ubuntu-24.04-arm64-2-core
             timeoutMinutes: 30
           - os: macos-arm
-            runsOn: macos-14
-          - os: macos-intel
-            runsOn: macos-26-intel
-            timeoutMinutes: 40
+            runsOn: macos-15
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -104,9 +101,12 @@ jobs:
       matrix:
         include:
           - group: rust-1.88
-            crates: client common common-wasm macros protos sdk-core workflow
+            crates: aws-s3driver client common common-wasm macros protos sdk-core workflow
+            feature-args: --all-features
           - group: rust-1.92
             crates: sdk
+            # Wasmtime raises the MSRV only for the experimental wasm-workflows feature.
+            feature-args: --features experimental,otel,opentelemetry,examples,wasm-examples,dynamic-tls,testing
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup
@@ -114,10 +114,13 @@ jobs:
           mise-install-args: protoc cargo:cargo-msrv
           rust-cache-key: msrv-${{ matrix.group }}
       - name: Verify crate MSRVs
+        env:
+          FEATURE_ARGS: ${{ matrix.feature-args }}
         run: |
           read -ra crates <<< "${{ matrix.crates }}"
+          read -ra feature_args <<< "$FEATURE_ARGS"
           for crate in "${crates[@]}"; do
-            cargo msrv verify --all-features --path "crates/$crate"
+            cargo msrv verify "${feature_args[@]}" --path "crates/$crate"
           done
 
   cgroup-tests:
@@ -145,17 +148,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-arm, macos-intel, macos-arm, windows-latest]
+        os: [ubuntu-latest, ubuntu-arm, macos-arm, windows-latest]
         include:
           - os: windows-latest
           - os: ubuntu-latest
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
           - os: macos-arm
-            runsOn: macos-14
-          - os: macos-intel
-            runsOn: macos-26-intel
-            timeoutMinutes: 40
+            runsOn: macos-15
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -372,7 +372,7 @@ jobs:
     name: Required PR Checks
     # Without always(), this job would be skipped when a dependency fails, and GitHub
     # treats a skipped required check as passing.
-    if: always()
+    if: ${{ always() && github.event_name == 'pull_request' }}
     needs:
       - build-and-lint
       - test
