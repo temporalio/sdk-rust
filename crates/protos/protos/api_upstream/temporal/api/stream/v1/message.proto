@@ -30,9 +30,12 @@ message StreamRef {
 // started_time. An epoch orders the writes of one Producer only, and a Producer is one run. A
 // reset run and the next run of a chain are other Producers, so their epochs start again.
 message WorkflowTaskEpoch {
+    // Required.
     int64 started_event_id = 1;
+    // Required. 1 or more.
     int32 attempt = 2;
-    // Tells a reused started event id apart, for example after a dropped speculative task.
+    // Tells a reused started event id apart, for example after a dropped speculative task. Core
+    // leaves it empty when the server gave the task no started time.
     google.protobuf.Timestamp started_time = 3;
 }
 
@@ -41,18 +44,19 @@ message WorkflowTaskEpoch {
 // Workflow Task is a higher epoch. The Producer carries the run. Records of two runs have no
 // order by epoch, only their order in the Stream.
 message LocalActivityEpoch {
-    // The Workflow Task attempt that dispatched the Local Activity.
+    // Required. The Workflow Task attempt that dispatched the Local Activity.
     WorkflowTaskEpoch task = 1;
-    // The Local Activity's own attempt in that Workflow Task.
+    // Required. The Local Activity's own attempt in that Workflow Task, 1 or more.
     int32 attempt = 2;
 }
 
 // Experimental. Might change in the future.
 // The attempt of an Activity. It orders by attempt_scheduled_time, then attempt.
 message ActivityEpoch {
-    // When the server scheduled this attempt. An Activity reset starts the attempt count again,
-    // so only this time orders the attempts across a reset.
+    // Required. When the server scheduled this attempt. An Activity reset starts the attempt count
+    // again, so only this time orders the attempts across a reset.
     google.protobuf.Timestamp attempt_scheduled_time = 1;
+    // Required. 1 or more.
     int32 attempt = 2;
 }
 
@@ -61,22 +65,25 @@ message ActivityEpoch {
 // name across restarts stores this number and raises it at each start, so the new process
 // fences the old one. A client with no name of its own is a new Producer in each process.
 message ClientEpoch {
+    // Required. 1 or more.
     int32 attempt = 1;
 }
 
 // Experimental. Might change in the future.
 // A Workflow run Producer. It writes in its Workflow Task. A higher epoch fences the lower ones.
 message WorkflowProducer {
-    // The run id of the Workflow run, not of its chain. Each run is its own Producer.
+    // Required. The run id of the Workflow run, not of its chain. Each run is its own Producer.
     string run_id = 1;
+    // A Workflow Producer only closes a Stream, and its close sends no epoch.
     WorkflowTaskEpoch epoch = 2;
 }
 
 // Experimental. Might change in the future.
 // A Local Activity Producer, one for each call of a run. A higher epoch fences the lower ones.
 message LocalActivityProducer {
-    // The run id of the Workflow run.
+    // Required. The run id of the Workflow run.
     string run_id = 1;
+    // Required.
     LocalActivityEpoch epoch = 2;
 }
 
@@ -87,6 +94,7 @@ message ActivityProducer {
     // The run id of the Workflow run that scheduled the Activity. Empty for a Standalone
     // Activity, whose own run id is in the Producer id.
     string run_id = 1;
+    // Required.
     ActivityEpoch epoch = 2;
 }
 
@@ -94,6 +102,7 @@ message ActivityProducer {
 // A client Producer. A higher epoch only fences the lower ones, since a restarted client's earlier
 // Records are real messages, not the Records of a failed attempt. A client has no run.
 message ClientProducer {
+    // Required.
     ClientEpoch epoch = 1;
 }
 
@@ -103,8 +112,8 @@ message ClientProducer {
 // fails with FENCED. The epochs of two Producers never compare. A run-based kind carries its run,
 // so a client can't.
 message Producer {
-    // Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run. It is
-    // unique in one Stream, and a Stream is in one namespace, so it carries no namespace.
+    // Required. Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
+    // It is unique in one Stream, so it carries no namespace.
     string id = 1;
     // Required. The case is the kind of the Producer.
     oneof kind {
@@ -120,14 +129,6 @@ message Producer {
 }
 
 // Experimental. Might change in the future.
-// The Producer of a write. An append and a close carry the same writer, so the Store orders each
-// write the same way.
-message StreamWriter {
-    // Required on a write.
-    Producer producer = 1;
-}
-
-// Experimental. Might change in the future.
 // One Record of a batch to append. The Store adds the batch's Producer and an offset.
 message AppendRecord {
     temporal.api.common.v1.Payload body = 1;
@@ -138,6 +139,10 @@ message AppendRecord {
 message StreamData {
     Producer producer = 1;
     temporal.api.common.v1.Payload body = 2;
+    // Required. The Record's offset. An offset is ordered and unique in one Stream, and it is
+    // sparse. Offsets have gaps, so they don't count Records. An offset is never empty. A read
+    // gives its Stream, so the read checks the offset against that Stream.
+    bytes offset = 3;
 }
 
 // Experimental. Might change in the future.
@@ -149,18 +154,18 @@ message StreamClose {
     Producer producer = 1;
     // Why the Stream closed.
     temporal.api.enums.v1.StreamCloseStatus status = 2;
+    // Required. Where the Stream ended.
+    bytes offset = 3;
 }
 
 // Experimental. Might change in the future.
-// An offset is ordered and unique in one Stream, and it is sparse. Offsets have gaps, so they
-// don't count Records. An offset is never empty. A read gives its Stream, so the read checks the
-// offset against that Stream.
+// One item that a read gives. Each item carries its own offset.
 message StreamRecord {
-    bytes offset = 1;
-    // A read item is a Record or the close.
+    // A read item is a Record or the close. A newer server may send a kind that an older SDK
+    // doesn't know.
     oneof item {
-        StreamData data = 2;
-        StreamClose close = 4;
+        StreamData data = 1;
+        StreamClose close = 2;
     }
 }
 

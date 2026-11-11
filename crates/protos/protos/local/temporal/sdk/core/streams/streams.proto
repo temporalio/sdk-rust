@@ -19,8 +19,8 @@ import "temporal/api/stream/v1/message.proto";
 // continues above its earlier batches.
 message OpenWriterRequest {
     temporal.api.stream.v1.StreamRef ref = 1;
-    // Each batch sends it as AppendRecords does.
-    temporal.api.stream.v1.StreamWriter writer = 2;
+    // Required. The Producer of each batch, which sends it as AppendRecords does.
+    temporal.api.stream.v1.Producer producer = 2;
     // A write sends at most this many Records in one batch. Zero is 1000.
     int32 max_batch_size = 3;
     // How long a write retries a Store failure. Empty is 10 s.
