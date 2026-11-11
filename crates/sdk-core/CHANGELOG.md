@@ -33,6 +33,11 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Workflows no longer get stuck failing workflow tasks when an activity cancelled with the
+  `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
+  late completions of abandoned activities already were.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added

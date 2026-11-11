@@ -59,9 +59,10 @@ use temporalio_common::{
         temporal::api::{
             command::v1::command::Attributes,
             common::v1::{Payload, RetryPolicy},
-            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+            enums::v1::{CommandType, EventType, RetryState, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
+                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes,
                 TimerFiredEventAttributes, WorkflowPropertiesModifiedExternallyEventAttributes,
                 history_event,
             },
@@ -472,6 +473,133 @@ async fn started_activity_cancellation_abandon(hist_batches: &'static [usize]) {
     let core = build_fake_worker(wfid, t, hist_batches);
 
     verify_activity_cancellation(&core, activity_id, ActivityCancellationType::Abandon).await;
+}
+
+#[derive(Clone, Copy)]
+enum LateActivityEvent {
+    Started,
+    Completed,
+    Failed,
+    TimedOut,
+}
+
+// The server keeps running an abandoned activity, so whatever eventually happens to it still lands
+// in history after the workflow was told the activity was cancelled.
+#[rstest]
+#[case::scheduled_then_completed(false, &[LateActivityEvent::Started, LateActivityEvent::Completed])]
+#[case::scheduled_then_failed(false, &[LateActivityEvent::Started, LateActivityEvent::Failed])]
+#[case::scheduled_then_timed_out(false, &[LateActivityEvent::Started, LateActivityEvent::TimedOut])]
+#[case::scheduled_then_timed_out_unstarted(false, &[LateActivityEvent::TimedOut])]
+#[case::started_then_completed(true, &[LateActivityEvent::Completed])]
+#[case::started_then_failed(true, &[LateActivityEvent::Failed])]
+#[case::started_then_timed_out(true, &[LateActivityEvent::TimedOut])]
+#[tokio::test]
+async fn abandoned_activity_ignores_late_events(
+    #[case] started_before_abandon: bool,
+    #[case] late_events: &[LateActivityEvent],
+    #[values(false, true)] replay: bool,
+) {
+    let activity_seq = 1;
+    let timer_seq = 1;
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled_event_id = t.add_activity_task_scheduled(activity_seq.to_string());
+    let mut started_event_id = if started_before_abandon {
+        t.add_activity_task_started(scheduled_event_id)
+    } else {
+        0
+    };
+    t.add_we_signaled("abandon", vec![]);
+    t.add_full_wf_task();
+    let timer_started_event_id = t.add_timer_started(timer_seq.to_string());
+    for event in late_events {
+        match event {
+            LateActivityEvent::Started => {
+                started_event_id = t.add_activity_task_started(scheduled_event_id);
+            }
+            LateActivityEvent::Completed => {
+                t.add_activity_task_completed(
+                    scheduled_event_id,
+                    started_event_id,
+                    Default::default(),
+                );
+            }
+            LateActivityEvent::Failed => {
+                t.add(ActivityTaskFailedEventAttributes {
+                    scheduled_event_id,
+                    started_event_id,
+                    failure: Some(Failure {
+                        message: "failed after being abandoned".to_string(),
+                        ..Default::default()
+                    }),
+                    retry_state: RetryState::MaximumAttemptsReached.into(),
+                    ..Default::default()
+                });
+            }
+            LateActivityEvent::TimedOut => {
+                t.add(ActivityTaskTimedOutEventAttributes {
+                    scheduled_event_id,
+                    started_event_id,
+                    retry_state: RetryState::Timeout.into(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    t.add_full_wf_task();
+    t.add_timer_fired(timer_started_event_id, timer_seq.to_string());
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let response_batches = if replay {
+        vec![ResponseType::AllHistory]
+    } else {
+        vec![1.into(), 2.into(), 3.into(), 4.into()]
+    };
+    let core = build_fake_worker("fake_wf_id", t, response_batches);
+
+    poll_and_reply(
+        &core,
+        NonSticky,
+        &[
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::InitializeWorkflow(_)),
+                vec![
+                    ScheduleActivity {
+                        seq: activity_seq,
+                        activity_id: activity_seq.to_string(),
+                        cancellation_type: ActivityCancellationType::Abandon as i32,
+                        ..default_act_sched()
+                    }
+                    .into(),
+                ],
+            ),
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::SignalWorkflow(_)),
+                vec![RequestCancelActivity { seq: activity_seq }.into()],
+            ),
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::ResolveActivity(
+                    ResolveActivity {
+                        result: Some(ActivityResolution {
+                            status: Some(activity_resolution::Status::Cancelled(..)),
+                        }),
+                        ..
+                    }
+                )),
+                vec![start_timer_cmd(timer_seq, Duration::from_secs(1))],
+            ),
+            // The activity was already resolved as cancelled, so the late events must not resolve
+            // it again.
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::FireTimer(_)),
+                vec![CompleteWorkflowExecution { result: None }.into()],
+            ),
+        ],
+    )
+    .await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 3]), case::replay(&[3]))]

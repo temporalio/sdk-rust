@@ -88,6 +88,10 @@ fsm! {
     Canceled --(ActivityTaskStarted(i64), shared on_activity_task_started) --> Canceled;
     Canceled --(ActivityTaskCompleted(ActivityTaskCompletedEventAttributes),
         shared on_activity_task_completed) --> Canceled;
+    Canceled --(ActivityTaskFailed(ActivityTaskFailedEventAttributes),
+        shared on_activity_task_failed) --> Canceled;
+    Canceled --(ActivityTaskTimedOut(ActivityTaskTimedOutEventAttributes),
+        shared on_activity_task_timed_out) --> Canceled;
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -653,6 +657,7 @@ impl Canceled {
     ) -> ActivityMachineTransition<Canceled> {
         // Abandoned activities might start anyway. Ignore the result.
         if dat.cancellation_type == ActivityCancellationType::Abandon {
+            debug!(seq = dat.attrs.seq, "Ignoring start of abandoned activity");
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
@@ -668,10 +673,52 @@ impl Canceled {
     ) -> ActivityMachineTransition<Canceled> {
         // Abandoned activities might complete anyway. Ignore the result.
         if dat.cancellation_type == ActivityCancellationType::Abandon {
+            debug!(
+                seq = dat.attrs.seq,
+                "Ignoring completion of abandoned activity"
+            );
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
                 "Non-Abandon cancel mode activities cannot be completed after being cancelled: {attrs:?}"
+            ))
+        }
+    }
+    pub(super) fn on_activity_task_failed(
+        self,
+        dat: &mut SharedState,
+        attrs: ActivityTaskFailedEventAttributes,
+    ) -> ActivityMachineTransition<Canceled> {
+        // The server keeps running abandoned activities, so they might still fail for good (a
+        // non-retryable failure, or retries exhausted). Ignore the result.
+        if dat.cancellation_type == ActivityCancellationType::Abandon {
+            debug!(
+                seq = dat.attrs.seq,
+                "Ignoring failure of abandoned activity"
+            );
+            TransitionResult::default()
+        } else {
+            TransitionResult::Err(nondeterminism!(
+                "Non-Abandon cancel mode activities cannot fail after being cancelled: {attrs:?}"
+            ))
+        }
+    }
+    pub(super) fn on_activity_task_timed_out(
+        self,
+        dat: &mut SharedState,
+        attrs: ActivityTaskTimedOutEventAttributes,
+    ) -> ActivityMachineTransition<Canceled> {
+        // The server keeps enforcing the timeouts of abandoned activities, so they might still
+        // time out. Ignore the result.
+        if dat.cancellation_type == ActivityCancellationType::Abandon {
+            debug!(
+                seq = dat.attrs.seq,
+                "Ignoring timeout of abandoned activity"
+            );
+            TransitionResult::default()
+        } else {
+            TransitionResult::Err(nondeterminism!(
+                "Non-Abandon cancel mode activities cannot time out after being cancelled: {attrs:?}"
             ))
         }
     }
@@ -807,6 +854,7 @@ mod test {
         internal_flags::InternalFlags,
         worker::workflow::{OutgoingJob, machines::Machines},
     };
+    use rstest::rstest;
     use std::{cell::RefCell, mem::discriminant, rc::Rc};
     use temporalio_common::protos::coresdk::workflow_activation::workflow_activation_job;
 
@@ -871,5 +919,47 @@ mod test {
         );
         let curstate = s.state();
         assert!(matches!(curstate, &ActivityMachineState::Canceled(_)));
+    }
+
+    // Abandoned activities keep running on the server, so any outcome may still be recorded after
+    // cancellation. Other cancellation types only reach `Canceled` once the server has nothing more
+    // to report, so a late outcome means history doesn't match the workflow.
+    #[rstest]
+    #[case::abandon(ActivityCancellationType::Abandon, true)]
+    #[case::try_cancel(ActivityCancellationType::TryCancel, false)]
+    #[case::wait_cancellation_completed(ActivityCancellationType::WaitCancellationCompleted, false)]
+    fn late_events_after_cancellation(
+        #[case] cancellation_type: ActivityCancellationType,
+        #[case] ignored: bool,
+    ) {
+        for event in [
+            ActivityMachineEvents::ActivityTaskStarted(6),
+            ActivityMachineEvents::ActivityTaskCompleted(Default::default()),
+            ActivityMachineEvents::ActivityTaskFailed(Default::default()),
+            ActivityMachineEvents::ActivityTaskTimedOut(Default::default()),
+        ] {
+            let mut s = ActivityMachine::from_parts(
+                Canceled {}.into(),
+                SharedState {
+                    scheduled_event_id: 5,
+                    started_event_id: 0,
+                    attrs: Default::default(),
+                    cancellation_type,
+                    cancelled_before_sent: false,
+                    internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                    annotations: Default::default(),
+                },
+            );
+            let res = OnEventWrapper::on_event_mut(&mut s, event);
+            if ignored {
+                assert_matches!(res, Ok(cmds) if cmds.is_empty());
+                assert!(matches!(s.state(), ActivityMachineState::Canceled(_)));
+            } else {
+                assert_matches!(
+                    res,
+                    Err(MachineError::Underlying(WFMachinesError::Nondeterminism(_)))
+                );
+            }
+        }
     }
 }
