@@ -332,6 +332,7 @@ pub trait WorkerClient: Sync + Send {
         &self,
         task_token: TaskToken,
         result: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RespondActivityTaskCompletedResponse>;
     /// Complete a Nexus task
     async fn complete_nexus_task(
@@ -344,12 +345,14 @@ pub trait WorkerClient: Sync + Send {
         &self,
         task_token: TaskToken,
         details: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RecordActivityTaskHeartbeatResponse>;
     /// Cancel an activity task
     async fn cancel_activity_task(
         &self,
         task_token: TaskToken,
         details: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RespondActivityTaskCanceledResponse>;
     /// Fail an activity task
     async fn fail_activity_task(
@@ -358,6 +361,7 @@ pub trait WorkerClient: Sync + Send {
         cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RespondActivityTaskFailedResponse>;
     /// Fail a workflow task
     async fn fail_workflow_task(
@@ -365,6 +369,7 @@ pub trait WorkerClient: Sync + Send {
         task_token: TaskToken,
         cause: WorkflowTaskFailedCause,
         failure: Option<Failure>,
+        resource_id: String,
     ) -> Result<RespondWorkflowTaskFailedResponse>;
     /// Fail a Nexus task
     async fn fail_nexus_task(
@@ -760,6 +765,7 @@ impl WorkerClient for WorkerClientBag {
         &self,
         task_token: TaskToken,
         result: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RespondActivityTaskCompletedResponse> {
         Ok(self
             .client
@@ -775,7 +781,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
+                    resource_id,
                 }
                 .into_request(),
             )
@@ -809,6 +815,7 @@ impl WorkerClient for WorkerClientBag {
         &self,
         task_token: TaskToken,
         details: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RecordActivityTaskHeartbeatResponse> {
         Ok(self
             .client
@@ -819,7 +826,7 @@ impl WorkerClient for WorkerClientBag {
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
-                    resource_id: Default::default(),
+                    resource_id,
                 }
                 .into_request(),
             )
@@ -831,6 +838,7 @@ impl WorkerClient for WorkerClientBag {
         &self,
         task_token: TaskToken,
         details: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RespondActivityTaskCanceledResponse> {
         Ok(self
             .client
@@ -846,7 +854,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
+                    resource_id,
                 }
                 .into_request(),
             )
@@ -860,6 +868,7 @@ impl WorkerClient for WorkerClientBag {
         cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
+        resource_id: String,
     ) -> Result<RespondActivityTaskFailedResponse> {
         Ok(self
             .client
@@ -876,7 +885,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
+                    resource_id,
                     cause: cause as i32,
                 }
                 .into_request(),
@@ -890,6 +899,7 @@ impl WorkerClient for WorkerClientBag {
         task_token: TaskToken,
         cause: WorkflowTaskFailedCause,
         failure: Option<Failure>,
+        resource_id: String,
     ) -> Result<RespondWorkflowTaskFailedResponse> {
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskFailedRequest {
@@ -904,7 +914,7 @@ impl WorkerClient for WorkerClientBag {
             // Will never be set, deprecated.
             deployment: None,
             deployment_options: self.deployment_options(),
-            resource_id: Default::default(),
+            resource_id,
         };
         Ok(self
             .client
@@ -1308,6 +1318,7 @@ mod tests {
                 ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
                 None,
                 Some(last_heartbeat_details.clone()),
+                String::new(),
             )
             .await
             .unwrap();

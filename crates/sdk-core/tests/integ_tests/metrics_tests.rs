@@ -2165,7 +2165,7 @@ async fn lang_reported_activity_failure_cause_reaches_metric() {
     mock_client
         .expect_fail_activity_task()
         .times(1)
-        .returning(|_, cause, _, _| {
+        .returning(|_, cause, _, _, _| {
             assert_eq!(cause, ActivityTaskFailedCause::ExternalStorageFailure);
             Ok(Default::default())
         });
@@ -2308,7 +2308,7 @@ async fn payloads_too_large_activity_failure_reaches_metric() {
     mock_client
         .expect_complete_activity_task()
         .times(1)
-        .returning(|_, _| {
+        .returning(|_, _, _| {
             let violation = PayloadLimitViolation {
                 path: "result".to_string(),
                 class: LimitClass::Blob,
@@ -2323,7 +2323,7 @@ async fn payloads_too_large_activity_failure_reaches_metric() {
     mock_client
         .expect_fail_activity_task()
         .times(1)
-        .returning(|_, cause, _, _| {
+        .returning(|_, cause, _, _, _| {
             assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             Ok(Default::default())
         });

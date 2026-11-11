@@ -484,6 +484,7 @@ impl Workflows {
                                     completion_time,
                                     FailedActivationWFTReport::new(
                                         task_token,
+                                        workflow_id,
                                         attempt,
                                         cause,
                                         failure,
@@ -532,6 +533,7 @@ impl Workflows {
     ) -> WFTReportStatus {
         let FailedActivationWFTReport {
             task_token,
+            workflow_id,
             attempt,
             cause,
             failure,
@@ -557,7 +559,12 @@ impl Workflows {
                 warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
                 self.handle_wft_reporting_errs(run_id, || async {
                     self.client
-                        .fail_workflow_task(task_token, cause, failure.failure)
+                        .fail_workflow_task(
+                            task_token,
+                            cause,
+                            failure.failure,
+                            format!("workflow:{workflow_id}"),
+                        )
                         .await
                 })
                 .await;
@@ -1112,6 +1119,7 @@ struct WorkflowTaskInfo {
 #[derive(Debug)]
 struct FailedActivationWFTReport {
     task_token: TaskToken,
+    workflow_id: String,
     attempt: u32,
     cause: WorkflowTaskFailedCause,
     failure: Failure,
@@ -1121,6 +1129,7 @@ impl FailedActivationWFTReport {
     /// Records the task-failed metric as part of constructing the report.
     fn new(
         task_token: TaskToken,
+        workflow_id: String,
         attempt: u32,
         cause: WorkflowTaskFailedCause,
         failure: Failure,
@@ -1132,6 +1141,7 @@ impl FailedActivationWFTReport {
             .wf_task_failed();
         Self {
             task_token,
+            workflow_id,
             attempt,
             cause,
             failure,
@@ -1157,6 +1167,7 @@ enum WftFailureKind {
 #[derive(Debug, Clone)]
 struct UnstoredWftFailInfo {
     task_token: TaskToken,
+    workflow_id: String,
     attempt: u32,
     workflow_type: String,
 }

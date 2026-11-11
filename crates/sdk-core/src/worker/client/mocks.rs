@@ -96,6 +96,7 @@ mockall::mock! {
             &self,
             task_token: TaskToken,
             result: Option<Payloads>,
+            resource_id: String,
         ) -> impl Future<Output = Result<RespondActivityTaskCompletedResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
@@ -110,6 +111,7 @@ mockall::mock! {
             &self,
             task_token: TaskToken,
             details: Option<Payloads>,
+            resource_id: String,
         ) -> impl Future<Output = Result<RespondActivityTaskCanceledResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
@@ -119,6 +121,7 @@ mockall::mock! {
             cause: ActivityTaskFailedCause,
             failure: Option<Failure>,
             last_heartbeat_details: Option<Payloads>,
+            resource_id: String,
         ) -> impl Future<Output = Result<RespondActivityTaskFailedResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
@@ -127,6 +130,7 @@ mockall::mock! {
             task_token: TaskToken,
             cause: WorkflowTaskFailedCause,
             failure: Option<Failure>,
+            resource_id: String,
         ) -> impl Future<Output = Result<RespondWorkflowTaskFailedResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
@@ -141,6 +145,7 @@ mockall::mock! {
            &self,
            task_token: TaskToken,
            details: Option<Payloads>,
+           resource_id: String,
         ) -> impl Future<Output = Result<RecordActivityTaskHeartbeatResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 

@@ -513,7 +513,7 @@ async fn test_task_type_combinations_unified(
         if enable_local_activities || enable_remote_activities {
             client
                 .expect_complete_activity_task()
-                .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
+                .returning(|_, _, _| Ok(RespondActivityTaskCompletedResponse::default()));
         }
         if enable_nexus {
             client

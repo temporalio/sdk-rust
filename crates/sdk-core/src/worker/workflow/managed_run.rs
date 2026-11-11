@@ -454,6 +454,7 @@ impl ManagedRun {
             {
                 ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
                     info.task_token,
+                    info.workflow_id,
                     info.attempt,
                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                     Failure::application_failure(reason, true).into(),
@@ -685,6 +686,7 @@ impl ManagedRun {
         self.reply_to_complete(
             ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
                 tt,
+                self.wfm.machines.workflow_id.clone(),
                 attempt,
                 cause,
                 failure,

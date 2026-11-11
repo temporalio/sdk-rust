@@ -58,6 +58,7 @@ struct ValidActivityHeartbeat {
     details: Vec<Payload>,
     throttle_interval: Duration,
     timeout_resetter: Option<Arc<Notify>>,
+    resource_id: String,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,7 @@ enum HeartbeatExecutorAction {
     Report {
         task_token: TaskToken,
         details: Vec<Payload>,
+        resource_id: String,
     },
 }
 
@@ -145,9 +147,17 @@ impl ActivityHeartbeatManager {
                                 },
                             };
                             }
-                            HeartbeatExecutorAction::Report { task_token: tt, details } => {
+                            HeartbeatExecutorAction::Report {
+                                task_token: tt,
+                                details,
+                                resource_id,
+                            } => {
                                 match sg
-                                    .record_activity_heartbeat(tt.clone(), details.into_payloads())
+                                    .record_activity_heartbeat(
+                                        tt.clone(),
+                                        details.into_payloads(),
+                                        resource_id.clone(),
+                                    )
                                     .await
                                 {
                                     Ok(RecordActivityTaskHeartbeatResponse {
@@ -204,6 +214,7 @@ impl ActivityHeartbeatManager {
                                                     ActivityTaskFailedCause::PayloadsTooLarge,
                                                     Some(make_payloads_too_large_failure(violation)),
                                                     None,
+                                                    resource_id,
                                                 )
                                                 .await
                                             {
@@ -250,6 +261,7 @@ impl ActivityHeartbeatManager {
         hb: ActivityHeartbeat,
         throttle_interval: Duration,
         timeout_resetter: Option<Arc<Notify>>,
+        resource_id: String,
     ) -> Result<(), ActivityHeartbeatError> {
         self.heartbeat_tx
             .send(HeartbeatAction::SendHeartbeat(ValidActivityHeartbeat {
@@ -257,6 +269,7 @@ impl ActivityHeartbeatManager {
                 details: hb.details,
                 throttle_interval,
                 timeout_resetter,
+                resource_id,
             }))
             .expect("Receive half of the heartbeats event channel must not be dropped");
 
@@ -304,6 +317,7 @@ struct ActivityHeartbeatState {
     throttle_interval: Duration,
     throttled_cancellation_token: Option<CancellationToken>,
     timeout_resetter: Option<Arc<Notify>>,
+    resource_id: String,
 }
 
 impl ActivityHeartbeatState {
@@ -360,11 +374,13 @@ impl HeartbeatStreamState {
                     is_record_in_flight: true,
                     throttled_cancellation_token: None,
                     timeout_resetter: hb.timeout_resetter,
+                    resource_id: hb.resource_id.clone(),
                 };
                 e.insert(state);
                 Some(HeartbeatExecutorAction::Report {
                     task_token: hb.task_token,
                     details: hb.details,
+                    resource_id: hb.resource_id,
                 })
             }
             Entry::Occupied(mut o) => {
@@ -413,6 +429,7 @@ impl HeartbeatStreamState {
                     Some(HeartbeatExecutorAction::Report {
                         task_token: tt,
                         details,
+                        resource_id: state.resource_id.clone(),
                     })
                 } else {
                     // Nothing to report, forget this task token
@@ -445,6 +462,7 @@ impl HeartbeatStreamState {
                 return Some(HeartbeatExecutorAction::Report {
                     task_token: tt,
                     details: last_deets,
+                    resource_id: state.resource_id,
                 });
             } else if state.is_record_in_flight {
                 self.tt_needs_flush.insert(tt, on_complete);
@@ -475,7 +493,7 @@ mod test {
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(2);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -497,7 +515,7 @@ mod test {
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(3);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -516,7 +534,7 @@ mod test {
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(1);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -536,7 +554,7 @@ mod test {
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(2);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -554,7 +572,7 @@ mod test {
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(2);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -575,7 +593,7 @@ mod test {
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(1);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -591,7 +609,7 @@ mod test {
         // Should only expect 1 heartbeat call, not 2 (the second would be from evict flushing)
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
+            .returning(|_, _, _| Ok(RecordActivityTaskHeartbeatResponse::default()))
             .times(1);
         let (cancel_tx, _cancel_rx) = unbounded_channel();
         let hm = ActivityHeartbeatManager::new(Arc::new(mock_client), cancel_tx);
@@ -634,6 +652,7 @@ mod test {
             // Mimic the same delay we would apply in activity task manager
             throttle_interval,
             None,
+            String::new(),
         )
         .expect("hearbeat recording should not fail");
     }

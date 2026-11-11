@@ -1,1 +1,1 @@
-Workflow task completions sent to the server identify their workflow in `resource_id` as `workflow:<workflow_id>`, so proxies in front of Temporal can tell which workflow a completion is for.
+Workflow task completions and failures, and activity task completions, failures, cancellations, and heartbeats, identify their workflow in `resource_id` as `workflow:<workflow_id>` (or `activity:<activity_id>` for a standalone activity), so proxies in front of Temporal can tell which workflow or activity a request is for.
