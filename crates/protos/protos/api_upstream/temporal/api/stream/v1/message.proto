@@ -71,11 +71,14 @@ message ClientEpoch {
 }
 
 // Experimental. Might change in the future.
-// A Workflow run Producer. It writes in its Workflow Task.
+// A Workflow run Producer. On the server's Streams, a Workflow writes as this Producer in its
+// Workflow Task. On a Store, a Workflow appends as a Local Activity Producer, and this Producer
+// only closes the Stream.
 message WorkflowProducer {
     // Required. The run id of the Workflow run, not of its chain. Each run is its own Producer.
     string run_id = 1;
-    // A Workflow Producer only closes a Stream, and its close sends no epoch.
+    // The Workflow Task of the write. A close on a Store runs after the Workflow Task and sends
+    // no epoch.
     WorkflowTaskEpoch epoch = 2;
 }
 
