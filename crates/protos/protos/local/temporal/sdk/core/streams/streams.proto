@@ -6,17 +6,16 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 import "google/protobuf/duration.proto";
 import "temporal/api/stream/v1/message.proto";
 
-// The messages of the calls that `temporalio-streams` adds to the five Stream service operations.
-// Lang sends them through the bridge's call on the runtime object, by the method name in each
-// comment. One generic call keeps Stream logic out of every bridge.
+// The writer messages that `temporalio-streams` adds to the five Stream service operations. A
+// bridge passes them as bytes to the runtime's byte calls, so it decodes no proto.
 
-// Method `OpenWriter`, asynchronous. A writer for an Activity, a Local Activity or a client
-// Producer, which keeps its epoch and `sequence` order. A writer of a Local Activity, or of an
-// Activity attempt above 1, first sends an empty batch, so that the new epoch fences the earlier
-// one. The opens of one Producer epoch on one Stream share one writer. Each open adds a
-// reference, and each `CloseWriter` or `FreeWriter` releases one. The batches of every writer in
-// a process take their `sequence` from one counter, so a writer that opens again after its close
-// continues above its earlier batches.
+// The open of a writer, through the runtime's `open_writer`. A writer is for an Activity, a Local
+// Activity or a client Producer, and it keeps its epoch and `sequence` order. A writer of a Local
+// Activity, or of an Activity attempt above 1, first sends an empty batch, so that the new epoch
+// fences the earlier one. The writers of one Producer epoch on one Stream share one order of
+// batches. The batches of every writer in a process take their `sequence` from one counter, so a
+// writer that opens again after a close continues above its earlier batches. The bridge holds the
+// writer as an object, and dropping the object releases the writer.
 message OpenWriterRequest {
     // The caller's namespace. The SDK sets it, and the writer copies it into each append. The SDK
     // Stores don't read it, but native Streams will.
@@ -24,26 +23,20 @@ message OpenWriterRequest {
     temporal.api.stream.v1.StreamRef ref = 2;
     // Required. The Producer of each batch, which sends it as AppendRecords does.
     temporal.api.stream.v1.Producer producer = 3;
-    // A write sends at most this many Records in one batch. Zero is 1000.
+    // A write sends at most this many Records in one batch. Zero, or a value above 1000, is 1000.
     int32 max_batch_size = 4;
     // How long a write retries a Store failure. Empty is 10 s.
     google.protobuf.Duration max_retry_duration = 5;
 }
 
-message OpenWriterResponse {
-    // The writer that the other writer calls name.
-    uint64 writer_id = 1;
-}
-
-// Method `WriteRecords`, asynchronous. Appends Records at once for an open writer and responds when
-// the Store has them. It uses the writer's Producer epoch and `sequence` order. After a Store
-// failure it resends the same batch, so that the Store writes it once. Records past the Store's
-// batch limit go in more batches, in order. An awaited publish of an Activity or a client uses this
-// call. A Store failure after the retries fails only that write, and the next write takes a higher
-// `sequence`. Any other failure fails the writer.
+// A write, through the writer's `write`. It appends the Records at once and answers when the
+// Store has them, in the writer's Producer epoch and `sequence` order. After a Store failure it
+// resends the same batch, so that the Store writes it once. Records past the Store's batch limit
+// go in more batches, in order. A Store failure after the retries fails only that write, and the
+// next write takes a higher `sequence`. Any other Store refusal fails the writer. A write on a
+// closed writer fails with CLOSED.
 message WriteRecordsRequest {
-    uint64 writer_id = 1;
-    repeated temporal.api.stream.v1.AppendRecord records = 2;
+    repeated temporal.api.stream.v1.AppendRecord records = 1;
 }
 
 message WriteRecordsResponse {
@@ -52,34 +45,9 @@ message WriteRecordsResponse {
     bytes last_offset = 2;
 }
 
-// Method `CloseWriter`, asynchronous. Releases one reference of the writer. The last reference
-// waits for a write in flight, then drops the writer. It doesn't close the Stream. It fails with
-// the writer's error if the writer failed.
-message CloseWriterRequest {
-    uint64 writer_id = 1;
-}
-
+// The answer of the writer's `close`. The close waits for a write in flight, and it doesn't close
+// the Stream. It fails with the writer's error if the writer failed.
 message CloseWriterResponse {
     // The offset of the newest Record the writer wrote. Empty if it wrote none.
     bytes last_offset = 1;
-}
-
-// Method `FreeWriter`. Releases one reference of the writer with no wait, for a reference that
-// lang drops, such as from a finalizer. The bridge may also call it with no async runtime. A write
-// in flight still completes. The writer's error, if any, is lost.
-message FreeWriterRequest {
-    uint64 writer_id = 1;
-}
-
-message FreeWriterResponse {
-}
-
-// Method `CloseWriters`, asynchronous. Drops every open writer, for example when the backend's
-// client or Worker shuts down.
-message CloseWritersRequest {
-}
-
-message CloseWritersResponse {
-    // The writers that had failed.
-    int32 failed = 1;
 }

@@ -16,7 +16,7 @@ pub enum Reason {
     NotFound,
     /// The Stream's Retention or last-write TTL passed.
     Expired,
-    /// The Stream is closed.
+    /// The Stream is closed, or the SDK writer is.
     Closed,
     /// The Producer's epoch is lower than the newest one.
     Fenced,
@@ -36,8 +36,6 @@ pub enum Reason {
     Invalid,
     /// The Store failed or did not answer. A retry can succeed.
     StorageUnavailable,
-    /// No writer has the id.
-    UnknownWriter,
     /// The Store lacks a capability that the call needs.
     Unsupported,
     /// A create that doesn't use an existing Stream names a Stream that exists.
@@ -63,7 +61,6 @@ impl Reason {
             Reason::TooLarge => "stream_too_large",
             Reason::Invalid => "stream_invalid",
             Reason::StorageUnavailable => "stream_storage_unavailable",
-            Reason::UnknownWriter => "stream_unknown_writer",
             Reason::Unsupported => "stream_unsupported",
             Reason::AlreadyExists => "stream_already_exists",
             Reason::StorageCorrupt => "stream_storage_corrupt",
@@ -85,7 +82,6 @@ impl Reason {
             Reason::TooLarge => StreamErrorReason::TooLarge,
             Reason::Invalid => StreamErrorReason::Invalid,
             Reason::StorageUnavailable => StreamErrorReason::StorageUnavailable,
-            Reason::UnknownWriter => StreamErrorReason::UnknownWriter,
             Reason::Unsupported => StreamErrorReason::Unsupported,
             Reason::AlreadyExists => StreamErrorReason::AlreadyExists,
             Reason::StorageCorrupt => StreamErrorReason::StorageCorrupt,
@@ -95,7 +91,7 @@ impl Reason {
     /// The status code of the reason, as in the proposal's Appendix A.
     pub fn code(self) -> Code {
         match self {
-            Reason::NotFound | Reason::Expired | Reason::UnknownWriter => Code::NotFound,
+            Reason::NotFound | Reason::Expired => Code::NotFound,
             Reason::Closed
             | Reason::Fenced
             | Reason::SequenceTooLow
