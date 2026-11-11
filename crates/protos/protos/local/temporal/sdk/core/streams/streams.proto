@@ -18,13 +18,16 @@ import "temporal/api/stream/v1/message.proto";
 // a process take their `sequence` from one counter, so a writer that opens again after its close
 // continues above its earlier batches.
 message OpenWriterRequest {
-    temporal.api.stream.v1.StreamRef ref = 1;
+    // The caller's namespace. The SDK sets it, and the writer copies it into each append. The SDK
+    // Stores don't read it, but native Streams will.
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef ref = 2;
     // Required. The Producer of each batch, which sends it as AppendRecords does.
-    temporal.api.stream.v1.Producer producer = 2;
+    temporal.api.stream.v1.Producer producer = 3;
     // A write sends at most this many Records in one batch. Zero is 1000.
-    int32 max_batch_size = 3;
+    int32 max_batch_size = 4;
     // How long a write retries a Store failure. Empty is 10 s.
-    google.protobuf.Duration max_retry_duration = 4;
+    google.protobuf.Duration max_retry_duration = 5;
 }
 
 message OpenWriterResponse {
