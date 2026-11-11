@@ -14,7 +14,7 @@ pub type StreamResult<T> = Result<T, StreamError>;
 pub enum Reason {
     /// Nobody created the Stream, even after `create_wait`.
     NotFound,
-    /// The Stream's Retention or safety TTL passed.
+    /// The Stream's Retention or last-write TTL passed.
     Expired,
     /// The Stream is closed.
     Closed,

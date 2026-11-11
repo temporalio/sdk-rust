@@ -19,14 +19,15 @@ import "temporal/api/enums/v1/stream.proto";
 message StreamRef {
     string id = 1;
     // The name of the backend that holds the Stream, as the Worker and client config register
-    // it, so every process routes a ref it receives. Empty is the default backend. The Store
-    // never reads it.
+    // it, so every process routes a ref it receives. Empty is the default backend. Only an SDK
+    // reads it. A request carries the whole ref, and the server and a Store ignore this field.
     string backend = 3;
 }
 
 // Experimental. Might change in the future.
 // One Workflow Task attempt of a run. It orders by started_event_id, then attempt, then
-// started_time.
+// started_time. An epoch orders the writes of one Producer only, and a Producer is one run. A
+// reset run and the next run of a chain are other Producers, so their epochs start again.
 message WorkflowTaskEpoch {
     int64 started_event_id = 1;
     int32 attempt = 2;
@@ -35,8 +36,9 @@ message WorkflowTaskEpoch {
 }
 
 // Experimental. Might change in the future.
-// The attempt of a Local Activity. It orders by task, then attempt, so a Local Activity of a
-// later Workflow Task supersedes one of an earlier task.
+// The attempt of a Local Activity. It orders by task, then attempt, so the same call in a later
+// Workflow Task is a higher epoch. The Producer carries the run. Records of two runs have no
+// order by epoch, only their order in the Stream.
 message LocalActivityEpoch {
     // The Workflow Task attempt that dispatched the Local Activity.
     WorkflowTaskEpoch task = 1;
@@ -54,31 +56,35 @@ message ActivityEpoch {
 }
 
 // Experimental. Might change in the future.
-// The attempt of a client Producer, which the client picks.
+// The attempt of a client Producer, which the client picks. A client that keeps one Producer
+// name across restarts stores this number and raises it at each start, so the new process
+// fences the old one. A client with no name of its own is a new Producer in each process.
 message ClientEpoch {
     int32 attempt = 1;
 }
 
 // Experimental. Might change in the future.
-// A Workflow run Producer. It writes in its Workflow Task. A higher epoch supersedes the Records of
-// the run's Workflow Tasks that never completed, with those of their Local Activities.
+// A Workflow run Producer. It writes in its Workflow Task. A higher epoch fences the lower ones.
 message WorkflowProducer {
-    // The first execution run id of the run chain.
+    // The run id of the Workflow run, not of its chain. Each run is its own Producer.
     string run_id = 1;
     WorkflowTaskEpoch epoch = 2;
 }
 
 // Experimental. Might change in the future.
-// A Local Activity Producer. A higher epoch supersedes the Producer's lower epochs.
+// A Local Activity Producer, one for each call of a run. A higher epoch fences the lower ones.
 message LocalActivityProducer {
+    // The run id of the Workflow run.
     string run_id = 1;
     LocalActivityEpoch epoch = 2;
 }
 
 // Experimental. Might change in the future.
 // An Activity Producer, for an Activity of a Workflow or a Standalone Activity. A higher epoch
-// supersedes the Producer's lower epochs.
+// fences the lower ones. Their Records are those of a failed attempt, which a reader may hide.
 message ActivityProducer {
+    // The run id of the Workflow run that scheduled the Activity. Empty for a Standalone
+    // Activity, whose own run id is in the Producer id.
     string run_id = 1;
     ActivityEpoch epoch = 2;
 }
@@ -92,16 +98,21 @@ message ClientProducer {
 
 // Experimental. Might change in the future.
 // The code that wrote a batch. Its id stays the same across attempts, and the kind's case orders
-// its epochs and picks which earlier Records a higher epoch supersedes. A run-based kind carries its
-// run, so a client can't.
+// its epochs. After a write of a higher epoch, a write of a lower epoch of the same Producer
+// fails with FENCED. The epochs of two Producers never compare. A run-based kind carries its run,
+// so a client can't.
 message Producer {
-    // Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
+    // Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run. It is
+    // unique in one Stream, and a Stream is in one namespace, so it carries no namespace.
     string id = 1;
     // Required. The case is the kind of the Producer.
     oneof kind {
         WorkflowProducer workflow = 2;
         LocalActivityProducer local_activity = 3;
-        ActivityProducer activity = 4;
+        // An Activity that a Workflow scheduled.
+        ActivityProducer workflow_activity = 4;
+        // An Activity with no Workflow. Both Activity cases order their epochs the same way. The
+        // case tells which identity the Producer has, since only the first has a Workflow run.
         ActivityProducer standalone_activity = 5;
         ClientProducer client = 6;
     }
@@ -129,22 +140,22 @@ message StreamData {
 }
 
 // Experimental. Might change in the future.
-// The close of a Stream. A Stream has at most one, and a read returns it last.
+// The close of a Stream, as a read item. A close is its own call and stores no Record. A read
+// builds this item from the close state of the Stream and returns it last, so a reader learns in
+// order that the Stream ended, who closed it and why.
 message StreamClose {
     // The Producer that closed the Stream.
     Producer producer = 1;
-    reserved 2, 3;
-    reserved "result", "failure";
     // Why the Stream closed.
-    temporal.api.enums.v1.StreamCloseStatus status = 4;
+    temporal.api.enums.v1.StreamCloseStatus status = 2;
 }
 
 // Experimental. Might change in the future.
 // An offset is ordered and unique in one Stream, and it is sparse. Offsets have gaps, so they
-// don't count Records. Zero is never an offset. A read gives its Stream, so the read checks the
+// don't count Records. An offset is never empty. A read gives its Stream, so the read checks the
 // offset against that Stream.
 message StreamRecord {
-    int64 offset = 1;
+    bytes offset = 1;
     // A read item is a Record or the close.
     oneof item {
         StreamData data = 2;
