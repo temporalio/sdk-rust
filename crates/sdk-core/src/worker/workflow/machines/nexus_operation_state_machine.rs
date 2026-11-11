@@ -46,6 +46,7 @@ fsm! {
     ScheduleCommandCreated --(Cancel, shared on_cancelled)--> Cancelled;
 
     ScheduledEventRecorded --(Cancel, shared on_issue_cancel)--> ScheduledEventRecorded;
+    ScheduledEventRecorded --(Cancel, shared on_issue_cancel)--> Cancelled;
     ScheduledEventRecorded --(CommandRequestCancelNexusOperation)--> ScheduledEventRecorded;
     ScheduledEventRecorded --(NexusOperationCancelRequested)--> ScheduledEventRecorded;
     ScheduledEventRecorded
@@ -74,6 +75,7 @@ fsm! {
     Started --(NexusOperationCancelRequestCompleted(NexusOperationCancelRequestCompletedEventAttributes), shared on_cancel_request_completed)--> Started;
     Started --(NexusOperationCancelRequestCompleted(NexusOperationCancelRequestCompletedEventAttributes), shared on_cancel_request_completed)--> Cancelled;
     Started --(NexusOperationCancelRequestFailed(NexusOperationCancelRequestFailedEventAttributes), shared on_cancel_request_failed)--> Started;
+    Started --(NexusOperationCancelRequestFailed(NexusOperationCancelRequestFailedEventAttributes), shared on_cancel_request_failed)--> Cancelled;
 
     Started
       --(NexusOperationTimedOut(NexusOperationTimedOutEventAttributes), on_timed_out)--> TimedOut;
@@ -81,6 +83,7 @@ fsm! {
     Cancelled --(Cancel)--> Cancelled;
     Cancelled --(CommandRequestCancelNexusOperation)--> Cancelled;
     Cancelled --(NexusOperationCancelRequested)--> Cancelled;
+    Cancelled --(NexusOperationStarted(NexusOperationStartedEventAttributes), shared on_started)--> Cancelled;
     Cancelled --(NexusOperationCompleted(NexusOperationCompletedEventAttributes), shared on_completed)--> Cancelled;
     Cancelled --(NexusOperationFailed(NexusOperationFailedEventAttributes), shared on_failed)--> Cancelled;
     Cancelled --(NexusOperationTimedOut(NexusOperationTimedOutEventAttributes), shared on_timed_out)--> Cancelled;
@@ -241,12 +244,33 @@ impl ScheduledEventRecorded {
     pub(crate) fn on_issue_cancel(
         &self,
         ss: &mut SharedState,
-    ) -> NexusOperationMachineTransition<ScheduledEventRecorded> {
-        if !ss.cancel_sent {
-            ss.cancel_sent = true;
-            NexusOperationMachineTransition::commands([NexusOperationCommand::IssueCancel])
+    ) -> NexusOperationMachineTransition<ScheduledEventRecordedOrCancelled> {
+        if ss.cancel_sent {
+            return TransitionResult::ok(
+                [],
+                ScheduledEventRecordedOrCancelled::ScheduledEventRecorded(Default::default()),
+            );
+        }
+        ss.cancel_sent = true;
+        if ss.resolves_immediately_on_cancel() {
+            // Lang is told the operation failed to start, so nothing the server later records
+            // about it (a start or any outcome) may reach lang.
+            TransitionResult::ok(
+                [
+                    NexusOperationCommand::IssueCancel,
+                    NexusOperationCommand::FailBeforeStart(
+                        ss.cancelled_failure(
+                            "Nexus operation cancelled before starting".to_owned(),
+                        ),
+                    ),
+                ],
+                ScheduledEventRecordedOrCancelled::Cancelled(Default::default()),
+            )
         } else {
-            NexusOperationMachineTransition::default()
+            TransitionResult::ok(
+                [NexusOperationCommand::IssueCancel],
+                ScheduledEventRecordedOrCancelled::ScheduledEventRecorded(Default::default()),
+            )
         }
     }
 
@@ -319,15 +343,22 @@ impl Started {
     ) -> NexusOperationMachineTransition<StartedOrCancelled> {
         if !ss.cancel_sent {
             ss.cancel_sent = true;
-            let dest = if matches!(
-                ss.cancel_type,
-                NexusOperationCancellationType::Abandon | NexusOperationCancellationType::TryCancel
-            ) {
-                StartedOrCancelled::Cancelled(Default::default())
+            if ss.resolves_immediately_on_cancel() {
+                TransitionResult::ok(
+                    [
+                        NexusOperationCommand::IssueCancel,
+                        NexusOperationCommand::Cancel(ss.cancelled_failure(
+                            "Nexus operation cancelled after starting".to_owned(),
+                        )),
+                    ],
+                    StartedOrCancelled::Cancelled(Default::default()),
+                )
             } else {
-                StartedOrCancelled::Started(Default::default())
-            };
-            TransitionResult::ok([NexusOperationCommand::IssueCancel], dest)
+                TransitionResult::ok(
+                    [NexusOperationCommand::IssueCancel],
+                    StartedOrCancelled::Started(Default::default()),
+                )
+            }
         } else {
             TransitionResult::ok([], StartedOrCancelled::Started(Default::default()))
         }
@@ -386,9 +417,11 @@ impl Started {
         self,
         ss: &mut SharedState,
         fa: NexusOperationCancelRequestFailedEventAttributes,
-    ) -> NexusOperationMachineTransition<Started> {
+    ) -> NexusOperationMachineTransition<StartedOrCancelled> {
         if ss.cancel_type == NexusOperationCancellationType::WaitCancellationRequested {
             let message = "Nexus operation cancellation request failed".to_string();
+            // Lang is resolved here, but the operation keeps running, so its outcome must be
+            // ignored like any other outcome that arrives after lang saw the cancellation.
             TransitionResult::ok(
                 [NexusOperationCommand::Fail(ss.failure(
                     message.clone(),
@@ -397,10 +430,10 @@ impl Started {
                         ..Default::default()
                     }),
                 ))],
-                self,
+                StartedOrCancelled::Cancelled(Default::default()),
             )
         } else {
-            TransitionResult::ok([], self)
+            TransitionResult::ok([], StartedOrCancelled::Started(Default::default()))
         }
     }
 
@@ -429,22 +462,36 @@ pub(super) struct TimedOut;
 #[derive(Default, Clone)]
 pub(super) struct Cancelled;
 
-fn completion_of_not_abandoned_err() -> WFMachinesError {
-    nondeterminism!(
-        "Nexus operation which don't have the ABANDON cancellation type cannot complete after \
-         being cancelled."
-    )
-}
-
+// Lang has already been given a result when the machine is cancelled, while the operation may
+// still be running on the server, so whatever the server records about it afterwards is ignored.
 impl Cancelled {
+    pub(super) fn on_started(
+        self,
+        ss: &mut SharedState,
+        _: NexusOperationStartedEventAttributes,
+    ) -> NexusOperationMachineTransition<Cancelled> {
+        if !ss.resolves_immediately_on_cancel() {
+            return NexusOperationMachineTransition::Err(nondeterminism!(
+                "Nexus operation with cancellation type {:?} cannot start after being cancelled",
+                ss.cancel_type
+            ));
+        }
+        debug!(
+            seq = ss.lang_seq_num,
+            "Ignoring start of cancelled Nexus operation"
+        );
+        NexusOperationMachineTransition::ok([], self)
+    }
+
     pub(super) fn on_completed(
         self,
         ss: &mut SharedState,
         _: NexusOperationCompletedEventAttributes,
     ) -> NexusOperationMachineTransition<Cancelled> {
-        if ss.cancel_type == NexusOperationCancellationType::Abandon {
-            return NexusOperationMachineTransition::Err(completion_of_not_abandoned_err());
-        }
+        debug!(
+            seq = ss.lang_seq_num,
+            "Ignoring completion of cancelled Nexus operation"
+        );
         NexusOperationMachineTransition::ok([], self)
     }
 
@@ -460,9 +507,10 @@ impl Cancelled {
         ss: &mut SharedState,
         _: NexusOperationFailedEventAttributes,
     ) -> NexusOperationMachineTransition<Cancelled> {
-        if ss.cancel_type == NexusOperationCancellationType::Abandon {
-            return NexusOperationMachineTransition::Err(completion_of_not_abandoned_err());
-        }
+        debug!(
+            seq = ss.lang_seq_num,
+            "Ignoring failure of cancelled Nexus operation"
+        );
         NexusOperationMachineTransition::ok([], self)
     }
 
@@ -471,9 +519,10 @@ impl Cancelled {
         ss: &mut SharedState,
         _: NexusOperationTimedOutEventAttributes,
     ) -> NexusOperationMachineTransition<Cancelled> {
-        if ss.cancel_type == NexusOperationCancellationType::Abandon {
-            return NexusOperationMachineTransition::Err(completion_of_not_abandoned_err());
-        }
+        debug!(
+            seq = ss.lang_seq_num,
+            "Ignoring timeout of cancelled Nexus operation"
+        );
         NexusOperationMachineTransition::ok([], self)
     }
 }
@@ -691,26 +740,6 @@ impl WFMachinesAdapter for NexusOperationMachine {
                         self.shared_state.annotations.clone(),
                     )))
                 }
-                // Immediately resolve abandon/trycancel modes
-                if matches!(
-                    self.shared_state.cancel_type,
-                    NexusOperationCancellationType::Abandon
-                        | NexusOperationCancellationType::TryCancel
-                ) {
-                    resps.push(
-                        ResolveNexusOperation {
-                            seq: self.shared_state.lang_seq_num,
-                            result: Some(NexusOperationResult {
-                                status: Some(nexus_operation_result::Status::Cancelled(
-                                    self.shared_state.cancelled_failure(
-                                        "Nexus operation cancelled after starting".to_owned(),
-                                    ),
-                                )),
-                            }),
-                        }
-                        .into(),
-                    )
-                }
                 resps
             }
         })
@@ -730,6 +759,13 @@ impl TryFrom<CommandType> for NexusOperationMachineEvents {
 }
 
 impl SharedState {
+    fn resolves_immediately_on_cancel(&self) -> bool {
+        matches!(
+            self.cancel_type,
+            NexusOperationCancellationType::Abandon | NexusOperationCancellationType::TryCancel
+        )
+    }
+
     fn cancelled_failure(&self, message: String) -> Failure {
         self.failure(
             message,

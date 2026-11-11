@@ -1,5 +1,5 @@
 use crate::{
-    common::{CoreWfStarter, WorkflowHandleExt, rand_6_chars},
+    common::{CoreWfStarter, WorkflowHandleExt, eventually, rand_6_chars},
     integ_tests::mk_nexus_endpoint,
 };
 use assert_matches::assert_matches;
@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    UntypedSignal, UntypedWorkflow, WorkflowCancelOptions, WorkflowSignalOptions,
-    WorkflowStartOptions,
+    UntypedSignal, UntypedWorkflow, WorkflowCancelOptions, WorkflowExecuteUpdateOptions,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_common::{
     data_converters::{
@@ -29,7 +29,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::{Callback, callback},
-            enums::v1::NexusHandlerErrorRetryBehavior,
+            enums::v1::{EventType, NexusHandlerErrorRetryBehavior},
             failure::v1::{Failure, failure::FailureInfo},
             nexus,
             nexus::v1::{
@@ -1258,4 +1258,274 @@ async fn nexus_cancellation_types(
         .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct NexusAbandonWf {
+    endpoint: String,
+    before_start: bool,
+    abandon: bool,
+    abandoned: bool,
+    finish: bool,
+}
+
+#[workflow_methods]
+impl NexusAbandonWf {
+    #[init]
+    fn new(_ctx: &WorkflowContextView, (endpoint, before_start): (String, bool)) -> Self {
+        Self {
+            endpoint,
+            before_start,
+            ..Default::default()
+        }
+    }
+
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let start = ctx.start_nexus_operation(
+            NexusOperationOptions::builder()
+                .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                .service("svc")
+                .operation("op")
+                .cancellation_type(NexusOperationCancellationType::Abandon)
+                .build(),
+        );
+        if ctx.state(|wf| wf.before_start) {
+            ctx.wait_condition(|wf| wf.abandon).await?;
+            start.cancel();
+            ctx.state_mut(|wf| wf.abandoned = true);
+            let failure = start.await.unwrap_err();
+            assert_matches!(
+                failure.cause.as_deref(),
+                Some(Failure {
+                    failure_info: Some(FailureInfo::CanceledFailureInfo(_)),
+                    ..
+                })
+            );
+        } else {
+            let started = start.await.unwrap();
+            ctx.wait_condition(|wf| wf.abandon).await?;
+            started.cancel();
+            ctx.state_mut(|wf| wf.abandoned = true);
+            assert_matches!(
+                started.result().await.status,
+                Some(nexus_operation_result::Status::Cancelled(_))
+            );
+        }
+        // Stay open so the abandoned operation's outcome is recorded while the workflow runs.
+        ctx.wait_condition(|wf| wf.finish).await?;
+        Ok(())
+    }
+
+    // Completes in the workflow task that abandoned the operation, so the caller of the update
+    // knows the abandonment happened before the operation's outcome.
+    #[update]
+    async fn abandon(ctx: &mut WorkflowContext<Self>) {
+        ctx.state_mut(|wf| wf.abandon = true);
+        ctx.wait_condition(|wf| wf.abandoned)
+            .await
+            .expect("workflow was not cancelled");
+    }
+
+    #[signal]
+    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.finish = true;
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct NexusAbandonHandlerWf {
+    finish: bool,
+}
+
+#[workflow_methods]
+impl NexusAbandonHandlerWf {
+    #[run(name = "nexus_abandon_handler")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|wf| wf.finish).await?;
+        Ok(())
+    }
+
+    #[signal]
+    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.finish = true;
+    }
+}
+
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
+#[rstest::rstest]
+#[tokio::test]
+async fn nexus_abandoned_operation_outcome_is_ignored(#[values(false, true)] before_start: bool) {
+    let wf_name = "nexus_abandoned_operation_outcome_is_ignored";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.set_core_task_types(WorkerTaskTypes {
+        enable_workflows: true,
+        enable_local_activities: false,
+        enable_remote_activities: false,
+        enable_nexus: true,
+    });
+    starter
+        .sdk_config
+        .register_workflow::<NexusAbandonWf>()
+        .unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<NexusAbandonHandlerWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let core_worker = starter.get_core_worker().await;
+    let submitter = worker.get_submitter_handle();
+    let client = starter.get_core_client().await;
+
+    let endpoint = mk_nexus_endpoint(&mut starter).await;
+    let handle = worker
+        .submit_workflow(
+            NexusAbandonWf::run,
+            (endpoint, before_start),
+            starter.workflow_options.clone(),
+        )
+        .await
+        .unwrap();
+
+    let abandon = || async {
+        handle
+            .execute_update(
+                NexusAbandonWf::abandon,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let driver = async {
+        let nt = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
+        let start_req = assert_matches!(
+            nt.request.unwrap().variant.unwrap(),
+            request::Variant::StartOperation(sr) => sr
+        );
+        let handler_wf_id = format!("{}-handler", starter.get_task_queue());
+        let start_response = if before_start {
+            // The start request is still unanswered, so the operation cannot have started.
+            abandon().await;
+            start_operation_response::Variant::SyncSuccess(start_operation_response::Sync {
+                payload: Some("late".into()),
+                links: vec![],
+            })
+        } else {
+            let links = start_req
+                .links
+                .iter()
+                .map(workflow_event_link_from_nexus)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            submitter
+                .submit_wf(
+                    "nexus_abandon_handler",
+                    vec![],
+                    WorkflowStartOptions::new(
+                        starter.get_task_queue().to_owned(),
+                        handler_wf_id.clone(),
+                    )
+                    .completion_callbacks(vec![Callback {
+                        variant: Some(callback::Variant::Nexus(callback::Nexus {
+                            url: start_req.callback,
+                            header: start_req.callback_header,
+                        })),
+                        links: links.clone(),
+                    }])
+                    .links(links)
+                    .build(),
+                )
+                .await
+                .unwrap();
+            #[allow(deprecated)]
+            start_operation_response::Variant::AsyncSuccess(start_operation_response::Async {
+                operation_id: "op-1".to_string(),
+                links: vec![],
+                operation_token: "op-1".to_string(),
+            })
+        };
+        core_worker
+            .complete_nexus_task(NexusTaskCompletion {
+                task_token: nt.task_token,
+                status: Some(nexus_task_completion::Status::Completed(
+                    nexus::v1::Response {
+                        variant: Some(nexus::v1::response::Variant::StartOperation(
+                            StartOperationResponse {
+                                variant: Some(start_response),
+                            },
+                        )),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        if !before_start {
+            // The update only returns once the caller has seen the start and abandoned the
+            // operation, so letting the handler finish afterwards completes an abandoned
+            // operation.
+            abandon().await;
+            client
+                .get_workflow_handle::<nexus_abandon_handler_wf::Run>(handler_wf_id)
+                .signal(
+                    NexusAbandonHandlerWf::finish,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let events = eventually(
+            || async {
+                let events = handle
+                    .fetch_history(Default::default())
+                    .into_events()
+                    .await?;
+                let processed_outcome = events
+                    .iter()
+                    .skip_while(|e| e.event_type() != EventType::NexusOperationCompleted)
+                    .any(|e| {
+                        matches!(
+                            e.event_type(),
+                            EventType::WorkflowTaskCompleted | EventType::WorkflowTaskFailed
+                        )
+                    });
+                if processed_outcome {
+                    Ok(events)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "abandoned operation's completion not processed yet"
+                    ))
+                }
+            },
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type() == EventType::WorkflowTaskFailed),
+            "abandoned operation's completion failed a workflow task: {events:?}"
+        );
+
+        handle
+            .signal(NexusAbandonWf::finish, (), WorkflowSignalOptions::default())
+            .await
+            .unwrap();
+        assert_matches!(
+            core_worker.poll_nexus_task().await,
+            Err(PollError::ShutDown)
+        );
+    };
+    join!(driver, async { worker.run_until_done().await.unwrap() });
+
+    handle.get_result(Default::default()).await.unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
