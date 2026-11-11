@@ -58,7 +58,7 @@ enum StreamErrorReason {
     STREAM_ERROR_REASON_NOT_FOUND = 1;
     // The Stream's Retention or its last-write TTL passed. NOT_FOUND.
     STREAM_ERROR_REASON_EXPIRED = 2;
-    // The Stream is closed. FAILED_PRECONDITION.
+    // The Stream is closed, or the SDK's writer is closed. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_CLOSED = 3;
     // The Producer's epoch is lower than the newest one. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_FENCED = 4;
@@ -80,13 +80,11 @@ enum StreamErrorReason {
     STREAM_ERROR_REASON_INVALID = 11;
     // The Store failed or did not answer. A retry can succeed. UNAVAILABLE.
     STREAM_ERROR_REASON_STORAGE_UNAVAILABLE = 12;
-    // No writer has the id. The SDK's in-process writer only. NOT_FOUND.
-    STREAM_ERROR_REASON_UNKNOWN_WRITER = 13;
     // The Store lacks a capability that the call needs. UNIMPLEMENTED.
-    STREAM_ERROR_REASON_UNSUPPORTED = 14;
+    STREAM_ERROR_REASON_UNSUPPORTED = 13;
     // A create with the FAIL conflict policy is for a Stream that exists. ALREADY_EXISTS.
-    STREAM_ERROR_REASON_ALREADY_EXISTS = 15;
+    STREAM_ERROR_REASON_ALREADY_EXISTS = 14;
     // The Store gave back data that isn't valid, such as a stored value with the wrong length. A
     // retry reads the same data. DATA_LOSS.
-    STREAM_ERROR_REASON_STORAGE_CORRUPT = 16;
+    STREAM_ERROR_REASON_STORAGE_CORRUPT = 15;
 }
