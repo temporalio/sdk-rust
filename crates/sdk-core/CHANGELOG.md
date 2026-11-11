@@ -33,6 +33,9 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
@@ -55,7 +58,6 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
-* Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
 * Slot gauges now reflect the current number of used and available slots after concurrent worker updates.
 * A workflow task failure reported with the cause `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`
   is now counted on `workflow_task_execution_failed` with `failure_reason="ExternalStorageError"`,
