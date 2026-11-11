@@ -12,7 +12,7 @@ pub type StreamResult<T> = Result<T, StreamError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reason {
-    /// Nobody created the Stream, even after `create_wait`.
+    /// Nobody created the Stream.
     NotFound,
     /// The Stream's Retention or last-write TTL passed.
     Expired,

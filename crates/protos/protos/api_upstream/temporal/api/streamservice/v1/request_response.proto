@@ -108,30 +108,27 @@ message ReadRecordsRequest {
     // How long the read waits for a new Record before it answers with an empty page. Empty answers
     // at once, and a wait longer than 60 s waits 60 s.
     google.protobuf.Duration wait = 6;
-    // How long to wait for a Stream that nobody created yet. Empty fails at once with NOT_FOUND.
-    // At most 60 s.
-    google.protobuf.Duration create_wait = 7;
     // The exclusive end of the read. The read scans no entry at or after it, so a replay reads the
     // same range. Empty means no end. Only the server serves it, and a Store refuses it.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "from" and "to" mark the ends of a range of offsets. --)
-    bytes to_offset = 8;
+    bytes to_offset = 7;
     // Asks only for a wake-up, for a reader that must not get Records in this answer, such as a
     // Workflow whose Records stay out of History. The read waits as a normal read does. It then
     // answers with no Records and last_offset = from_offset, when a Record after from_offset
     // exists, when the Stream closes (done), or when wait ends. The reader then gets the Records
     // with a normal read. The wait may be days, since a parked read adds nothing to History.
     // Only the server serves it, and a Store refuses it.
-    bool wake_only = 9;
+    bool wake_only = 8;
     // The most Record bytes in one page, so a page fits the caller's limit, such as a History
     // marker. A larger Record still comes alone, so the read always moves on. Zero is no cap.
-    int64 max_bytes = 10;
+    int64 max_bytes = 9;
     // The lowest offset this run read on replay. A reset run copies the earlier run's reads into
     // its History, so its floor must cover them too, not only its first live page. Only read by
     // the server.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: The floor is the lowest from_offset of the run's reads. --)
-    bytes floor_from = 11;
+    bytes floor_from = 10;
 }
 
 // Experimental. Might change in the future.

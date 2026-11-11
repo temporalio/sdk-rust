@@ -54,7 +54,7 @@ enum StreamIdConflictPolicy {
 // that carries the reason.
 enum StreamErrorReason {
     STREAM_ERROR_REASON_UNSPECIFIED = 0;
-    // Nobody created the Stream, even after `create_wait`. NOT_FOUND.
+    // Nobody created the Stream. NOT_FOUND.
     STREAM_ERROR_REASON_NOT_FOUND = 1;
     // The Stream's Retention or its last-write TTL passed. NOT_FOUND.
     STREAM_ERROR_REASON_EXPIRED = 2;
