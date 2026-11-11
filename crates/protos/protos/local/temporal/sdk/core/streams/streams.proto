@@ -6,8 +6,23 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 import "google/protobuf/duration.proto";
 import "temporal/api/stream/v1/message.proto";
 
-// The writer messages that `temporalio-streams` adds to the five Stream service operations. A
-// bridge passes them as bytes to the runtime's byte calls, so it decodes no proto.
+// The writer messages that `temporalio-streams` adds to the five Stream service operations, and
+// the config of its memory runtime. A bridge passes them as bytes to the runtime's byte calls, so
+// it decodes no proto.
+
+// The settings of the memory Stream runtime, for tests. Each field has the number of the same
+// field in the config of the other Stores, such as Redis, so a backend can send that config here
+// too.
+message MemoryStreamConfig {
+    // The default Retention of a new Stream. Empty is 7 days.
+    google.protobuf.Duration retention = 4;
+    // How long an open Stream stays after its last write. Empty keeps an open Stream until its
+    // close.
+    google.protobuf.Duration last_write_ttl = 5;
+    // The backend name that lang registered this runtime under. The runtime sets it on each
+    // StreamRef that it builds, such as the one in a create response.
+    string backend = 10;
+}
 
 // The open of a writer, through the runtime's `open_writer`. A writer is for an Activity, a Local
 // Activity or a client Producer, and it keeps its epoch and `sequence` order. A writer of a Local

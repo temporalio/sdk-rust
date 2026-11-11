@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* A new experimental crate, `temporalio-streams`, has the Stream runtime that the SDKs link
+  into their bridges. Core itself has no Stream code.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
