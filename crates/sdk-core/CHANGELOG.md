@@ -53,7 +53,9 @@ relevant information.
 * Workflow task completions and failures set `resource_id` to `workflow:<workflow_id>`, on every
   page of a paginated completion. Activity task completions, failures, cancellations, and
   heartbeats set it to `workflow:<workflow_id>`, or `activity:<activity_id>` for a standalone
-  activity. Proxies can identify the workflow or activity without decoding the task token.
+  activity. Worker heartbeats set it to `worker:<worker_grouping_key>`, the grouping key each
+  heartbeat already reports in its host info. Proxies can identify the workflow, activity, or
+  worker without decoding task tokens or heartbeat contents.
 
 ## [0.11.0] - 2026-11-09
 

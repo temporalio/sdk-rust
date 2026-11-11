@@ -1072,7 +1072,7 @@ impl WorkerClient for WorkerClientBag {
             namespace,
             identity: self.identity(),
             worker_heartbeat,
-            resource_id: Default::default(),
+            resource_id: format!("worker:{}", self.worker_grouping_key()),
         };
         Ok(self
             .client
@@ -1327,6 +1327,69 @@ mod tests {
             requests.lock().unwrap()[0].last_heartbeat_details,
             Some(last_heartbeat_details)
         );
+    }
+
+    #[tokio::test]
+    async fn worker_heartbeat_resource_id_uses_heartbeat_grouping_key() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = requests.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |request| {
+                let requests = requests_clone.clone();
+                Box::pin(async move {
+                    let proto = match request.rpc.as_str() {
+                        "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+                        "RecordWorkerHeartbeat" => {
+                            requests.lock().unwrap().push(
+                                RecordWorkerHeartbeatRequest::decode(request.proto)
+                                    .expect("heartbeat request is valid"),
+                            );
+                            RecordWorkerHeartbeatResponse::default().encode_to_vec()
+                        }
+                        rpc => panic!("unexpected RPC: {rpc}"),
+                    };
+                    Ok(GrpcSuccessResponse {
+                        headers: Default::default(),
+                        proto,
+                    })
+                })
+            }),
+        };
+        let connection = Connection::connect(
+            ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                .service_override(service_override)
+                .dns_load_balancing(None)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let client = WorkerClientBag::new(
+            SharedReplaceableClient::new(connection),
+            "namespace".to_string(),
+            WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            },
+            Uuid::new_v4(),
+        );
+        let mut heartbeat = WorkerHeartbeat {
+            host_info: Some(Default::default()),
+            ..Default::default()
+        };
+        client.set_heartbeat_client_fields(&mut heartbeat);
+
+        client
+            .record_worker_heartbeat("namespace".to_string(), vec![heartbeat])
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let grouping_key = &requests[0].worker_heartbeat[0]
+            .host_info
+            .as_ref()
+            .unwrap()
+            .worker_grouping_key;
+        assert!(!grouping_key.is_empty());
+        assert_eq!(requests[0].resource_id, format!("worker:{grouping_key}"));
     }
 
     #[allow(deprecated)]
