@@ -72,15 +72,13 @@ version = "~1.2.0"
 
 [dev-dependencies]
 aws-sdk-s3 = "1"
-bytes = "1"
 flate2 = "1"
 futures = "0.3"
+http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 rstest = "0.28"
-# Newer releases need a later Rust than this repository's toolchain.
-s3s = "=0.14.1"
 tokio = { version = "1.47", features = ["net", "signal"] }
 
 [dev-dependencies.temporalio-aws-s3driver]

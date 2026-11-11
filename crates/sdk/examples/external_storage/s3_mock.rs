@@ -1,113 +1,76 @@
 //! An in-memory S3-compatible server, so the sample runs without an AWS account or Docker. It
 //! implements only the three requests the S3 storage driver makes: `HeadObject`, `PutObject`, and
-//! `GetObject`.
+//! `GetObject`. It does not check request signatures.
 
-use bytes::Bytes;
-use futures::TryStreamExt;
+use http_body_util::{BodyExt, Full};
 use hyper::{
-    Request,
-    body::Incoming,
-    service::{Service, service_fn},
+    Method, Request, Response, StatusCode,
+    body::{Bytes, Incoming},
+    header,
+    service::service_fn,
 };
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
 };
-use s3s::{
-    S3, S3Request, S3Response, S3Result,
-    auth::SimpleAuth,
-    dto::{
-        GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, PutObjectInput,
-        PutObjectOutput, StreamingBlob,
-    },
-    s3_error,
-    service::S3ServiceBuilder,
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
 };
-use std::{collections::HashMap, convert::Infallible, sync::Mutex, time::Instant};
 use tokio::net::TcpListener;
 
 const ADDRESS: &str = "localhost:5000";
 const BUCKET: &str = "temporal-payloads";
-const ACCESS_KEY: &str = "test";
-const SECRET_KEY: &str = "test";
 
-#[derive(Default)]
-struct MemoryBucket(Mutex<HashMap<String, Bytes>>);
+type Objects = Arc<Mutex<HashMap<String, Bytes>>>;
 
-impl MemoryBucket {
-    fn get(&self, bucket: &str, key: &str) -> S3Result<Bytes> {
-        if bucket != BUCKET {
-            return Err(s3_error!(NoSuchBucket));
+async fn handle(
+    objects: Objects,
+    request: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(key) = request
+        .uri()
+        .path()
+        .strip_prefix(&format!("/{BUCKET}/"))
+        .map(str::to_owned)
+    else {
+        return Ok(error(StatusCode::NOT_FOUND, "NoSuchBucket"));
+    };
+    let response = match *request.method() {
+        Method::HEAD | Method::GET => {
+            let data = objects.lock().unwrap().get(&key).cloned();
+            match data {
+                Some(data) if request.method() == Method::HEAD => Response::builder()
+                    .header(header::CONTENT_LENGTH, data.len())
+                    .body(Full::default())
+                    .unwrap(),
+                Some(data) => Response::new(Full::new(data)),
+                None => error(StatusCode::NOT_FOUND, "NoSuchKey"),
+            }
         }
-        self.0
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned()
-            .ok_or_else(|| s3_error!(NoSuchKey))
-    }
+        Method::PUT => {
+            let data = request.into_body().collect().await?.to_bytes();
+            objects.lock().unwrap().insert(key, data);
+            Response::new(Full::default())
+        }
+        _ => error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
+    };
+    Ok(response)
 }
 
-#[async_trait::async_trait]
-impl S3 for MemoryBucket {
-    async fn head_object(
-        &self,
-        req: S3Request<HeadObjectInput>,
-    ) -> S3Result<S3Response<HeadObjectOutput>> {
-        let data = self.get(&req.input.bucket, &req.input.key)?;
-        Ok(S3Response::new(HeadObjectOutput {
-            content_length: Some(data.len() as i64),
-            ..Default::default()
-        }))
-    }
-
-    async fn get_object(
-        &self,
-        req: S3Request<GetObjectInput>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
-        let data = self.get(&req.input.bucket, &req.input.key)?;
-        Ok(S3Response::new(GetObjectOutput {
-            content_length: Some(data.len() as i64),
-            body: Some(StreamingBlob::wrap(futures::stream::iter([Ok::<
-                _,
-                Infallible,
-            >(
-                data
-            )]))),
-            ..Default::default()
-        }))
-    }
-
-    async fn put_object(
-        &self,
-        req: S3Request<PutObjectInput>,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
-        let PutObjectInput {
-            bucket, key, body, ..
-        } = req.input;
-        if bucket != BUCKET {
-            return Err(s3_error!(NoSuchBucket));
-        }
-        let Some(body) = body else {
-            return Err(s3_error!(IncompleteBody));
-        };
-        let chunks: Vec<Bytes> = body
-            .try_collect()
-            .await
-            .map_err(|e| s3_error!(IncompleteBody, "{e}"))?;
-        self.0.lock().unwrap().insert(key, chunks.concat().into());
-        Ok(S3Response::new(PutObjectOutput::default()))
-    }
+fn error(status: StatusCode, code: &str) -> Response<Full<Bytes>> {
+    let body = format!("<Error><Code>{code}</Code></Error>");
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Full::new(body.into()))
+        .unwrap()
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let service = {
-        let mut builder = S3ServiceBuilder::new(MemoryBucket::default());
-        builder.set_auth(SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY));
-        builder.build()
-    };
-
+    let objects = Objects::default();
     let listener = TcpListener::bind(ADDRESS).await?;
     println!("Mock S3 server running at http://{ADDRESS}");
     println!("Bucket {BUCKET:?} created. Press ctrl+c to stop.");
@@ -118,14 +81,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             accepted = listener.accept() => accepted?,
             _ = tokio::signal::ctrl_c() => return Ok(()),
         };
-        let service = service.clone();
+        let objects = objects.clone();
         let logged = service_fn(move |request: Request<Incoming>| {
             let method = request.method().clone();
             let path = request.uri().path().to_owned();
             let started = Instant::now();
-            // S3Service has an inherent `call` taking its own body type, which method syntax would
-            // pick.
-            let response = Service::call(&service, request);
+            let response = handle(objects.clone(), request);
             async move {
                 let response = response.await;
                 if let Ok(response) = &response {
