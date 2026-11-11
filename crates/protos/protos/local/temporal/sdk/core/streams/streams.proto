@@ -12,17 +12,14 @@ import "temporal/api/stream/v1/message.proto";
 
 // Method `OpenWriter`, asynchronous. A writer for an Activity, a Local Activity or a client
 // Producer, which keeps its epoch and `sequence` order. A writer of a Local Activity, or of an
-// Activity attempt above 1, first sends an empty batch, so that the new epoch withdraws the earlier
-// one's Records. The opens of one Producer epoch on one Stream share one writer. Each open adds a
-// reference, and each `CloseWriter` or `FreeWriter` releases one. The batches of every writer in a
-// process take their `sequence` from one counter, so a writer that opens again after its close
+// Activity attempt above 1, first sends an empty batch, so that the new epoch fences the earlier
+// one. The opens of one Producer epoch on one Stream share one writer. Each open adds a
+// reference, and each `CloseWriter` or `FreeWriter` releases one. The batches of every writer in
+// a process take their `sequence` from one counter, so a writer that opens again after its close
 // continues above its earlier batches.
 message OpenWriterRequest {
     temporal.api.stream.v1.StreamRef ref = 1;
-    // Each batch sends it as AppendRecords does. For a Local Activity its withdrawal has the run's
-    // task facts, so the writes withdraw the run's orphaned Local Activity Records. The withdrawal's
-    // withdraw_run must be empty, since only a retry run's first append withdraws a run, and a
-    // writer sends many.
+    // Each batch sends it as AppendRecords does.
     temporal.api.stream.v1.StreamWriter writer = 2;
     // A write sends at most this many Records in one batch. Zero is 1000.
     int32 max_batch_size = 3;

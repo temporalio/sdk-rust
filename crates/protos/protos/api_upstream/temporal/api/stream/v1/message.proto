@@ -19,8 +19,9 @@ import "temporal/api/enums/v1/stream.proto";
 message StreamRef {
     string id = 1;
     // The name of the backend that holds the Stream, as the Worker and client config register
-    // it, so every process routes a ref it receives. Empty is the default backend. Only an SDK
-    // reads it. A request carries the whole ref, and the server and a Store ignore this field.
+    // it, so every process routes a ref it receives. With no name, the SDK picks the backend from
+    // its config. Only an SDK reads it. A request carries the whole ref, and the server and a
+    // Store ignore this field.
     string backend = 3;
 }
 

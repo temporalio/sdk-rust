@@ -18,8 +18,7 @@ pub enum Reason {
     Expired,
     /// The Stream is closed.
     Closed,
-    /// The Producer's epoch is lower than the newest one, its Workflow Task was withdrawn, or a
-    /// Workflow retry withdrew its run.
+    /// The Producer's epoch is lower than the newest one.
     Fenced,
     /// The batch has a lower `sequence` than the last one of its epoch.
     SequenceTooLow,
