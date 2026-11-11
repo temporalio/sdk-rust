@@ -18,17 +18,16 @@ import "temporal/api/stream/v1/message.proto";
 // process take their `sequence` from one counter, so a writer that opens again after its close
 // continues above its earlier batches.
 message OpenWriterRequest {
-    string namespace = 1;
-    temporal.api.stream.v1.StreamRef ref = 2;
+    temporal.api.stream.v1.StreamRef ref = 1;
     // Each batch sends it as AppendRecords does. For a Local Activity its withdrawal has the run's
     // task facts, so the writes withdraw the run's orphaned Local Activity Records. The withdrawal's
     // withdraw_run must be empty, since only a retry run's first append withdraws a run, and a
     // writer sends many.
-    temporal.api.stream.v1.StreamWriter writer = 3;
+    temporal.api.stream.v1.StreamWriter writer = 2;
     // A write sends at most this many Records in one batch. Zero is 1000.
-    int32 max_batch_size = 4;
+    int32 max_batch_size = 3;
     // How long a write retries a Store failure. Empty is 10 s.
-    google.protobuf.Duration max_retry_duration = 5;
+    google.protobuf.Duration max_retry_duration = 4;
 }
 
 message OpenWriterResponse {
@@ -48,9 +47,9 @@ message WriteRecordsRequest {
 }
 
 message WriteRecordsResponse {
-    // The offsets of the first and the last Record. Zero when the request has no Record.
-    int64 first_offset = 1;
-    int64 last_offset = 2;
+    // The offsets of the first and the last Record. Empty when the request has no Record.
+    bytes first_offset = 1;
+    bytes last_offset = 2;
 }
 
 // Method `CloseWriter`, asynchronous. Releases one reference of the writer. The last reference
@@ -61,8 +60,8 @@ message CloseWriterRequest {
 }
 
 message CloseWriterResponse {
-    // The offset of the newest Record the writer wrote. Zero if it wrote none.
-    int64 last_offset = 1;
+    // The offset of the newest Record the writer wrote. Empty if it wrote none.
+    bytes last_offset = 1;
 }
 
 // Method `FreeWriter`. Releases one reference of the writer with no wait, for a reference that

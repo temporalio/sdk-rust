@@ -29,8 +29,7 @@ pub enum Reason {
     NotOwner,
     /// A newer format version wrote the Stream.
     FormatTooNew,
-    /// The offset is past the newest offset + 1, for example after a failover lost the newest
-    /// Records.
+    /// The offset is past the newest offset, for example after a failover lost the newest Records.
     OffsetTooHigh,
     /// A Record or a batch is over the Store's limit.
     TooLarge,
