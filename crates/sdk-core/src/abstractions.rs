@@ -8,7 +8,7 @@ use std::{
     fmt::{Debug, Formatter},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 use temporalio_common::{telemetry::metrics::TemporalMeter, worker::WorkerDeploymentVersion};
@@ -35,6 +35,7 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     /// there will need to be some associated refactoring.
     max_permits: Option<usize>,
     metrics_ctx: MetricsContext,
+    slot_metric_version: Arc<AtomicU64>,
     meter: Option<TemporalMeter>,
     /// Only applies to permit dealers for workflow tasks. True if this permit dealer is associated
     /// with a sticky queue poller.
@@ -98,6 +99,7 @@ where
             unused_claimants: Arc::new(AtomicUsize::new(0)),
             extant_permits: watch::channel(0),
             metrics_ctx,
+            slot_metric_version: Default::default(),
             meter,
             max_permits,
             is_sticky_poller: false,
@@ -165,19 +167,29 @@ where
         let supp_c = self.supplier.clone();
         let supp_c_c = self.supplier.clone();
         let mets = self.metrics_ctx.clone();
-        let metric_rec =
-            // The supplier permit is still alive while its drop callback runs, so suppliers backed
-            // by an RAII permit do not include the slot being released in `available_slots` yet.
-            move |permit_is_being_released: bool| {
-                let available_adjustment = usize::from(permit_is_being_released);
+        let slot_metric_version = self.slot_metric_version.clone();
+        let metric_rec = move || {
+            // Suppliers and meters may call back into the worker. If a slot changed while
+            // they were running, an older sample could have overwritten a newer one.
+            let mut version = slot_metric_version
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            loop {
                 let unused = uc_c.load(Ordering::Acquire);
                 if let Some(avail) = supp.available_slots() {
-                    mets.available_task_slots(avail + unused + available_adjustment);
+                    mets.available_task_slots(avail + unused);
                 }
-                mets.task_slots_used(ep_rx_c.borrow().saturating_sub(unused) as u64);
-            };
+                let used = ep_rx_c.borrow().saturating_sub(unused) as u64;
+                mets.task_slots_used(used);
+                let latest = slot_metric_version.load(Ordering::Acquire);
+                if latest == version {
+                    break;
+                }
+                version = latest;
+            }
+        };
         let mrc = metric_rec.clone();
-        mrc(false);
+        mrc();
 
         OwnedMeteredSemPermit {
             unused_claimants: Some(self.unused_claimants.clone()),
@@ -188,12 +200,14 @@ where
             },
             use_fn: Box::new(move |info| {
                 supp_c.mark_slot_used(info);
-                metric_rec(false)
+                metric_rec()
             }),
             release_fn: Box::new(move |info| {
                 supp_c_c.release_slot(info);
                 ep_tx_c.send_modify(|ep| *ep -= 1);
-                mrc(true)
+                // The fixed-size supplier returns capacity when its permit is dropped.
+                drop(std::mem::take(&mut info.permit));
+                mrc()
             }),
         }
     }
@@ -399,14 +413,14 @@ pub(crate) struct OwnedMeteredSemPermit<SK: SlotKind> {
     #[allow(clippy::type_complexity)] // not really tho, bud
     use_fn: Box<dyn Fn(&UseCtx<SK>) + Send + Sync>,
     #[allow(clippy::type_complexity)] // not really tho, bud
-    release_fn: Box<dyn Fn(&ReleaseCtx<SK>) + Send + Sync>,
+    release_fn: Box<dyn Fn(&mut ReleaseCtx<SK>) + Send + Sync>,
 }
 impl<SK: SlotKind> Drop for OwnedMeteredSemPermit<SK> {
     fn drop(&mut self) {
         if let Some(uc) = self.unused_claimants.take() {
             uc.fetch_sub(1, Ordering::Release);
         }
-        (self.release_fn)(&self.release_ctx);
+        (self.release_fn)(&mut self.release_ctx);
     }
 }
 impl<SK: SlotKind> Debug for OwnedMeteredSemPermit<SK> {
@@ -479,9 +493,12 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         advance_fut,
+        telemetry::metrics::{WorkerHeartbeatMetrics, activity_worker_type},
         worker::{WorkflowSlotKind, tuner::FixedSizeSlotSupplier},
     };
     use futures_util::FutureExt;
+    use std::sync::mpsc::{self, Sender};
+    use temporalio_common::protos::coresdk::ActivitySlotInfo;
 
     pub(crate) fn fixed_size_permit_dealer<SK: SlotKind>(size: usize) -> MeteredPermitDealer<SK> {
         MeteredPermitDealer::new(
@@ -491,6 +508,118 @@ pub(crate) mod tests {
             Arc::new(Default::default()),
             None,
         )
+    }
+
+    fn activity_slots(gauges: &WorkerHeartbeatMetrics) -> (u64, u64) {
+        let used = gauges
+            .worker_task_slots_used
+            .activity_worker
+            .load(Ordering::Relaxed);
+        let available = gauges
+            .worker_task_slots_available
+            .activity_worker
+            .load(Ordering::Relaxed);
+        (used, available)
+    }
+
+    struct ReentrantSlotSupplier {
+        inner: FixedSizeSlotSupplier<ActivitySlotKind>,
+        on_capacity: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SlotSupplier for ReentrantSlotSupplier {
+        type SlotKind = ActivitySlotKind;
+
+        async fn reserve_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
+            self.inner.reserve_slot(ctx).await
+        }
+
+        fn try_reserve_slot(&self, ctx: &dyn SlotReservationContext) -> Option<SlotSupplierPermit> {
+            self.inner.try_reserve_slot(ctx)
+        }
+
+        fn mark_slot_used(&self, ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {
+            self.inner.mark_slot_used(ctx);
+        }
+
+        fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
+            self.inner.release_slot(ctx);
+        }
+
+        fn available_slots(&self) -> Option<usize> {
+            let on_capacity = self.on_capacity.lock().take();
+            if let Some(on_capacity) = on_capacity {
+                on_capacity();
+            }
+            self.inner.available_slots()
+        }
+    }
+
+    #[test]
+    fn poll_reservation_cannot_overwrite_a_newer_activity_slot_sample() {
+        let supplier = Arc::new(ReentrantSlotSupplier {
+            inner: FixedSizeSlotSupplier::new(2),
+            on_capacity: Default::default(),
+        });
+        let metrics = MetricsContext::no_op().with_new_attrs([activity_worker_type()]);
+        let gauges = metrics.in_memory_meter().unwrap();
+        let dealer =
+            MeteredPermitDealer::new(supplier.clone(), metrics, None, Default::default(), None);
+        let activity = dealer.try_acquire_owned().unwrap();
+        let (send_activity, activity_started) = mpsc::channel();
+        *supplier.on_capacity.lock() = Some(Box::new(move || {
+            send_activity
+                .send(activity.into_used(ActivitySlotInfo::default()))
+                .unwrap();
+        }));
+
+        // The poller has read the unused count when the activity claims its slot.
+        let _idle_poll = dealer.try_acquire_owned().unwrap();
+        let _in_flight = activity_started.try_recv().unwrap();
+        assert_eq!(activity_slots(&gauges), (1, 1));
+    }
+
+    struct ReserveBeforeReturn {
+        _permit: SlotSupplierPermit,
+        dealer: Arc<MeteredPermitDealer<ActivitySlotKind>>,
+        send_poll: Sender<OwnedMeteredSemPermit<ActivitySlotKind>>,
+    }
+
+    impl Drop for ReserveBeforeReturn {
+        fn drop(&mut self) {
+            self.send_poll
+                .send(self.dealer.try_acquire_owned().unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn poll_reservation_during_release_sees_the_returned_slot() {
+        let metrics = MetricsContext::no_op().with_new_attrs([activity_worker_type()]);
+        let gauges = metrics.in_memory_meter().unwrap();
+        let dealer = Arc::new(MeteredPermitDealer::new(
+            Arc::new(FixedSizeSlotSupplier::new(2)),
+            metrics,
+            None,
+            Default::default(),
+            None,
+        ));
+        let mut activity = dealer
+            .try_acquire_owned()
+            .unwrap()
+            .into_used(ActivitySlotInfo::default());
+        let (send_poll, poll_reserved) = mpsc::channel();
+        let permit = &mut activity.0.release_ctx.permit;
+        *permit = SlotSupplierPermit::with_user_data(ReserveBeforeReturn {
+            _permit: std::mem::take(permit),
+            dealer: dealer.clone(),
+            send_poll,
+        });
+        drop(activity);
+        let _idle_poll = poll_reserved.try_recv().unwrap();
+
+        assert_eq!(activity_slots(&gauges), (0, 2));
     }
 
     #[test]

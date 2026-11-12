@@ -1,1 +1,0 @@
-Workflows now run static summaries and details through a client's data converter and payload codec. Before they used a default PayloadConverter so describe() failed on summaries that a codec encoded (when using cross SDK workflows).

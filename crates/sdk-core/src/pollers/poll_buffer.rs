@@ -101,6 +101,18 @@ pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
     did_stop: bool,
 }
 
+/// Per-poller-type state the poll scaler publishes for the worker heartbeat, which is built
+/// before any poller exists. Shared, so the heartbeat and the pool see the same cells.
+pub(crate) type PollerHeartbeatState = Arc<PollerHeartbeatStateInner>;
+
+#[derive(Default)]
+pub(crate) struct PollerHeartbeatStateInner {
+    /// When the pool last polled successfully.
+    pub(crate) last_successful_poll_time: AtomicCell<Option<SystemTime>>,
+    /// The pool's poller target. `None` until the pool exists.
+    pub(crate) target: AtomicCell<Option<i32>>,
+}
+
 pub(crate) struct WorkflowTaskOptions {
     pub(crate) wft_poller_shared: Option<Arc<StickyPollerShared>>,
 }
@@ -123,7 +135,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
         options: WorkflowTaskOptions,
-        last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+        heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self {
         let is_sticky = sticky_queue.is_some();
@@ -131,7 +143,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
             poller_behavior,
             num_pollers_handler,
             shutdown.clone(),
-            last_successful_poll_time,
+            heartbeat_state,
             capabilities.clone(),
         );
         if let Some(wftps) = options.wft_poller_shared.as_ref() {
@@ -178,6 +190,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override: opts.timeout_override,
+                            target_pollers: opts.target_pollers,
                             retry_semaphore: opts.retry_semaphore,
                         },
                         PollWorkflowOptions { sticky_queue_name },
@@ -207,7 +220,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
         options: ActivityTaskOptions,
-        last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+        heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self {
         let pre_permit_delay = options
@@ -236,6 +249,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override: opts.timeout_override,
+                            target_pollers: opts.target_pollers,
                             retry_semaphore: opts.retry_semaphore,
                         },
                         PollActivityOptions {
@@ -250,7 +264,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
             poller_behavior,
             num_pollers_handler,
             shutdown.clone(),
-            last_successful_poll_time,
+            heartbeat_state,
             capabilities.clone(),
         );
         Self::new(
@@ -274,7 +288,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         permit_dealer: MeteredPermitDealer<NexusSlotKind>,
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
-        last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+        heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
         worker_commands_queue: bool,
     ) -> Self {
@@ -295,6 +309,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override: opts.timeout_override,
+                            target_pollers: opts.target_pollers,
                             retry_semaphore: opts.retry_semaphore,
                         },
                         PollNexusOptions {
@@ -312,7 +327,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
                 poller_behavior,
                 num_pollers_handler,
                 shutdown,
-                last_successful_poll_time,
+                heartbeat_state,
                 capabilities.clone(),
             ),
             None::<fn() -> BoxFuture<'static, ()>>,
@@ -332,6 +347,7 @@ thread_local! {
 
 struct PollFnOptions {
     timeout_override: Option<Duration>,
+    target_pollers: Option<i32>,
     retry_semaphore: Option<Arc<Semaphore>>,
 }
 
@@ -368,80 +384,92 @@ where
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(Duration::from_millis);
 
-        let poller_task =
-            tokio::spawn(
-                async move {
-                    tokio::select! {
-                        _ = wait_for_start.recv() => (),
-                        _ = shutdown_clone.cancelled() => return,
-                    }
-                    drop(wait_for_start);
+        let poller_task = tokio::spawn(
+            async move {
+                tokio::select! {
+                    _ = wait_for_start.recv() => (),
+                    _ = shutdown_clone.cancelled() => return,
+                }
+                drop(wait_for_start);
 
-                    let (spawned_tx, spawned_rx) = unbounded_channel();
-                    let shutdown_for_awaiter = shutdown_clone.clone();
-                    // This is needed to ensure we don't exit this task before all received polls have
-                    // been sent out for processing.
-                    let poll_task_awaiter = tokio::spawn(async move {
-                        UnboundedReceiverStream::new(spawned_rx)
-                            .for_each_concurrent(None, |t| async {
-                                handle_task_panic(t, Some(&shutdown_for_awaiter)).await;
-                            })
-                            .await;
-                    });
-                    loop {
-                        if shutdown_clone.is_cancelled() {
-                            break;
-                        }
-                        if let Some(ref ppd) = pre_permit_delay {
-                            tokio::select! {
-                                _ = ppd() => (),
-                                _ = shutdown_clone.cancelled() => break,
-                            }
-                        }
-                        let permit = tokio::select! {
-                            p = permit_dealer.acquire_owned() => p,
+                let (spawned_tx, spawned_rx) = unbounded_channel();
+                let shutdown_for_awaiter = shutdown_clone.clone();
+                // This is needed to ensure we don't exit this task before all received polls have
+                // been sent out for processing.
+                let poll_task_awaiter = tokio::spawn(async move {
+                    UnboundedReceiverStream::new(spawned_rx)
+                        .for_each_concurrent(None, |t| async {
+                            handle_task_panic(t, Some(&shutdown_for_awaiter)).await;
+                        })
+                        .await;
+                });
+                loop {
+                    if shutdown_clone.is_cancelled() {
+                        break;
+                    }
+                    if let Some(ref ppd) = pre_permit_delay {
+                        tokio::select! {
+                            _ = ppd() => (),
                             _ = shutdown_clone.cancelled() => break,
+                        }
+                    }
+                    let permit = tokio::select! {
+                        p = permit_dealer.acquire_owned() => p,
+                        _ = shutdown_clone.cancelled() => break,
+                    };
+                    let active_guard = tokio::select! {
+                        ag = poll_scaler.wait_until_allowed() => ag,
+                        _ = shutdown_clone.cancelled() => break,
+                    };
+                    // Spawn poll task
+                    let shutdown = shutdown_clone.clone();
+                    let pf = pf.clone();
+                    let post_pf = post_pf.clone();
+                    let tx = tx.clone();
+                    let report_handle = poll_scaler.get_report_handle();
+                    // Reduce poll timeout if we're frequently getting tasks, to avoid having many
+                    // outstanding long polls for a full minute after a burst subsides.
+                    let timeout_override =
+                        if report_handle.ingested_this_period.load(Ordering::Relaxed) > 1 {
+                            Some(Duration::from_secs(11))
+                        } else {
+                            None
                         };
-                        let active_guard = tokio::select! {
-                            ag = poll_scaler.wait_until_allowed() => ag,
-                            _ = shutdown_clone.cancelled() => break,
-                        };
-                        // Spawn poll task
-                        let shutdown = shutdown_clone.clone();
-                        let pf = pf.clone();
-                        let post_pf = post_pf.clone();
-                        let tx = tx.clone();
-                        let report_handle = poll_scaler.get_report_handle();
-                        // Reduce poll timeout if we're frequently getting tasks, to avoid having many
-                        // outstanding long polls for a full minute after a burst subsides.
-                        let timeout_override =
-                            if report_handle.ingested_this_period.load(Ordering::Relaxed) > 1 {
-                                Some(Duration::from_secs(11))
-                            } else {
-                                None
-                            };
-                        let capabilities = capabilities.clone();
-                        let poll_task = tokio::spawn(
+                    let target_pollers = Some(report_handle.target_pollers());
+                    let capabilities = capabilities.clone();
+                    let poll_task = tokio::spawn(
                         async move {
                             let (retry_semaphore, poll_interruptor) = {
                                 if capabilities.graceful_poll_shutdown() {
                                     let sem = Arc::new(Semaphore::new(0));
-                                    (Some(sem.clone()), async move {
-                                        match sem.acquire().await {
-                                            Ok(permit) =>
+                                    (
+                                        Some(sem.clone()),
+                                        async move {
+                                            match sem.acquire().await {
+                                                Ok(permit) =>
                                                 // prevent further polls
-                                                permit.forget(),
-                                            Err(_) =>
+                                                {
+                                                    permit.forget()
+                                                }
+                                                Err(_) =>
                                                 // should never happen, but even then it's safe to ignore
-                                                dbg_panic!("Poll semaphore closed")
+                                                {
+                                                    dbg_panic!("Poll semaphore closed")
+                                                }
+                                            }
                                         }
-                                    }.left_future())
+                                        .left_future(),
+                                    )
                                 } else {
-                                    (None, async move {
-                                        if let Some(w) = poll_shutdown_interrupt_wait {
-                                            tokio::time::sleep(w).await;
+                                    (
+                                        None,
+                                        async move {
+                                            if let Some(w) = poll_shutdown_interrupt_wait {
+                                                tokio::time::sleep(w).await;
+                                            }
                                         }
-                                    }.right_future())
+                                        .right_future(),
+                                    )
                                 }
                             };
 
@@ -451,7 +479,11 @@ where
                                     shutdown.cancelled().await;
                                     poll_interruptor.await;
                                 } => return,
-                                r = pf(PollFnOptions { timeout_override, retry_semaphore }) => r,
+                                r = pf(PollFnOptions {
+                                    timeout_override,
+                                    target_pollers,
+                                    retry_semaphore
+                                }) => r,
                             };
                             if let Ok(r) = &r
                                 && let Some(ppf) = post_pf.as_ref()
@@ -474,16 +506,16 @@ where
                         }
                         .in_current_span(),
                     );
-                        let _ = spawned_tx.send(poll_task);
-                    }
-                    drop(spawned_tx);
-                    poll_task_awaiter.await.unwrap();
-                    if let Some(it) = poll_scaler.ingestor_task {
-                        it.await.unwrap();
-                    }
+                    let _ = spawned_tx.send(poll_task);
                 }
-                .instrument(info_span!("polling_task").or_current()),
-            );
+                drop(spawned_tx);
+                poll_task_awaiter.await.unwrap();
+                if let Some(it) = poll_scaler.ingestor_task {
+                    it.await.unwrap();
+                }
+            }
+            .instrument(info_span!("polling_task").or_current()),
+        );
         Self {
             buffered_polls: rx,
             shutdown,
@@ -594,7 +626,7 @@ where
         behavior: PollerBehavior,
         num_pollers_handler: Option<F>,
         shutdown: CancellationToken,
-        last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+        heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self {
         let (active_tx, active_rx) = watch::channel(0);
@@ -618,11 +650,13 @@ where
             ingested_this_period: Default::default(),
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
-            last_successful_poll_time,
+            heartbeat_state,
             persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
+        // Seed the cell so a pool that never changes target still reports one.
+        report_handle.publish_target();
         let rhc = report_handle.clone();
         let ingestor_task = if behavior.is_autoscaling() {
             // Here we spawn a task to periodically check if we should permit increasing the
@@ -682,7 +716,7 @@ struct PollScalerReportHandle {
     ingested_this_period: AtomicUsize,
     ingested_last_period: AtomicUsize,
     scale_up_allowed: AtomicBool,
-    last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    heartbeat_state: PollerHeartbeatState,
     persistent_error_warning_state: parking_lot::Mutex<PersistentPollErrorWarningState>,
 
     // Exponential backoff for normal errors and resource exhausted errors
@@ -691,6 +725,11 @@ struct PollScalerReportHandle {
 }
 
 impl PollScalerReportHandle {
+    /// The pool's poller target: the autoscaled target, or the configured size if fixed.
+    fn target_pollers(&self) -> i32 {
+        (*self.target.borrow()).try_into().unwrap_or(i32::MAX)
+    }
+
     /// Returns (should_forward, backoff_duration)
     /// - should_forward: true if the response should be passed on, false if it should be swallowed
     /// - backoff_duration: Some(duration) if we should sleep before the next poll
@@ -700,7 +739,8 @@ impl PollScalerReportHandle {
     ) -> (bool, Option<Duration>) {
         match res {
             Ok(res) => {
-                self.last_successful_poll_time
+                self.heartbeat_state
+                    .last_successful_poll_time
                     .store(Some(SystemTime::now()));
                 // Reset backoff on successful poll
                 *self.exponential_backoff.lock() = TASK_POLL_BACKOFF.build();
@@ -798,6 +838,14 @@ impl PollScalerReportHandle {
             *target = new_target;
             true
         });
+        self.publish_target();
+    }
+
+    /// Mirrors the current target into the cell the heartbeat reads.
+    fn publish_target(&self) {
+        self.heartbeat_state
+            .target
+            .store(Some(self.target_pollers()));
     }
 
     /// We want to avoid scaling down on empty polls if the server has never made any scaling
@@ -952,7 +1000,7 @@ mod tests {
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
             },
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
         );
 
@@ -972,6 +1020,91 @@ mod tests {
         // Now we grab the buffered poll response, the poll task will go again but we don't grab it,
         // therefore we will have only polled twice.
         pb.poll().await.unwrap().unwrap();
+        pb.shutdown().await;
+    }
+
+    #[rstest]
+    #[case::fixed(PollerBehavior::SimpleMaximum(5), 5)]
+    #[case::autoscaling(
+        PollerBehavior::Autoscaling {
+            minimum: 1,
+            maximum: 10,
+            initial: 3,
+        },
+        3
+    )]
+    #[tokio::test]
+    async fn poll_request_reports_target_pollers(
+        #[case] behavior: PollerBehavior,
+        #[case] expected: i32,
+    ) {
+        let seen_target = Arc::new(AtomicCell::new(None));
+        let seen_target_clone = seen_target.clone();
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_poll_workflow_task()
+            .returning(move |opts, _| {
+                seen_target_clone.store(opts.target_pollers);
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(Default::default())
+                }
+                .boxed()
+            });
+
+        let mut pb = LongPollBuffer::new_workflow_task(
+            Arc::new(mock_client),
+            "sometq".to_string(),
+            None,
+            behavior,
+            fixed_size_permit_dealer(10),
+            CancellationToken::new(),
+            None::<fn(usize)>,
+            WorkflowTaskOptions {
+                wft_poller_shared: None,
+            },
+            PollerHeartbeatState::default(),
+            Arc::new(NamespaceCapabilities::default()),
+        );
+
+        pb.poll().await.unwrap().unwrap();
+        pb.shutdown().await;
+
+        assert_eq!(seen_target.load(), Some(expected));
+    }
+
+    #[rstest]
+    #[case::fixed(PollerBehavior::SimpleMaximum(5), 5)]
+    #[case::autoscaling(
+        PollerBehavior::Autoscaling {
+            minimum: 1,
+            maximum: 10,
+            initial: 3,
+        },
+        3
+    )]
+    #[tokio::test]
+    async fn heartbeat_target_is_populated(
+        #[case] behavior: PollerBehavior,
+        #[case] expected: i32,
+    ) {
+        let heartbeat_state = PollerHeartbeatState::default();
+        let pb = LongPollBuffer::new_workflow_task(
+            Arc::new(mock_manual_worker_client()),
+            "sometq".to_string(),
+            None,
+            behavior,
+            fixed_size_permit_dealer(10),
+            CancellationToken::new(),
+            None::<fn(usize)>,
+            WorkflowTaskOptions {
+                wft_poller_shared: None,
+            },
+            heartbeat_state.clone(),
+            Arc::new(NamespaceCapabilities::default()),
+        );
+
+        assert_eq!(heartbeat_state.target.load(), Some(expected));
         pb.shutdown().await;
     }
 
@@ -1009,7 +1142,7 @@ mod tests {
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
             },
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
         );
 
@@ -1086,7 +1219,7 @@ mod tests {
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
             },
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
         );
 
@@ -1201,7 +1334,7 @@ mod tests {
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
             },
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
         );
 
@@ -1279,7 +1412,7 @@ mod tests {
             WorkflowTaskOptions {
                 wft_poller_shared: None,
             },
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
                 poller_autoscaling: true,
                 ..Default::default()
@@ -1358,7 +1491,7 @@ mod tests {
             WorkflowTaskOptions {
                 wft_poller_shared: None,
             },
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
                 worker_poll_complete_on_shutdown: graceful,
                 ..Default::default()
@@ -1431,7 +1564,7 @@ mod tests {
             ingested_this_period: Default::default(),
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(scale_up_allowed),
-            last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            heartbeat_state: PollerHeartbeatState::default(),
             persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
@@ -1476,7 +1609,7 @@ mod tests {
             ingested_this_period: Default::default(),
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
-            last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            heartbeat_state: PollerHeartbeatState::default(),
             persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),

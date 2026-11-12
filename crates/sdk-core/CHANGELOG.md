@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.11.0] - 2026-11-09
+
 ### Added
 * A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. `workflow_task`
@@ -54,11 +56,14 @@ relevant information.
 
 ### Fixed
 * Fixed dropping workflow tasks during shutdown in certain scenarios.
+* Slot gauges now reflect the current number of used and available slots after concurrent worker updates.
 * A workflow task failure reported with the cause `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`
   is now counted on `workflow_task_execution_failed` with `failure_reason="ExternalStorageError"`,
   matching activity failures with the storage cause. It was previously counted as `WorkflowError`.
 * Ephemeral dev and test servers now complete the automatic port reservation handshake on Linux
   and macOS before starting, preventing intermittent address-in-use errors during TCP teardown.
+* Downloading an ephemeral dev or test server binary now retries transient HTTP failures, such as a
+  `503` returned while a release is rolling out, with backoff instead of failing on the first attempt.
 * Resource-based worker tuners now read CPU usage and quotas from standard cgroup v1 mounts. Workers
   on cgroup v1 systems no longer fall back to host CPU usage and admit work based on understated
   container load.
@@ -104,6 +109,10 @@ relevant information.
 
 ### Changed
 * Worker now retries `ShutdownWorker` RPC on retryable errors until the task pollers finish.
+* Poller pools now report their poller target to the server on each poll and in the worker
+  heartbeat: the current target for autoscaling pools, the configured maximum for fixed-size
+  pools. (We'll use this count on the server side for now for load balancing pollers between
+  workers, and for creating a per-worker poller count metric.)
 
 ## [0.10.0] - 2026-10-06
 
