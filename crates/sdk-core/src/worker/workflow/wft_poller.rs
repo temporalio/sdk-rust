@@ -2,8 +2,8 @@ use crate::{
     MetricsContext, WorkerConfig,
     abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit},
     pollers::{
-        BoxedWFPoller, LongPollBuffer, Poller, PollerHeartbeatState, PollerError, PollerResult, StickyPollerShared,
-        StickyTaskPoller, WorkflowTaskOptions, sticky_poller_behavior,
+        BoxedWFPoller, LongPollBuffer, Poller, PollerError, PollerHeartbeatState, PollerResult,
+        StickyPollerShared, StickyTaskPoller, WorkflowTaskOptions, sticky_poller_behavior,
     },
     protosext::ValidPollWFTQResponse,
     telemetry::metrics::{workflow_poller, workflow_sticky_poller},

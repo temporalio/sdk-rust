@@ -1045,7 +1045,6 @@ mod tests {
         server.abort();
     }
 
-    #[ignore]
     #[test]
     fn get_free_port_can_bind_immediately() {
         let host = "127.0.0.1";
