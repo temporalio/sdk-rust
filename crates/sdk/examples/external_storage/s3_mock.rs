@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::net::TcpListener;
 
-const ADDRESS: &str = "localhost:5000";
+const ADDRESS: &str = "localhost:9100";
 const BUCKET: &str = "temporal-payloads";
 
 type Objects = Arc<Mutex<HashMap<String, Bytes>>>;

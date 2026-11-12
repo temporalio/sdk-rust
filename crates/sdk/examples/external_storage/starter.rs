@@ -12,7 +12,7 @@ use workflows::{BatchSummary, ProcessOrderBatchWorkflow};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (conn_opts, mut client_opts) =
         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())?;
-    client_opts.data_converter = storage::data_converter()?;
+    client_opts.data_converter = storage::data_converter().await?;
     let connection = Connection::connect(conn_opts).await?;
     let client = Client::new(connection, client_opts)?;
 

@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())?;
     // The worker uses its client's data converter, so this is all it takes to offload the large
     // activity inputs and results it sends.
-    client_opts.data_converter = storage::data_converter()?;
+    client_opts.data_converter = storage::data_converter().await?;
     let connection = Connection::connect(conn_opts).await?;
     let client = Client::new(connection, client_opts)?;
 
