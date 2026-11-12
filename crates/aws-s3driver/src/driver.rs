@@ -229,7 +229,8 @@ impl StorageDriver for S3StorageDriver {
         context: &StorageDriverStoreContext,
         payloads: Vec<Payload>,
     ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
-        let context_segments = context_key_segments(context.target.as_ref());
+        let context_segments =
+            context_key_segments(context.target.as_ref(), context.namespace.as_deref());
         let objects: Result<Vec<_>, _> = payloads
             .into_iter()
             .map(|payload| self.stored_object(context, payload, &context_segments))
@@ -383,7 +384,10 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
-fn context_key_segments(target: Option<&StorageDriverTargetInfo>) -> String {
+fn context_key_segments(
+    target: Option<&StorageDriverTargetInfo>,
+    namespace: Option<&str>,
+) -> String {
     match target {
         Some(StorageDriverTargetInfo::Workflow(workflow)) => format!(
             "/ns/{}/wt/{}/wi/{}/ri/{}",
@@ -399,7 +403,7 @@ fn context_key_segments(target: Option<&StorageDriverTargetInfo>) -> String {
             encode_key_segment(activity.id.as_deref()),
             encode_key_segment(activity.run_id.as_deref()),
         ),
-        _ => String::new(),
+        _ => format!("/ns/{}", encode_key_segment(namespace)),
     }
 }
 
@@ -829,11 +833,25 @@ mod tests {
     }
 
     async fn store_key(target: Option<StorageDriverTargetInfo>, data: &str) -> String {
+        stored_key(store_context(target), data).await
+    }
+
+    async fn store_key_in_namespace(
+        target: Option<StorageDriverTargetInfo>,
+        namespace: &str,
+        data: &str,
+    ) -> String {
+        let context = StorageDriverStoreContext::builder()
+            .maybe_target(target)
+            .namespace(namespace.to_owned())
+            .limiter(Arc::new(RecordingLimiter::new()))
+            .build();
+        stored_key(context, data).await
+    }
+
+    async fn stored_key(context: StorageDriverStoreContext, data: &str) -> String {
         let driver = new_driver(Arc::new(FakeS3Client::default()), "my-bucket");
-        let claims = driver
-            .store(&store_context(target), vec![payload(data)])
-            .await
-            .unwrap();
+        let claims = driver.store(&context, vec![payload(data)]).await.unwrap();
         claims[0].claim_data[CLAIM_KEY].clone()
     }
 
@@ -969,10 +987,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_without_target_key_has_only_the_digest() {
+    async fn store_without_target_or_namespace_writes_a_null_namespace() {
         assert_eq!(
             store_key(None, "one").await,
-            format!("v0/d/sha256/{}", hash_of("one"))
+            format!("v0/ns/null/d/sha256/{}", hash_of("one"))
+        );
+    }
+
+    #[tokio::test]
+    async fn store_without_target_uses_the_context_namespace() {
+        assert_eq!(
+            store_key_in_namespace(None, "my ns", "one").await,
+            format!("v0/ns/my%20ns/d/sha256/{}", hash_of("one"))
+        );
+    }
+
+    #[tokio::test]
+    async fn store_target_namespace_overrides_the_context_namespace() {
+        let target = workflow_target("target-ns", Some("wf"), Some("run"), Some("WF"));
+
+        assert!(
+            store_key_in_namespace(Some(target), "other", "one")
+                .await
+                .starts_with("v0/ns/target-ns/wt/")
         );
     }
 
@@ -1179,7 +1216,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "S3StorageDriver store failed [bucket=my-bucket, key=v0/d/sha256/{}, \
+                "S3StorageDriver store failed [bucket=my-bucket, key=v0/ns/null/d/sha256/{}, \
                  client_region=us-west-2]",
                 hash_of("one")
             )

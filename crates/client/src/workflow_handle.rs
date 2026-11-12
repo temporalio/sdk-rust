@@ -821,7 +821,7 @@ where
                                 "",
                             )
                         });
-                        store_external_payloads(&mut request, &data_converter, target).await?;
+                        store_external_payloads(&mut request, &data_converter, &client.namespace(), target).await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         WorkflowService::signal_workflow_execution(&mut client, request)
@@ -903,7 +903,7 @@ where
                                 "",
                             )
                         });
-                        store_external_payloads(&mut request, &data_converter, target).await?;
+                        store_external_payloads(&mut request, &data_converter, &client.namespace(), target).await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         let mut response = client
@@ -1001,18 +1001,19 @@ where
         U: UpdateDefinition<Workflow = W::Run>,
         U::Input: Send,
     {
-        let output = interceptors::call_start_workflow_update(
-            self.client.client_interceptors(),
-            StartWorkflowUpdateInput::new(
-                self.info().workflow_id.clone(),
-                self.info().run_id.clone().unwrap_or_default(),
-                update.name().to_string(),
-                input,
-                options,
-            ),
-            Next::new({
-                let mut client = self.client.clone();
-                move |input: StartWorkflowUpdateInput| -> BoxFuture<
+        let output =
+            interceptors::call_start_workflow_update(
+                self.client.client_interceptors(),
+                StartWorkflowUpdateInput::new(
+                    self.info().workflow_id.clone(),
+                    self.info().run_id.clone().unwrap_or_default(),
+                    update.name().to_string(),
+                    input,
+                    options,
+                ),
+                Next::new({
+                    let mut client = self.client.clone();
+                    move |input: StartWorkflowUpdateInput| -> BoxFuture<
                         '_,
                         Result<StartWorkflowUpdateOutput, WorkflowUpdateError>,
                     > {
@@ -1061,7 +1062,13 @@ where
                                     "",
                                 )
                             });
-                            store_external_payloads(&mut request, &data_converter, target).await?;
+                            store_external_payloads(
+                                &mut request,
+                                &data_converter,
+                                &client.namespace(),
+                                target,
+                            )
+                            .await?;
                             let mut response = loop {
                                 let mut rpc_request = request.clone().into_request();
                                 options.rpc_options.apply_to(&mut rpc_request);
@@ -1094,9 +1101,9 @@ where
                             ))
                         })
                     }
-            }),
-        )
-        .await?;
+                }),
+            )
+            .await?;
 
         Ok(WorkflowUpdateHandle::new(
             self.client.clone(),
@@ -1230,7 +1237,7 @@ where
                                 "",
                             )
                         });
-                        store_external_payloads(&mut request, client.data_converter(), target)
+                        store_external_payloads(&mut request, client.data_converter(), &client.namespace(), target)
                             .await?;
                         let mut request = request.into_request();
                         input.options.rpc_options.apply_to(&mut request);

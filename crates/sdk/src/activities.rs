@@ -147,6 +147,7 @@ impl ActivityContextBackend {
                 store_external_payloads(
                     &mut heartbeat,
                     &client_options.data_converter,
+                    &client_options.namespace,
                     store_target.as_deref().cloned(),
                 )
                 .await?;
