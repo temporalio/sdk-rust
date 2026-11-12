@@ -84,7 +84,7 @@ impl StreamRuntime {
         Err(not_implemented())
     }
 
-    /// Reads one page of items from an offset.
+    /// Reads one page of Records after an offset.
     pub async fn read_records(
         &self,
         request: ReadRecordsRequest,
@@ -93,7 +93,7 @@ impl StreamRuntime {
         Err(not_implemented())
     }
 
-    /// Gets the status, the newest offset and the Retention of a Stream.
+    /// Gets the status and the newest offset of a Stream.
     pub async fn describe_stream(
         &self,
         request: DescribeStreamRequest,
