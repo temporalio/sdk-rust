@@ -1238,7 +1238,8 @@ mod tests {
         data_converters::{DataConverter, TemporalDeserializable, TemporalSerializable},
         protos::{
             coresdk::{
-                workflow_activation::InitializeWorkflow, workflow_commands::WorkflowCommand,
+                workflow_activation::{FireTimer, InitializeWorkflow},
+                workflow_commands::WorkflowCommand,
             },
             temporal::api::common::v1::Payload,
         },
@@ -1246,6 +1247,73 @@ mod tests {
     use temporalio_macros::{workflow, workflow_methods};
 
     struct NoopHost;
+
+    #[workflow]
+    #[derive(Default)]
+    struct CancelledTimerWorkflow;
+
+    #[workflow_methods]
+    impl CancelledTimerWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> crate::WorkflowResult<()> {
+            assert_eq!(
+                ctx.timer(std::time::Duration::from_secs(60)).await,
+                TimerResult::Cancelled
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancelled_timer_can_fire_in_same_activation() {
+        let base_ctx = BaseWorkflowContext::from_raw(
+            WorkflowInit {
+                namespace: "default".to_string(),
+                task_queue: "task-queue".to_string(),
+                run_id: "run-id".to_string(),
+                initialize_workflow: InitializeWorkflow {
+                    workflow_type: CancelledTimerWorkflow::name().to_string(),
+                    ..Default::default()
+                },
+            },
+            DataConverter::default(),
+            Rc::new(NoopHost),
+            None,
+            Vec::new(),
+        );
+        let mut instance = GuestWorkflowInstance::<CancelledTimerWorkflow>::new_with_workflow(
+            CancelledTimerWorkflow,
+            base_ctx,
+            None,
+        );
+        assert!(matches!(
+            instance
+                .poll_routine(MAIN_ROUTINE_ID, Waker::noop())
+                .unwrap()
+                .completion,
+            Some(RoutineCompletion::Main(MainRoutineCompletion::Blocked))
+        ));
+        instance
+            .activate(
+                WorkflowActivation {
+                    jobs: vec![
+                        ActivationVariant::CancelWorkflow(Default::default()).into(),
+                        ActivationVariant::FireTimer(FireTimer { seq: 1 }).into(),
+                    ],
+                    ..Default::default()
+                },
+                Waker::noop(),
+            )
+            .unwrap();
+        assert!(matches!(
+            instance
+                .poll_routine(MAIN_ROUTINE_ID, Waker::noop())
+                .unwrap()
+                .completion,
+            Some(RoutineCompletion::Main(MainRoutineCompletion::Terminal(outcome)))
+                if matches!(*outcome, TerminalOutcome::Completed(_))
+        ));
+    }
 
     impl WorkflowHost for NoopHost {
         fn set_current_details(&self, _details: String) {}
