@@ -16,7 +16,7 @@ pub mod proto {
     pub use temporalio_common::protos::{
         coresdk::streams::*,
         temporal::api::{
-            enums::v1::{StreamErrorReason, StreamIdConflictPolicy, StreamReadStart, StreamStatus},
+            enums::v1::{StreamErrorReason, StreamIdConflictPolicy, StreamStatus},
             stream::v1::*,
             streamservice::v1::*,
         },

@@ -21,24 +21,6 @@ enum StreamStatus {
 }
 
 // Experimental. Might change in the future.
-// How a Stream closed. CLOSED comes from a Producer that called close(). Native Streams add their
-// own close statuses later.
-// (-- api-linter: core::0216::synonyms=disabled
-//     aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
-enum StreamCloseStatus {
-    STREAM_CLOSE_STATUS_UNSPECIFIED = 0;
-    STREAM_CLOSE_STATUS_CLOSED = 1;
-}
-
-// Experimental. Might change in the future.
-// Where a read starts when it has no from_offset.
-enum StreamReadStart {
-    STREAM_READ_START_UNSPECIFIED = 0;
-    STREAM_READ_START_BEGINNING = 1;
-    STREAM_READ_START_END = 2;
-}
-
-// Experimental. Might change in the future.
 // What a create does when its Stream exists. Unspecified is FAIL, as for a Workflow start.
 enum StreamIdConflictPolicy {
     STREAM_ID_CONFLICT_POLICY_UNSPECIFIED = 0;

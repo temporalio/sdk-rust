@@ -15,13 +15,15 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/stream.proto";
 
 // Experimental. Might change in the future.
-// Identifies one Stream. The id is opaque to callers.
+// Identifies one Stream. The id is opaque to callers. A Stream has no incarnations. A create of a
+// closed or expired Stream fails, and it doesn't make a second Stream with the same id.
 message StreamRef {
     string id = 1;
     // The name of the backend that holds the Stream, as the Worker and client config register
     // it, so every process routes a ref it receives. With no name, the SDK picks the backend from
-    // its config. Only an SDK reads it. A request carries the whole ref, and the server and a
-    // Store ignore this field.
+    // its config. Only an SDK sets and reads it, since only the SDK knows the name that its config
+    // gives a backend. A request carries the whole ref, and the server and a Store ignore this
+    // field.
     string backend = 3;
 }
 
@@ -62,15 +64,6 @@ message ActivityEpoch {
 }
 
 // Experimental. Might change in the future.
-// The attempt of a client Producer, which the client picks. A client that runs the same work
-// again under one Producer name stores this number and raises it at each start. A client with no
-// name of its own is a new Producer in each process, so nothing fences or supersedes it.
-message ClientEpoch {
-    // Required. 1 or more.
-    int32 attempt = 1;
-}
-
-// Experimental. Might change in the future.
 // A Workflow run Producer. On the server's Streams, a Workflow writes as this Producer in its
 // Workflow Task. On a Store, a Workflow appends as a Local Activity Producer, and this Producer
 // only closes the Stream.
@@ -102,21 +95,22 @@ message ActivityProducer {
 }
 
 // Experimental. Might change in the future.
-// A client Producer. A client has no run.
+// A client Producer. A client has no run and no epoch. So nothing fences a client's writes, and a
+// reader never hides them.
 message ClientProducer {
-    // Required.
-    ClientEpoch epoch = 1;
 }
 
 // Experimental. Might change in the future.
 // The code that wrote a batch, which is one unit of work. Its id stays the same across attempts,
 // and an epoch is one attempt. The kind's case orders its epochs. After a write of a higher epoch,
 // a write of a lower epoch of the same Producer fails with FENCED, and a reader may hide the
-// Records of the lower epoch. The rule is the same for every kind. The epochs of two Producers
-// never compare. A run-based kind carries its run, so a client can't.
+// Records of the lower epoch. The rule is the same for every kind that has an epoch. A client has
+// none. The epochs of two Producers never compare. A new run has new Producers, so no write
+// fences or supersedes the Records of an earlier run, such as the base run of a reset.
 message Producer {
     // Required. Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
-    // It is unique in one Stream, so it carries no namespace.
+    // It is unique in one Stream. The id of a run-based kind has its run id, so it stays unique
+    // when Producers of more than one namespace write to one Stream.
     string id = 1;
     // Required. The case is the kind of the Producer.
     oneof kind {
@@ -139,38 +133,15 @@ message AppendRecord {
 }
 
 // Experimental. Might change in the future.
-// One Record that a Producer appended.
-message StreamData {
+// One Record that a Producer appended, as a read gives it. A read gives only Records. A close
+// stores no Record, so a read tells of it with the done flag of its response.
+message StreamRecord {
     Producer producer = 1;
     temporal.api.common.v1.Payload body = 2;
     // Required. The Record's offset. An offset is ordered and unique in one Stream, and it is
     // sparse. Offsets have gaps, so they don't count Records. An offset is never empty. A read
     // gives its Stream, so the read checks the offset against that Stream.
     bytes offset = 3;
-}
-
-// Experimental. Might change in the future.
-// The close of a Stream, as a read item. A close is its own call and stores no Record. A read
-// builds this item from the close state of the Stream and returns it last, so a reader learns in
-// order that the Stream ended, who closed it and why.
-message StreamClose {
-    // The Producer that closed the Stream.
-    Producer producer = 1;
-    // Why the Stream closed.
-    temporal.api.enums.v1.StreamCloseStatus status = 2;
-    // Required. Where the Stream ended.
-    bytes offset = 3;
-}
-
-// Experimental. Might change in the future.
-// One item that a read gives. Each item carries its own offset.
-message StreamRecord {
-    // A read item is a Record or the close. A newer server may send a kind that an older SDK
-    // doesn't know.
-    oneof item {
-        StreamData data = 1;
-        StreamClose close = 2;
-    }
 }
 
 // Experimental. Might change in the future.
