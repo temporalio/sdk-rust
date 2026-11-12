@@ -2643,7 +2643,8 @@ mod tests {
     use super::*;
     use crate::{
         advance_fut, advance_fut_pinned,
-        test_help::test_worker_cfg,
+        replay::canned_histories,
+        test_help::{hist_to_poll_resp, start_timer_cmd, test_worker_cfg},
         worker::{
             PollerBehavior,
             client::mocks::{
@@ -2653,9 +2654,15 @@ mod tests {
         },
     };
     use futures_util::FutureExt;
-    use temporalio_common::protos::temporal::api::{
-        namespace::v1::namespace_info::Capabilities,
-        workflowservice::v1::PollActivityTaskQueueResponse,
+    use temporalio_common::protos::{
+        coresdk::{
+            workflow_activation::workflow_activation_job,
+            workflow_completion::WorkflowActivationCompletion,
+        },
+        temporal::api::{
+            namespace::v1::namespace_info::Capabilities,
+            workflowservice::v1::PollActivityTaskQueueResponse,
+        },
     };
     use tokio::{
         join,
@@ -3119,5 +3126,61 @@ mod tests {
 
         let (poll_result, ()) = join!(poll_fut, shutdown_fut);
         assert_matches!(poll_result, Err(PollError::ShutDown));
+    }
+
+    /// An eager WFT slot handed out before shutdown begins can still have its task scheduled after
+    /// the real WFT pollers have drained (StartWorkflowExecution is in flight). Workflow shutdown
+    /// must keep waiting for that slot instead of finishing as soon as the pollers stop, otherwise
+    /// the eagerly dispatched task is lost until it times out on the server.
+    #[tokio::test]
+    async fn eager_wft_scheduled_after_pollers_stop_is_not_dropped() {
+        let mut mock_client = MockManualWorkerClient::new();
+        // Real pollers only merge in the eager WFT channel for non-mock clients
+        mock_client.expect_is_mock().return_const(false);
+        mock_client
+            .expect_poll_workflow_task()
+            .returning(|_, _| future::pending().boxed());
+        mock_client
+            .expect_complete_workflow_task()
+            .returning(|_, _| async { Ok(Default::default()) }.boxed());
+        setup_mock_manual_worker_client(&mut mock_client);
+
+        let mut cfg = test_worker_cfg().build().unwrap();
+        cfg.task_types = WorkerTaskTypes::workflow_only();
+        let worker = Worker::new_test(cfg, mock_client);
+        LazyLock::force(&worker.task_subsystems);
+
+        let slot = worker
+            .client_worker_registrator
+            .try_reserve_wft_slot()
+            .expect("eager slot should be available");
+        worker.initiate_shutdown();
+
+        let mut poll = std::pin::pin!(worker.poll_workflow_activation());
+        // Correct behavior is for the poll to stay pending while the eager slot is outstanding,
+        // which can only be observed by waiting for a bit.
+        if let Ok(r) = tokio::time::timeout(Duration::from_secs(2), &mut poll).await {
+            panic!(
+                "poll resolved with {r:?} while an eager WFT slot was still reserved -- workflow \
+                 shutdown completed before the eager task could be delivered"
+            );
+        }
+
+        let t = canned_histories::single_timer("1");
+        slot.schedule_wft(hist_to_poll_resp(&t, "eager-wf", 1.into()).resp)
+            .expect("eager WFT channel should still be open");
+        let act = poll.await.unwrap();
+        assert_matches!(
+            act.jobs[0].variant,
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                act.run_id,
+                start_timer_cmd(1, Duration::from_secs(1)),
+            ))
+            .await
+            .unwrap();
+        worker.shutdown().await;
     }
 }

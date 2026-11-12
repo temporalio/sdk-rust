@@ -3,8 +3,8 @@ use crate::{
     replay::canned_histories,
     test_help::{
         MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
-        test_worker_cfg,
+        WorkerTestHelpers, build_fake_worker, build_mock_pollers, hist_to_poll_resp, mock_worker,
+        start_timer_cmd, test_worker_cfg,
     },
     worker::{
         self, PollerBehavior,
@@ -44,6 +44,7 @@ use temporalio_common::{
                 ApplicationFailureInfo, CanceledFailureInfo, Failure, NexusHandlerFailureInfo,
                 TimeoutFailureInfo, failure::FailureInfo,
             },
+            history::v1::History,
             namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
             nexus::{
                 self,
@@ -54,11 +55,11 @@ use temporalio_common::{
                 },
             },
             workflowservice::v1::{
-                DescribeNamespaceResponse, PollActivityTaskQueueResponse,
-                PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
-                RespondActivityTaskCompletedResponse, RespondNexusTaskCompletedResponse,
-                RespondNexusTaskFailedResponse, RespondWorkflowTaskCompletedResponse,
-                ShutdownWorkerResponse,
+                DescribeNamespaceResponse, GetWorkflowExecutionHistoryResponse,
+                PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
+                PollWorkflowTaskQueueResponse, RespondActivityTaskCompletedResponse,
+                RespondNexusTaskCompletedResponse, RespondNexusTaskFailedResponse,
+                RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
             },
         },
     },
@@ -67,7 +68,7 @@ use temporalio_common::{
 };
 use tokio::{
     select,
-    sync::{Barrier, watch},
+    sync::{Barrier, Notify, watch},
 };
 use uuid::Uuid;
 
@@ -1534,4 +1535,71 @@ async fn nexus_shutdown_does_not_hang_when_completion_is_malformed() {
         worker.shutdown().await;
         worker.finalize_shutdown().await;
     }
+}
+
+/// The WFT extractor resolves its inputs with `buffer_unordered`, so a `PollerStopped` that is
+/// queued behind a WFT whose history is still being paginated can overtake it. WFStream treats
+/// `PollerStopped` as "every task has been delivered", so shutdown must not complete (and drop
+/// the task) while that fetch is still in flight.
+#[tokio::test]
+async fn poller_stopped_does_not_overtake_wft_with_in_flight_history_fetch() {
+    let t = canned_histories::single_timer("1");
+    let mut poll_resp = hist_to_poll_resp(&t, "wfid", 1.into()).resp;
+    let rest_of_history = poll_resp.history.as_mut().unwrap().events.split_off(1);
+    poll_resp.next_page_token = vec![1];
+
+    let fetch_started = Arc::new(Notify::new());
+    let release_fetch = Arc::new(Notify::new());
+    let mut mock_client = mock_manual_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .times(1)
+        .returning({
+            let fetch_started = fetch_started.clone();
+            let release_fetch = release_fetch.clone();
+            move |_, _, _| {
+                let fetch_started = fetch_started.clone();
+                let release_fetch = release_fetch.clone();
+                let page = GetWorkflowExecutionHistoryResponse {
+                    history: Some(History {
+                        events: rest_of_history.clone(),
+                    }),
+                    ..Default::default()
+                };
+                async move {
+                    fetch_started.notify_one();
+                    release_fetch.notified().await;
+                    Ok(page)
+                }
+                .boxed()
+            }
+        });
+    mock_client
+        .expect_complete_workflow_task()
+        .returning(|_, _| async { Ok(Default::default()) }.boxed());
+
+    let worker = mock_worker(MocksHolder::from_wft_stream(
+        mock_client,
+        stream::iter([poll_resp]),
+    ));
+
+    let mut poll = std::pin::pin!(worker.poll_workflow_activation());
+    select! {
+        r = &mut poll => panic!("poll resolved before history fetch began: {r:?}"),
+        _ = fetch_started.notified() => {}
+    }
+    // Correct behavior is for the poll to stay pending while the fetch is blocked, which can only
+    // be observed by waiting for a bit.
+    if let Ok(r) = tokio::time::timeout(Duration::from_secs(2), &mut poll).await {
+        panic!(
+            "poll resolved with {r:?} while the only WFT was still fetching history -- the WFT \
+             was dropped by shutdown"
+        );
+    }
+    release_fetch.notify_one();
+    let act = poll.await.unwrap();
+    assert_matches!(
+        act.jobs[0].variant,
+        Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+    );
 }

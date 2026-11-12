@@ -2052,6 +2052,7 @@ mod tests {
         collections::HashSet,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::{Context, Poll},
+        time::Duration,
     };
     use temporalio_common::{
         protos::temporal::api::{
@@ -2549,6 +2550,42 @@ mod tests {
             dispatched.load(Ordering::SeqCst),
             "Eager workflow task should have been dispatched to the worker"
         );
+    }
+
+    /// `RetrySemaphore` is a public request extension, so a caller may close it. A retry gated on a
+    /// closed semaphore can never proceed and must surface an error rather than hang the call.
+    #[tokio::test]
+    async fn call_with_closed_retry_semaphore_errors_instead_of_hanging() {
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new({
+                let call_counter = call_counter.clone();
+                move |_| {
+                    call_counter.fetch_add(1, Ordering::SeqCst);
+                    async { Err(tonic::Status::internal("please retry")) }.boxed()
+                }
+            }),
+        };
+        let opts = ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+            .skip_get_system_info(true)
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build();
+        let mut connection = crate::Connection::connect(opts).await.unwrap();
+
+        let sem = Arc::new(Semaphore::new(0));
+        sem.close();
+        let mut req = PollWorkflowTaskQueueRequest::default().into_request();
+        req.extensions_mut().insert(RetrySemaphore(sem));
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            connection.poll_workflow_task_queue(req),
+        )
+        .await
+        .expect("call hung forever on a closed RetrySemaphore");
+        assert!(res.is_err());
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
