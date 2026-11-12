@@ -1016,7 +1016,7 @@ pub fn hist_to_poll_resp(
 /// Forcibly drive a future a number of times, enforcing it is always returning Pending. This is
 /// useful for ensuring some future has proceeded "enough" before racing it against another future.
 /// This macro pins the provided future, which changes the static type of the variable. To avoid it,
-/// call `pin_mut!` on it first then use [`advance_fut_pinned`].
+/// call `pin_mut!` on it first then use [`advance_fut_pinned`](crate::advance_fut_pinned).
 #[macro_export]
 macro_rules! advance_fut {
     ($fut:ident) => {
