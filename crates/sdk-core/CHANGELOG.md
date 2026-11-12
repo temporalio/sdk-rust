@@ -36,6 +36,9 @@ relevant information.
 ### Fixed
 * Fixed dropping workflow tasks during shutdown in certain scenarios.
 
+### Changed
+* Worker now retries `ShutdownWorker` RPC on retryable errors until the task pollers finish.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
@@ -110,7 +113,6 @@ relevant information.
   remain the default.
 
 ### Changed
-* Worker now retries `ShutdownWorker` RPC on retryable errors until the task pollers finish.
 * Poller pools now report their poller target to the server on each poll and in the worker
   heartbeat: the current target for autoscaling pools, the configured maximum for fixed-size
   pools. (We'll use this count on the server side for now for load balancing pollers between
