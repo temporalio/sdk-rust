@@ -281,15 +281,16 @@ jobs:
           TMPDIR: ${{ runner.temp }}
       - name: Verify worker environment detection inside Docker
         run: |
+          # Ask Cargo for artifact paths so this works across build-directory layouts.
+          artifacts="$RUNNER_TEMP/docker-integ-artifacts.json"
+          cargo build --package temporalio-sdk-core --test integ_tests --test integ_runner \
+            --features temporalio-common/serde_serialize,test-utilities,ephemeral-server,temporalio-sdk/experimental,otel \
+            --message-format=json > "$artifacts"
           integ_test_binary="$(
-            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
-              -name 'integ_tests-*' -perm -111 \
-              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+            jq -ers 'map(select(.reason == "compiler-artifact" and .target.name == "integ_tests" and .executable != null)) | .[0].executable' "$artifacts"
           )"
           integ_runner_binary="$(
-            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
-              -name 'integ_runner-*' -perm -111 \
-              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+            jq -ers 'map(select(.reason == "compiler-artifact" and .target.name == "integ_runner" and .executable != null)) | .[0].executable' "$artifacts"
           )"
           test -x "$integ_test_binary"
           test -x "$integ_runner_binary"
@@ -347,10 +348,21 @@ jobs:
           mise-install-args: protoc
 
       - name: Build crate as static library
-        run: cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static -- --crate-type=staticlib
+        id: static-library
+        run: |
+          cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static \
+            --crate-type=staticlib --message-format=json > "$RUNNER_TEMP/static-library-artifacts.json"
+          library="$(
+            jq -ers '[.[] | select(.reason == "compiler-artifact" and .target.name == "temporalio_sdk_core_c_bridge") | .filenames[] | select(endswith(".a"))] | .[0]' \
+              "$RUNNER_TEMP/static-library-artifacts.json"
+          )"
+          test -f "$library"
+          echo "path=$library" >> "$GITHUB_OUTPUT"
 
       - name: Build C test program
-        run: gcc -I./crates/sdk-core-c-bridge/include crates/sdk-core/tests/c_bridge_smoke_test.c target/debug/deps/libtemporalio_sdk_core_c_bridge.a -lpthread -ldl -lm -o test
+        env:
+          STATIC_LIBRARY: ${{ steps.static-library.outputs.path }}
+        run: gcc -I./crates/sdk-core-c-bridge/include crates/sdk-core/tests/c_bridge_smoke_test.c "$STATIC_LIBRARY" -lpthread -ldl -lm -o test
 
       - name: Run C test program
         run: ./test

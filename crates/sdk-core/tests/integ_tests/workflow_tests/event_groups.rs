@@ -443,6 +443,10 @@ async fn event_group_markers_persist_to_history_events() {
     );
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Keep the SDK's activity error intact in this test helper"
+)]
 async fn echo_activity<W>(
     ctx: &WorkflowContext<W>,
     name: &str,
@@ -1957,6 +1961,10 @@ struct ContinueAsNewCommandsWf;
 #[workflow_methods]
 impl ContinueAsNewCommandsWf {
     #[run(name = "event_groups_continue_as_new")]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>, second_run: bool) -> WorkflowResult<()> {
         if second_run {
             return Ok(());

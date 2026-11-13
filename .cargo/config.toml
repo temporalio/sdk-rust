@@ -1,3 +1,9 @@
+[registry]
+global-min-publish-age = "14 days"
+
+[resolver]
+incompatible-publish-age = "deny"
+
 [env]
 # This temporarily overrides the version of the CLI used for integration tests, locally and in CI
 # TEMP: workflow task completion pagination requires server >=v1.32.0-162.0, for which there's no

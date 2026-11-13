@@ -155,7 +155,7 @@ pub(crate) fn sticky_q_name_for_worker(
     if max_cached_workflows > 0 {
         Some(format!(
             "{}-{}",
-            &process_identity,
+            process_identity,
             uuid::Uuid::new_v4().simple()
         ))
     } else {
