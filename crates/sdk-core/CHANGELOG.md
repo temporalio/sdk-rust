@@ -13,7 +13,10 @@ The Rust SDK runs on Core too, so a user-observable change in Core behavior norm
 belongs in the root changelog as well, worded for each audience. What belongs only here is
 what only the other SDKs' users can see — a Core capability the Rust SDK does not surface,
 or a C-bridge change. A Rust-level API change that a language SDK absorbs inside its own
-bridge, without its users noticing, belongs in neither file.
+bridge, without its users noticing, belongs in neither file as a user-facing entry. If
+language SDK maintainers still need to know about it (for example, a breaking change to a
+Rust API their bridge calls), start the entry with `[lang-internal]`. Language SDKs do not
+import those entries into their changelogs or release notes.
 
 When your PR includes a user-facing change, add an entry below under the
 appropriate heading (create the heading if it does not yet exist) in the

@@ -175,6 +175,21 @@ fn update_entries(previous: &Entries, current: BTreeMap<String, Vec<Vec<String>>
     updated
 }
 
+/// Marks Core changelog entries that only language SDK maintainers need, such as breaking changes
+/// to Rust APIs a bridge absorbs, so they are not propagated to language SDK release notes.
+const LANG_INTERNAL_MARKER: &str = "[lang-internal]";
+
+fn is_lang_internal(lines: &[String]) -> bool {
+    lines.first().is_some_and(|line| {
+        let line = line.trim_start();
+        line.strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line)
+            .trim_start()
+            .starts_with(LANG_INTERNAL_MARKER)
+    })
+}
+
 pub fn categorized_entries(
     repo: &Path,
     from: &str,
@@ -218,7 +233,9 @@ pub fn categorized_entries(
     let mut categorized: Entries = Entries::new();
     for entries in entries.into_values() {
         for entry in entries {
-            if let Some(header) = entry.introduced_header.clone() {
+            if let Some(header) = entry.introduced_header.clone()
+                && !is_lang_internal(&entry.lines)
+            {
                 categorized.entry(header).or_default().push(entry);
             }
         }
