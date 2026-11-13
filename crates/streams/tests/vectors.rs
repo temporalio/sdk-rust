@@ -1,4 +1,4 @@
-//! The shared test vectors, which `testdata/gen_vectors.py` writes from a second implementation.
+//! The shared test vectors, which `examples/gen_vectors.rs` writes from a second implementation.
 //! The crate's README says which other side reads each file.
 
 use prost_types::Timestamp;
