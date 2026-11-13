@@ -3,9 +3,9 @@
 
 #![allow(dead_code)]
 
-use super::{RawKeys, test_stores};
+use super::{RawKeys, RuntimeConfig, test_stores};
 use crate::{
-    StreamResult,
+    StreamResult, StreamRuntime,
     digest::batch_digest,
     proto::{
         AppendRecord, LocalActivityEpoch, LocalActivityProducer, Producer, StreamRecord, StreamRef,
@@ -271,4 +271,39 @@ impl Target {
     pub(crate) async fn close(&self, producer: &Producer) -> StreamResult<Closed> {
         self.store.close(&self.stream_ref(), producer).await
     }
+}
+
+/// One runtime under test, the namespace its cases use, and what its Store gives.
+pub(crate) struct Runtime {
+    pub(crate) ext: Arc<StreamRuntime>,
+    /// The namespace of a Store that has fixed ones, such as the server. `None` lets the case
+    /// make one of its own.
+    pub(crate) namespace: Option<String>,
+    pub(crate) gives: Needs,
+}
+
+/// A runtime with `config` on each Store under test that gives `needs`.
+pub(crate) async fn runtimes(needs: Needs, config: &RuntimeConfig) -> Vec<Runtime> {
+    test_stores()
+        .into_iter()
+        .filter(|test_store| test_store.gives().gives(needs))
+        .map(|test_store| Runtime {
+            ext: test_store.runtime(config),
+            namespace: None,
+            gives: test_store.gives(),
+        })
+        .collect()
+}
+
+/// A runtime on each Store under test, whose refs carry `store_name`.
+pub(crate) fn named_runtimes(store_name: &str) -> Vec<Arc<StreamRuntime>> {
+    test_stores()
+        .into_iter()
+        .map(|test_store| {
+            test_store.runtime(&RuntimeConfig {
+                store_name: store_name.to_string(),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
