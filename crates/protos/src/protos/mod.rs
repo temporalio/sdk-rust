@@ -283,7 +283,7 @@ pub mod coresdk {
                 write!(
                     f,
                     "WorkflowActivationCompletion(run_id: {}, status: ",
-                    &self.run_id
+                    self.run_id
                 )?;
                 match &self.status {
                     None => write!(f, "empty")?,

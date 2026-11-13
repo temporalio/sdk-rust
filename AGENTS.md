@@ -81,9 +81,16 @@ Documentation can be generated with `cargo doc`.
   both changelogs, worded for each audience. What belongs only in the sdk-core changelog is what only
   the other SDKs' users can see — a Core capability the Rust SDK does not surface, or a C-bridge
   change. Conversely, an internal Rust API change that a language SDK absorbs inside its own
-  bridge, without its users noticing, belongs in neither file. This applies to the crates Core
-  shares as well: `temporalio-client`, `temporalio-common`, `temporalio-common-wasm`,
-  `temporalio-macros`, and `temporalio-protos`.
+  bridge, without its users noticing, does not belong in the root changelog or as a plain
+  sdk-core entry. This applies to the crates Core shares as well: `temporalio-client`,
+  `temporalio-common`, `temporalio-common-wasm`, `temporalio-macros`, and `temporalio-protos`.
+- When language SDK maintainers still need to know about such a change — most often a breaking
+  change to a Rust API their bridges call, such as a removed or renamed option or a changed
+  signature — add it to the sdk-core changelog with the entry starting with `[lang-internal]`,
+  for example `* [lang-internal] Removed the ... worker option; ...`. The changelog tool skips
+  these entries when importing Core changes into language SDK changelogs and release notes, so
+  they reach maintainers without appearing in user-facing notes. Do not use the sigil for
+  anything a language SDK's users can observe, and do not use it in root `changelog/` fragments.
 - Write each entry from the perspective of the file's audience, and word a change that goes in
   both changelogs separately for each rather than copying it verbatim. The root changelog should not
   describe Core internals or bridge-only APIs, and the sdk-core changelog should not name Rust

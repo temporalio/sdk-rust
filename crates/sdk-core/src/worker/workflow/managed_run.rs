@@ -621,7 +621,7 @@ impl ManagedRun {
             return None;
         };
 
-        let message = format!("Workflow activation completion failed: {:?}", &failure);
+        let message = format!("Workflow activation completion failed: {:?}", failure);
         // We don't want to fail queries that could otherwise be retried
         let is_no_report_query_fail = self.pending_work_is_legacy_query()
             && is_auto_fail

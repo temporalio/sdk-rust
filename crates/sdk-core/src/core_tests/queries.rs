@@ -202,11 +202,11 @@ async fn new_queries(#[values(1, 3)] num_queries: usize) {
     .unwrap();
 
     let task = core.poll_workflow_activation().await.unwrap();
-    for i in 0..num_queries {
+    for job in &task.jobs[..num_queries] {
         assert_matches!(
-            task.jobs[i],
+            job,
             WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::QueryWorkflow(ref q)),
+                variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
             } => {
                 assert_eq!(q.headers.get("head").unwrap(), &b"er".into());
             }

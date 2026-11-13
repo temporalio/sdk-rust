@@ -286,7 +286,6 @@ async fn worker_heartbeat_basic(backing: &str) {
     #[workflow_methods]
     impl HeartbeatBasicWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
                 .execute_activity(
@@ -471,7 +470,6 @@ async fn docker_worker_heartbeat_tuner() {
     #[workflow_methods]
     impl HeartbeatTunerWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
                 .execute_activity(
@@ -757,7 +755,6 @@ async fn worker_heartbeat_sticky_cache_miss() {
     #[workflow_methods]
     impl StickyCacheMissWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>, wf_marker: String) -> WorkflowResult<()> {
             let _ = ctx
                 .execute_activity(
@@ -886,7 +883,6 @@ async fn worker_heartbeat_multiple_workers() {
     #[workflow_methods]
     impl MultiWorkersWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             Ok(())
         }
@@ -1212,7 +1208,6 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
     #[workflow_methods]
     impl NoRuntimeHeartbeatWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
                 .execute_activity(
@@ -1293,7 +1288,6 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
     #[workflow_methods]
     impl SkipClientWorkerSetCheckWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
                 .execute_activity(
@@ -1438,7 +1432,6 @@ async fn worker_heartbeat_reports_storage_driver_types() {
     #[workflow_methods]
     impl StorageDriversWf {
         #[run]
-        #[allow(dead_code)]
         async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             Ok(())
         }

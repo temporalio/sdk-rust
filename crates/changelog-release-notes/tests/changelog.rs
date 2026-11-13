@@ -132,9 +132,9 @@ fn core_update_through_preparation_and_publishing() {
     let parent = core_parent(&core, &old);
     git(&parent.root, &["tag", "-d", "1.0.0"]).unwrap();
     git(&parent.root, &["tag", "v1.0.0"]).unwrap();
-    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
+    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n- [lang-internal] A bridge-only breaking change.\n");
     core.commit();
-    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
+    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n- [lang-internal] A bridge-only breaking change.\n");
     let new = core.commit();
     assert_eq!(
         update_core(
@@ -759,7 +759,7 @@ fn resolves_core_range_from_parent_tags_and_gitlinks() {
     let old = core.commit();
     core.write(
         "crates/sdk-core/CHANGELOG.md",
-        "# Changelog\n\n## Unreleased\n\n### Fixed\n- Core fix.\n",
+        "# Changelog\n\n## Unreleased\n\n### Fixed\n- Core fix.\n\n### Changed\n* [lang-internal] Internal change.\n",
     );
     let new = core.commit();
     let parent = Repo::new();
@@ -794,6 +794,8 @@ fn resolves_core_range_from_parent_tags_and_gitlinks() {
     assert!(status.success());
     let notes = core_notes(&parent.root, Path::new("core"), "1.1.0", None, "HEAD").unwrap();
     assert!(notes.contains("- Core fix."));
+    assert!(!notes.contains("Internal change."));
+    assert!(!notes.contains("#### Changed"));
     assert!(
         core_notes(
             &parent.root,
