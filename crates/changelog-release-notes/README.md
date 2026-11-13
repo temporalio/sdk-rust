@@ -23,6 +23,9 @@ Commands:
   without its source list marker and prefixed with `Core: ` to distinguish it
   from language SDK changes. Inline Markdown is preserved; unsupported block
   Markdown and unknown categories cause an error before the checkout changes.
+  Core entries beginning with `[lang-internal]` (after the list marker) are meant
+  only for language SDK maintainers and are skipped; `core-notes` and the
+  `changelog-release-notes` range interface skip them as well.
   Review and commit the pin and generated fragments together. The command does
   not stage, commit, update language lockfiles, or resolve bridge compatibility.
   Import failures remove newly created files and restore the original checkout;
