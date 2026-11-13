@@ -891,7 +891,7 @@ where
         }
     }
     fn new_instrument(&self, params: MetricParameters, kind: MetricKind) -> BufferInstrument<I> {
-        let hole = LazyRefInner::hole();
+        let hole = LazyBufferInstrument::hole();
         if self.calls_tx.send(MetricEvent::Create {
             params,
             kind,
@@ -911,7 +911,7 @@ where
     I: BufferInstrumentRef + Debug + Send + Sync + Clone + 'static,
 {
     fn new_attributes(&self, opts: NewAttributes) -> MetricAttributes {
-        let ba = LazyRefInner::hole();
+        let ba = BufferAttributes::hole();
         if self.calls_tx.send(MetricEvent::CreateAttributes {
             populate_into: ba.clone(),
             append_from: None,
@@ -933,7 +933,7 @@ where
             if !ol.create_was_queued() {
                 return MetricAttributes::Buffer(ol);
             }
-            let ba = LazyRefInner::hole();
+            let ba = BufferAttributes::hole();
             if self.calls_tx.send(MetricEvent::CreateAttributes {
                 populate_into: ba.clone(),
                 append_from: Some(ol),
@@ -1288,7 +1288,7 @@ mod tests {
                 MetricEvent::Create { populate_into, .. }
                 => populate_into
             );
-            hole.set(Arc::new(DummyInstrumentRef(metric_num))).unwrap();
+            hole.set(DummyInstrumentRef(metric_num)).unwrap();
         }
         assert_matches!(
             &events[num_metrics + 2], // +2 for attrib creation (at start), then this update
@@ -1544,7 +1544,7 @@ mod tests {
             if params.name == "ctr"
             => populate_into
         );
-        ctr_1.set(Arc::new(DummyInstrumentRef(1))).unwrap();
+        ctr_1.set(DummyInstrumentRef(1)).unwrap();
         let hist_2 = assert_matches!(
             calls.pop(),
             Some(MetricEvent::Create {
@@ -1555,7 +1555,7 @@ mod tests {
             if params.name == "histo"
             => populate_into
         );
-        hist_2.set(Arc::new(DummyInstrumentRef(2))).unwrap();
+        hist_2.set(DummyInstrumentRef(2)).unwrap();
         let gauge_3 = assert_matches!(
             calls.pop(),
             Some(MetricEvent::Create {
@@ -1566,7 +1566,7 @@ mod tests {
             if params.name == "gauge"
             => populate_into
         );
-        gauge_3.set(Arc::new(DummyInstrumentRef(3))).unwrap();
+        gauge_3.set(DummyInstrumentRef(3)).unwrap();
         let hist_4 = assert_matches!(
             calls.pop(),
             Some(MetricEvent::Create {
@@ -1577,7 +1577,7 @@ mod tests {
             if params.name == "histo_dur"
             => populate_into
         );
-        hist_4.set(Arc::new(DummyInstrumentRef(4))).unwrap();
+        hist_4.set(DummyInstrumentRef(4)).unwrap();
         let up_down_5 = assert_matches!(
             calls.pop(),
             Some(MetricEvent::Create {
@@ -1588,7 +1588,7 @@ mod tests {
             if params.name == "up_down_ctr"
             => populate_into
         );
-        up_down_5.set(Arc::new(DummyInstrumentRef(5))).unwrap();
+        up_down_5.set(DummyInstrumentRef(5)).unwrap();
         let a1 = assert_matches!(
             calls.pop(),
             Some(MetricEvent::CreateAttributes {
@@ -1677,7 +1677,7 @@ mod tests {
             for event in events {
                 match event {
                     MetricEvent::Create { populate_into, .. } => {
-                        populate_into.set(Arc::new(DummyInstrumentRef(1))).unwrap();
+                        populate_into.set(DummyInstrumentRef(1)).unwrap();
                     }
                     MetricEvent::CreateAttributes {
                         populate_into,
