@@ -6,16 +6,23 @@
 //! builds the runtime and calls it with an operation name and the encoded request.
 
 pub mod digest;
+mod dispatch;
 pub mod epoch;
 mod error;
 pub mod ids;
 pub mod memory;
+mod metrics;
 pub mod offset;
+mod read;
+mod record;
+mod runtime;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use error::{Reason, StreamError, StreamResult};
+pub use read::MAX_WAIT;
+pub use runtime::{MemoryStreamOptions, MemoryStreamRuntime, StreamRuntime};
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.
