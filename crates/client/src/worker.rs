@@ -367,6 +367,13 @@ impl NamespaceDescriptionSource {
     }
 }
 
+/// Coordinates activity registration with commands buffered by a shared namespace worker.
+pub trait WorkerCommandCache: Send + Sync {
+    /// Calls `register` exactly once while synchronized with cancellation lookup and buffering.
+    /// Returns whether a buffered cancellation was consumed. `register` must not reenter this cache.
+    fn register_activity(&self, token: &TaskToken, register: &mut dyn FnMut()) -> bool;
+}
+
 /// This trait represents a shared namespace worker that sends worker heartbeats and
 /// receives worker commands.
 pub trait SharedNamespaceWorkerTrait {
@@ -387,6 +394,11 @@ pub trait SharedNamespaceWorkerTrait {
     /// Returns whether this shared worker is polling the worker control task queue.
     fn worker_control_task_queue_enabled(&self) -> bool {
         false
+    }
+
+    /// Returns the command cache shared by workers registered to this namespace worker.
+    fn worker_command_cache(&self) -> Option<Arc<dyn WorkerCommandCache>> {
+        None
     }
 }
 
@@ -421,6 +433,16 @@ impl ClientWorkerSet {
         self.worker_manager
             .write()
             .namespace_description_source(namespace)
+    }
+
+    /// Returns the active namespace worker's cache; the returned Arc keeps it alive during use.
+    #[doc(hidden)]
+    pub fn worker_command_cache(&self, namespace: &str) -> Option<Arc<dyn WorkerCommandCache>> {
+        self.worker_manager
+            .read()
+            .shared_worker
+            .get(namespace)
+            .and_then(|worker| worker.worker_command_cache())
     }
 
     /// Try to reserve a compatible processing slot in any of the registered workers.
