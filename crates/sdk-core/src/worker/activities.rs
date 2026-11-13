@@ -20,7 +20,7 @@ use crate::{
     worker::{
         ActivitySlotKind, PollError,
         activities::activity_heartbeat_manager::ActivityHeartbeatError,
-        client::{WorkerClient, payload_limit_violation_from},
+        client::{TaskInfo, WorkerClient, payload_limit_violation_from},
     },
 };
 use activity_heartbeat_manager::ActivityHeartbeatManager;
@@ -375,7 +375,10 @@ impl WorkerActivityTasks {
             Span::current().record("run_id", act_info.base.workflow_run_id);
             act_metrics.act_execution_latency(act_info.base.start_time.elapsed());
             let known_not_found = act_info.known_not_found;
-            let resource_id = act_info.resource_id;
+            let task_info = TaskInfo {
+                task_token: task_token.clone(),
+                resource_id: act_info.resource_id,
+            };
 
             if let Some(jh) = act_info.local_timeouts_task {
                 jh.abort()
@@ -415,11 +418,7 @@ impl WorkerActivityTasks {
                     aer::Status::Completed(ar::Success { result }) => {
                         // If the gRPC layer rejects an oversized result, report the activity task as failed.
                         match client
-                            .complete_activity_task(
-                                task_token.clone(),
-                                result.map(Into::into),
-                                resource_id.clone(),
-                            )
+                            .complete_activity_task(task_info.clone(), result.map(Into::into))
                             .await
                         {
                             Ok(_) => {
@@ -441,11 +440,10 @@ impl WorkerActivityTasks {
                                         .act_execution_failed();
                                     client
                                         .fail_activity_task(
-                                            task_token.clone(),
+                                            task_info.clone(),
                                             ActivityTaskFailedCause::PayloadsTooLarge,
                                             Some(make_payloads_too_large_failure(violation)),
                                             last_heartbeat_details.clone(),
-                                            resource_id,
                                         )
                                         .await
                                         .err()
@@ -486,11 +484,10 @@ impl WorkerActivityTasks {
                         };
                         client
                             .fail_activity_task(
-                                task_token.clone(),
+                                task_info.clone(),
                                 cause,
                                 failure,
                                 last_heartbeat_details,
-                                resource_id,
                             )
                             .await
                             .err()
@@ -515,11 +512,10 @@ impl WorkerActivityTasks {
                             };
                             client
                                 .fail_activity_task(
-                                    task_token.clone(),
+                                    task_info.clone(),
                                     cause,
                                     Some(failure),
                                     last_heartbeat_details,
-                                    resource_id,
                                 )
                                 .await
                                 .err()
@@ -540,11 +536,7 @@ impl WorkerActivityTasks {
                                 None
                             };
                             match client
-                                .cancel_activity_task(
-                                    task_token.clone(),
-                                    details,
-                                    resource_id.clone(),
-                                )
+                                .cancel_activity_task(task_info.clone(), details)
                                 .await
                             {
                                 Ok(_) => None,
@@ -557,11 +549,10 @@ impl WorkerActivityTasks {
                                             .act_execution_failed();
                                         client
                                             .fail_activity_task(
-                                                task_token.clone(),
+                                                task_info.clone(),
                                                 ActivityTaskFailedCause::PayloadsTooLarge,
                                                 Some(make_payloads_too_large_failure(violation)),
                                                 last_heartbeat_details,
-                                                resource_id,
                                             )
                                             .await
                                             .err()
@@ -1155,7 +1146,7 @@ mod tests {
         mock_client
             .expect_complete_activity_task()
             .times(2)
-            .returning(|_, _, _| Ok(Default::default()));
+            .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
         let sem = fixed_size_permit_dealer(10);
         let shutdown_token = CancellationToken::new();
@@ -1299,7 +1290,7 @@ mod tests {
         mock_client
             .expect_record_activity_heartbeat()
             .times(2)
-            .returning(|_, _, _| Ok(Default::default()));
+            .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
         let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
@@ -1362,7 +1353,7 @@ mod tests {
             .returning(|_, _| Ok(Default::default()));
         mock_client
             .expect_record_activity_heartbeat()
-            .returning(|_, _, _| Ok(Default::default()));
+            .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
         let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 

@@ -330,9 +330,8 @@ pub trait WorkerClient: Sync + Send {
     /// Complete an activity task
     async fn complete_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         result: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RespondActivityTaskCompletedResponse>;
     /// Complete a Nexus task
     async fn complete_nexus_task(
@@ -343,33 +342,29 @@ pub trait WorkerClient: Sync + Send {
     /// Record an activity heartbeat
     async fn record_activity_heartbeat(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RecordActivityTaskHeartbeatResponse>;
     /// Cancel an activity task
     async fn cancel_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RespondActivityTaskCanceledResponse>;
     /// Fail an activity task
     async fn fail_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RespondActivityTaskFailedResponse>;
     /// Fail a workflow task
     async fn fail_workflow_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: WorkflowTaskFailedCause,
         failure: Option<Failure>,
-        resource_id: String,
     ) -> Result<RespondWorkflowTaskFailedResponse>;
     /// Fail a Nexus task
     async fn fail_nexus_task(
@@ -436,6 +431,15 @@ pub trait WorkerClient: Sync + Send {
     fn payload_error_limits(&self) -> Option<PayloadErrorLimits> {
         None
     }
+}
+
+/// Identifies the task being responded to.
+#[derive(Debug, Clone)]
+pub struct TaskInfo {
+    pub task_token: TaskToken,
+    /// Lets proxies identify the task without decoding the task token: `workflow:<workflow_id>`,
+    /// or `activity:<activity_id>` for a standalone activity.
+    pub resource_id: String,
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -763,9 +767,8 @@ impl WorkerClient for WorkerClientBag {
 
     async fn complete_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         result: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RespondActivityTaskCompletedResponse> {
         Ok(self
             .client
@@ -773,7 +776,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_completed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCompletedRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     result,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -781,7 +784,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id,
+                    resource_id: task.resource_id,
                 }
                 .into_request(),
             )
@@ -813,20 +816,19 @@ impl WorkerClient for WorkerClientBag {
 
     async fn record_activity_heartbeat(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RecordActivityTaskHeartbeatResponse> {
         Ok(self
             .client
             .clone()
             .record_activity_task_heartbeat(
                 RecordActivityTaskHeartbeatRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
-                    resource_id,
+                    resource_id: task.resource_id,
                 }
                 .into_request(),
             )
@@ -836,9 +838,8 @@ impl WorkerClient for WorkerClientBag {
 
     async fn cancel_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RespondActivityTaskCanceledResponse> {
         Ok(self
             .client
@@ -846,7 +847,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_canceled(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCanceledRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -854,7 +855,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id,
+                    resource_id: task.resource_id,
                 }
                 .into_request(),
             )
@@ -864,11 +865,10 @@ impl WorkerClient for WorkerClientBag {
 
     async fn fail_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
-        resource_id: String,
     ) -> Result<RespondActivityTaskFailedResponse> {
         Ok(self
             .client
@@ -876,7 +876,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_failed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskFailedRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     failure,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -885,7 +885,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id,
+                    resource_id: task.resource_id,
                     cause: cause as i32,
                 }
                 .into_request(),
@@ -896,14 +896,13 @@ impl WorkerClient for WorkerClientBag {
 
     async fn fail_workflow_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: WorkflowTaskFailedCause,
         failure: Option<Failure>,
-        resource_id: String,
     ) -> Result<RespondWorkflowTaskFailedResponse> {
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskFailedRequest {
-            task_token: task_token.into_inner(),
+            task_token: task.task_token.into_inner(),
             cause: cause as i32,
             failure,
             identity: self.identity(),
@@ -914,7 +913,7 @@ impl WorkerClient for WorkerClientBag {
             // Will never be set, deprecated.
             deployment: None,
             deployment_options: self.deployment_options(),
-            resource_id,
+            resource_id: task.resource_id,
         };
         Ok(self
             .client
@@ -1314,11 +1313,13 @@ mod tests {
 
         client
             .fail_activity_task(
-                vec![1].into(),
+                TaskInfo {
+                    task_token: vec![1].into(),
+                    resource_id: String::new(),
+                },
                 ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
                 None,
                 Some(last_heartbeat_details.clone()),
-                String::new(),
             )
             .await
             .unwrap();

@@ -30,8 +30,8 @@ use crate::{
         WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
         client::{
-            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
-            payload_limit_violation_from,
+            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, TaskInfo, WorkerClient,
+            WorkflowTaskCompletion, payload_limit_violation_from,
         },
         workflow::{
             history_update::HistoryPaginator,
@@ -560,10 +560,12 @@ impl Workflows {
                 self.handle_wft_reporting_errs(run_id, || async {
                     self.client
                         .fail_workflow_task(
-                            task_token,
+                            TaskInfo {
+                                task_token,
+                                resource_id: format!("workflow:{workflow_id}"),
+                            },
                             cause,
                             failure.failure,
-                            format!("workflow:{workflow_id}"),
                         )
                         .await
                 })

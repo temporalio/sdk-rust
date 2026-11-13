@@ -1332,8 +1332,8 @@ async fn task_failures_carry_workflow_resource_id() {
     mock_client
         .expect_fail_workflow_task()
         .times(1)
-        .returning(|_, _, _, resource_id| {
-            assert_eq!(resource_id, "workflow:resource-wf");
+        .returning(|task, _, _| {
+            assert_eq!(task.resource_id, "workflow:resource-wf");
             Ok(Default::default())
         });
     let mock_cfg =
@@ -3434,8 +3434,8 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         })
         .times(1);
     mock.expect_fail_workflow_task()
-        .returning(|_, _, _, resource_id| {
-            assert_eq!(resource_id, "workflow:fake_wf_id");
+        .returning(|task, _, _| {
+            assert_eq!(task.resource_id, "workflow:fake_wf_id");
             Ok(Default::default())
         })
         .times(1);

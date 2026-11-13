@@ -790,7 +790,7 @@ async fn activity_tasks_from_completion_reserve_slots() {
     ];
     mock.expect_complete_activity_task()
         .times(2)
-        .returning(|_, _, _| Ok(RespondActivityTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
     let barr: &'static Barrier = Box::leak(Box::new(Barrier::new(2)));
     let mut mh = MockPollCfg::from_resp_batches(
         wf_id,

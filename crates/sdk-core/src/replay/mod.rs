@@ -136,7 +136,7 @@ where
             });
         client
             .expect_fail_workflow_task()
-            .returning(move |_, _, _, _| {
+            .returning(move |_, _, _| {
                 hist_allow_tx.send("Failed".to_string()).unwrap();
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });

@@ -822,10 +822,10 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
     let fail_wft_matcher = cfg.expect_fail_wft_matcher;
     cfg.mock_client
         .expect_fail_workflow_task()
-        .withf(move |tt, cause, failure, _| fail_wft_matcher(tt, cause, failure))
+        .withf(move |task, cause, failure| fail_wft_matcher(&task.task_token, cause, failure))
         .times::<TimesRange>(cfg.num_expected_fails.into())
-        .returning(move |tt, _, _, _| {
-            outstanding.release_token(&tt);
+        .returning(move |task, _, _| {
+            outstanding.release_token(&task.task_token);
             Ok(Default::default())
         });
     let outstanding = outstanding_wf_task_tokens.clone();
