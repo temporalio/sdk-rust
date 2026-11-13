@@ -1001,19 +1001,18 @@ where
         U: UpdateDefinition<Workflow = W::Run>,
         U::Input: Send,
     {
-        let output =
-            interceptors::call_start_workflow_update(
-                self.client.client_interceptors(),
-                StartWorkflowUpdateInput::new(
-                    self.info().workflow_id.clone(),
-                    self.info().run_id.clone().unwrap_or_default(),
-                    update.name().to_string(),
-                    input,
-                    options,
-                ),
-                Next::new({
-                    let mut client = self.client.clone();
-                    move |input: StartWorkflowUpdateInput| -> BoxFuture<
+        let output = interceptors::call_start_workflow_update(
+            self.client.client_interceptors(),
+            StartWorkflowUpdateInput::new(
+                self.info().workflow_id.clone(),
+                self.info().run_id.clone().unwrap_or_default(),
+                update.name().to_string(),
+                input,
+                options,
+            ),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: StartWorkflowUpdateInput| -> BoxFuture<
                         '_,
                         Result<StartWorkflowUpdateOutput, WorkflowUpdateError>,
                     > {
@@ -1101,9 +1100,9 @@ where
                             ))
                         })
                     }
-                }),
-            )
-            .await?;
+            }),
+        )
+        .await?;
 
         Ok(WorkflowUpdateHandle::new(
             self.client.clone(),
