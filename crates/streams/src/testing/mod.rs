@@ -4,16 +4,18 @@
 mod support;
 
 pub mod fields;
+pub mod service;
 pub mod store;
 
 pub use support::Needs;
 
 use crate::{
+    MemoryStreamOptions, MemoryStreamRuntime, StreamRuntime,
     memory::MemoryStore,
     store::{DEFAULT_RETENTION, Store},
 };
 use futures_util::{FutureExt, future::join_all};
-use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
+use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration};
 
 /// The state under a Store's calls, which some cases read or change.
 #[async_trait::async_trait]
@@ -32,6 +34,17 @@ pub trait RawKeys: Send + Sync {
     async fn drop_log(&self, stream: &str);
 }
 
+/// The settings of a runtime under test. A field left `None` keeps the Store's own value.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeConfig {
+    /// The Store name that the runtime sets on each ref it builds.
+    pub store_name: String,
+    /// The Retention of each Stream that the runtime creates.
+    pub retention: Option<Duration>,
+    /// How long an open Stream stays after its last write.
+    pub last_write_ttl: Option<Duration>,
+}
+
 /// A Store that the suites run on, with the server under it.
 #[async_trait::async_trait]
 pub trait TestStore: Send + Sync {
@@ -39,6 +52,8 @@ pub trait TestStore: Send + Sync {
     fn gives(&self) -> Needs;
     /// A Store for one case, and the state under it.
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>);
+    /// A runtime on the Store with `config`.
+    fn runtime(&self, config: &RuntimeConfig) -> Arc<StreamRuntime>;
 }
 
 /// The memory Store, with a new Store for each case.
@@ -54,6 +69,14 @@ impl TestStore for MemoryTestStore {
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
         let store = Arc::new(MemoryStore::new(DEFAULT_RETENTION, None));
         (store.clone(), store)
+    }
+
+    fn runtime(&self, config: &RuntimeConfig) -> Arc<StreamRuntime> {
+        let options = MemoryStreamOptions {
+            retention: config.retention,
+            last_write_ttl: config.last_write_ttl,
+        };
+        MemoryStreamRuntime::new(config.store_name.clone(), options, None)
     }
 }
 
@@ -138,5 +161,10 @@ mod tests {
     #[tokio::test]
     async fn the_store_suite_passes_on_the_memory_store() {
         run(vec![Arc::new(MemoryTestStore)], store::CASES).await;
+    }
+
+    #[tokio::test]
+    async fn the_service_suite_passes_on_the_memory_store() {
+        run(vec![Arc::new(MemoryTestStore)], service::CASES).await;
     }
 }
