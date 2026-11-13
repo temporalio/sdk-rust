@@ -9,3 +9,9 @@
 pub mod protos;
 
 pub use protos::*;
+
+#[cfg(test)]
+#[path = "../selective_boxing.rs"]
+mod boxing_selection;
+#[cfg(test)]
+mod boxing_selection_tests;

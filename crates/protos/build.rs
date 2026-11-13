@@ -1,3 +1,4 @@
+mod selective_boxing;
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "vendored-protox")]
@@ -176,17 +177,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.skip_protoc_run();
     }
 
-    builder
-        .file_descriptor_set_path(&descriptor_file)
-        .compile_with_config(
-            {
-                let mut c = Config::new();
-                c.enable_type_names();
-                c
-            },
-            protos,
-            includes,
-        )?;
+    let mut config = Config::new();
+    config
+        .enable_type_names()
+        .file_descriptor_set_path(&descriptor_file);
+    #[cfg(feature = "vendored-protox")]
+    config.skip_protoc_run();
+    let descriptors = config.load_fds(protos, includes)?;
+    let selections =
+        selective_boxing::select_with_options(&descriptors, selective_boxing::Options::default());
+    for choice in &selections {
+        builder = builder.boxed(&choice.path);
+    }
+    println!("cargo:rerun-if-env-changed=TEMPORAL_BOXING_AUDIT");
+    let audit_path = env::var_os("TEMPORAL_BOXING_AUDIT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| out.join("boxing-selections.txt"));
+    std::fs::write(
+        audit_path,
+        selections
+            .iter()
+            .map(|s| format!("{}: {}", s.path, s.reason))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )?;
+    builder.compile_fds_with_config(descriptors, config)?;
 
     // TODO [rust-sdk-branch]: support normal JSON and proto JSON serialization
     let descriptors = std::fs::read(&descriptor_file)?;

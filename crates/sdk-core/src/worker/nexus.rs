@@ -215,7 +215,7 @@ impl NexusManager {
 
                                 // Convert the failure to an UnsuccessfulOperationError
                                 let failure =
-                                        nexus::v1::Failure::try_from(failure)
+                                        nexus::v1::Failure::try_from(*failure)
                                         .map_err(|err| CompleteNexusError::MalformedNexusCompletion {
                                             reason: format!(
                                                 "error converting temporal failure to nexus failure: {:?}",
@@ -226,12 +226,12 @@ impl NexusManager {
                                 // Set StartOperationResponse variant to new UnsuccessfulOperationError
                                 so.variant = Some(
                                     #[allow(deprecated)]
-                                    start_operation_response::Variant::OperationError(
+                                    start_operation_response::Variant::OperationError(Box::new(
                                         UnsuccessfulOperationError {
                                             operation_state: operation_state.to_string(),
                                             failure: Some(failure),
                                         },
-                                    ),
+                                    )),
                                 )
                             }
 
@@ -295,7 +295,7 @@ impl NexusManager {
                     ))])
                     .nexus_task_execution_failed();
                 let maybe_net_err = client
-                    .fail_nexus_task(tt, NexusTaskFailure::Legacy(e))
+                    .fail_nexus_task(tt, NexusTaskFailure::Legacy(*e))
                     .await
                     .err();
                 (true, maybe_net_err)
@@ -326,9 +326,9 @@ impl NexusManager {
                     .nexus_task_execution_failed();
 
                 let task_failure = if use_temporal_failures {
-                    NexusTaskFailure::Temporal(f)
+                    NexusTaskFailure::Temporal(*f)
                 } else {
-                    let failure = nexus::v1::Failure::try_from(f).map_err(|err| {
+                    let failure = nexus::v1::Failure::try_from(*f).map_err(|err| {
                         CompleteNexusError::MalformedNexusCompletion {
                             reason: format!(
                                 "error converting temporal failure to nexus failure: {:?}",
@@ -529,7 +529,7 @@ where
                                 },
                             );
                             Some(Ok(NexusTask {
-                                variant: Some(nexus_task::Variant::Task(t.resp)),
+                                variant: Some(nexus_task::Variant::Task(Box::new(t.resp))),
                                 request_deadline,
                                 endpoint,
                             }))

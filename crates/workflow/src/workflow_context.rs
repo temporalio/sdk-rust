@@ -3237,15 +3237,17 @@ impl Future for LATimerBackoffFut {
                     } else {
                         self.terminated = true;
                         Poll::Ready(ActivityResolution {
-                            status: Some(activity_resolution::Status::Cancelled(Cancellation {
-                                failure: Some(Failure {
-                                    message: "Activity cancelled".to_owned(),
-                                    failure_info: Some(FailureInfo::CanceledFailureInfo(
-                                        CanceledFailureInfo::default(),
-                                    )),
-                                    ..Default::default()
-                                }),
-                            })),
+                            status: Some(activity_resolution::Status::Cancelled(Box::new(
+                                Cancellation {
+                                    failure: Some(Failure {
+                                        message: "Activity cancelled".to_owned(),
+                                        failure_info: Some(FailureInfo::CanceledFailureInfo(
+                                            CanceledFailureInfo::default(),
+                                        )),
+                                        ..Default::default()
+                                    }),
+                                },
+                            ))),
                         })
                     }
                 }
@@ -3262,15 +3264,17 @@ impl Future for LATimerBackoffFut {
             if self.did_cancel.load(Ordering::Acquire) {
                 self.terminated = true;
                 return Poll::Ready(ActivityResolution {
-                    status: Some(activity_resolution::Status::Cancelled(Cancellation {
-                        failure: Some(Failure {
-                            message: "Activity cancelled".to_owned(),
-                            failure_info: Some(FailureInfo::CanceledFailureInfo(
-                                CanceledFailureInfo::default(),
-                            )),
-                            ..Default::default()
-                        }),
-                    })),
+                    status: Some(activity_resolution::Status::Cancelled(Box::new(
+                        Cancellation {
+                            failure: Some(Failure {
+                                message: "Activity cancelled".to_owned(),
+                                failure_info: Some(FailureInfo::CanceledFailureInfo(
+                                    CanceledFailureInfo::default(),
+                                )),
+                                ..Default::default()
+                            }),
+                        },
+                    ))),
                 });
             }
 

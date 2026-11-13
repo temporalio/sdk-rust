@@ -104,13 +104,13 @@ pub(super) fn has_change<'a>(
     } else {
         Executing {}.into()
     };
-    let command = RecordMarkerCommandAttributes {
+    let command = Box::new(RecordMarkerCommandAttributes {
         marker_name: PATCH_MARKER_NAME.to_string(),
         details: build_has_change_marker_details(&shared_state.patch_id, deprecated)
             .context("While encoding patch marker details")?,
         header: None,
         failure: None,
-    }
+    })
     .into();
     let mut machine = PatchMachine::from_parts(initial_state, shared_state);
 

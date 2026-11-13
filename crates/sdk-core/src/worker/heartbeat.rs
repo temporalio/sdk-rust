@@ -335,7 +335,7 @@ async fn handle_worker_command_task(
         task_token,
         status: Some(nexus_task_completion::Status::Completed(
             nexus::v1::Response {
-                variant: Some(nexus::v1::response::Variant::StartOperation(
+                variant: Some(nexus::v1::response::Variant::StartOperation(Box::new(
                     nexus::v1::StartOperationResponse {
                         variant: Some(nexus::v1::start_operation_response::Variant::SyncSuccess(
                             nexus::v1::start_operation_response::Sync {
@@ -347,7 +347,7 @@ async fn handle_worker_command_task(
                             },
                         )),
                     },
-                )),
+                ))),
             },
         )),
     };

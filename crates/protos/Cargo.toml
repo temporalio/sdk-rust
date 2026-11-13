@@ -34,10 +34,14 @@ tonic-prost = { workspace = true }
 pbjson = { workspace = true }
 
 [build-dependencies]
+prost_descriptor = { package = "prost-types", version = "0.14" }
 prost = { workspace = true }
 tonic-prost-build = { workspace = true }
 pbjson-build = { workspace = true }
 protox = { version = "0.9.1", optional = true }
+
+[dev-dependencies]
+prost_descriptor = { package = "prost-types", version = "0.14" }
 
 [lints]
 workspace = true

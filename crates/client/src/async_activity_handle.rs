@@ -267,7 +267,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskFailedRequest {
                                 task_token: token.into_inner(),
-                                failure: Some(failure),
+                                failure: Some(Box::new(failure)),
                                 identity: client.identity(),
                                 namespace: client.namespace(),
                                 last_heartbeat_details,
@@ -289,7 +289,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 workflow_id,
                                 run_id,
                                 activity_id,
-                                failure: Some(failure),
+                                failure: Some(Box::new(failure)),
                                 identity: client.identity(),
                                 last_heartbeat_details,
                                 resource_id: Default::default(),

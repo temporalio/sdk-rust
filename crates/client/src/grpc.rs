@@ -797,7 +797,7 @@ proxier! {
             if let Some(s) = slot
                 && let Ok(response) = resp.as_ref()
                     && let Some(task) = response.get_ref().clone().eager_workflow_task
-                        && let Err(e) = s.schedule_wft(task) {
+                        && let Err(e) = s.schedule_wft(*task) {
                             // This is a latency issue, i.e., the client does not need to handle
                             //  this error, because the WFT will be retried after a timeout.
                             warn!(details = ?e, "Eager workflow task rejected by worker.");

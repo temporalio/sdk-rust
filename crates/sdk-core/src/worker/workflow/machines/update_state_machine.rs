@@ -120,7 +120,7 @@ impl UpdateMachine {
         );
         NewMachineWithResponse {
             machine: me.into(),
-            response: MachineResponse::PushWFJob(do_update.into()),
+            response: MachineResponse::PushWFJob(Box::new(do_update).into()),
         }
     }
 
@@ -139,7 +139,7 @@ impl UpdateMachine {
                 self.on_event(UpdateMachineEvents::Accept)
             }
             Some(update_response::Response::Rejected(f)) => {
-                self.on_event(UpdateMachineEvents::Reject(f))
+                self.on_event(UpdateMachineEvents::Reject(*f))
             }
             Some(update_response::Response::Completed(p)) => {
                 self.on_event(UpdateMachineEvents::Complete(p))
@@ -263,7 +263,7 @@ impl WFMachinesAdapter for UpdateMachine {
                         rejected_request_message_id: self.shared_state.message_id.clone(),
                         rejected_request_sequencing_event_id: self.shared_state.event_seq_id,
                         rejected_request: Some(orig),
-                        failure: Some(fail),
+                        failure: Some(Box::new(fail)),
                     }),
                 )?]
             }
@@ -281,7 +281,7 @@ impl WFMachinesAdapter for UpdateMachine {
                 UpdateMsg::Response(Response {
                     meta: Some(self.shared_state.meta.clone()),
                     outcome: Some(Outcome {
-                        value: Some(outcome::Value::Failure(f)),
+                        value: Some(outcome::Value::Failure(Box::new(f))),
                     }),
                 }),
             )?,

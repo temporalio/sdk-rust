@@ -677,7 +677,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                             status: Some(c.into()),
                         },
                         LocalActivityExecutionResult::Failed(f) => ActivityResolution {
-                            status: Some(f.into()),
+                            status: Some(Box::new(f).into()),
                         },
                         LocalActivityExecutionResult::TimedOut(mut failure) => {
                             wrap_fail!(
@@ -687,7 +687,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                                 FailureInfo::TimeoutFailureInfo(_)
                             );
                             ActivityResolution {
-                                status: Some(failure.into()),
+                                status: Some(Box::new(failure).into()),
                             }
                         }
                         LocalActivityExecutionResult::Cancelled(mut cancel) => {
@@ -698,18 +698,18 @@ impl WFMachinesAdapter for LocalActivityMachine {
                                 FailureInfo::CanceledFailureInfo(_)
                             );
                             ActivityResolution {
-                                status: Some(cancel.into()),
+                                status: Some(Box::new(cancel).into()),
                             }
                         }
                     }
                 };
 
                 let mut responses = vec![
-                    ResolveActivity {
+                    Box::new(ResolveActivity {
                         seq: self.shared_state.attrs.seq,
                         result: Some(resolution),
                         is_local: true,
-                    }
+                    })
                     .into(),
                     MachineResponse::UpdateWFTime(complete_time),
                 ];
@@ -758,7 +758,8 @@ impl WFMachinesAdapter for LocalActivityMachine {
                     let command = ProtoCommand {
                         user_metadata: self.shared_state.attrs.user_metadata.clone(),
                         event_group_markers: self.shared_state.attrs.event_group_markers.clone(),
-                        ..command::Attributes::RecordMarkerCommandAttributes(marker_data).into()
+                        ..command::Attributes::RecordMarkerCommandAttributes(Box::new(marker_data))
+                            .into()
                     };
                     responses.push(MachineResponse::IssueNewCommand(command));
                 }

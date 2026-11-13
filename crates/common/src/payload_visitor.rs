@@ -51,6 +51,15 @@ pub trait PayloadVisitable: Send {
     ) -> BoxFuture<'a, Result<(), PayloadConversionError>>;
 }
 
+impl<T: PayloadVisitable + ?Sized> PayloadVisitable for Box<T> {
+    fn visit_payloads_mut<'a>(
+        &'a mut self,
+        visitor: &'a mut (dyn AsyncPayloadVisitor + Send),
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
+        self.as_mut().visit_payloads_mut(visitor)
+    }
+}
+
 /// Check if a field path represents search attributes that must not be transformed.
 /// Search attributes must remain server-readable for indexing.
 fn is_search_attributes_path(path: &str) -> bool {
@@ -81,6 +90,12 @@ impl<'a> PayloadField<'a> {
 pub trait PayloadFieldCollectable {
     /// Add every payload field in this message, including those of nested messages, to `fields`.
     fn collect_payload_fields<'a>(&'a mut self, fields: &mut Vec<PayloadField<'a>>);
+}
+
+impl<T: PayloadFieldCollectable + ?Sized> PayloadFieldCollectable for Box<T> {
+    fn collect_payload_fields<'a>(&'a mut self, fields: &mut Vec<PayloadField<'a>>) {
+        self.as_mut().collect_payload_fields(fields);
+    }
 }
 
 /// The fields of a message that may be transformed: encoded, decoded, or offloaded.

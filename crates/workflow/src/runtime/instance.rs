@@ -1123,7 +1123,7 @@ where
                 Some(ActivationVariant::SignalWorkflow(signal)) => {
                     self.start_signal_routine(signal)?
                 }
-                Some(ActivationVariant::DoUpdate(update)) => self.start_update_routine(update)?,
+                Some(ActivationVariant::DoUpdate(update)) => self.start_update_routine(*update)?,
                 Some(ActivationVariant::QueryWorkflow(query)) => {
                     ActivationJobResult::QueryResponse(Box::new(self.query(query)))
                 }

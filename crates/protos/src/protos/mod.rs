@@ -142,13 +142,13 @@ pub mod coresdk {
             ) -> Self {
                 Self {
                     run_id: run_id.into(),
-                    status: Some(workflow_activation_completion::Status::Failed(
+                    status: Some(workflow_activation_completion::Status::Failed(Box::new(
                         workflow_completion::Failure {
                             failure: Some(failure),
                             force_cause: cause.unwrap_or(WorkflowTaskFailedCause::Unspecified)
                                 as i32,
                         },
-                    )),
+                    ))),
                     ..Default::default()
                 }
             }
@@ -326,7 +326,7 @@ pub mod coresdk {
                     .unwrap_or_default();
                 Self {
                     task_token: r.task_token,
-                    variant: Some(activity_task::activity_task::Variant::Start(
+                    variant: Some(activity_task::activity_task::Variant::Start(Box::new(
                         activity_task::Start {
                             workflow_namespace: r.workflow_namespace,
                             workflow_type: r
@@ -358,7 +358,7 @@ pub mod coresdk {
                                 .propagated_nexus_serialization_context,
                             workflow_task: None,
                         },
-                    )),
+                    ))),
                 }
             }
         }
@@ -747,24 +747,26 @@ pub mod coresdk {
 
                 pub fn fail(fail: APIFailure) -> Self {
                     Self {
-                        status: Some(aer::Status::Failed(Failure {
+                        status: Some(aer::Status::Failed(Box::new(Failure {
                             failure: Some(fail),
                             cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
-                        })),
+                        }))),
                     }
                 }
 
                 pub fn cancel(fail: APIFailure) -> Self {
                     Self {
-                        status: Some(aer::Status::Cancelled(Cancellation {
+                        status: Some(aer::Status::Cancelled(Box::new(Cancellation {
                             failure: Some(fail),
-                        })),
+                        }))),
                     }
                 }
 
                 pub fn cancel_from_details(payload: Option<Payload>) -> Self {
                     Self {
-                        status: Some(aer::Status::Cancelled(Cancellation::from_details(payload))),
+                        status: Some(aer::Status::Cancelled(Box::new(
+                            Cancellation::from_details(payload),
+                        ))),
                     }
                 }
 
@@ -834,11 +836,11 @@ pub mod coresdk {
                     Self {
                         status: match r {
                             Ok(p) => Some(aer::Status::Completed(Success { result: Some(p) })),
-                            Err(f) => Some(aer::Status::Failed(Failure {
+                            Err(f) => Some(aer::Status::Failed(Box::new(Failure {
                                 failure: Some(f),
                                 cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure
                                     as i32,
-                            })),
+                            }))),
                         },
                     }
                 }
@@ -871,11 +873,10 @@ pub mod coresdk {
                 }
 
                 pub fn timed_out(&self) -> Option<TimeoutType> {
-                    match self.status {
-                        Some(activity_resolution::Status::Failed(Failure {
-                            failure: Some(ref f),
-                            ..
-                        })) => f.is_timeout(),
+                    match &self.status {
+                        Some(activity_resolution::Status::Failed(f)) => {
+                            f.failure.as_ref().and_then(|failure| failure.is_timeout())
+                        }
                         _ => None,
                     }
                 }
@@ -1396,7 +1397,7 @@ pub mod coresdk {
                 /// Unwrap the inner server-delivered nexus task if that's what this is, else panic.
                 pub fn unwrap_task(self) -> PollNexusTaskQueueResponse {
                     if let Some(nexus_task::Variant::Task(t)) = self.variant {
-                        return t;
+                        return *t;
                     }
                     panic!("Nexus task did not contain a server task");
                 }
@@ -1898,7 +1899,7 @@ pub mod temporal {
                         s: workflow_commands::ScheduleActivity,
                         use_workflow_build_id: bool,
                     ) -> command::Attributes {
-                        command::Attributes::ScheduleActivityTaskCommandAttributes(
+                        command::Attributes::ScheduleActivityTaskCommandAttributes(Box::new(
                             ScheduleActivityTaskCommandAttributes {
                                 activity_id: s.activity_id,
                                 activity_type: Some(ActivityType {
@@ -1916,7 +1917,7 @@ pub mod temporal {
                                 use_workflow_build_id,
                                 priority: s.priority,
                             },
-                        )
+                        ))
                     }
 
                     #[allow(deprecated)]
@@ -1924,7 +1925,7 @@ pub mod temporal {
                         s: workflow_commands::StartChildWorkflowExecution,
                         inherit_build_id: bool,
                     ) -> command::Attributes {
-                        command::Attributes::StartChildWorkflowExecutionCommandAttributes(
+                        command::Attributes::StartChildWorkflowExecutionCommandAttributes(Box::new(
                             StartChildWorkflowExecutionCommandAttributes {
                                 workflow_id: s.workflow_id,
                                 workflow_type: Some(WorkflowType {
@@ -1948,7 +1949,7 @@ pub mod temporal {
                                 priority: s.priority,
                                 versioning_override: s.versioning_override,
                             },
-                        )
+                        ))
                     }
 
                     impl From<workflow_commands::CompleteWorkflowExecution> for command::Attributes {
@@ -1963,11 +1964,11 @@ pub mod temporal {
 
                     impl From<workflow_commands::FailWorkflowExecution> for command::Attributes {
                         fn from(c: workflow_commands::FailWorkflowExecution) -> Self {
-                            Self::FailWorkflowExecutionCommandAttributes(
+                            Self::FailWorkflowExecutionCommandAttributes(Box::new(
                                 FailWorkflowExecutionCommandAttributes {
                                     failure: c.failure.map(Into::into),
                                 },
-                            )
+                            ))
                         }
                     }
 
@@ -1977,7 +1978,7 @@ pub mod temporal {
                         inherit_build_id: bool,
                     ) -> command::Attributes {
                         command::Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
-                            ContinueAsNewWorkflowExecutionCommandAttributes {
+                            Box::new(ContinueAsNewWorkflowExecutionCommandAttributes {
                                 workflow_type: Some(c.workflow_type.into()),
                                 task_queue: Some(c.task_queue.into()),
                                 input: c.arguments.into_payloads(),
@@ -1999,7 +2000,7 @@ pub mod temporal {
                                 inherit_build_id,
                                 initial_versioning_behavior: c.initial_versioning_behavior,
                                 ..Default::default()
-                            },
+                            }),
                         )
                     }
 
@@ -2013,7 +2014,7 @@ pub mod temporal {
 
                     impl From<workflow_commands::ScheduleNexusOperation> for command::Attributes {
                         fn from(c: workflow_commands::ScheduleNexusOperation) -> Self {
-                            Self::ScheduleNexusOperationCommandAttributes(
+                            Self::ScheduleNexusOperationCommandAttributes(Box::new(
                                 ScheduleNexusOperationCommandAttributes {
                                     endpoint: c.endpoint,
                                     service: c.service,
@@ -2024,7 +2025,7 @@ pub mod temporal {
                                     start_to_close_timeout: c.start_to_close_timeout,
                                     nexus_header: c.nexus_header,
                                 },
-                            )
+                            ))
                         }
                     }
                 }

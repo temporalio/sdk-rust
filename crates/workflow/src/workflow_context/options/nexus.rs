@@ -117,7 +117,7 @@ impl NexusOperationOptions {
         #[cfg(not(feature = "experimental"))]
         let event_group_markers = Vec::new();
         super::command_with_metadata(
-            workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
+            workflow_command::Variant::ScheduleNexusOperation(Box::new(ScheduleNexusOperation {
                 seq,
                 endpoint: self.endpoint,
                 service: self.service,
@@ -138,7 +138,7 @@ impl NexusOperationOptions {
                         .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
                 )
                 .into(),
-            }),
+            })),
             None,
             None,
             event_group_markers,

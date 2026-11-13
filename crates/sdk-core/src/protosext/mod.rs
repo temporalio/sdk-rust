@@ -162,9 +162,9 @@ impl WorkflowActivationExt for WorkflowActivation {
 pub(crate) fn legacy_query_failure(fail: workflow_completion::Failure) -> QueryResult {
     QueryResult {
         query_id: LEGACY_QUERY_ID.to_string(),
-        variant: Some(query_result::Variant::Failed(
+        variant: Some(query_result::Variant::Failed(Box::new(
             fail.failure.unwrap_or_default(),
-        )),
+        ))),
     }
 }
 
@@ -186,13 +186,11 @@ impl HistoryEventExt for HistoryEvent {
     fn get_patch_marker_details(&self) -> Option<(String, bool)> {
         if self.event_type() == EventType::MarkerRecorded {
             match &self.attributes {
-                Some(history_event::Attributes::MarkerRecordedEventAttributes(
-                    MarkerRecordedEventAttributes {
-                        marker_name,
-                        details,
-                        ..
-                    },
-                )) if marker_name == PATCH_MARKER_NAME => decode_change_marker_details(details),
+                Some(history_event::Attributes::MarkerRecordedEventAttributes(attrs))
+                    if attrs.marker_name == PATCH_MARKER_NAME =>
+                {
+                    decode_change_marker_details(&attrs.details)
+                }
                 _ => None,
             }
         } else {
@@ -204,8 +202,8 @@ impl HistoryEventExt for HistoryEvent {
         if self.event_type() == EventType::MarkerRecorded {
             return matches!(&self.attributes,
                 Some(history_event::Attributes::MarkerRecordedEventAttributes(
-                    MarkerRecordedEventAttributes { marker_name, .. },
-                )) if marker_name == LOCAL_ACTIVITY_MARKER_NAME
+                    attrs,
+                )) if attrs.marker_name == LOCAL_ACTIVITY_MARKER_NAME
             );
         }
         false
@@ -214,14 +212,10 @@ impl HistoryEventExt for HistoryEvent {
     fn extract_local_activity_marker_data(&self) -> Option<LocalActivityMarkerData> {
         if self.event_type() == EventType::MarkerRecorded {
             match &self.attributes {
-                Some(history_event::Attributes::MarkerRecordedEventAttributes(
-                    MarkerRecordedEventAttributes {
-                        marker_name,
-                        details,
-                        ..
-                    },
-                )) if marker_name == LOCAL_ACTIVITY_MARKER_NAME => {
-                    extract_local_activity_marker_data(details)
+                Some(history_event::Attributes::MarkerRecordedEventAttributes(attrs))
+                    if attrs.marker_name == LOCAL_ACTIVITY_MARKER_NAME =>
+                {
+                    extract_local_activity_marker_data(&attrs.details)
                 }
                 _ => None,
             }
@@ -233,14 +227,14 @@ impl HistoryEventExt for HistoryEvent {
     fn into_local_activity_marker_details(self) -> Option<CompleteLocalActivityData> {
         if self.event_type() == EventType::MarkerRecorded {
             match self.attributes {
-                Some(history_event::Attributes::MarkerRecordedEventAttributes(
-                    MarkerRecordedEventAttributes {
-                        marker_name,
+                Some(history_event::Attributes::MarkerRecordedEventAttributes(attrs))
+                    if attrs.marker_name == LOCAL_ACTIVITY_MARKER_NAME =>
+                {
+                    let MarkerRecordedEventAttributes {
                         mut details,
                         failure,
                         ..
-                    },
-                )) if marker_name == LOCAL_ACTIVITY_MARKER_NAME => {
+                    } = *attrs;
                     let (data, ok_res) = extract_local_activity_marker_details(&mut details);
                     let data = data?;
                     let result = match (ok_res, failure) {
@@ -295,10 +289,10 @@ impl TryFrom<activity_execution_result::Status> for LocalActivityExecutionResult
                     .map(|fail| fail.is_timeout().is_some())
                     .unwrap_or_default() =>
             {
-                Ok(LocalActivityExecutionResult::TimedOut(f))
+                Ok(LocalActivityExecutionResult::TimedOut(*f))
             }
-            Status::Failed(f) => Ok(LocalActivityExecutionResult::Failed(f)),
-            Status::Cancelled(cancel) => Ok(LocalActivityExecutionResult::Cancelled(cancel)),
+            Status::Failed(f) => Ok(LocalActivityExecutionResult::Failed(*f)),
+            Status::Cancelled(cancel) => Ok(LocalActivityExecutionResult::Cancelled(*cancel)),
             Status::WillCompleteAsync(_) => {
                 Err(CompleteActivityError::MalformedActivityCompletion {
                     reason: "Local activities cannot be completed async".to_string(),

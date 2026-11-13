@@ -94,6 +94,12 @@ pub(crate) trait PayloadLimitsValidatable {
     fn validate_payload_limits(&self, sink: &mut dyn PayloadLimitSink);
 }
 
+impl<T: PayloadLimitsValidatable + ?Sized> PayloadLimitsValidatable for Box<T> {
+    fn validate_payload_limits(&self, sink: &mut dyn PayloadLimitSink) {
+        self.as_ref().validate_payload_limits(sink);
+    }
+}
+
 /// Serialized size of a [`Payloads`] message, as the server measures it.
 pub(crate) fn payloads_size(payloads: &Payloads) -> usize {
     payloads.encoded_len()
