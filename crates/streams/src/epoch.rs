@@ -9,7 +9,6 @@ use crate::{
     proto::{Producer, WorkflowTaskEpoch, producer::Kind},
 };
 use prost_types::Timestamp;
-use std::cmp::Ordering;
 
 /// The kind of a Producer, which is the case of its epoch. The stored field names and keys hold
 /// its number, so each kind keeps its number.
@@ -120,19 +119,14 @@ pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
     }
 }
 
-/// Orders two epochs field by field.
-pub fn compare_epochs(a: Option<&Kind>, b: Option<&Kind>) -> Ordering {
-    epoch_key(a).cmp(&epoch_key(b))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{LocalActivityEpoch, LocalActivityProducer, producer::Kind};
+    use crate::proto::{LocalActivityEpoch, LocalActivityProducer};
 
     // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
-    fn a_negative_field_compares_as_zero() {
+    fn a_negative_field_keys_as_zero() {
         let negative = Kind::LocalActivity(LocalActivityProducer {
             epoch: Some(LocalActivityEpoch {
                 task: None,
@@ -140,6 +134,6 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert_eq!(compare_epochs(Some(&negative), None), Ordering::Equal);
+        assert_eq!(epoch_key(Some(&negative)), epoch_key(None));
     }
 }

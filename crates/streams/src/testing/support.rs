@@ -149,14 +149,6 @@ pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// The bytes of a hex text, as the vectors give binary values.
-pub(crate) fn hex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
-        .collect()
-}
-
 /// The digest of the batch that [record] makes of each text.
 pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
     let records: Vec<_> = texts
