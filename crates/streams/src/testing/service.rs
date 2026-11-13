@@ -358,7 +358,7 @@ async fn a_producer_has_a_kind_and_is_not_a_workflow() {
     }
 }
 
-/// A Producer id is opaque bytes. The runtime refuses an empty one and one over the limit, and
+/// A Producer id is opaque text. The runtime refuses an empty one and one over the limit, and
 /// takes any other, also with separators in it.
 async fn a_producer_id_is_opaque_but_not_empty_or_too_long() {
     for case in cases_for(Needs::CALLS).await {
@@ -382,26 +382,90 @@ async fn a_producer_id_is_opaque_but_not_empty_or_too_long() {
     }
 }
 
-/// A close takes a Producer of any kind, an Activity's too. Only an append refuses a Workflow
-/// Producer.
-async fn a_close_takes_a_producer_of_any_kind() {
-    for case in cases_for(Needs::UNCHECKED).await {
+/// A Producer id may hold any text, such as a NUL, a newline, the `|` and `:` that the Store
+/// fields use, and non-ASCII text. An id of the longest length is taken too. A read gives each
+/// Record with the id as sent.
+async fn a_producer_id_of_any_text_or_the_longest_length_reads_back() {
+    for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        let activity = Producer {
-            id: "act:r1:a:s".to_string(),
-            kind: Some(Kind::WorkflowActivity(ActivityProducer {
-                run_id: "r1".to_string(),
-                epoch: Some(ActivityEpoch {
-                    attempt_scheduled_time: Some(prost_types::Timestamp::default()),
+        let ids = [
+            "nul\0line\nbar|colon:é".to_string(),
+            "p".repeat(MAX_PRODUCER_ID_BYTES),
+        ];
+        for (sequence, id) in ids.iter().enumerate() {
+            let producer = Producer {
+                id: id.clone(),
+                ..client()
+            };
+            case.append(producer, 1, vec![record(&sequence.to_string())])
+                .await
+                .unwrap();
+        }
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["0", "1"]);
+        let read_ids: Vec<_> = read
+            .records
+            .iter()
+            .map(|record| record.producer.as_ref().unwrap().id.clone())
+            .collect();
+        assert_eq!(read_ids, ids);
+    }
+}
+
+/// A close takes a Producer of any kind. The Workflow Producer sends no epoch, as its close on a
+/// Store does. Only an append refuses a Workflow Producer.
+async fn a_close_takes_a_producer_of_any_kind() {
+    let activity = ActivityProducer {
+        run_id: "r1".to_string(),
+        epoch: Some(ActivityEpoch {
+            attempt_scheduled_time: Some(prost_types::Timestamp::default()),
+            attempt: 1,
+        }),
+    };
+    let kinds = [
+        Kind::Workflow(WorkflowProducer {
+            run_id: "r1".to_string(),
+            epoch: None,
+        }),
+        Kind::LocalActivity(LocalActivityProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(LocalActivityEpoch {
+                task: Some(WorkflowTaskEpoch {
+                    started_event_id: 3,
                     attempt: 1,
+                    started_time: None,
                 }),
-            })),
-        };
-        case.close(activity).await.unwrap();
-        assert_eq!(
-            case.describe().await.unwrap().status,
-            StreamStatus::Closed as i32
-        );
+                attempt: 1,
+            }),
+        }),
+        Kind::WorkflowActivity(activity.clone()),
+        Kind::StandaloneActivity(ActivityProducer {
+            run_id: String::new(),
+            ..activity
+        }),
+        Kind::Client(ClientProducer {}),
+    ];
+    for case in cases_for(Needs::UNCHECKED).await {
+        for (at, kind) in kinds.iter().enumerate() {
+            let case = Case {
+                ext: case.ext.clone(),
+                namespace: case.namespace.clone(),
+                stream: format!("{}-{at}", case.stream),
+            };
+            case.create().await.unwrap();
+            let producer = Producer {
+                id: format!("p:r1:{at}"),
+                kind: Some(kind.clone()),
+            };
+            case.close(producer.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{producer:?} {error:?}"));
+            assert_eq!(
+                case.describe().await.unwrap().status,
+                StreamStatus::Closed as i32,
+                "{producer:?}"
+            );
+        }
     }
 }
 
@@ -456,9 +520,9 @@ async fn an_append_with_a_record_that_has_no_body_is_invalid() {
     }
 }
 
-/// An append with no sequence takes the next one of its Producer's epoch, as a call with no writer
-/// state sends it. Nothing dedupes it, so its retry writes the batch again. A negative sequence
-/// fails.
+/// An append with no sequence takes the next one of its Producer's epoch, as a caller that tracks
+/// no sequence sends it. Nothing dedupes it, so its retry writes the batch again. A negative
+/// sequence fails.
 async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
@@ -593,7 +657,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
         assert!(!quiet.done);
         let ext = case.ext.clone();
         let (namespace, stream) = (case.namespace.clone(), case.stream.clone());
-        let writer = tokio::spawn(async move {
+        let appender = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let request = AppendRecordsRequest {
                 namespace,
@@ -616,7 +680,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
             .await
             .unwrap();
         assert_eq!(texts(&woke), ["2"]);
-        writer.await.unwrap().unwrap();
+        appender.await.unwrap().unwrap();
     }
 }
 
@@ -891,6 +955,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_producer_has_a_kind_and_is_not_a_workflow),
     case!(a_producer_id_is_opaque_but_not_empty_or_too_long),
+    case!(a_producer_id_of_any_text_or_the_longest_length_reads_back),
     case!(a_close_takes_a_producer_of_any_kind),
     case!(a_write_with_a_missing_required_field_is_invalid),
     case!(an_append_with_a_record_that_has_no_body_is_invalid),
