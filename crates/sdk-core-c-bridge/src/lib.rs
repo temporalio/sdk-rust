@@ -89,7 +89,9 @@ impl ByteArrayRef {
 
     pub fn to_str_map_on_newlines(&self) -> HashMap<&str, &str> {
         let strs: Vec<&str> = self.to_str().split('\n').collect();
-        strs.chunks_exact(2)
+        strs.as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0], pair[1]))
             .collect()
     }

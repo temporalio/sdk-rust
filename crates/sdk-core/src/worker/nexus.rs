@@ -553,7 +553,7 @@ where
                 let (grace_killer, stop_grace) = futures_util::future::abortable(async {
                     if let Some(gp) = self.grace_period {
                         tokio::time::sleep(gp).await;
-                        for (tt, _) in outstanding_task_clone.lock().iter() {
+                        for tt in outstanding_task_clone.lock().keys() {
                             let _ = cancels_tx_clone.send(CancelNexusTask {
                                 task_token: tt.clone().into_inner(),
                                 reason: NexusTaskCancelReason::WorkerShutdown.into(),

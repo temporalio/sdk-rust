@@ -1475,7 +1475,7 @@ mod tests {
             ];
             assert_eq!(emitted_updates.len(), expected.len() * 3);
             for (updates, (values, worker_type, poller_type, workflow_type)) in
-                emitted_updates.chunks_exact(3).zip(expected)
+                emitted_updates.as_chunks::<3>().0.iter().zip(expected)
             {
                 for ((value, labels), expected_value) in updates.iter().zip(values) {
                     assert_eq!(*value, expected_value);

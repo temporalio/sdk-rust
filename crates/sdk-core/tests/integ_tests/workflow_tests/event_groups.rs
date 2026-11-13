@@ -443,6 +443,10 @@ async fn event_group_markers_persist_to_history_events() {
     );
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Keep the SDK's activity error intact in this test helper"
+)]
 async fn echo_activity<W>(
     ctx: &WorkflowContext<W>,
     name: &str,
@@ -1963,13 +1967,14 @@ impl ContinueAsNewCommandsWf {
         }
         let scope = EventGroup::new("scope-id");
         let direct = EventGroup::new("direct-id");
-        ctx.with_event_group(scope).continue_as_new(
-            true,
-            ContinueAsNewOptions::builder()
-                .event_groups(vec![direct])
-                .build(),
-        )?;
-        Ok(())
+        ctx.with_event_group(scope)
+            .continue_as_new(
+                true,
+                ContinueAsNewOptions::builder()
+                    .event_groups(vec![direct])
+                    .build(),
+            )
+            .map(|never| match never {})
     }
 }
 

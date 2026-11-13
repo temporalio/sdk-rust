@@ -151,8 +151,8 @@ impl WfWithTimer {
             ContinueAsNewOptions::builder()
                 .initial_versioning_behavior(ContinueAsNewVersioningBehavior::AutoUpgrade)
                 .build(),
-        )?;
-        Ok(())
+        )
+        .map(|never| match never {})
     }
 }
 
@@ -202,8 +202,8 @@ impl ContinueAsNewSuggestedWf {
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
         assert!(ctx.target_worker_deployment_version_changed());
-        ctx.continue_as_new((), ContinueAsNewOptions::default())?;
-        Ok(())
+        ctx.continue_as_new((), ContinueAsNewOptions::default())
+            .map(|never| match never {})
     }
 }
 
