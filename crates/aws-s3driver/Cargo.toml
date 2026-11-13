@@ -38,8 +38,11 @@ features = ["experimental"]
 
 [dev-dependencies]
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-# Default features, because the examples need the SDK's HTTP client to reach S3.
-aws-sdk-s3 = "1"
+# The examples need an HTTP client to reach S3, unlike the tests, which replay canned responses.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 aws-smithy-http-client = { version = "1", features = ["test-util"] }
 aws-smithy-types = "1"
 flate2 = "1"
