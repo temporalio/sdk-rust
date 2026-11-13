@@ -476,22 +476,14 @@ impl Cancelled {
                 ss.cancel_type
             ));
         }
-        debug!(
-            seq = ss.lang_seq_num,
-            "Ignoring start of cancelled Nexus operation"
-        );
         NexusOperationMachineTransition::ok([], self)
     }
 
     pub(super) fn on_completed(
         self,
-        ss: &mut SharedState,
+        _ss: &mut SharedState,
         _: NexusOperationCompletedEventAttributes,
     ) -> NexusOperationMachineTransition<Cancelled> {
-        debug!(
-            seq = ss.lang_seq_num,
-            "Ignoring completion of cancelled Nexus operation"
-        );
         NexusOperationMachineTransition::ok([], self)
     }
 
@@ -504,25 +496,17 @@ impl Cancelled {
 
     pub(super) fn on_failed(
         self,
-        ss: &mut SharedState,
+        _ss: &mut SharedState,
         _: NexusOperationFailedEventAttributes,
     ) -> NexusOperationMachineTransition<Cancelled> {
-        debug!(
-            seq = ss.lang_seq_num,
-            "Ignoring failure of cancelled Nexus operation"
-        );
         NexusOperationMachineTransition::ok([], self)
     }
 
     pub(super) fn on_timed_out(
         self,
-        ss: &mut SharedState,
+        _ss: &mut SharedState,
         _: NexusOperationTimedOutEventAttributes,
     ) -> NexusOperationMachineTransition<Cancelled> {
-        debug!(
-            seq = ss.lang_seq_num,
-            "Ignoring timeout of cancelled Nexus operation"
-        );
         NexusOperationMachineTransition::ok([], self)
     }
 }
