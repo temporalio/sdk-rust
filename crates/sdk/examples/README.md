@@ -46,4 +46,5 @@ See each example's README for details and expected output.
 - [Cancellation](cancellation/) — Workflow and activity cancellation with cleanup
 - [Encryption](encryption/) — Custom `PayloadCodec` for payload encryption
 - [Schedules](schedules/) — Creating and managing scheduled workflows
+- [External Storage](../../aws-s3driver/examples/external_storage/) — Offloading large payloads to S3 with a compression codec and a mock S3 server
 - [WASM Workflows](wasm_workflows/) — Component workflow used by WASM workflow integration tests

@@ -1062,7 +1062,7 @@ mod tests {
         let rand_fname = format!("{}", rand::random::<u64>());
         let temp_dir = temp_dir();
 
-        let dest_file_path = temp_dir.join(format!("core-test-{}", &rand_fname));
+        let dest_file_path = temp_dir.join(format!("core-test-{}", rand_fname));
         let dest_file = File::create(&dest_file_path).unwrap();
         let set_time_to = SystemTime::now() - Duration::from_secs(100);
         dest_file.set_modified(set_time_to).unwrap();

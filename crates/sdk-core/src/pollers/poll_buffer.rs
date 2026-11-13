@@ -821,6 +821,10 @@ impl TaskPollerResult for PollNexusTaskQueueResponse {
 
 #[cfg(any(feature = "test-utilities", test))]
 #[derive(derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub(crate) struct MockPermittedPollBuffer<PT, SK: SlotKind> {
     sem: Arc<MeteredPermitDealer<SK>>,
     inner: PT,

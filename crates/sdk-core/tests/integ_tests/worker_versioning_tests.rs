@@ -329,6 +329,10 @@ struct ContinueAsNewAutoUpgradeV1 {
 #[workflow_methods]
 impl ContinueAsNewAutoUpgradeV1 {
     #[run(name = "continue_as_new_auto_upgrade_uses_current_deployment_version")]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
         if attempt > 0 {
             return Ok("v1.0".to_string());
@@ -456,6 +460,10 @@ struct ContinueAsNewUseRampingVersionV1 {
 #[workflow_methods]
 impl ContinueAsNewUseRampingVersionV1 {
     #[run(name = "continue_as_new_use_ramping_version_uses_ramping_deployment_version")]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
         if attempt > 0 {
             return Ok("v1.0".to_string());
