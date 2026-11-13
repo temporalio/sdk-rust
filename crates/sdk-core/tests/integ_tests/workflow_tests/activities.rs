@@ -1,8 +1,8 @@
 use crate::{
     common::{
         ActivationAssertionsInterceptor, CLI_VERSION_OVERRIDE_ENV_VAR, CoreWfStarter,
-        INTEG_CLIENT_IDENTITY, activity_functions::StdActivities, init_core_and_create_wf,
-        init_integ_telem,
+        INTEG_CLIENT_IDENTITY, WorkflowHandleExt, activity_functions::StdActivities, eventually,
+        init_core_and_create_wf, init_integ_telem,
     },
     shared_tests,
 };
@@ -18,7 +18,8 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    ActivityIdentifier, UntypedWorkflow, WorkflowStartOptions, WorkflowTerminateOptions,
+    ActivityIdentifier, UntypedWorkflow, WorkflowExecuteUpdateOptions, WorkflowSignalOptions,
+    WorkflowStartOptions, WorkflowTerminateOptions,
 };
 
 use temporalio_common::{
@@ -52,7 +53,7 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions, RetryState,
-    TimeoutType, WorkflowContext, WorkflowResult,
+    SyncWorkflowContext, TimeoutType, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
@@ -68,7 +69,11 @@ use temporalio_sdk_core::{
         mock_worker_client, schedule_activity_cmd,
     },
 };
-use tokio::{join, sync::Semaphore, time::sleep};
+use tokio::{
+    join,
+    sync::{Notify, Semaphore},
+    time::sleep,
+};
 use tracing::warn;
 
 #[workflow]
@@ -1945,6 +1950,154 @@ async fn one_activity_abandon_cancelled_after_complete() {
         .unwrap();
     worker.run_until_done().await.unwrap();
     handle.get_result(Default::default()).await.unwrap();
+}
+
+struct FailWhenReleasedActivities {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[activities]
+impl FailWhenReleasedActivities {
+    #[activity]
+    async fn fail_when_released(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+    ) -> Result<(), ActivityError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Err(ActivityError::application(
+            ApplicationFailure::non_retryable(anyhow!("failed after being abandoned")),
+        ))
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct OneActivityAbandonCancelledThenFails {
+    abandon: bool,
+    finish: bool,
+}
+
+#[workflow_methods]
+impl OneActivityAbandonCancelledThenFails {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let act_fut = ctx.execute_activity(
+            FailWhenReleasedActivities::fail_when_released,
+            (),
+            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
+                .cancellation_type(ActivityCancellationType::Abandon)
+                .build(),
+        );
+        ctx.wait_condition(|s| s.abandon).await?;
+        act_fut.cancel();
+        let err = act_fut.await.unwrap_err();
+        assert_matches!(err, ActivityExecutionError::Cancelled(_));
+        // Stay open so the activity's failure is recorded after it was abandoned.
+        ctx.wait_condition(|s| s.finish).await?;
+        Ok(())
+    }
+
+    #[update]
+    fn abandon(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.abandon = true;
+    }
+
+    #[signal]
+    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.finish = true;
+    }
+}
+
+#[tokio::test]
+async fn one_activity_abandon_cancelled_then_fails() {
+    let wf_name = "one_activity_abandon_cancelled_then_fails";
+    let mut starter = CoreWfStarter::new(wf_name);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    starter
+        .sdk_config
+        .register_activities(FailWhenReleasedActivities {
+            started: started.clone(),
+            release: release.clone(),
+        });
+    starter
+        .sdk_config
+        .register_workflow::<OneActivityAbandonCancelledThenFails>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OneActivityAbandonCancelledThenFails::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+
+    let driver = async {
+        // The activity must be scheduled before it is abandoned, or it never reaches the server.
+        started.notified().await;
+        // Updates complete with the workflow task that handled them, so the activity has been
+        // abandoned by the time this returns.
+        handle
+            .execute_update(
+                OneActivityAbandonCancelledThenFails::abandon,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let events = eventually(
+            || async {
+                let events = handle
+                    .fetch_history(Default::default())
+                    .into_events()
+                    .await?;
+                let processed_failure = events
+                    .iter()
+                    .skip_while(|e| e.event_type() != EventType::ActivityTaskFailed)
+                    .any(|e| {
+                        matches!(
+                            e.event_type(),
+                            EventType::WorkflowTaskCompleted | EventType::WorkflowTaskFailed
+                        )
+                    });
+                if processed_failure {
+                    Ok(events)
+                } else {
+                    Err(anyhow!("abandoned activity's failure not processed yet"))
+                }
+            },
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type() == EventType::WorkflowTaskFailed),
+            "abandoned activity's failure failed a workflow task: {events:?}"
+        );
+
+        handle
+            .signal(
+                OneActivityAbandonCancelledThenFails::finish,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let (_, worker_res) = join!(driver, worker.run_until_done());
+    worker_res.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
