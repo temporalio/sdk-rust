@@ -1,0 +1,1 @@
+Workflow replay supports histories that preserve every successful workflow task boundary, so activations retain their original timestamps and job grouping. Tasks without activation jobs are handled internally without polling workflow routines.

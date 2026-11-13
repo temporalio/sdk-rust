@@ -1,4 +1,5 @@
 use crate::{
+    internal_flags::CoreInternalFlags,
     protosext::ValidPollWFTQResponse,
     worker::{
         client::WorkerClient,
@@ -46,6 +47,29 @@ pub(crate) struct HistoryUpdate {
     /// additional updates should be made.
     has_last_wft: bool,
     wft_count: usize,
+    pub(super) chunking: WorkflowTaskChunking,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum WorkflowTaskChunking {
+    Disabled,
+    Untransitioned,
+    // Retain the completion ID even when extraction splits it off as lookahead, so peeking
+    // and draining agree on the transition task without scanning SDK metadata again.
+    Transitioned(i64),
+}
+
+impl WorkflowTaskChunking {
+    pub(super) fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    fn after_event(self, event_id: i64) -> Self {
+        match self {
+            Self::Transitioned(id) if event_id >= id => Self::Disabled,
+            _ => self,
+        }
+    }
 }
 
 impl Debug for HistoryUpdate {
@@ -94,6 +118,7 @@ pub(crate) struct HistoryPaginator {
     /// These are events that should be returned once pagination has finished. This only happens
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
+    chunking: WorkflowTaskChunking,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +173,7 @@ impl HistoryPaginator {
                 wft.previous_started_event_id,
                 wft.started_event_id,
                 true,
+                WorkflowTaskChunking::Untransitioned,
             )
             .0
         } else {
@@ -184,6 +210,7 @@ impl HistoryPaginator {
             event_queue: Default::default(),
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
+            chunking: WorkflowTaskChunking::Untransitioned,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -217,6 +244,7 @@ impl HistoryPaginator {
             previous_wft_started_id,
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
+            chunking: WorkflowTaskChunking::Untransitioned,
         }
     }
 
@@ -262,6 +290,7 @@ impl HistoryPaginator {
                     self.previous_wft_started_id,
                     self.wft_started_event_id,
                     true,
+                    self.chunking,
                 )
                 .0);
             }
@@ -288,6 +317,7 @@ impl HistoryPaginator {
                 self.previous_wft_started_id,
                 self.wft_started_event_id,
                 no_more,
+                self.chunking,
             );
 
             // If there are potentially more events and we haven't extracted two WFTs yet, keep
@@ -310,6 +340,9 @@ impl HistoryPaginator {
                 // There was not a meaningful WFT in the whole page. We must fetch more.
                 continue;
             }
+            self.chunking = update
+                .chunking
+                .after_event(update.events.last().map_or(0, |event| event.event_id));
             self.id_of_last_event_in_last_extracted_update =
                 update.events.last().map(|e| e.event_id);
             #[cfg(debug_assertions)]
@@ -441,6 +474,7 @@ impl HistoryUpdate {
             wft_started_id: -1,
             has_last_wft: false,
             wft_count: 0,
+            chunking: WorkflowTaskChunking::Untransitioned,
         }
     }
 
@@ -470,20 +504,27 @@ impl HistoryUpdate {
     /// partial WFT sequence at the end, all events after the last complete WFT sequence (ending
     /// with WFT started) are returned back to the caller, since the history update only works in
     /// terms of complete WFT sequences.
-    pub(crate) fn from_events<I: IntoIterator<Item = HistoryEvent>>(
+    fn from_events<I: IntoIterator<Item = HistoryEvent>>(
         events: I,
         previous_wft_started_id: i64,
         wft_started_id: i64,
         has_last_wft: bool,
+        mut chunking: WorkflowTaskChunking,
     ) -> (Self, Vec<HistoryEvent>)
     where
         <I as IntoIterator>::IntoIter: Send + 'static,
     {
         let mut all_events: Vec<_> = events.into_iter().collect();
+        if matches!(chunking, WorkflowTaskChunking::Untransitioned)
+            && let Some(event) = all_events.iter().find(|e| disables_chunking(e))
+        {
+            chunking = WorkflowTaskChunking::Transitioned(event.event_id);
+        }
         let mut last_end = find_end_index_of_next_wft_seq(
             all_events.as_slice(),
             previous_wft_started_id,
             has_last_wft,
+            chunking,
         );
         if matches!(last_end, NextWFTSeqEndIndex::Incomplete(_)) {
             return if has_last_wft {
@@ -494,6 +535,7 @@ impl HistoryUpdate {
                         wft_started_id,
                         has_last_wft,
                         wft_count: 1,
+                        chunking,
                     },
                     vec![],
                 )
@@ -505,6 +547,7 @@ impl HistoryUpdate {
                         wft_started_id,
                         has_last_wft,
                         wft_count: 0,
+                        chunking,
                     },
                     all_events,
                 )
@@ -520,6 +563,7 @@ impl HistoryUpdate {
                 &all_events[next_end_ix..],
                 next_end_eid,
                 has_last_wft,
+                chunking,
             )
             .add(next_end_ix);
             if matches!(next_end, NextWFTSeqEndIndex::Incomplete(_)) {
@@ -542,6 +586,7 @@ impl HistoryUpdate {
                 wft_started_id,
                 has_last_wft,
                 wft_count,
+                chunking,
             },
             remaining_events,
         )
@@ -559,13 +604,14 @@ impl HistoryUpdate {
     where
         <I as IntoIterator>::IntoIter: Send + 'static,
     {
-        Self {
-            events: events.into_iter().collect(),
+        Self::from_events(
+            events,
             previous_wft_started_id,
             wft_started_id,
-            has_last_wft: true,
-            wft_count: 0,
-        }
+            true,
+            WorkflowTaskChunking::Untransitioned,
+        )
+        .0
     }
 
     /// Given a workflow task started id, return all events starting at that number (exclusive) to
@@ -580,8 +626,12 @@ impl HistoryUpdate {
         if let Some(ix_first_relevant) = self.starting_index_after_skipping(from_wft_started_id) {
             self.events.drain(0..ix_first_relevant);
         }
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft || self.ends_at_known_boundary(),
+            self.chunking,
+        );
         match next_wft_ix {
             NextWFTSeqEndIndex::Incomplete(siz) => {
                 if self.has_last_wft {
@@ -604,10 +654,9 @@ impl HistoryUpdate {
     }
 
     fn build_next_wft(&mut self, drain_this_much: usize) -> NextWFT {
-        NextWFT::WFT(
-            self.events.drain(0..=drain_this_much).collect(),
-            self.events.is_empty() && self.has_last_wft,
-        )
+        let events: Vec<_> = self.events.drain(0..=drain_this_much).collect();
+        self.chunking = self.chunking.after_event(events.last().unwrap().event_id);
+        NextWFT::WFT(events, self.events.is_empty() && self.has_last_wft)
     }
 
     /// Lets the caller peek ahead at the next WFT sequence that will be returned by
@@ -622,17 +671,25 @@ impl HistoryUpdate {
         if relevant_events.is_empty() {
             return relevant_events;
         }
-        let ix_end =
-            find_end_index_of_next_wft_seq(relevant_events, from_wft_started_id, self.has_last_wft)
-                .index();
+        let ix_end = find_end_index_of_next_wft_seq(
+            relevant_events,
+            from_wft_started_id,
+            self.has_last_wft || self.ends_at_known_boundary(),
+            self.chunking,
+        )
+        .index();
         &relevant_events[0..=ix_end]
     }
 
     /// Returns true if this update has the next needed WFT sequence, false if events will need to
     /// be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft || self.ends_at_known_boundary(),
+            self.chunking,
+        );
         if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
             && !self.has_last_wft
         {
@@ -654,6 +711,14 @@ impl HistoryUpdate {
                 Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some(a),
                 _ => None,
             })
+    }
+
+    fn ends_at_known_boundary(&self) -> bool {
+        // Extraction already checked the outcome of the last started task before splitting
+        // off its lookahead. Do not require that lookahead again after earlier tasks are drained.
+        self.events
+            .last()
+            .is_some_and(|e| e.event_type() == EventType::WorkflowTaskStarted)
     }
 
     fn starting_index_after_skipping(&self, from_wft_started_id: i64) -> Option<usize> {
@@ -689,6 +754,69 @@ impl NextWFTSeqEndIndex {
 /// Discovers the index of the last event in next WFT sequence within the passed-in slice
 /// For more on workflow task chunking, see arch_docs/workflow_task_chunking.md
 fn find_end_index_of_next_wft_seq(
+    events: &[HistoryEvent],
+    from_event_id: i64,
+    has_last_wft: bool,
+    chunking: WorkflowTaskChunking,
+) -> NextWFTSeqEndIndex {
+    let transition_id = match chunking {
+        WorkflowTaskChunking::Transitioned(id) if from_event_id < id - 1 => id,
+        WorkflowTaskChunking::Untransitioned => {
+            return find_end_index_of_next_wft_seq_chunked(events, from_event_id, has_last_wft);
+        }
+        WorkflowTaskChunking::Disabled | WorkflowTaskChunking::Transitioned(_) => {
+            return find_end_index_of_next_wft_seq_unchunked(events, from_event_id, has_last_wft);
+        }
+    };
+    // Keep using legacy chunking before the transition point so earlier history replays
+    // with the same activation boundaries it had before chunking was disabled.
+    if let Ok(transition_index) = events.binary_search_by_key(&(transition_id - 1), |e| e.event_id)
+    {
+        return match find_end_index_of_next_wft_seq_chunked(
+            &events[..events.len().min(transition_index + 3)],
+            from_event_id,
+            true,
+        ) {
+            NextWFTSeqEndIndex::Complete(index) => {
+                NextWFTSeqEndIndex::Complete(index.min(transition_index))
+            }
+            NextWFTSeqEndIndex::Incomplete(_) => NextWFTSeqEndIndex::Complete(transition_index),
+        };
+    }
+    find_end_index_of_next_wft_seq_chunked(events, from_event_id, has_last_wft)
+}
+
+fn find_end_index_of_next_wft_seq_unchunked(
+    events: &[HistoryEvent],
+    from_event_id: i64,
+    has_last_wft: bool,
+) -> NextWFTSeqEndIndex {
+    for (ix, event) in events.iter().enumerate() {
+        if event.event_id <= from_event_id {
+            continue;
+        }
+        if event.is_final_wf_execution_event() {
+            return NextWFTSeqEndIndex::Complete(ix);
+        }
+        if event.event_type() != EventType::WorkflowTaskStarted {
+            continue;
+        }
+        match events.get(ix + 1).map(|e| e.event_type()) {
+            Some(
+                EventType::WorkflowTaskFailed
+                | EventType::WorkflowTaskTimedOut
+                | EventType::WorkflowExecutionTimedOut
+                | EventType::WorkflowExecutionTerminated
+                | EventType::WorkflowExecutionCanceled,
+            ) => continue,
+            None if !has_last_wft => continue,
+            _ => return NextWFTSeqEndIndex::Complete(ix),
+        }
+    }
+    NextWFTSeqEndIndex::Incomplete(events.len().saturating_sub(1))
+}
+
+fn find_end_index_of_next_wft_seq_chunked(
     events: &[HistoryEvent],
     from_event_id: i64,
     has_last_wft: bool,
@@ -802,6 +930,12 @@ fn find_end_index_of_next_wft_seq(
     NextWFTSeqEndIndex::Incomplete(last_index)
 }
 
+fn disables_chunking(event: &HistoryEvent) -> bool {
+    matches!(&event.attributes, Some(Attributes::WorkflowTaskCompletedEventAttributes(a))
+        if a.sdk_metadata.as_ref().is_some_and(|m| m.core_used_flags.contains(
+            &(CoreInternalFlags::DisableWorkflowTaskChunking as u32))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,6 +984,193 @@ mod tests {
         let seq = update.take_next_wft_sequence(from_id).unwrap_events();
         assert_eq!(seq, seq_peeked);
         seq
+    }
+
+    #[test]
+    fn chunking_transition_preserves_prior_boundaries_and_skips_failed_attempts() {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_full_wf_task();
+        history.add_by_type(EventType::TimerStarted);
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+        history.set_flags_last_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+        history.add_full_wf_task();
+        history.add_workflow_task_scheduled_and_started();
+        history.add_workflow_task_timed_out();
+        history.add_workflow_task_scheduled_and_started();
+        let mut update = history.as_history_update();
+        let mut from_id = 0;
+        for expected in [3, 7, 13, 16, 22] {
+            let events = next_check_peek(&mut update, from_id);
+            assert_eq!(events.last().unwrap().event_id, expected);
+            from_id = expected;
+        }
+        assert_matches!(update.take_next_wft_sequence(from_id), NextWFT::ReplayOver);
+    }
+
+    #[test]
+    fn chunking_transition_retains_update_sequencing_lookahead() {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+        history.set_flags_last_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+        history.add_update_accepted("1", "update");
+        history.add_workflow_task_scheduled_and_started();
+        let mut events = history.get_full_history_info().unwrap().into_events();
+        let Some(Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(accepted)) =
+            &mut events[10].attributes
+        else {
+            panic!("Expected update acceptance");
+        };
+        accepted.accepted_request_sequencing_event_id = 8;
+
+        let mut update = HistoryUpdate::new_from_events(events, 0, 13);
+        let sequence = next_check_peek(&mut update, 3);
+        assert_eq!(sequence.last().unwrap().event_id, 6);
+        let sequence = next_check_peek(&mut update, 6);
+        assert_eq!(sequence.last().unwrap().event_id, 9);
+        let sequence = next_check_peek(&mut update, 9);
+        assert_eq!(sequence.last().unwrap().event_id, 13);
+    }
+
+    #[test]
+    fn skipping_past_transition_preserves_empty_task_boundaries() {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_full_wf_task();
+        history.set_flags_last_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+        history.add_workflow_task_scheduled_and_started();
+
+        let mut update = history.as_history_update();
+        for from_id in [3, 6, 9] {
+            let sequence = next_check_peek(&mut update, from_id);
+            assert_eq!(sequence.last().unwrap().event_id, from_id + 3);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(EventType::WorkflowTaskFailed, false, None)]
+    #[case(EventType::WorkflowTaskTimedOut, false, None)]
+    #[case(EventType::WorkflowExecutionTimedOut, false, Some(1))]
+    #[case(EventType::WorkflowExecutionTerminated, false, Some(1))]
+    #[case(EventType::WorkflowExecutionCanceled, false, Some(1))]
+    #[case(EventType::WorkflowTaskCompleted, false, Some(0))]
+    #[case(EventType::Unspecified, false, None)]
+    #[case(EventType::Unspecified, true, Some(0))]
+    fn unchunked_boundary_requires_successful_or_final_task(
+        #[case] outcome: EventType,
+        #[case] has_last_wft: bool,
+        #[case] expected_boundary: Option<usize>,
+    ) {
+        let mut events = vec![HistoryEvent {
+            event_id: 1,
+            event_type: EventType::WorkflowTaskStarted as i32,
+            ..Default::default()
+        }];
+        if outcome != EventType::Unspecified {
+            events.push(HistoryEvent {
+                event_id: 2,
+                event_type: outcome as i32,
+                ..Default::default()
+            });
+        }
+        let boundary = find_end_index_of_next_wft_seq_unchunked(&events, 0, has_last_wft);
+        match (boundary, expected_boundary) {
+            (NextWFTSeqEndIndex::Complete(actual), Some(expected)) => assert_eq!(actual, expected),
+            (NextWFTSeqEndIndex::Incomplete(_), None) => {}
+            _ => panic!("Unexpected boundary: {boundary:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn chunking_transition_survives_pagination(
+        #[case] command_free_initialization: bool,
+        #[values(false, true)] signals_in_scheduled_tasks: bool,
+    ) {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_full_wf_task();
+        if !command_free_initialization {
+            history.add_by_type(EventType::TimerStarted);
+            history.add_full_wf_task();
+        }
+        history.set_flags_last_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+        for index in 0..8 {
+            if signals_in_scheduled_tasks && index % 2 == 0 {
+                history.add_workflow_task_scheduled();
+                history.add_we_signaled("tick", vec![]);
+                history.add_workflow_task_started();
+                history.add_workflow_task_completed();
+            } else {
+                history.add_full_wf_task();
+            }
+        }
+        history.add_workflow_task_scheduled_and_started();
+        let events = history.get_full_history_info().unwrap().into_events();
+        let expected: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type() == EventType::WorkflowTaskStarted)
+            .map(|event| event.event_id)
+            .collect();
+        let last_started_id = *expected.last().unwrap();
+        for page_size in 1..=events.len() {
+            let mut pages: Vec<_> = events.chunks(page_size).map(|p| p.to_vec()).collect();
+            let first_page = pages.remove(0);
+            let has_more = !pages.is_empty();
+            let mut client = mock_worker_client();
+            let mut remaining = pages.into_iter().peekable();
+            client
+                .expect_get_workflow_execution_history()
+                .returning(move |_, _, _| {
+                    let events = remaining.next().unwrap();
+                    Ok(GetWorkflowExecutionHistoryResponse {
+                        history: Some(History { events }),
+                        next_page_token: if remaining.peek().is_some() {
+                            vec![1]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    })
+                });
+            let mut paginator = HistoryPaginator::new(
+                History { events: first_page },
+                0,
+                last_started_id,
+                "wf".to_owned(),
+                "run".to_owned(),
+                if has_more { vec![1] } else { vec![] },
+                Arc::new(client),
+            );
+            let mut from_id = 0;
+            let mut boundaries = vec![];
+            loop {
+                let mut update = paginator.extract_next_update().await.unwrap();
+                loop {
+                    match update.take_next_wft_sequence(from_id) {
+                        NextWFT::WFT(events, _) => {
+                            from_id = events.last().unwrap().event_id;
+                            boundaries.push(from_id);
+                        }
+                        NextWFT::NeedFetch => break,
+                        NextWFT::ReplayOver => break,
+                    }
+                }
+                if from_id == last_started_id {
+                    break;
+                }
+            }
+            assert_eq!(boundaries, expected, "page size {page_size}");
+        }
     }
 
     #[test]
@@ -1094,6 +1415,7 @@ mod tests {
                 .unwrap()
                 .workflow_task_started_event_id(),
             false,
+            WorkflowTaskChunking::Untransitioned,
         );
         assert_eq!(remaining[0].event_id, 12);
         assert_eq!(remaining.last().unwrap().event_id, truncate_at as i64);

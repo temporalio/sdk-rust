@@ -45,6 +45,10 @@ relevant information.
   name the run's last completed workflow task, and `failed_tasks`, the started event ids of the
   run's last 100 failed or timed out workflow tasks. Retries that Core runs locally keep the
   value. Core leaves it unset for other activities.
+* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
+  including for running workflows. The transition is recorded in history and defaults to off.
+  Core handles tasks with no activation jobs internally, without polling workflow routines; see
+  [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

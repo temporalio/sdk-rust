@@ -131,14 +131,14 @@ impl ManagedRun {
         (me, rua)
     }
 
-    /// Returns true if there are pending jobs that need to be sent to lang.
+    /// Returns true if lang needs another activation.
     pub(super) fn more_pending_work(&self) -> bool {
         // We don't want to consider there to be more local-only work to be done if there is
         // no workflow task associated with the run right now. This can happen if, ex, we
         // complete a local activity while waiting for server to send us the next WFT.
         // Activating lang would be harmful at this stage, as there might be work returned
         // in that next WFT which should be part of the next activation.
-        self.wft.is_some() && self.wfm.machines.has_pending_jobs()
+        self.wft.is_some() && self.wfm.machines.activation_needed()
     }
 
     pub(super) fn waiting_on_local_activities(&self) -> bool {
@@ -358,7 +358,7 @@ impl ManagedRun {
             return Ok(None);
         }
 
-        if self.wfm.machines.has_pending_jobs() && !self.am_broken {
+        if self.wfm.machines.activation_needed() && !self.am_broken {
             Ok(Some(ActivationOrAuto::LangActivation(
                 self.wfm.get_next_activation()?,
             )))
@@ -1224,7 +1224,7 @@ impl ManagedRun {
         // activations and we are caught up on replay. We don't want to complete a wft if we already
         // saw the final event in the workflow, or if we are playing back for the express purpose of
         // fulfilling a query. Eviction only reports output buffered by prior normal activations.
-        let should_respond = !(machines_wft_response.has_pending_jobs
+        let should_respond = !(machines_wft_response.activation_needed
             || (machines_wft_response.replaying && !data.is_forced_failure)
             || is_query_playback
             || (data.activation_was_eviction && !eviction_has_output)
@@ -1572,14 +1572,12 @@ impl WorkflowManager {
     /// Callers may also need to call [get_server_commands] after this to issue any pending commands
     /// to the server.
     fn get_next_activation(&mut self) -> Result<WorkflowActivation> {
-        // First check if there are already some pending jobs, which can be a result of replay.
-        let mut activation = self.machines.get_wf_activation();
-        if activation.jobs.is_empty() {
+        // Replay may require another activation even without new history from the server.
+        if !self.machines.activation_needed() {
             self.machines.apply_next_wft_from_history()?;
-            activation = self.machines.get_wf_activation();
         }
-        self.awaiting_activation_completion = !activation.jobs.is_empty();
-        Ok(activation)
+        self.awaiting_activation_completion = self.machines.activation_needed();
+        Ok(self.machines.get_wf_activation())
     }
 
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
@@ -1588,19 +1586,19 @@ impl WorkflowManager {
         self.machines.ready_to_apply_next_wft()
     }
 
-    /// If there are no pending jobs for the workflow apply the next workflow task and check again
-    /// if there are any jobs. Importantly, does not *drain* jobs.
+    /// If no activation is needed, apply the next workflow task and check again.
+    /// Importantly, does not *drain* jobs.
     fn apply_next_task_if_ready(&mut self) -> Result<()> {
-        if self.machines.has_pending_jobs() {
+        if self.machines.activation_needed() {
             return Ok(());
         }
         loop {
             let consumed_events = self.machines.apply_next_wft_from_history()?;
 
-            if consumed_events == 0 || !self.machines.replaying || self.machines.has_pending_jobs()
+            if consumed_events == 0 || !self.machines.replaying || self.machines.activation_needed()
             {
-                // Keep applying tasks while there are events, we are still replaying, and there are
-                // no jobs
+                // Keep applying tasks while there are events, we are still replaying, and no
+                // activation is needed
                 break;
             }
         }
@@ -2051,7 +2049,8 @@ mod tests {
     mod local_activity_replay_tests {
         use super::super::WorkflowManager;
         use crate::{
-            replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+            internal_flags::CoreInternalFlags,
+            replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
             telemetry::metrics::MetricsContext,
             test_help::{
                 PollWFTRespExt, schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg,
@@ -2084,6 +2083,7 @@ mod tests {
                 common::v1::Payload,
                 enums::v1::EventType,
                 history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes},
+                workflowservice::v1::get_system_info_response::Capabilities,
             },
         };
 
@@ -2419,6 +2419,213 @@ mod tests {
                     }
                 }
                 assert!(workflow.finished, "replay failed to finish for {plan:?}");
+            }
+        }
+
+        #[rstest]
+        #[case(true)]
+        #[case(false)]
+        #[test]
+        fn chunking_transition_waits_for_local_activities_and_persisted_history(
+            #[case] sdk_metadata: bool,
+        ) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = WorkflowManager::new(RunBasics {
+                worker_config: test_worker_cfg().build().unwrap().into(),
+                workflow_id: "transition".to_owned(),
+                workflow_type: DEFAULT_WORKFLOW_TYPE.to_owned(),
+                run_id: history.get_orig_run_id().to_owned(),
+                history: history.get_full_history_info().unwrap().into(),
+                metrics: MetricsContext::no_op(),
+                capabilities: &Capabilities {
+                    sdk_metadata,
+                    ..Default::default()
+                },
+                sdk_name: "test",
+                sdk_version: "test",
+            });
+            assert!(
+                !live
+                    .machines
+                    .get_metadata_for_wft_complete()
+                    .core_used_flags
+                    .contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32))
+            );
+            live.get_next_activation().unwrap();
+            let mut workflow = FanoutWorkflow::default();
+            live.push_commands_and_iterate(vec![workflow.schedule(Activity::Work(1))])
+                .unwrap();
+            live.drain_queued_local_activities();
+            let flags = live
+                .machines
+                .get_metadata_for_wft_complete()
+                .core_used_flags;
+            assert!(!flags.contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32)));
+            live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
+                seq: 1,
+                result: LocalActivityExecutionResult::Completed(Success { result: None }),
+                runtime: Duration::ZERO,
+                attempt: 1,
+                backoff: None,
+                original_schedule_time: None,
+            }))
+            .unwrap();
+            live.get_next_activation().unwrap();
+            live.push_commands_and_iterate(vec![]).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    live.machines
+                        .get_metadata_for_wft_complete()
+                        .core_used_flags
+                        .contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32)),
+                    sdk_metadata && cfg!(feature = "disable_workflow_task_chunking")
+                );
+            }
+        }
+
+        #[rstest]
+        fn local_activity_after_chunking_transition_replays_empty_heartbeat(
+            #[values(false, true)] legacy_query_before_heartbeat: bool,
+        ) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            live.get_next_activation().unwrap();
+            live.push_commands_and_iterate(vec![]).unwrap();
+            history.add_workflow_task_completed();
+            history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+
+            history.add_we_signaled("start", vec![]);
+            history.add_workflow_task_scheduled_and_started();
+            let activation = live
+                .new_work_from_server(history.get_one_wft(2).unwrap().into(), vec![], false)
+                .unwrap();
+            assert_matches!(activation.jobs[0].variant, Some(Variant::SignalWorkflow(_)));
+            let mut workflow = FanoutWorkflow::default();
+            live.push_commands_and_iterate(vec![workflow.schedule(Activity::Work(1))])
+                .unwrap();
+            live.drain_queued_local_activities();
+            history.add_workflow_task_completed();
+
+            history.add_workflow_task_scheduled_and_started();
+            if legacy_query_before_heartbeat {
+                let activation = live
+                    .new_work_from_server(history.get_one_wft(3).unwrap().into(), vec![], true)
+                    .unwrap();
+                assert!(activation.jobs.is_empty());
+                live.push_commands_and_iterate(vec![]).unwrap();
+            }
+            let activation = live
+                .new_work_from_server(history.get_one_wft(3).unwrap().into(), vec![], false)
+                .unwrap();
+            assert!(activation.jobs.is_empty());
+            assert!(!live.awaiting_activation_completion);
+            live.push_commands_and_iterate(vec![]).unwrap();
+            live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
+                seq: 1,
+                result: LocalActivityExecutionResult::Completed(Success {
+                    result: Some(Activity::Work(1).result()),
+                }),
+                runtime: Duration::ZERO,
+                attempt: 1,
+                backoff: None,
+                original_schedule_time: None,
+            }))
+            .unwrap();
+            let live_resolution = live.get_next_activation().unwrap();
+            assert_matches!(
+                live_resolution.jobs[0].variant,
+                Some(Variant::ResolveActivity(_))
+            );
+            live.push_commands_and_iterate(vec![]).unwrap();
+
+            history.add_workflow_task_completed();
+            let completed_event_id = history.current_event_id();
+            for command in live.machines.get_commands() {
+                let command::Attributes::RecordMarkerCommandAttributes(marker) =
+                    command.attributes.unwrap()
+                else {
+                    panic!("Expected a local activity marker");
+                };
+                history.add(MarkerRecordedEventAttributes {
+                    marker_name: marker.marker_name,
+                    details: marker.details,
+                    failure: marker.failure,
+                    workflow_task_completed_event_id: completed_event_id,
+                    ..Default::default()
+                });
+            }
+            history.add_workflow_task_scheduled_and_started();
+
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            replay.push_commands_and_iterate(vec![]).unwrap();
+            let activation = replay.get_next_activation().unwrap();
+            assert_matches!(activation.jobs[0].variant, Some(Variant::SignalWorkflow(_)));
+            let mut workflow = FanoutWorkflow::default();
+            replay
+                .push_commands_and_iterate(vec![workflow.schedule(Activity::Work(1))])
+                .unwrap();
+            let replay_resolution = replay.get_next_activation().unwrap();
+            assert_eq!(replay_resolution.jobs, live_resolution.jobs);
+            replay.push_commands_and_iterate(vec![]).unwrap();
+            let activation = replay.get_next_activation().unwrap();
+            assert!(activation.jobs.is_empty());
+            assert!(!replay.awaiting_activation_completion);
+        }
+
+        #[test]
+        fn unchunked_held_la_resolutions_preserve_separate_activations() {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_full_wf_task();
+            history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+            history.add_we_signaled("start", vec![]);
+            history.add_full_wf_task();
+            history.add_full_wf_task();
+            for seq in 1..=2 {
+                history.add_local_activity_marker(
+                    seq,
+                    &seq.to_string(),
+                    Some("done".as_json_payload().unwrap()),
+                    None,
+                    |marker| marker.activation_index = Some(u64::from(seq)),
+                );
+            }
+            history.add_workflow_task_scheduled_and_started();
+
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            replay.push_commands_and_iterate(vec![]).unwrap();
+            let activation = replay.get_next_activation().unwrap();
+            assert_matches!(activation.jobs[0].variant, Some(Variant::SignalWorkflow(_)));
+            let commands = (1..=2)
+                .map(|seq| {
+                    let workflow_command::Variant::ScheduleLocalActivity(command) =
+                        schedule_local_activity_cmd(
+                            seq,
+                            DEFAULT_ACTIVITY_TYPE,
+                            ActivityCancellationType::TryCancel,
+                            Duration::from_secs(10),
+                        )
+                    else {
+                        unreachable!()
+                    };
+                    WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+                })
+                .collect();
+            replay.push_commands_and_iterate(commands).unwrap();
+            for seq in 1..=2 {
+                let activation = replay.get_next_activation().unwrap();
+                assert_eq!(activation.jobs.len(), 1);
+                assert_matches!(
+                    &activation.jobs[0].variant,
+                    Some(Variant::ResolveActivity(resolution)) if resolution.seq == seq
+                );
+                replay.push_commands_and_iterate(vec![]).unwrap();
             }
         }
 

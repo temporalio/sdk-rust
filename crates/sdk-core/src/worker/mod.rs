@@ -1464,6 +1464,7 @@ impl Worker {
     /// It is important to understand that all activations must be responded to. There can only
     /// be one outstanding activation for a particular run of a workflow at any time. If an
     /// activation is not responded to, it will cause that workflow to become stuck forever.
+    /// Workflow tasks without activation jobs are handled internally and do not activate lang.
     ///
     /// See [WorkflowActivation] for more details on the expected behavior of lang w.r.t activation
     /// & job processing.

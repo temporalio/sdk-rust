@@ -69,9 +69,9 @@ use temporalio_sdk_core::{
         canned_histories, default_wes_attribs,
     },
     test_help::{
-        LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_mock_pollers, drain_pollers_and_shutdown, hist_to_poll_resp,
-        mock_worker, mock_worker_client, query_ok, schedule_activity_cmd,
+        CoreInternalFlags, LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType,
+        WorkerExt, WorkerTestHelpers, build_mock_pollers, drain_pollers_and_shutdown,
+        hist_to_poll_resp, mock_worker, mock_worker_client, query_ok, schedule_activity_cmd,
         schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
     },
 };
@@ -2153,10 +2153,14 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
 async fn legacy_query_must_not_execute_local_activity(
     #[case] task_started: bool,
     #[case] cached: bool,
+    #[values(false, true)] unchunked: bool,
 ) {
     let mut history = TestHistoryBuilder::default();
     history.add(default_wes_attribs());
     history.add_full_wf_task();
+    if unchunked {
+        history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+    }
     let scheduled = history.add_activity_task_scheduled("remote");
     let started = history.add_activity_task_started(scheduled);
     history.add_activity_task_completed(scheduled, started, vec![1].into());

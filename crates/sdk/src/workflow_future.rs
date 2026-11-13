@@ -245,19 +245,13 @@ impl WorkflowFuture {
         &self,
         mut activation: CoreWorkflowActivation,
     ) -> Result<(WorkflowActivation, Vec<ActivationJobContext>, bool), Error> {
-        let mut should_poll_routines = false;
+        let should_poll_routines = activation.jobs.iter().any(|job| {
+            !matches!(
+                job.variant,
+                Some(Variant::QueryWorkflow(_) | Variant::DoUpdate(_))
+            )
+        });
         let mut job_contexts = Vec::with_capacity(activation.jobs.len());
-        macro_rules! push_context {
-            ($context:expr $(,)?) => {{
-                job_contexts.push($context);
-            }};
-        }
-        macro_rules! push_polled_context {
-            ($context:expr $(,)?) => {{
-                should_poll_routines = true;
-                push_context!($context);
-            }};
-        }
         for job in &mut activation.jobs {
             match job
                 .variant
@@ -265,57 +259,57 @@ impl WorkflowFuture {
                 .context("Empty activation job variant")?
             {
                 Variant::InitializeWorkflow(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::FireTimer(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveActivity(attrs) => {
                     attrs.result.as_ref().context("Activity must have result")?;
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveChildWorkflowExecutionStart(attrs) => {
                     attrs
                         .status
                         .as_ref()
                         .context("Workflow start must have status")?;
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveChildWorkflowExecution(attrs) => {
                     attrs
                         .result
                         .as_ref()
                         .context("Child Workflow execution must have a result")?;
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::UpdateRandomSeed(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::QueryWorkflow(q) => {
                     debug!(query_type = %q.query_type, "Query received");
                     let query_id = q.query_id.clone();
-                    push_context!(ActivationJobContext::Query { query_id });
+                    job_contexts.push(ActivationJobContext::Query { query_id });
                 }
                 Variant::CancelWorkflow(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::SignalWorkflow(sig) => {
                     debug!(signal_name = %sig.signal_name, "Signal received");
-                    push_polled_context!(ActivationJobContext::Signal);
+                    job_contexts.push(ActivationJobContext::Signal);
                 }
                 Variant::NotifyHasPatch(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveSignalExternalWorkflow(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveRequestCancelExternalWorkflow(_) => {
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 // Whether an update can change state is only known once its validator has run
                 Variant::DoUpdate(u) => {
                     let protocol_instance_id = u.protocol_instance_id.clone();
-                    push_context!(ActivationJobContext::Update {
+                    job_contexts.push(ActivationJobContext::Update {
                         protocol_instance_id,
                     });
                 }
@@ -324,14 +318,14 @@ impl WorkflowFuture {
                         .status
                         .as_ref()
                         .context("Nexus operation start must have status")?;
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::ResolveNexusOperation(attrs) => {
                     attrs
                         .result
                         .as_ref()
                         .context("Nexus operation must have result")?;
-                    push_polled_context!(ActivationJobContext::Passive);
+                    job_contexts.push(ActivationJobContext::Passive);
                 }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
@@ -758,6 +752,163 @@ fn update_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SyncWorkflowContext, WorkflowContext, workflow_registry::WorkflowDefinitions};
+    use futures_util::FutureExt;
+    use std::time::{Duration, UNIX_EPOCH};
+    use temporalio_common::protos::coresdk::{
+        workflow_activation::{QueryWorkflow, SignalWorkflow, WorkflowActivationJob},
+        workflow_completion::workflow_activation_completion::Status,
+    };
+    use temporalio_macros::{workflow, workflow_methods};
+    use temporalio_workflow::WorkflowContextView;
+
+    #[workflow]
+    #[derive(Default)]
+    struct ClockConditionWorkflow;
+
+    #[workflow_methods]
+    impl ClockConditionWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            let clock = ctx.clone();
+            ctx.wait_condition(move |_| {
+                clock.workflow_time() >= Some(UNIX_EPOCH + Duration::from_secs(3))
+            })
+            .await?;
+            assert_eq!(ctx.history_length(), 3);
+            assert_eq!(ctx.is_replaying_history_events(), ctx.is_replaying());
+            Ok(())
+        }
+
+        #[query]
+        fn ready(&self, _ctx: &WorkflowContextView) -> bool {
+            true
+        }
+
+        #[signal]
+        fn tick(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {}
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn jobless_activations_do_not_drive_clock_conditions(
+        #[values(false, true)] replaying: bool,
+    ) {
+        let mut definitions = WorkflowDefinitions::new();
+        definitions
+            .register_workflow::<ClockConditionWorkflow>()
+            .unwrap();
+        let workflow_type = definitions
+            .workflow_definitions()
+            .next()
+            .unwrap()
+            .workflow_type
+            .clone();
+        let init = InitializeWorkflow {
+            workflow_type: workflow_type.clone(),
+            ..Default::default()
+        };
+        let (completions_tx, mut completions_rx) = unbounded_channel();
+        let (workflow, activations) = start_workflow(
+            definitions.get_workflow(&workflow_type).unwrap(),
+            "namespace".to_owned(),
+            "task-queue".to_owned(),
+            "run".to_owned(),
+            init.clone(),
+            completions_tx,
+            DataConverter::default(),
+            true,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let mut workflow = Box::pin(workflow);
+
+        for seconds in [1, 3] {
+            activations
+                .send(CoreWorkflowActivation {
+                    run_id: "run".to_owned(),
+                    timestamp: Some(prost_types::Timestamp { seconds, nanos: 0 }),
+                    history_length: seconds as u32,
+                    is_replaying: replaying,
+                    jobs: if seconds == 1 {
+                        vec![WorkflowActivationJob {
+                            variant: Some(Variant::InitializeWorkflow(init.clone())),
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(workflow.as_mut().now_or_never().is_none());
+            let completion = completions_rx.try_recv().unwrap();
+            let Some(Status::Successful(success)) = completion.status else {
+                panic!("Expected successful completion: {completion:?}");
+            };
+            assert!(success.commands.is_empty());
+        }
+
+        // A query at the target time must not drive the waiting workflow to completion.
+        activations
+            .send(CoreWorkflowActivation {
+                run_id: "run".to_owned(),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: 3,
+                    nanos: 0,
+                }),
+                history_length: 3,
+                is_replaying: true,
+                jobs: vec![WorkflowActivationJob {
+                    variant: Some(Variant::QueryWorkflow(QueryWorkflow {
+                        query_id: "query".to_owned(),
+                        query_type: "ready".to_owned(),
+                        ..Default::default()
+                    })),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(workflow.as_mut().now_or_never().is_none());
+        let completion = completions_rx.try_recv().unwrap();
+        let Some(Status::Successful(success)) = completion.status else {
+            panic!("Expected successful query: {completion:?}");
+        };
+        assert_eq!(success.commands.len(), 1);
+        assert!(matches!(
+            success.commands[0].variant,
+            Some(workflow_command::Variant::RespondToQuery(_))
+        ));
+
+        activations
+            .send(CoreWorkflowActivation {
+                run_id: "run".to_owned(),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: 3,
+                    nanos: 0,
+                }),
+                history_length: 3,
+                is_replaying: replaying,
+                jobs: vec![WorkflowActivationJob {
+                    variant: Some(Variant::SignalWorkflow(SignalWorkflow {
+                        signal_name: "tick".to_owned(),
+                        ..Default::default()
+                    })),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(workflow.as_mut().now_or_never().is_none());
+        let completion = completions_rx.try_recv().unwrap();
+        let Some(Status::Successful(success)) = completion.status else {
+            panic!("Expected workflow completion: {completion:?}");
+        };
+        assert_eq!(success.commands.len(), 1);
+        assert!(matches!(
+            success.commands[0].variant,
+            Some(workflow_command::Variant::CompleteWorkflowExecution(_))
+        ));
+    }
 
     #[test]
     fn workflow_task_failed_cause_from_wit_preserves_known_causes() {

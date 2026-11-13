@@ -140,6 +140,16 @@ impl LocalActivityData {
         self.activation_index += 1;
     }
 
+    pub(super) fn advance_to_next_resolution_activation(&mut self) {
+        if let Some(activation_index) = self
+            .preresolutions
+            .front()
+            .and_then(|item| item.activation_index)
+        {
+            self.activation_index = self.activation_index.max(activation_index);
+        }
+    }
+
     pub(super) fn current_activation_index(&self) -> u64 {
         self.activation_index
     }
