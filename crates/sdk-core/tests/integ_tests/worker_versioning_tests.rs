@@ -329,6 +329,10 @@ struct ContinueAsNewAutoUpgradeV1 {
 #[workflow_methods]
 impl ContinueAsNewAutoUpgradeV1 {
     #[run(name = "continue_as_new_auto_upgrade_uses_current_deployment_version")]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
         if attempt > 0 {
             return Ok("v1.0".to_string());
@@ -338,8 +342,8 @@ impl ContinueAsNewAutoUpgradeV1 {
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
-        ctx.continue_as_new(attempt + 1, options)
-            .map(|never| match never {})
+        ctx.continue_as_new(attempt + 1, options)?;
+        Ok("v1.0".to_string())
     }
 
     #[signal]
@@ -456,6 +460,10 @@ struct ContinueAsNewUseRampingVersionV1 {
 #[workflow_methods]
 impl ContinueAsNewUseRampingVersionV1 {
     #[run(name = "continue_as_new_use_ramping_version_uses_ramping_deployment_version")]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
         if attempt > 0 {
             return Ok("v1.0".to_string());
@@ -465,8 +473,8 @@ impl ContinueAsNewUseRampingVersionV1 {
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
             Some(ContinueAsNewVersioningBehavior::UseRampingVersion);
-        ctx.continue_as_new(attempt + 1, options)
-            .map(|never| match never {})
+        ctx.continue_as_new(attempt + 1, options)?;
+        Ok("v1.0".to_string())
     }
 
     #[signal]

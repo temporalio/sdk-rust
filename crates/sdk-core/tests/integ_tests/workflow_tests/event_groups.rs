@@ -1961,20 +1961,23 @@ struct ContinueAsNewCommandsWf;
 #[workflow_methods]
 impl ContinueAsNewCommandsWf {
     #[run(name = "event_groups_continue_as_new")]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>, second_run: bool) -> WorkflowResult<()> {
         if second_run {
             return Ok(());
         }
         let scope = EventGroup::new("scope-id");
         let direct = EventGroup::new("direct-id");
-        ctx.with_event_group(scope)
-            .continue_as_new(
-                true,
-                ContinueAsNewOptions::builder()
-                    .event_groups(vec![direct])
-                    .build(),
-            )
-            .map(|never| match never {})
+        ctx.with_event_group(scope).continue_as_new(
+            true,
+            ContinueAsNewOptions::builder()
+                .event_groups(vec![direct])
+                .build(),
+        )?;
+        Ok(())
     }
 }
 

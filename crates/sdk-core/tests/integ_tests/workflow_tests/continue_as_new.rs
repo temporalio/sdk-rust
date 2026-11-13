@@ -144,6 +144,10 @@ struct WfWithTimer;
 #[workflow_methods]
 impl WfWithTimer {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
         ctx.continue_as_new(
@@ -151,8 +155,8 @@ impl WfWithTimer {
             ContinueAsNewOptions::builder()
                 .initial_versioning_behavior(ContinueAsNewVersioningBehavior::AutoUpgrade)
                 .build(),
-        )
-        .map(|never| match never {})
+        )?;
+        Ok(())
     }
 }
 
@@ -194,6 +198,10 @@ struct ContinueAsNewSuggestedWf;
 #[workflow_methods]
 impl ContinueAsNewSuggestedWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    #[allow(
+        unreachable_code,
+        reason = "The trailing return is needed before Rust 1.100"
+    )]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         // First WFT: flag should be false
         assert!(!ctx.continue_as_new_suggested());
@@ -202,8 +210,8 @@ impl ContinueAsNewSuggestedWf {
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
         assert!(ctx.target_worker_deployment_version_changed());
-        ctx.continue_as_new((), ContinueAsNewOptions::default())
-            .map(|never| match never {})
+        ctx.continue_as_new((), ContinueAsNewOptions::default())?;
+        Ok(())
     }
 }
 
