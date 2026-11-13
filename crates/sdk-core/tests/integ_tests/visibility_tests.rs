@@ -13,7 +13,7 @@ use temporalio_common::protos::{
         },
     },
 };
-use temporalio_sdk_core::test_help::{WorkerTestHelpers, drain_pollers_and_shutdown};
+use temporalio_sdk_core::test_help::{WorkerExt, WorkerTestHelpers};
 use tokio::time::sleep;
 use tonic::IntoRequest;
 
@@ -90,7 +90,7 @@ async fn client_list_open_closed_workflow_executions() {
     // Complete workflow
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 
     // List above CLOSED workflow. Visibility doesn't always update immediately so we give this a
     // few tries.

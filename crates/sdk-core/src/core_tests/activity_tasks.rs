@@ -4,9 +4,9 @@ use crate::{
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
-        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, drain_pollers_and_shutdown,
-        fanout_tasks, gen_assert_and_reply, mock_manual_poller, mock_poller, mock_worker,
-        poll_and_reply, single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
+        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, fanout_tasks,
+        gen_assert_and_reply, mock_manual_poller, mock_poller, mock_worker, poll_and_reply,
+        single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
     },
     worker::{
         PollerBehavior, WorkerVersioningStrategy,
@@ -150,6 +150,7 @@ async fn activity_not_found_returns_ok() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -248,6 +249,7 @@ async fn heartbeats_report_cancels_only_once() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -334,6 +336,7 @@ async fn activity_cancel_interrupts_poll() {
     // So that we know we blocked
     assert_eq!(last_finisher.load(Ordering::Acquire), 2);
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -472,7 +475,7 @@ async fn many_concurrent_heartbeat_cancels() {
     })
     .await;
 
-    drain_pollers_and_shutdown(worker).await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -527,6 +530,7 @@ async fn activity_timeout_no_double_resolve() {
     .await;
 
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -574,7 +578,7 @@ async fn can_heartbeat_acts_during_shutdown() {
     })
     .await
     .unwrap();
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[derive(PartialEq)]
@@ -767,6 +771,7 @@ async fn complete_act_with_fail_includes_latest_heartbeat() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -931,6 +936,7 @@ async fn activity_failure_distinguishes_no_heartbeat_from_empty_heartbeat() {
         .await
         .unwrap();
         core.drain_pollers_and_shutdown().await;
+        core.finalize_shutdown().await;
     }
 }
 
@@ -971,6 +977,7 @@ async fn activity_cancellation_still_flushes_latest_heartbeat() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 /// Builds a tonic `Status` carrying a `PayloadLimitViolation` source, exactly as the gRPC client
@@ -1043,6 +1050,7 @@ async fn oversized_activity_result_failure_includes_latest_heartbeat() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 /// An oversized cancel `details` payload must be reported as a (retryable) activity task failure
@@ -1093,6 +1101,7 @@ async fn oversized_cancel_details_fails_activity() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 /// Oversized *final* heartbeat details replace whatever lang reported, so the cause and failure sent
@@ -1189,6 +1198,7 @@ async fn oversized_final_heartbeat_details_replace_reported_failure() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 /// An oversized heartbeat `details` payload must fail the activity task (retryably) and stop the
@@ -1248,6 +1258,7 @@ async fn oversized_heartbeat_fails_activity() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1388,6 +1399,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 
     assert_eq!(num_eager_requested.load(Ordering::Relaxed), 0);
 }
@@ -1520,6 +1532,7 @@ async fn activity_tasks_from_completion_are_delivered() {
     }
 
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 
     // Verify the configured number of eager activities were requested.
     assert_eq!(num_eager_requested.load(Ordering::Relaxed), 2);
@@ -1552,6 +1565,7 @@ async fn retryable_net_error_exhaustion_is_nonfatal() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1670,6 +1684,7 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
             .unwrap();
     }
     worker.drain_pollers_and_shutdown().await;
+    worker.finalize_shutdown().await;
 }
 
 #[rstest::rstest]
@@ -1725,7 +1740,7 @@ async fn activities_must_be_flushed_to_server_on_shutdown(#[values(true, false)]
     let task = worker.poll_activity_task().await.unwrap();
 
     let shutdown_task = async {
-        drain_pollers_and_shutdown(&worker).await;
+        worker.drain_pollers_and_shutdown().await;
         shutdown_finished.store(true, Ordering::Release);
     };
     let complete_task = async {
@@ -1902,4 +1917,5 @@ async fn heartbeat_response_can_be_paused() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
+    core.finalize_shutdown().await;
 }

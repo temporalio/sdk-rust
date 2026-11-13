@@ -3,8 +3,8 @@ use crate::{
     replay::canned_histories,
     test_help::{
         MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_fake_worker, build_mock_pollers, drain_pollers_and_shutdown,
-        mock_worker, start_timer_cmd, test_worker_cfg,
+        WorkerTestHelpers, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
+        test_worker_cfg,
     },
     worker::{
         self, PollerBehavior,
@@ -192,6 +192,7 @@ async fn can_shutdown_local_act_only_worker_when_act_polling() {
         }
     );
     worker.drain_pollers_and_shutdown().await;
+    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -230,6 +231,31 @@ async fn complete_with_task_not_found_during_shutdown() {
 }
 
 #[tokio::test]
+async fn complete_eviction_after_shutdown_doesnt_panic() {
+    let core = build_fake_worker("fakeid", canned_histories::single_timer("1"), [1]);
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert!(eviction.is_only_eviction());
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id.clone()))
+        .await
+        .unwrap();
+    core.shutdown().await;
+
+    assert_matches!(
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+            .await,
+        Ok(())
+    );
+    core.finalize_shutdown().await;
+}
+
+#[tokio::test]
 async fn shutdown_waits_for_eviction_completion() {
     let t = canned_histories::single_timer("1");
     let mut mh = build_mock_pollers(MockPollCfg::from_resp_batches(
@@ -257,6 +283,8 @@ async fn shutdown_waits_for_eviction_completion() {
     let shutdown = core.shutdown();
     tokio::pin!(shutdown);
     assert!(futures_util::poll!(&mut shutdown).is_pending());
+    // This query follows the shutdown bump on the workflow stream, independently of the RPC.
+    assert_eq!(core.cached_workflows().await, 1);
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(res.run_id))
         .await
         .unwrap();
@@ -383,7 +411,7 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
             .await
             .unwrap();
 
-        drain_pollers_and_shutdown(&worker).await;
+        worker.drain_pollers_and_shutdown().await;
     });
 }
 
@@ -1360,6 +1388,7 @@ async fn validate_enables_auto_enroll_capability() {
     assert!(!caps.poller_autoscaling());
 
     worker.drain_pollers_and_shutdown().await;
+    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1388,6 +1417,7 @@ async fn validate_without_auto_enroll_leaves_capabilities_off() {
     assert!(!caps.poller_autoscaling());
 
     worker.drain_pollers_and_shutdown().await;
+    worker.finalize_shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

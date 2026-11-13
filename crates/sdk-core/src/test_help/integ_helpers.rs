@@ -72,21 +72,6 @@ use uuid::Uuid;
 /// Default namespace for testing
 pub const NAMESPACE: &str = "default";
 
-/// Initiate shutdown, drain the pollers (handling evictions), and wait for shutdown to complete.
-pub async fn drain_pollers_and_shutdown(worker: &Worker) {
-    worker.initiate_shutdown();
-    tokio::join!(
-        async {
-            assert_matches!(
-                worker.poll_activity_task().await.unwrap_err(),
-                PollError::ShutDown
-            );
-        },
-        worker.drain_workflow_poller()
-    );
-    worker.shutdown().await;
-}
-
 #[allow(clippy::type_complexity)]
 pub fn test_worker_cfg() -> WorkerConfigBuilder<
     worker_config_builder::SetWorkflowTaskPollerBehavior<
@@ -998,14 +983,23 @@ macro_rules! prost_dur {
 #[async_trait]
 pub trait WorkerExt {
     /// Initiate shutdown, drain the pollers, and wait for shutdown to complete.
-    async fn drain_pollers_and_shutdown(self);
+    async fn drain_pollers_and_shutdown(&self);
 }
 
 #[async_trait]
 impl WorkerExt for Worker {
-    async fn drain_pollers_and_shutdown(self) {
-        drain_pollers_and_shutdown(&self).await;
-        self.finalize_shutdown().await;
+    async fn drain_pollers_and_shutdown(&self) {
+        self.initiate_shutdown();
+        tokio::join!(
+            async {
+                assert_matches!(
+                    self.poll_activity_task().await.unwrap_err(),
+                    PollError::ShutDown
+                );
+            },
+            self.drain_workflow_poller()
+        );
+        self.shutdown().await;
     }
 }
 

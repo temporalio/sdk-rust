@@ -1,8 +1,8 @@
 use crate::{
     replay::TestHistoryBuilder,
     test_help::{
-        MocksHolder, ResponseType, WorkerTestHelpers, drain_pollers_and_shutdown,
-        hist_to_poll_resp, mock_worker, query_ok,
+        MocksHolder, ResponseType, WorkerExt, WorkerTestHelpers, hist_to_poll_resp, mock_worker,
+        query_ok,
     },
     worker::{LEGACY_QUERY_ID, client::mocks::mock_worker_client},
 };
@@ -158,7 +158,7 @@ async fn preserves_queries_buffered_during_same_run_eviction(
         .await
         .unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(5), drain_pollers_and_shutdown(&core))
+    tokio::time::timeout(Duration::from_secs(5), core.drain_pollers_and_shutdown())
         .await
         .expect("serviced queries must not prevent shutdown");
     assert_eq!(core.available_wft_permits(), initial_permits);

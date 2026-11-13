@@ -19,7 +19,7 @@ use temporalio_common::{
 };
 use temporalio_sdk_core::{
     prost_dur,
-    test_help::{WorkerTestHelpers, drain_pollers_and_shutdown, start_timer_cmd},
+    test_help::{WorkerExt, WorkerTestHelpers, start_timer_cmd},
 };
 use tokio::join;
 
@@ -216,7 +216,7 @@ async fn query_after_execution_complete(#[case] do_evict: bool) {
         query_futs.push(do_workflow(true).map(|_| ()).boxed());
     }
     while query_futs.next().await.is_some() {}
-    drain_pollers_and_shutdown(core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[rstest]
@@ -464,7 +464,7 @@ async fn queries_handled_before_next_wft() {
         core.handle_eviction().await;
     };
     join!(join_all(query_futs), complete_fut);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]

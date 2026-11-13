@@ -65,8 +65,8 @@ use temporalio_sdk_core::{
     prost_dur,
     replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, ResponseType, WorkerTestHelpers, drain_pollers_and_shutdown,
-        mock_worker_client, schedule_activity_cmd,
+        MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, mock_worker_client,
+        schedule_activity_cmd,
     },
 };
 use tokio::{
@@ -1767,7 +1767,7 @@ async fn activity_cancelled_after_heartbeat_times_out() {
     .unwrap();
 
     // Verify shutdown completes
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
     // Cleanup just in case
     starter
         .get_core_client()
@@ -1857,7 +1857,7 @@ async fn activity_failure_includes_latest_heartbeat_on_retry() {
     );
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[workflow]
