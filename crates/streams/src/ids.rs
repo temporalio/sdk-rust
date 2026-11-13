@@ -1,5 +1,5 @@
 //! The checks of Stream ids and Producers, and the Redis key layout. A caller builds both kinds of
-//! id, so the crate treats each as opaque bytes. `testdata/ids.json` has the shared vectors of the
+//! id, so the crate treats each as opaque text. `testdata/ids.json` has the shared vectors of the
 //! key layout.
 //!
 //! ```text
@@ -23,7 +23,9 @@ pub const MAX_STREAM_ID_BYTES: usize = 4096;
 
 /// The longest Producer id, in bytes. A caller builds the id from names that Temporal limits to
 /// 1000 characters, so an id with two of them still fits. A Store keeps the id in one meta field of
-/// each Producer for as long as the Stream lives, and in the first entry of each of its batches.
+/// each Producer for as long as the Stream lives. Each Record of a batch holds its Producer, so the
+/// size check counts the Producer once for each Record against
+/// [MAX_BATCH_BYTES](crate::store::MAX_BATCH_BYTES).
 pub const MAX_PRODUCER_ID_BYTES: usize = 4096;
 
 /// The key prefix when the Store options set none.
@@ -56,8 +58,11 @@ pub fn check_stream_id(id: &str) -> StreamResult<()> {
     Ok(())
 }
 
-/// Refuses a Producer with no id, an id over [MAX_PRODUCER_ID_BYTES], or no kind. The id is
-/// opaque, so the Store requires no shape of it.
+/// Refuses a Producer with no id, an id over [MAX_PRODUCER_ID_BYTES], or no kind. The id is opaque
+/// text, so the Store requires no shape of it. It names one Producer in one Stream. A Store keeps
+/// the fence of a Producer by kind and id, and an epoch has no run. So the id of a run-based kind
+/// must hold its run id. A caller that uses one id in two runs gets `FENCED` in the second run when
+/// that run's epoch is lower.
 pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     if producer.id.is_empty() {
         return Err(StreamError::invalid("The Producer id is empty"));

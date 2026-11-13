@@ -198,9 +198,9 @@ async fn a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused() {
     }
 }
 
-/// A Producer id is bytes. An id with the field separator and non-ASCII text keeps its own dedupe
-/// state, apart from an id that it starts with.
-async fn a_producer_id_is_bytes_with_its_own_state() {
+/// A Producer id is opaque text. An id with the field separator and non-ASCII text keeps its own
+/// dedupe state, apart from an id that it starts with.
+async fn a_producer_id_is_text_with_its_own_state() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
         let odd = Producer {
@@ -251,6 +251,64 @@ async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
         append(&target, &client(), 1, &["c1"]).await.unwrap();
         append(&target, &client(), 2, &["c2"]).await.unwrap();
         assert_eq!(target.texts().await, ["la2", "a2", "c1", "c2"]);
+    }
+}
+
+/// The fence of a Producer is kept by kind and id, and an epoch has no run. So two runs with their
+/// own ids keep their own fences, and a lower epoch of the second run is not fenced. A second run
+/// that sends the id of the first shares its fence.
+async fn two_runs_with_their_own_ids_keep_their_own_fences() {
+    for target in stores_for(Needs::UNCHECKED).await {
+        target.create().await;
+        let first = Run::new("r1").local_activity("1", 20, 1, 1);
+        let second = Run::new("r2").local_activity("1", 5, 1, 1);
+        assert_eq!(
+            (first.id.as_str(), second.id.as_str()),
+            ("la:r1:1", "la:r2:1")
+        );
+        target.batch(&first, 1, &["r1"]).await.unwrap();
+        target.batch(&second, 1, &["r2"]).await.unwrap();
+        let reused = Producer {
+            id: first.id.clone(),
+            ..second
+        };
+        let stale = target.batch(&reused, 1, &["reused"]).await;
+        assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
+        assert_eq!(target.texts().await, ["r1", "r2"]);
+    }
+}
+
+/// Two Producers of different kinds with one id keep their own fence state. A high epoch of one
+/// fences no lower epoch of another, while a lower epoch of the same kind is still fenced.
+async fn producers_of_two_kinds_with_one_id_keep_their_own_fences() {
+    for target in stores_for(Needs::UNCHECKED).await {
+        target.create().await;
+        let id = "shared".to_string();
+        let local = Producer {
+            id: id.clone(),
+            ..Run::new("r1").local_activity("1", 20, 1, 1)
+        };
+        let high = Producer {
+            id: id.clone(),
+            ..activity("r1", 5, 50)
+        };
+        let Some(Kind::WorkflowActivity(epoch)) = activity("", 1, 10).kind else {
+            unreachable!()
+        };
+        let standalone = Producer {
+            id: id.clone(),
+            kind: Some(Kind::StandaloneActivity(epoch)),
+        };
+        target.batch(&local, 1, &["local"]).await.unwrap();
+        target.batch(&high, 1, &["activity"]).await.unwrap();
+        target.batch(&standalone, 1, &["standalone"]).await.unwrap();
+        let lower = Producer {
+            id,
+            ..activity("r1", 4, 50)
+        };
+        let stale = target.batch(&lower, 1, &["lower"]).await;
+        assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
+        assert_eq!(target.texts().await, ["local", "activity", "standalone"]);
     }
 }
 
@@ -718,8 +776,10 @@ pub const CASES: &[super::Case] = &[
     case!(closed_and_expired_come_before_already_exists),
     case!(a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused),
     case!(a_resend_with_other_content_fails_as_divergent),
-    case!(a_producer_id_is_bytes_with_its_own_state),
+    case!(a_producer_id_is_text_with_its_own_state),
     case!(a_lower_epoch_is_fenced_for_each_producer_kind),
+    case!(two_runs_with_their_own_ids_keep_their_own_fences),
+    case!(producers_of_two_kinds_with_one_id_keep_their_own_fences),
     case!(a_close_stops_appends_but_not_a_resend),
     case!(a_newer_format_refuses_every_write),
     case!(an_expired_stream_refuses_writes_and_its_create),
