@@ -1252,7 +1252,13 @@ where
         if let Some(action) = update.pending_action.take() {
             let mut action = action.into_proto(self.client.data_converter()).await?;
             let target = schedule_store_target(&self.namespace, &action);
-            store_external_payloads(&mut action, self.client.data_converter(), target).await?;
+            store_external_payloads(
+                &mut action,
+                self.client.data_converter(),
+                &self.namespace,
+                target,
+            )
+            .await?;
             update.schedule.action = Some(action);
         }
         let mut request = UpdateScheduleRequest {
@@ -1547,7 +1553,7 @@ impl Client {
                             .as_ref()
                             .and_then(|s| s.action.as_ref())
                             .and_then(|a| schedule_store_target(&request.namespace, a));
-                        store_external_payloads(&mut request, client.data_converter(), target)
+                        store_external_payloads(&mut request, client.data_converter(), &client.namespace(), target)
                             .await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
@@ -2853,7 +2859,7 @@ mod tests {
                     .unwrap(),
             ],
         };
-        store_external_payloads(&mut input, &data_converter, None)
+        store_external_payloads(&mut input, &data_converter, "", None)
             .await
             .unwrap();
         let client = MockScheduleClient {

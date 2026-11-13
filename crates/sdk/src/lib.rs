@@ -993,6 +993,7 @@ impl ActivityNotRegisteredError {
 async fn encode_workflow_completion(
     completion: &mut WorkflowActivationCompletion,
     data_converter: &DataConverter,
+    namespace: &str,
     run: Option<&RunStoreTargets>,
 ) {
     let run_id = completion.run_id.clone();
@@ -1008,12 +1009,16 @@ async fn encode_workflow_completion(
             Some(workflow_activation_completion::Status::Successful(success)) => {
                 for command in &mut success.commands {
                     let target = run.and_then(|run| run.for_command(command));
-                    uploads.push(store_external_payloads(command, data_converter, target).await?);
+                    uploads.push(
+                        store_external_payloads(command, data_converter, namespace, target).await?,
+                    );
                 }
             }
             Some(workflow_activation_completion::Status::Failed(failed)) => {
                 let target = run.map(RunStoreTargets::current);
-                uploads.push(store_external_payloads(failed, data_converter, target).await?);
+                uploads.push(
+                    store_external_payloads(failed, data_converter, namespace, target).await?,
+                );
             }
             None => {}
         }
@@ -1071,6 +1076,7 @@ fn activity_processing_failure(
 async fn encode_activity_completion(
     completion: &mut ActivityTaskCompletion,
     data_converter: &DataConverter,
+    namespace: &str,
     target: Option<StoreTarget>,
 ) {
     let encoded = async {
@@ -1080,7 +1086,7 @@ async fn encode_activity_completion(
             &SerializationContextData::Activity(ActivitySerializationContext::new()),
         )
         .await?;
-        store_external_payloads(completion, data_converter, target).await?;
+        store_external_payloads(completion, data_converter, namespace, target).await?;
         Ok::<_, PayloadConversionError>(())
     }
     .await;
@@ -1373,6 +1379,7 @@ impl Worker {
                         encode_workflow_completion(
                             &mut completion,
                             &common.data_converter,
+                            &common.worker.get_config().namespace,
                             run.as_deref(),
                         )
                         .await;
@@ -1557,6 +1564,7 @@ impl Worker {
                             encode_activity_completion(
                                 &mut completion,
                                 &common.data_converter,
+                                &common.worker.get_config().namespace,
                                 store_target,
                             )
                             .await;
@@ -1602,6 +1610,7 @@ impl Worker {
                                 encode_activity_completion(
                                     &mut completion,
                                     &common.data_converter,
+                                    &common.worker.get_config().namespace,
                                     store_target,
                                 )
                                 .await;
@@ -1896,6 +1905,7 @@ impl ActivityHalf {
                     encode_activity_completion(
                         &mut completion,
                         &codec_data_converter,
+                        &worker.get_config().namespace,
                         store_target,
                     )
                     .await;
@@ -2323,7 +2333,7 @@ mod tests {
             }),
         );
 
-        encode_workflow_completion(&mut completion, &data_converter, None).await;
+        encode_workflow_completion(&mut completion, &data_converter, "", None).await;
 
         let Some(workflow_activation_completion::Status::Failed(failed)) = completion.status else {
             panic!("expected failed workflow completion")
@@ -2352,7 +2362,7 @@ mod tests {
             result: Some(ActivityExecutionResult::ok(Payload::default())),
         };
 
-        encode_activity_completion(&mut completion, &data_converter, None).await;
+        encode_activity_completion(&mut completion, &data_converter, "", None).await;
 
         let Some(activity_execution_result::Status::Failed(failed)) =
             completion.result.unwrap().status
