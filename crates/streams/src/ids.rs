@@ -31,7 +31,7 @@ pub const MAX_PRODUCER_ID_BYTES: usize = 4096;
 /// The key prefix when the Store options set none.
 pub const DEFAULT_KEY_PREFIX: &str = "temporal-streams";
 
-/// Percent-encodes every byte but the unreserved ones, as Python's `quote(text, safe="")` does.
+/// Percent-encodes every byte but the unreserved ones, so an id never holds a key separator.
 pub fn encode_part(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {

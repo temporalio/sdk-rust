@@ -15,9 +15,10 @@ re-exports them, so a value needs no conversion between the crates.
   `crates/protos/protos/api_upstream`.
 - `testdata/*.json` are the shared vectors. They cover the Store keys of a Stream id, the meta
   field of a Producer, offsets, epoch keys and the batch digest of a dedupe entry.
-  `testdata/gen_vectors.py` writes them from a second implementation, and the crate's tests read
-  each file. Each Store reads `fields.json` through the shared Store suite. `digests.json` is the
-  golden of the crate's batch digest.
+  `examples/gen_vectors.rs` writes them from a second implementation, and the crate's tests read
+  each file. Run it with `cargo run -p temporalio-streams --example gen_vectors`. It shares no
+  code with the crate. Each Store reads `fields.json` through the shared Store suite.
+  `digests.json` is the golden of the crate's batch digest.
 
 A Stream id and a Producer id are opaque text. The caller builds both. The runtime refuses an
 empty id of either kind, and one over 4096 bytes. A Producer id names one Producer in one Stream.
