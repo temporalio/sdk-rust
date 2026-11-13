@@ -3,8 +3,8 @@ use crate::{
     prost_dur,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
-        FakeWfResponses, MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
-        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, build_multihist_mock_sg,
+        MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
+        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, drain_pollers_and_shutdown,
         fanout_tasks, gen_assert_and_reply, mock_manual_poller, mock_poller, mock_worker,
         poll_and_reply, single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
     },
@@ -149,7 +149,7 @@ async fn activity_not_found_returns_ok() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -247,7 +247,7 @@ async fn heartbeats_report_cancels_only_once() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -333,7 +333,7 @@ async fn activity_cancel_interrupts_poll() {
     };
     // So that we know we blocked
     assert_eq!(last_finisher.load(Ordering::Acquire), 2);
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -472,7 +472,7 @@ async fn many_concurrent_heartbeat_cancels() {
     })
     .await;
 
-    worker.drain_activity_poller_and_shutdown().await;
+    drain_pollers_and_shutdown(worker).await;
 }
 
 #[tokio::test]
@@ -529,98 +529,6 @@ async fn activity_timeout_no_double_resolve() {
     core.drain_pollers_and_shutdown().await;
 }
 
-/// Regression test for a race between stream shutdown and eviction completion.
-///
-/// With zero-cache and `ignore_evicts_on_shutdown=true`, the workflow stream can
-/// decide to shut down (via `shutdown_done()`) after accepting an eviction
-/// completion message but before processing it. The BumpStream from
-/// `initiate_shutdown` is queued in the local channel ahead of the eviction
-/// completion (FIFO). The stream processes BumpStream, sees `shutdown_done()`
-/// is true, and exits — dropping the eviction completion's response channel
-/// sender without fulfilling it.
-#[tokio::test]
-async fn eviction_completion_during_shutdown_does_not_panic() {
-    let t = canned_histories::activity_double_resolve_repro();
-    let mut mh = build_multihist_mock_sg(
-        vec![FakeWfResponses {
-            wf_id: "fake_wf_id".to_owned(),
-            hist: t,
-            response_batches: vec![3.into()],
-        }],
-        true,
-        0,
-    );
-    // Prevent PollerDead from arriving so we control shutdown timing exactly.
-    mh.make_wft_stream_interminable();
-    let core = mock_worker(mh);
-    let activity_id = 1;
-
-    poll_and_reply(
-        &core,
-        WorkflowCachingPolicy::NonSticky,
-        &[
-            gen_assert_and_reply(
-                &job_assert!(workflow_activation_job::Variant::InitializeWorkflow(_)),
-                vec![
-                    ScheduleActivity {
-                        seq: activity_id,
-                        activity_id: activity_id.to_string(),
-                        cancellation_type: ActivityCancellationType::TryCancel as i32,
-                        ..Default::default()
-                    }
-                    .into(),
-                ],
-            ),
-            gen_assert_and_reply(
-                &job_assert!(workflow_activation_job::Variant::SignalWorkflow(_)),
-                vec![
-                    RequestCancelActivity { seq: activity_id }.into(),
-                    start_timer_cmd(2, Duration::from_secs(1)),
-                ],
-            ),
-            gen_assert_and_reply(
-                &job_assert!(workflow_activation_job::Variant::ResolveActivity(
-                    ResolveActivity {
-                        result: Some(ActivityResolution {
-                            status: Some(activity_resolution::Status::Cancelled(..)),
-                        }),
-                        ..
-                    }
-                )),
-                vec![],
-            ),
-            gen_assert_and_reply(
-                &job_assert!(
-                    workflow_activation_job::Variant::SignalWorkflow(_),
-                    workflow_activation_job::Variant::FireTimer(_)
-                ),
-                vec![CompleteWorkflowExecution { result: None }.into()],
-            ),
-        ],
-    )
-    .await;
-
-    // The zero-cache eviction produces an eviction activation after the last
-    // completion's PostActivation is processed.
-    let eviction = core.poll_workflow_activation().await.unwrap();
-    assert!(eviction.is_only_eviction());
-
-    // Cancel the shutdown token and enqueue BumpStream into the local channel.
-    // The stream will process BumpStream, see shutdown_done()=true (because
-    // ignore_evicts_on_shutdown skips the eviction activation), and exit.
-    core.initiate_shutdown();
-
-    // Complete the eviction. Its WFActCompleteMsg is queued AFTER BumpStream
-    // (same FIFO channel), so the stream exits before processing it — dropping
-    // the response channel sender. Without the fix, rx.await returning Err for
-    // an empty completion triggers dbg_panic!.
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
-        .await
-        .unwrap();
-
-    core.finalize_shutdown().await;
-}
-
 #[tokio::test]
 async fn can_heartbeat_acts_during_shutdown() {
     let mut mock_client = mock_worker_client();
@@ -666,7 +574,7 @@ async fn can_heartbeat_acts_during_shutdown() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    drain_pollers_and_shutdown(&core).await;
 }
 
 #[derive(PartialEq)]
@@ -858,7 +766,7 @@ async fn complete_act_with_fail_includes_latest_heartbeat() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -960,12 +868,9 @@ async fn oversized_throttled_heartbeat_failure_is_reported() {
     .await
     .expect("activity completion did not finish")
     .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        core.drain_activity_poller_and_shutdown(),
-    )
-    .await
-    .expect("activity worker did not shut down");
+    tokio::time::timeout(Duration::from_secs(5), core.drain_pollers_and_shutdown())
+        .await
+        .expect("activity worker did not shut down");
 
     let heartbeat_requests = heartbeat_requests.lock().unwrap();
     assert_eq!(heartbeat_requests.len(), 1);
@@ -1025,7 +930,7 @@ async fn activity_failure_distinguishes_no_heartbeat_from_empty_heartbeat() {
         })
         .await
         .unwrap();
-        core.drain_activity_poller_and_shutdown().await;
+        core.drain_pollers_and_shutdown().await;
     }
 }
 
@@ -1065,7 +970,7 @@ async fn activity_cancellation_still_flushes_latest_heartbeat() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// Builds a tonic `Status` carrying a `PayloadLimitViolation` source, exactly as the gRPC client
@@ -1137,7 +1042,7 @@ async fn oversized_activity_result_failure_includes_latest_heartbeat() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// An oversized cancel `details` payload must be reported as a (retryable) activity task failure
@@ -1187,7 +1092,7 @@ async fn oversized_cancel_details_fails_activity() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// Oversized *final* heartbeat details replace whatever lang reported, so the cause and failure sent
@@ -1283,7 +1188,7 @@ async fn oversized_final_heartbeat_details_replace_reported_failure() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// An oversized heartbeat `details` payload must fail the activity task (retryably) and stop the
@@ -1342,7 +1247,7 @@ async fn oversized_heartbeat_fails_activity() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1646,7 +1551,7 @@ async fn retryable_net_error_exhaustion_is_nonfatal() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1820,7 +1725,7 @@ async fn activities_must_be_flushed_to_server_on_shutdown(#[values(true, false)]
     let task = worker.poll_activity_task().await.unwrap();
 
     let shutdown_task = async {
-        worker.drain_activity_poller_and_shutdown().await;
+        drain_pollers_and_shutdown(&worker).await;
         shutdown_finished.store(true, Ordering::Release);
     };
     let complete_task = async {
@@ -1996,5 +1901,5 @@ async fn heartbeat_response_can_be_paused() {
     .await
     .unwrap();
 
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }

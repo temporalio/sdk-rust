@@ -756,7 +756,7 @@ async fn complete_activation_with_failure(
         ],
     )
     .await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
@@ -1058,7 +1058,7 @@ async fn lots_of_workflows() {
         }
     });
     join!(killer, poller);
-    worker.shutdown().await;
+    drain_pollers_and_shutdown(worker).await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
@@ -1136,7 +1136,7 @@ async fn complete_after_eviction() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1162,7 +1162,7 @@ async fn sends_appropriate_sticky_task_queue_responses() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1250,6 +1250,7 @@ async fn buffered_work_drained_on_shutdown() {
         ))
         .await
         .unwrap();
+        core.drain_workflow_poller().await;
     };
     let complete_first = async move {
         // If the first complete is sent too fast, we may not have had a chance to buffer work.
@@ -1323,7 +1324,7 @@ async fn fail_wft_then_recover() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1357,7 +1358,7 @@ async fn default_wft_fail_cause_is_worker_unhandled() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1447,7 +1448,7 @@ async fn lang_slower_than_wft_timeouts() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1590,7 +1591,7 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    drain_pollers_and_shutdown(&core).await;
 }
 
 fn la_cancel_mock_cfg() -> MockPollCfg {
@@ -2385,7 +2386,7 @@ async fn tries_cancel_of_completed_activity() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2438,7 +2439,7 @@ async fn failing_wft_doesnt_eat_permit_forever() {
         ))
         .await
         .unwrap();
-    worker.shutdown().await;
+    drain_pollers_and_shutdown(&worker).await;
     assert_eq!(worker.available_wft_permits(), Some(2));
 }
 
@@ -2529,7 +2530,7 @@ async fn cache_miss_will_fetch_history() {
         .await
         .unwrap();
     assert_eq!(worker.outstanding_workflow_tasks().await, 0);
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2618,7 +2619,7 @@ async fn tasks_from_completion_are_delivered() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2671,7 +2672,7 @@ async fn pagination_works_with_tasks_from_completion() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2852,7 +2853,7 @@ async fn eviction_waits_until_replay_finished() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2918,7 +2919,7 @@ async fn autocompletes_wft_no_work() {
         PollError::ShutDown
     );
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2948,15 +2949,11 @@ async fn no_race_acquiring_permits() {
         .returning(|_, _| async move { Ok(Default::default()) }.boxed());
 
     let worker = Worker::new_test(
-        {
-            let mut cfg = test_worker_cfg()
-                .max_outstanding_workflow_tasks(2_usize)
-                .max_cached_workflows(0_usize)
-                .build()
-                .unwrap();
-            cfg.ignore_evicts_on_shutdown = false;
-            cfg
-        },
+        test_worker_cfg()
+            .max_outstanding_workflow_tasks(2_usize)
+            .max_cached_workflows(0_usize)
+            .build()
+            .unwrap(),
         mock_client,
     );
 
@@ -2993,9 +2990,6 @@ async fn no_race_acquiring_permits() {
     join!(poll_1_f, poll_2_f, other_f);
     // Deal with eviction due to cache being full
     worker.handle_eviction().await;
-    // Complete workflow (otherwise, this test can encounter a rare shutdown-related race that is
-    // only possible with the `ignore_evicts_on_shutdown` flag set true, as it is to make tests
-    // more convenient).
     let r = worker.poll_workflow_activation().await.unwrap();
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
@@ -3057,7 +3051,7 @@ async fn continue_as_new_preserves_some_values() {
         ))
         .await
         .unwrap();
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[rstest]
@@ -3266,8 +3260,11 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
             variant: Some(workflow_activation_job::Variant::RemoveFromCache(c)),
         }] if c.message.contains("Fetching history")
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
+        .await
+        .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -3311,7 +3308,7 @@ async fn lang_internal_flags() {
     let act = core.poll_workflow_activation().await.unwrap();
     assert_matches!(act.available_internal_flags.as_slice(), [1, 2]);
     core.complete_execution(&act.run_id).await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -3405,7 +3402,7 @@ async fn core_internal_flags() {
 
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -3510,10 +3507,7 @@ async fn _do_post_terminal_commands_test(
     .await
     .unwrap();
 
-    core.initiate_shutdown();
-    let act = core.poll_workflow_activation().await;
-    assert_matches!(act.unwrap_err(), PollError::ShutDown);
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 // Lang expects to always see jobs in this order:
@@ -3763,7 +3757,7 @@ async fn use_compatible_version_flag(
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(r.run_id, cmd))
         .await
         .unwrap();
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -4192,7 +4186,7 @@ async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
         core.poll_workflow_activation().await.unwrap_err(),
         PollError::ShutDown
     );
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(
@@ -4268,7 +4262,7 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
             .await
             .unwrap();
     }
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(

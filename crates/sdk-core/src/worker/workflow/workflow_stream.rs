@@ -35,7 +35,6 @@ pub(super) struct WFStream {
 
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
-    ignore_evicts_on_shutdown: bool,
 
     metrics: MetricsContext,
 }
@@ -96,7 +95,6 @@ impl WFStream {
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
-            ignore_evicts_on_shutdown: basics.worker_config.ignore_evicts_on_shutdown,
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
@@ -611,10 +609,7 @@ impl WFStream {
                 // Don't exit if there are outstanding fetch requests
                 return false;
             }
-            let all_runs_ready = self
-                .runs
-                .handles()
-                .all(|r| !r.has_any_pending_work(self.ignore_evicts_on_shutdown, false));
+            let all_runs_ready = self.runs.handles().all(|r| !r.has_any_pending_work(false));
             if all_runs_ready {
                 return true;
             }

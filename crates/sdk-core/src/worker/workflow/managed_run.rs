@@ -922,21 +922,10 @@ impl ManagedRun {
     }
 
     /// Returns true if the managed run has any form of pending work
-    /// If `ignore_evicts` is true, pending evictions do not count as pending work.
     /// If `ignore_buffered` is true, buffered workflow tasks do not count as pending work.
-    pub(super) fn has_any_pending_work(&self, ignore_evicts: bool, ignore_buffered: bool) -> bool {
-        let evict_work = if ignore_evicts {
-            false
-        } else {
-            self.trying_to_evict.is_some()
-        };
-        let act_work = if ignore_evicts {
-            self.activation
-                .map(|a| !matches!(a, OutstandingActivation::Eviction))
-                .unwrap_or_default()
-        } else {
-            self.activation.is_some()
-        };
+    pub(super) fn has_any_pending_work(&self, ignore_buffered: bool) -> bool {
+        let evict_work = self.trying_to_evict.is_some();
+        let act_work = self.activation.is_some();
         let buffered = if ignore_buffered {
             false
         } else {
@@ -1129,7 +1118,7 @@ impl ManagedRun {
                 match r {
                     // After each run update, check if it's ready to handle any buffered task
                     None | Some(ActivationOrAuto::Autocomplete { .. })
-                        if !self.has_any_pending_work(false, true) =>
+                        if !self.has_any_pending_work(true) =>
                     {
                         if let Some(bufft) = self.task_buffer.get_next_wft() {
                             self.incoming_wft(bufft)

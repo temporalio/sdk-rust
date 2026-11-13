@@ -3128,7 +3128,6 @@ async fn local_activity_after_wf_complete_is_discarded(#[case] old_heartbeat_his
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = 1;
-        wc.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mock);
 
@@ -3735,7 +3734,7 @@ async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     );
     core.complete_execution(&resolve_third.run_id).await;
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 
     let mut all_reported = vec![];
     while let Some(cmds) = reported_commands.pop() {

@@ -650,7 +650,6 @@ async fn repro_channel_missing_because_nondeterminism() {
             mh,
             |cfg| {
                 cfg.max_cached_workflows = 2;
-                cfg.ignore_evicts_on_shutdown = false;
             },
             |options| {
                 options

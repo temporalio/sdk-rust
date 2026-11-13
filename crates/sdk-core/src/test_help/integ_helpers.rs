@@ -82,22 +82,7 @@ pub async fn drain_pollers_and_shutdown(worker: &Worker) {
                 PollError::ShutDown
             );
         },
-        async {
-            loop {
-                match worker.poll_workflow_activation().await {
-                    Err(PollError::ShutDown) => break,
-                    Ok(a) if a.is_only_eviction() => {
-                        worker
-                            .complete_workflow_activation(WorkflowActivationCompletion::empty(
-                                a.run_id,
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                    o => panic!("Unexpected activation while draining: {o:?}"),
-                }
-            }
-        }
+        worker.drain_workflow_poller()
     );
     worker.shutdown().await;
 }
@@ -106,10 +91,8 @@ pub async fn drain_pollers_and_shutdown(worker: &Worker) {
 pub fn test_worker_cfg() -> WorkerConfigBuilder<
     worker_config_builder::SetWorkflowTaskPollerBehavior<
         worker_config_builder::SetTaskTypes<
-            worker_config_builder::SetIgnoreEvictsOnShutdown<
-                worker_config_builder::SetVersioningStrategy<
-                    worker_config_builder::SetTaskQueue<worker_config_builder::SetNamespace>,
-                >,
+            worker_config_builder::SetVersioningStrategy<
+                worker_config_builder::SetTaskQueue<worker_config_builder::SetNamespace>,
             >,
         >,
     >,
@@ -120,7 +103,6 @@ pub fn test_worker_cfg() -> WorkerConfigBuilder<
         .versioning_strategy(WorkerVersioningStrategy::None {
             build_id: "test_bin_id".to_string(),
         })
-        .ignore_evicts_on_shutdown(true)
         .task_types(WorkerTaskTypes::all())
         // Serial polling since it makes mocking much easier.
         .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
@@ -1017,9 +999,6 @@ macro_rules! prost_dur {
 pub trait WorkerExt {
     /// Initiate shutdown, drain the pollers, and wait for shutdown to complete.
     async fn drain_pollers_and_shutdown(self);
-    /// Initiate shutdown, drain the *activity* poller, and wait for shutdown to complete.
-    /// Takes a ref because of that one test that needs it.
-    async fn drain_activity_poller_and_shutdown(&self);
 }
 
 #[async_trait]
@@ -1028,20 +1007,13 @@ impl WorkerExt for Worker {
         drain_pollers_and_shutdown(&self).await;
         self.finalize_shutdown().await;
     }
-
-    async fn drain_activity_poller_and_shutdown(&self) {
-        self.initiate_shutdown();
-        assert_matches!(
-            self.poll_activity_task().await.unwrap_err(),
-            PollError::ShutDown
-        );
-        self.shutdown().await;
-    }
 }
 
 #[async_trait::async_trait]
 /// Test helper methods for core workers
 pub trait WorkerTestHelpers {
+    /// Drain workflow activations during shutdown, completing pending evictions.
+    async fn drain_workflow_poller(&self);
     /// Complete a workflow execution
     async fn complete_execution(&self, run_id: &str);
     /// Complete a timer with the given sequence number and duration
@@ -1052,6 +1024,22 @@ pub trait WorkerTestHelpers {
 
 #[async_trait::async_trait]
 impl WorkerTestHelpers for Worker {
+    async fn drain_workflow_poller(&self) {
+        loop {
+            match self.poll_workflow_activation().await {
+                Err(PollError::ShutDown) => break,
+                Ok(a) if a.is_only_eviction() => {
+                    self.complete_workflow_activation(WorkflowActivationCompletion::empty(
+                        a.run_id,
+                    ))
+                    .await
+                    .unwrap();
+                }
+                o => panic!("Unexpected activation while draining: {o:?}"),
+            }
+        }
+    }
+
     async fn complete_execution(&self, run_id: &str) {
         self.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.to_string(),
