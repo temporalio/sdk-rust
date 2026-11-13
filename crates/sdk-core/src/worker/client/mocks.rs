@@ -94,7 +94,7 @@ mockall::mock! {
 
         fn complete_activity_task<'a, 'b>(
             &self,
-            task_token: TaskToken,
+            task: TaskInfo,
             result: Option<Payloads>,
         ) -> impl Future<Output = Result<RespondActivityTaskCompletedResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
@@ -108,14 +108,14 @@ mockall::mock! {
 
         fn cancel_activity_task<'a, 'b>(
             &self,
-            task_token: TaskToken,
+            task: TaskInfo,
             details: Option<Payloads>,
         ) -> impl Future<Output = Result<RespondActivityTaskCanceledResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
         fn fail_activity_task<'a, 'b>(
             &self,
-            task_token: TaskToken,
+            task: TaskInfo,
             cause: ActivityTaskFailedCause,
             failure: Option<Failure>,
             last_heartbeat_details: Option<Payloads>,
@@ -124,7 +124,7 @@ mockall::mock! {
 
         fn fail_workflow_task<'a, 'b>(
             &self,
-            task_token: TaskToken,
+            task: TaskInfo,
             cause: WorkflowTaskFailedCause,
             failure: Option<Failure>,
         ) -> impl Future<Output = Result<RespondWorkflowTaskFailedResponse>> + Send + 'b
@@ -139,7 +139,7 @@ mockall::mock! {
 
         fn record_activity_heartbeat<'a, 'b>(
            &self,
-           task_token: TaskToken,
+           task: TaskInfo,
            details: Option<Payloads>,
         ) -> impl Future<Output = Result<RecordActivityTaskHeartbeatResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;

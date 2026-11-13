@@ -174,6 +174,7 @@ impl WFStream {
                                 run_id,
                                 report: Box::new(FailedActivationWFTReport::new(
                                     info.task_token,
+                                    info.workflow_id,
                                     info.attempt,
                                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                                     ApiFailure::application_failure(message, true).into(),

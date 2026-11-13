@@ -115,6 +115,7 @@ fn paginate_wft_completion(
         task_token: request.task_token.clone(),
         identity: request.identity.clone(),
         namespace: request.namespace.clone(),
+        resource_id: request.resource_id.clone(),
         intermediate_page: true,
         ..Default::default()
     };
@@ -329,7 +330,7 @@ pub trait WorkerClient: Sync + Send {
     /// Complete an activity task
     async fn complete_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         result: Option<Payloads>,
     ) -> Result<RespondActivityTaskCompletedResponse>;
     /// Complete a Nexus task
@@ -341,19 +342,19 @@ pub trait WorkerClient: Sync + Send {
     /// Record an activity heartbeat
     async fn record_activity_heartbeat(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
     ) -> Result<RecordActivityTaskHeartbeatResponse>;
     /// Cancel an activity task
     async fn cancel_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
     ) -> Result<RespondActivityTaskCanceledResponse>;
     /// Fail an activity task
     async fn fail_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
@@ -361,7 +362,7 @@ pub trait WorkerClient: Sync + Send {
     /// Fail a workflow task
     async fn fail_workflow_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: WorkflowTaskFailedCause,
         failure: Option<Failure>,
     ) -> Result<RespondWorkflowTaskFailedResponse>;
@@ -430,6 +431,15 @@ pub trait WorkerClient: Sync + Send {
     fn payload_error_limits(&self) -> Option<PayloadErrorLimits> {
         None
     }
+}
+
+/// Identifies the task being responded to.
+#[derive(Debug, Clone)]
+pub struct TaskInfo {
+    pub task_token: TaskToken,
+    /// Lets proxies identify the task without decoding the task token: `workflow:<workflow_id>`,
+    /// or `activity:<activity_id>` for a standalone activity.
+    pub resource_id: String,
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -660,7 +670,7 @@ impl WorkerClient for WorkerClientBag {
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
-            resource_id: Default::default(),
+            resource_id: request.resource_id,
             page_number: 0,
             intermediate_page: false,
         };
@@ -757,7 +767,7 @@ impl WorkerClient for WorkerClientBag {
 
     async fn complete_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         result: Option<Payloads>,
     ) -> Result<RespondActivityTaskCompletedResponse> {
         Ok(self
@@ -766,7 +776,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_completed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCompletedRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     result,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -774,7 +784,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
+                    resource_id: task.resource_id,
                 }
                 .into_request(),
             )
@@ -806,7 +816,7 @@ impl WorkerClient for WorkerClientBag {
 
     async fn record_activity_heartbeat(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
     ) -> Result<RecordActivityTaskHeartbeatResponse> {
         Ok(self
@@ -814,11 +824,11 @@ impl WorkerClient for WorkerClientBag {
             .clone()
             .record_activity_task_heartbeat(
                 RecordActivityTaskHeartbeatRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
-                    resource_id: Default::default(),
+                    resource_id: task.resource_id,
                 }
                 .into_request(),
             )
@@ -828,7 +838,7 @@ impl WorkerClient for WorkerClientBag {
 
     async fn cancel_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         details: Option<Payloads>,
     ) -> Result<RespondActivityTaskCanceledResponse> {
         Ok(self
@@ -837,7 +847,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_canceled(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCanceledRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -845,7 +855,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
+                    resource_id: task.resource_id,
                 }
                 .into_request(),
             )
@@ -855,7 +865,7 @@ impl WorkerClient for WorkerClientBag {
 
     async fn fail_activity_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
@@ -866,7 +876,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_failed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskFailedRequest {
-                    task_token: task_token.into_inner(),
+                    task_token: task.task_token.into_inner(),
                     failure,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -875,7 +885,7 @@ impl WorkerClient for WorkerClientBag {
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
+                    resource_id: task.resource_id,
                     cause: cause as i32,
                 }
                 .into_request(),
@@ -886,13 +896,13 @@ impl WorkerClient for WorkerClientBag {
 
     async fn fail_workflow_task(
         &self,
-        task_token: TaskToken,
+        task: TaskInfo,
         cause: WorkflowTaskFailedCause,
         failure: Option<Failure>,
     ) -> Result<RespondWorkflowTaskFailedResponse> {
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskFailedRequest {
-            task_token: task_token.into_inner(),
+            task_token: task.task_token.into_inner(),
             cause: cause as i32,
             failure,
             identity: self.identity(),
@@ -903,7 +913,7 @@ impl WorkerClient for WorkerClientBag {
             // Will never be set, deprecated.
             deployment: None,
             deployment_options: self.deployment_options(),
-            resource_id: Default::default(),
+            resource_id: task.resource_id,
         };
         Ok(self
             .client
@@ -1061,7 +1071,7 @@ impl WorkerClient for WorkerClientBag {
             namespace,
             identity: self.identity(),
             worker_heartbeat,
-            resource_id: Default::default(),
+            resource_id: format!("worker:{}", self.worker_grouping_key()),
         };
         Ok(self
             .client
@@ -1205,6 +1215,10 @@ pub struct WorkflowTaskCompletion {
     /// advertises one. A paginated completion larger than this is rejected server-side with
     /// `REQUEST_TOO_LARGE`, so the worker fails it proactively instead of sending doomed pages.
     pub wft_completion_size_limit: Option<usize>,
+    /// The workflow this task belongs to, as `workflow:<workflow_id>`. Sent on every page of a
+    /// paginated completion so proxies can route or authorize by workflow without decoding the
+    /// opaque task token.
+    pub resource_id: String,
 }
 
 #[derive(Clone, Default)]
@@ -1299,7 +1313,10 @@ mod tests {
 
         client
             .fail_activity_task(
-                vec![1].into(),
+                TaskInfo {
+                    task_token: vec![1].into(),
+                    resource_id: String::new(),
+                },
                 ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
                 None,
                 Some(last_heartbeat_details.clone()),
@@ -1311,6 +1328,69 @@ mod tests {
             requests.lock().unwrap()[0].last_heartbeat_details,
             Some(last_heartbeat_details)
         );
+    }
+
+    #[tokio::test]
+    async fn worker_heartbeat_resource_id_uses_heartbeat_grouping_key() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = requests.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |request| {
+                let requests = requests_clone.clone();
+                Box::pin(async move {
+                    let proto = match request.rpc.as_str() {
+                        "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+                        "RecordWorkerHeartbeat" => {
+                            requests.lock().unwrap().push(
+                                RecordWorkerHeartbeatRequest::decode(request.proto)
+                                    .expect("heartbeat request is valid"),
+                            );
+                            RecordWorkerHeartbeatResponse::default().encode_to_vec()
+                        }
+                        rpc => panic!("unexpected RPC: {rpc}"),
+                    };
+                    Ok(GrpcSuccessResponse {
+                        headers: Default::default(),
+                        proto,
+                    })
+                })
+            }),
+        };
+        let connection = Connection::connect(
+            ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                .service_override(service_override)
+                .dns_load_balancing(None)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let client = WorkerClientBag::new(
+            SharedReplaceableClient::new(connection),
+            "namespace".to_string(),
+            WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            },
+            Uuid::new_v4(),
+        );
+        let mut heartbeat = WorkerHeartbeat {
+            host_info: Some(Default::default()),
+            ..Default::default()
+        };
+        client.set_heartbeat_client_fields(&mut heartbeat);
+
+        client
+            .record_worker_heartbeat("namespace".to_string(), vec![heartbeat])
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let grouping_key = &requests[0].worker_heartbeat[0]
+            .host_info
+            .as_ref()
+            .unwrap()
+            .worker_grouping_key;
+        assert!(!grouping_key.is_empty());
+        assert_eq!(requests[0].resource_id, format!("worker:{grouping_key}"));
     }
 
     #[allow(deprecated)]
@@ -1485,6 +1565,7 @@ mod tests {
                 task_token: b"task-token".to_vec(),
                 identity: "identity".to_string(),
                 namespace: "namespace".to_string(),
+                resource_id: "workflow:wf-id".to_string(),
                 commands,
                 ..Default::default()
             }
@@ -1524,12 +1605,14 @@ mod tests {
             assert_eq!(final_page.page_number as usize, intermediate.len());
             assert!(final_page.encoded_len() <= max);
             assert_eq!(final_page.task_token, b"task-token");
+            assert_eq!(final_page.resource_id, "workflow:wf-id");
 
             let mut total_commands = 0;
             for (idx, page) in intermediate.iter().enumerate() {
                 assert!(page.intermediate_page);
                 assert_eq!(page.page_number as usize, idx);
                 assert_eq!(page.task_token, b"task-token");
+                assert_eq!(page.resource_id, "workflow:wf-id");
                 assert!(
                     page.encoded_len() <= max,
                     "intermediate page {idx} over limit"
@@ -1646,6 +1729,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: "workflow:shared-wf".to_string(),
             };
             client
                 .complete_workflow_task(completion, CancellationToken::new())
@@ -1658,8 +1742,9 @@ mod tests {
                 "expected multiple pages, got {}",
                 sent.len()
             );
-            // Every page shares the one task token.
+            // Every page shares the one task token and resource ID.
             assert!(sent.iter().all(|r| r.task_token == b"shared-token"));
+            assert!(sent.iter().all(|r| r.resource_id == "workflow:shared-wf"));
             // Exactly one final page, numbered after all the intermediate ones.
             let finals: Vec<_> = sent.iter().filter(|r| !r.intermediate_page).collect();
             assert_eq!(finals.len(), 1);
@@ -1747,6 +1832,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
 
             // Without cancellation this would hang on the never-completing page; the timeout guards
@@ -1823,6 +1909,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: Some(1024 * 1024),
+                resource_id: String::new(),
             };
             let err = client
                 .complete_workflow_task(completion, CancellationToken::new())
@@ -1909,6 +1996,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
             client
                 .complete_workflow_task(completion, CancellationToken::new())
@@ -1998,6 +2086,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
 
             let err = tokio::time::timeout(
@@ -2083,6 +2172,7 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
+                resource_id: String::new(),
             };
 
             client

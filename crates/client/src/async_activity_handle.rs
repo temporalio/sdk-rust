@@ -54,6 +54,18 @@ async fn encode_optional_value(
     Ok(Some(Payloads { payloads }))
 }
 
+/// The key proxies route activity RPCs by: the owning workflow, or the activity itself when it is
+/// standalone. Matches the Go SDK.
+fn activity_resource_id(workflow_id: &str, activity_id: &str) -> String {
+    if !workflow_id.is_empty() {
+        format!("workflow:{workflow_id}")
+    } else if !activity_id.is_empty() {
+        format!("activity:{activity_id}")
+    } else {
+        String::new()
+    }
+}
+
 /// Identifies an async activity for completion outside a worker.
 #[derive(Debug, Clone)]
 pub enum ActivityIdentifier {
@@ -187,6 +199,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .map_err(AsyncActivityError::from_status)?;
                         } else {
                             let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
+                            let resource_id = activity_resource_id(&workflow_id, &activity_id);
                             let mut request = RespondActivityTaskCompletedByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -194,7 +207,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 activity_id,
                                 result,
                                 identity: client.identity(),
-                                resource_id: Default::default(),
+                                resource_id,
                             };
                             let target = StoreTarget::activity_by_id(
                                 &request.namespace,
@@ -284,6 +297,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .map_err(AsyncActivityError::from_status)?;
                         } else {
                             let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
+                            let resource_id = activity_resource_id(&workflow_id, &activity_id);
                             let mut request = RespondActivityTaskFailedByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -292,7 +306,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 failure: Some(failure),
                                 identity: client.identity(),
                                 last_heartbeat_details,
-                                resource_id: Default::default(),
+                                resource_id,
                                 ..Default::default()
                             };
                             let target = StoreTarget::activity_by_id(
@@ -364,6 +378,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .map_err(AsyncActivityError::from_status)?;
                         } else {
                             let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
+                            let resource_id = activity_resource_id(&workflow_id, &activity_id);
                             let mut request = RespondActivityTaskCanceledByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -371,6 +386,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 activity_id,
                                 details,
                                 identity: client.identity(),
+                                resource_id,
                                 ..Default::default()
                             };
                             let target = StoreTarget::activity_by_id(
@@ -443,6 +459,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             Ok(ActivityHeartbeatResponse::from(response))
                         } else {
                             let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
+                            let resource_id = activity_resource_id(&workflow_id, &activity_id);
                             let mut request = RecordActivityTaskHeartbeatByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -450,7 +467,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 activity_id,
                                 details,
                                 identity: client.identity(),
-                                resource_id: Default::default(),
+                                resource_id,
                             };
                             let target = StoreTarget::activity_by_id(
                                 &request.namespace,
@@ -509,5 +526,128 @@ impl From<RecordActivityTaskHeartbeatByIdResponse> for ActivityHeartbeatResponse
             activity_paused: resp.activity_paused,
             activity_reset: resp.activity_reset,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use rstest::rstest;
+    use std::sync::Arc;
+    use temporalio_common::protos::temporal::api::workflowservice::v1::{
+        RespondActivityTaskCanceledByIdResponse, RespondActivityTaskCompletedByIdResponse,
+        RespondActivityTaskFailedByIdResponse,
+    };
+    use tonic::{Request, Response, Status};
+
+    #[derive(Clone, Default)]
+    struct RecordingClient {
+        sent: Arc<Mutex<Vec<(&'static str, String)>>>,
+    }
+
+    impl NamespacedClient for RecordingClient {
+        fn namespace(&self) -> String {
+            "test-namespace".to_owned()
+        }
+
+        fn identity(&self) -> String {
+            "test-identity".to_owned()
+        }
+    }
+
+    impl WorkflowService for RecordingClient {
+        fn respond_activity_task_completed_by_id(
+            &mut self,
+            request: Request<RespondActivityTaskCompletedByIdRequest>,
+        ) -> BoxFuture<'_, Result<Response<RespondActivityTaskCompletedByIdResponse>, Status>>
+        {
+            self.sent
+                .lock()
+                .push(("completed", request.into_inner().resource_id));
+            Box::pin(async { Ok(Response::new(Default::default())) })
+        }
+
+        fn respond_activity_task_failed_by_id(
+            &mut self,
+            request: Request<RespondActivityTaskFailedByIdRequest>,
+        ) -> BoxFuture<'_, Result<Response<RespondActivityTaskFailedByIdResponse>, Status>>
+        {
+            self.sent
+                .lock()
+                .push(("failed", request.into_inner().resource_id));
+            Box::pin(async { Ok(Response::new(Default::default())) })
+        }
+
+        fn respond_activity_task_canceled_by_id(
+            &mut self,
+            request: Request<RespondActivityTaskCanceledByIdRequest>,
+        ) -> BoxFuture<'_, Result<Response<RespondActivityTaskCanceledByIdResponse>, Status>>
+        {
+            self.sent
+                .lock()
+                .push(("canceled", request.into_inner().resource_id));
+            Box::pin(async { Ok(Response::new(Default::default())) })
+        }
+
+        fn record_activity_task_heartbeat_by_id(
+            &mut self,
+            request: Request<RecordActivityTaskHeartbeatByIdRequest>,
+        ) -> BoxFuture<'_, Result<Response<RecordActivityTaskHeartbeatByIdResponse>, Status>>
+        {
+            self.sent
+                .lock()
+                .push(("heartbeat", request.into_inner().resource_id));
+            Box::pin(async { Ok(Response::new(Default::default())) })
+        }
+    }
+
+    #[rstest]
+    #[case::workflow_activity(
+        ActivityIdentifier::by_id_workflow("wf-1", "", "act-1"),
+        "workflow:wf-1"
+    )]
+    #[case::standalone_activity(
+        ActivityIdentifier::by_id_standalone("act-1", ""),
+        "activity:act-1"
+    )]
+    #[tokio::test]
+    async fn by_id_requests_carry_resource_id(
+        #[case] identifier: ActivityIdentifier,
+        #[case] expected: &str,
+    ) {
+        let client = RecordingClient::default();
+        let handle = AsyncActivityHandle::new(client.clone(), identifier);
+
+        handle
+            .complete(None::<()>, RpcOptions::default())
+            .await
+            .unwrap();
+        handle
+            .fail(
+                ApplicationFailure::new(anyhow::anyhow!("boom")),
+                None::<()>,
+                RpcOptions::default(),
+            )
+            .await
+            .unwrap();
+        handle
+            .report_cancelation(None::<()>, RpcOptions::default())
+            .await
+            .unwrap();
+        handle
+            .heartbeat(None::<()>, RpcOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *client.sent.lock(),
+            [
+                ("completed", expected.to_owned()),
+                ("failed", expected.to_owned()),
+                ("canceled", expected.to_owned()),
+                ("heartbeat", expected.to_owned()),
+            ]
+        );
     }
 }
