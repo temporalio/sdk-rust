@@ -20,24 +20,26 @@ account or Docker. To use real S3 instead, see [Using real S3](#using-real-s3).
 
 ## Running this sample
 
+Run the `cargo` commands from the `crates/aws-s3driver/` directory.
+
 1. `temporal server start-dev` to start the Temporal server.
 2. In another terminal, start the mock S3 server. It listens on `localhost:9100`, serves the
    `temporal-payloads` bucket, and keeps objects in memory until it stops.
 
    ```bash
-   cargo run --features examples --example external-storage-s3-mock
+   cargo run --example external-storage-s3-mock
    ```
 
 3. In another terminal, start the worker:
 
    ```bash
-   cargo run --features examples,experimental --example external-storage-worker
+   cargo run --example external-storage-worker
    ```
 
 4. In another terminal, run the workflow:
 
    ```bash
-   cargo run --features examples,experimental --example external-storage-starter
+   cargo run --example external-storage-starter
    ```
 
    Example output:
@@ -126,7 +128,7 @@ export EXTERNAL_STORAGE_S3_BUCKET=<your-bucket>
 The S3 client then takes its region and credentials from the usual AWS configuration, such as the
 `AWS_REGION` and `AWS_PROFILE` environment variables or `~/.aws`. Set the variable in both
 terminals: a worker and a starter that disagree would write payloads where the other can't read
-them. See the [`temporalio-aws-s3driver` README](../../../aws-s3driver/README.md) for the IAM
+them. See the [`temporalio-aws-s3driver` README](../../README.md) for the IAM
 permissions the driver needs.
 
 ### Why a codec

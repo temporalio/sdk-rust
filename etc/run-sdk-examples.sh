@@ -5,29 +5,6 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 
-# Must match the features the CI build step uses, or cargo rebuilds inside the starter's timeout.
-features="examples,experimental"
-
-mapfile -t examples < <(
-  cargo metadata --no-deps --format-version 1 \
-    | jq -r '.packages[]
-      | select(.name == "temporalio-sdk")
-      | .targets[]
-      | select(.kind[] == "example")
-      | .name'
-)
-
-has_example() {
-  local expected="$1"
-  local example
-  for example in "${examples[@]}"; do
-    if [[ "$example" == "$expected" ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
 pids=()
 
 cleanup() {
@@ -41,38 +18,61 @@ cleanup() {
 
 trap cleanup EXIT
 
-for starter in "${examples[@]}"; do
-  if [[ "$starter" != *-starter ]]; then
-    continue
-  fi
+# Runs each `<sample>-starter` example in the package against its `<sample>-worker`. The remaining
+# arguments are passed to cargo, and must match the CI build step, or cargo rebuilds inside the
+# starter's timeout.
+run_examples() {
+  local package="$1"
+  shift
+  local cargo_args=("$@")
 
-  sample="${starter%-starter}"
-  worker="${sample}-worker"
+  local examples
+  mapfile -t examples < <(
+    cargo metadata --no-deps --format-version 1 \
+      | jq -r --arg package "$package" '.packages[]
+        | select(.name == $package)
+        | .targets[]
+        | select(.kind[] == "example")
+        | .name'
+  )
 
-  if ! has_example "$worker"; then
-    echo "Skipping $starter because $worker is not declared"
-    continue
-  fi
+  local starter sample worker example
+  for starter in "${examples[@]}"; do
+    if [[ "$starter" != *-starter ]]; then
+      continue
+    fi
 
-  # Mock services a sample depends on, such as a local S3 server, start before its worker.
-  for example in "${examples[@]}"; do
-    if [[ "$example" == "$sample"-*mock ]]; then
-      cargo run -p temporalio-sdk --features "$features" --example "$example" &
-      pids+=($!)
+    sample="${starter%-starter}"
+    worker="${sample}-worker"
+
+    if [[ ! " ${examples[*]} " == *" $worker "* ]]; then
+      echo "Skipping $starter because $worker is not declared"
+      continue
+    fi
+
+    # Mock services a sample depends on, such as a local S3 server, start before its worker.
+    for example in "${examples[@]}"; do
+      if [[ "$example" == "$sample"-*mock ]]; then
+        cargo run -p "$package" "${cargo_args[@]}" --example "$example" &
+        pids+=($!)
+      fi
+    done
+
+    cargo run -p "$package" "${cargo_args[@]}" --example "$worker" &
+    pids+=($!)
+
+    set +e
+    timeout 20 cargo run -p "$package" "${cargo_args[@]}" --example "$starter"
+    local starter_status=$?
+    set -e
+
+    cleanup
+
+    if [[ "$starter_status" -ne 0 ]]; then
+      exit "$starter_status"
     fi
   done
+}
 
-  cargo run -p temporalio-sdk --features "$features" --example "$worker" &
-  pids+=($!)
-
-  set +e
-  timeout 20 cargo run -p temporalio-sdk --features "$features" --example "$starter"
-  starter_status=$?
-  set -e
-
-  cleanup
-
-  if [[ "$starter_status" -ne 0 ]]; then
-    exit "$starter_status"
-  fi
-done
+run_examples temporalio-sdk --features examples
+run_examples temporalio-aws-s3driver

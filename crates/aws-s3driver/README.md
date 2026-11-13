@@ -32,6 +32,9 @@ let driver = S3StorageDriver::new(
 
 To choose the bucket per payload, pass `Bucket::selector(|context, payload| ...)` as the bucket.
 
+For a complete worker and starter that offload payloads to S3, with a mock S3 server to run them
+against locally, see the [external storage example](https://github.com/temporalio/sdk-rust/tree/main/crates/aws-s3driver/examples/external_storage).
+
 ## Required IAM Permissions
 
 Before uploading a payload, the driver checks whether the object already exists with a `HeadObject`

@@ -37,13 +37,53 @@ default-features = false
 features = ["experimental"]
 
 [dev-dependencies]
-aws-sdk-s3 = { version = "1", default-features = false, features = [
-  "rt-tokio",
-] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+# Default features, because the examples need the SDK's HTTP client to reach S3.
+aws-sdk-s3 = "1"
 aws-smithy-http-client = { version = "1", features = ["test-util"] }
 aws-smithy-types = "1"
+flate2 = "1"
+futures = "0.3"
 http = "1"
-tokio = { version = "1.47", features = ["macros", "rt", "sync", "time"] }
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.47", features = [
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[dev-dependencies.temporalio-client]
+path = "../client"
+
+[dev-dependencies.temporalio-macros]
+path = "../macros"
+
+[dev-dependencies.temporalio-sdk]
+path = "../sdk"
+features = ["experimental"]
+
+[dev-dependencies.temporalio-workflow]
+path = "../workflow"
+
+[[example]]
+name = "external-storage-worker"
+path = "examples/external_storage/worker.rs"
+
+[[example]]
+name = "external-storage-starter"
+path = "examples/external_storage/starter.rs"
+
+[[example]]
+name = "external-storage-s3-mock"
+path = "examples/external_storage/s3_mock.rs"
 
 [lints]
 workspace = true

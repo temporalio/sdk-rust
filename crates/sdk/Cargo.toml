@@ -71,19 +71,9 @@ path = "../macros"
 version = "~1.2.0"
 
 [dev-dependencies]
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
-flate2 = "1"
 futures = "0.3"
-http-body-util = "0.1"
-hyper = "1"
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 rstest = "0.28"
-tokio = { version = "1.47", features = ["net", "signal"] }
-
-[dev-dependencies.temporalio-aws-s3driver]
-path = "../aws-s3driver"
 
 [features]
 default = ["envconfig", "prometheus"]
@@ -275,21 +265,6 @@ required-features = ["examples"]
 [[example]]
 name = "standalone-activities-count"
 path = "examples/standalone_activities/count_activities.rs"
-required-features = ["examples"]
-
-[[example]]
-name = "external-storage-worker"
-path = "examples/external_storage/worker.rs"
-required-features = ["examples", "experimental"]
-
-[[example]]
-name = "external-storage-starter"
-path = "examples/external_storage/starter.rs"
-required-features = ["examples", "experimental"]
-
-[[example]]
-name = "external-storage-s3-mock"
-path = "examples/external_storage/s3_mock.rs"
 required-features = ["examples"]
 
 [[example]]
