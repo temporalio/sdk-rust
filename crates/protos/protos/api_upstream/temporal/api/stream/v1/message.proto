@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package temporal.api.stream.v1;
+
+option go_package = "go.temporal.io/api/stream/v1;stream";
+option java_package = "io.temporal.api.stream.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Stream::V1";
+option csharp_namespace = "Temporalio.Api.Stream.V1";
+
+import "google/protobuf/timestamp.proto";
+
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/stream.proto";
+
+// Experimental. Might change in the future.
+// Identifies one Stream. The id is opaque to callers. A Stream has no incarnations. A create of a
+// closed or expired Stream fails, and it doesn't make a second Stream with the same id.
+message StreamRef {
+    string id = 1;
+    // The name of the Store that holds the Stream, as the Worker and client config register it,
+    // so every process routes a ref it receives. With no name, the SDK picks the Store from its
+    // config. Only an SDK sets and reads it, since only the SDK knows the name that its config
+    // gives a Store. A request carries the whole ref, and the server and a Store ignore this
+    // field.
+    string store = 3;
+}
+
+// Experimental. Might change in the future.
+// One Workflow Task attempt of a run. It orders by started_event_id, then attempt, then
+// started_time. An epoch orders the attempts of one Producer only, and a Producer belongs to one
+// run. So a reset run and the next run of a chain have other Producers, and their epochs start
+// again.
+message WorkflowTaskEpoch {
+    // Required.
+    int64 started_event_id = 1;
+    // Required. 1 or more.
+    int32 attempt = 2;
+    // Tells a reused started event id apart, for example after a dropped speculative task. Core
+    // leaves it empty when the server gave the task no started time.
+    google.protobuf.Timestamp started_time = 3;
+}
+
+// Experimental. Might change in the future.
+// The attempt of a Local Activity. It orders by task, then attempt, so the same call in a later
+// Workflow Task is a higher epoch. The Producer carries the run. Records of two runs have no
+// order by epoch, only their order in the Stream.
+message LocalActivityEpoch {
+    // Required. The Workflow Task attempt that dispatched the Local Activity.
+    WorkflowTaskEpoch task = 1;
+    // Required. The Local Activity's own attempt in that Workflow Task, 1 or more.
+    int32 attempt = 2;
+}
+
+// Experimental. Might change in the future.
+// The attempt of an Activity. It orders by attempt_scheduled_time, then attempt.
+message ActivityEpoch {
+    // Required. When the server scheduled this attempt. An Activity reset starts the attempt count
+    // again, so only this time orders the attempts across a reset.
+    google.protobuf.Timestamp attempt_scheduled_time = 1;
+    // Required. 1 or more.
+    int32 attempt = 2;
+}
+
+// Experimental. Might change in the future.
+// A Workflow run Producer. On the server's Streams, a Workflow writes as this Producer in its
+// Workflow Task. On a Store, a Workflow appends as a Local Activity Producer, and this Producer
+// only closes the Stream.
+message WorkflowProducer {
+    // Required. The run id of the Workflow run, not of its chain. Each run is its own Producer.
+    string run_id = 1;
+    // The Workflow Task of the write. A close on a Store runs after the Workflow Task and sends
+    // no epoch.
+    WorkflowTaskEpoch epoch = 2;
+}
+
+// Experimental. Might change in the future.
+// A Local Activity Producer, one for each call of a run.
+message LocalActivityProducer {
+    // Required. The run id of the Workflow run.
+    string run_id = 1;
+    // Required.
+    LocalActivityEpoch epoch = 2;
+}
+
+// Experimental. Might change in the future.
+// An Activity Producer, for an Activity of a Workflow or a Standalone Activity.
+message ActivityProducer {
+    // The run id of the Workflow run that scheduled the Activity. Empty for a Standalone
+    // Activity, whose own run id is in the Producer id.
+    string run_id = 1;
+    // Required.
+    ActivityEpoch epoch = 2;
+}
+
+// Experimental. Might change in the future.
+// A client Producer. A client has no run and no epoch. So nothing fences a client's writes, and a
+// reader never hides them.
+message ClientProducer {
+}
+
+// Experimental. Might change in the future.
+// The code that wrote a batch, which is one unit of work. Its id stays the same across attempts,
+// and an epoch is one attempt. The kind's case orders its epochs. After a write of a higher epoch,
+// a write of a lower epoch of the same Producer fails with FENCED, and a reader may hide the
+// Records of the lower epoch. The rule is the same for every kind that has an epoch. A client has
+// none. The epochs of two Producers never compare. A new run has new Producers, so no write
+// fences or supersedes the Records of an earlier run, such as the base run of a reset.
+message Producer {
+    // Required. Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
+    // It is unique in one Stream. The id of a run-based kind has its run id, so it stays unique
+    // when Producers of more than one namespace write to one Stream.
+    string id = 1;
+    // Required. The case is the kind of the Producer.
+    oneof kind {
+        WorkflowProducer workflow = 2;
+        LocalActivityProducer local_activity = 3;
+        // An Activity that a Workflow scheduled.
+        ActivityProducer workflow_activity = 4;
+        // An Activity with no Workflow. Both Activity cases order their epochs the same way. The
+        // case tells which identity the Producer has, since only the first has a Workflow run.
+        ActivityProducer standalone_activity = 5;
+        ClientProducer client = 6;
+    }
+}
+
+// Experimental. Might change in the future.
+// One Record of a batch to append. The Store adds the batch's Producer and an offset.
+message AppendRecord {
+    // Required.
+    temporal.api.common.v1.Payload body = 1;
+}
+
+// Experimental. Might change in the future.
+// One Record that a Producer appended, as a read gives it. A read gives only Records. A close
+// stores no Record, so a read tells of it with the done flag of its response.
+message StreamRecord {
+    Producer producer = 1;
+    temporal.api.common.v1.Payload body = 2;
+    // Required. The Record's offset. An offset is ordered and unique in one Stream, and it is
+    // sparse. Offsets have gaps, so they don't count Records. An offset is never empty. A read
+    // gives its Stream, so the read checks the offset against that Stream.
+    bytes offset = 3;
+}
+
+// Experimental. Might change in the future.
+// The details of a failed Stream call, in the gRPC status details and in the details of the
+// application failure of a Nexus operation.
+message StreamErrorDetails {
+    temporal.api.enums.v1.StreamErrorReason reason = 1;
+}
