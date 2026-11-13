@@ -1,0 +1,92 @@
+[
+  {
+    "name": "empty batch",
+    "records": [],
+    "digest": "e3b0c44298fc1c149afbf4c8996fb924"
+  },
+  {
+    "name": "one record, no body",
+    "records": [
+      {}
+    ],
+    "digest": "6e340b9cffb37a989ca544e6bb780a2c"
+  },
+  {
+    "name": "one record, an empty body",
+    "records": [
+      {
+        "data": ""
+      }
+    ],
+    "digest": "6bb0f5246ac6ee3fa6a6879c512f393f"
+  },
+  {
+    "name": "one record",
+    "records": [
+      {
+        "data": "68656c6c6f"
+      }
+    ],
+    "digest": "00cedb65fe85721791cf031124cc4ba2"
+  },
+  {
+    "name": "metadata in key order",
+    "records": [
+      {
+        "metadata": {
+          "encoding": "6a736f6e2f706c61696e",
+          "a": "00ff"
+        },
+        "data": "7b2278223a317d"
+      }
+    ],
+    "digest": "eea3c073d22bc6bd16ffd5c5a18a2900"
+  },
+  {
+    "name": "two records",
+    "records": [
+      {
+        "data": "01"
+      },
+      {
+        "data": "0203"
+      }
+    ],
+    "digest": "b75e10295b9753dbbc5774e454c9a7fb"
+  },
+  {
+    "name": "external payloads",
+    "records": [
+      {
+        "data": "01",
+        "external_payloads": [
+          10,
+          20
+        ]
+      }
+    ],
+    "digest": "381530dbc9c2fb0d5ddefbc99e72c6e1"
+  },
+  {
+    "name": "metadata key and value split one way",
+    "records": [
+      {
+        "metadata": {
+          "ab": "63"
+        }
+      }
+    ],
+    "digest": "be5bd276e8b11daeb753e3d3b6d6f93d"
+  },
+  {
+    "name": "metadata key and value split another way",
+    "records": [
+      {
+        "metadata": {
+          "a": "6263"
+        }
+      }
+    ],
+    "digest": "ddc7d1a81ecebb12548d3adae06622b8"
+  }
+]
