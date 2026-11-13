@@ -326,7 +326,7 @@ message PollWorkflowTaskQueueRequest {
     reserved "worker_heartbeat";
 
     // EXPERIMENTAL. Subject to redesign or removal. Only applicable to sticky polls.
-    temporal.api.session.v1.WorkerSessionOptions session_options = 11;
+    temporal.api.session.v1.WorkerSessionOptions session_options = 12;
 }
 
 message PollWorkflowTaskQueueResponse {
@@ -559,7 +559,7 @@ message PollActivityTaskQueueRequest {
     reserved "worker_heartbeat";
 
     // EXPERIMENTAL. Subject to redesign or removal. Only applicable to sticky polls.
-    temporal.api.session.v1.WorkerSessionOptions session_options = 11;
+    temporal.api.session.v1.WorkerSessionOptions session_options = 12;
 }
 
 message PollActivityTaskQueueResponse {
