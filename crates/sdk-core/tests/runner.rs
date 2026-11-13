@@ -204,7 +204,7 @@ async fn main() -> Result<(), anyhow::Error> {
         println!("Running on {}", srv.target);
         cmd.env(
             INTEG_SERVER_TARGET_ENV_VAR,
-            format!("http://{}", &srv.target),
+            format!("http://{}", srv.target),
         );
     }
     let status = cmd

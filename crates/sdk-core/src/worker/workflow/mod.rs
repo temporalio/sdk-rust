@@ -1048,9 +1048,9 @@ impl PreparedWFT {
         format!(
             "WFT events: [{}], messages: {:?}, legacy_query: {:?}, queries: {:?}",
             self.update.get_events().iter().format(", "),
-            &self.messages,
-            &self.legacy_query,
-            &self.query_requests
+            self.messages,
+            self.legacy_query,
+            self.query_requests
         )
     }
 }
@@ -1825,6 +1825,10 @@ pub(crate) trait LocalActivityRequestSink: Send + Sync + 'static {
 }
 
 #[derive(derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub(super) struct LAReqSink {
     lam: Arc<LocalActivityManager>,
 }

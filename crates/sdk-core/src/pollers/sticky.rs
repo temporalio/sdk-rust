@@ -38,6 +38,10 @@ pub(crate) fn sticky_poller_behavior(
 
 /// A poller capable of polling on a sticky and a nonsticky queue simultaneously.
 #[derive(derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub(crate) struct StickyTaskPoller<T, SK: SlotKind> {
     normal_poller: LongPollBuffer<T, SK>,
     sticky_poller: Option<LongPollBuffer<T, SK>>,
@@ -176,11 +180,7 @@ impl StickyPollerShared {
 
                     // Just balance the two poller types.
                     // FIXME: Do we need anything more here, to ensure proper balancing?
-                    if num_sticky_active + num_non_sticky_active < max_slots {
-                        return true;
-                    }
-
-                    false
+                    num_sticky_active + num_non_sticky_active < max_slots
                 };
 
                 if allow() {

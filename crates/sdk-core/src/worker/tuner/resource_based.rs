@@ -132,6 +132,10 @@ const DEFAULT_NEXUS_SLOT_OPTS: ResourceSlotOptions = ResourceSlotOptions {
 
 /// Options for a specific slot type
 #[derive(Debug, Clone, Copy, derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub struct ResourceSlotOptions {
     /// Amount of slots of this type that will be issued regardless of any other checks
     min_slots: usize,

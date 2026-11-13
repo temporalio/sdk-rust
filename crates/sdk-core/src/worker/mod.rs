@@ -1422,6 +1422,10 @@ impl Worker {
 
     /// Tell the worker that an activity has finished executing. May (and should) be freely called
     /// concurrently.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the existing public error type without introducing boxing for a lint"
+    )]
     #[instrument(skip(self, completion),
                  fields(task_token, status,
                         task_queue=%self.config.task_queue, workflow_id, run_id))]
