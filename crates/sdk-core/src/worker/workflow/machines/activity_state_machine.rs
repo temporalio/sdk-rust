@@ -657,7 +657,6 @@ impl Canceled {
     ) -> ActivityMachineTransition<Canceled> {
         // Abandoned activities might start anyway. Ignore the result.
         if dat.cancellation_type == ActivityCancellationType::Abandon {
-            debug!(seq = dat.attrs.seq, "Ignoring start of abandoned activity");
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
@@ -673,10 +672,6 @@ impl Canceled {
     ) -> ActivityMachineTransition<Canceled> {
         // Abandoned activities might complete anyway. Ignore the result.
         if dat.cancellation_type == ActivityCancellationType::Abandon {
-            debug!(
-                seq = dat.attrs.seq,
-                "Ignoring completion of abandoned activity"
-            );
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
@@ -692,10 +687,6 @@ impl Canceled {
         // The server keeps running abandoned activities, so they might still fail for good (a
         // non-retryable failure, or retries exhausted). Ignore the result.
         if dat.cancellation_type == ActivityCancellationType::Abandon {
-            debug!(
-                seq = dat.attrs.seq,
-                "Ignoring failure of abandoned activity"
-            );
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
@@ -711,10 +702,6 @@ impl Canceled {
         // The server keeps enforcing the timeouts of abandoned activities, so they might still
         // time out. Ignore the result.
         if dat.cancellation_type == ActivityCancellationType::Abandon {
-            debug!(
-                seq = dat.attrs.seq,
-                "Ignoring timeout of abandoned activity"
-            );
             TransitionResult::default()
         } else {
             TransitionResult::Err(nondeterminism!(
