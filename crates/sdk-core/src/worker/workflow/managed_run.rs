@@ -714,6 +714,14 @@ impl ManagedRun {
         } else {
             false
         };
+        if evict {
+            let unapplied = self.wfm.deferred_local_activity_seqs();
+            if !unapplied.is_empty() {
+                warn!(run_id=%self.run_id(), local_activity_seqs=?unapplied,
+                      "Evicting run before applying these local activity results, so those local \
+                       activities will execute again when the run is replayed");
+            }
+        }
         if evict && let Some(sink) = self.local_activity_request_sink.as_deref() {
             let immediate_resolutions = sink.sink_reqs(vec![LocalActRequest::InvalidateRun(
                 self.wfm.machines.run_id.clone(),
@@ -776,6 +784,13 @@ impl ManagedRun {
         }
 
         let outcome = (|| {
+            // A completion with query responses is always reported as this WFT's completion, so LA
+            // results that arrived while lang answered the queries must wait for the next WFT, as
+            // they would after any other completion. Mark it before pushing lang's commands, which
+            // would otherwise apply those results and put their markers in this completion.
+            if !data.query_responses.is_empty() {
+                self.wfm.wft_completion_reported();
+            }
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;
@@ -892,7 +907,6 @@ impl ManagedRun {
             // The resolved attempt leaving the LA manager may be what lets the eviction go out
             return self._check_more_activations();
         }
-        debug!(resolution=?res, "Applying local resolution");
         self.wfm.notify_of_local_result(res)?;
         if self.activation.is_none() {
             self._check_more_activations()
@@ -1064,7 +1078,9 @@ impl ManagedRun {
                     }
                     Some(ActivationOrAuto::ReadyForQueries(mut act)) => {
                         if let Some(wft) = self.wft.as_mut() {
-                            put_queries_in_act(&mut act, wft);
+                            if put_queries_in_act(&mut act, wft) == DispatchedQueries::Attached {
+                                self.wfm.attached_queries_dispatched();
+                            }
                             Some(ActivationOrAuto::LangActivation(act))
                         } else {
                             dbg_panic!("Ready for queries but no WFT!");
@@ -1229,10 +1245,11 @@ impl ManagedRun {
             || is_query_playback
             || (data.activation_was_eviction && !eviction_has_output)
             || machines_wft_response.have_seen_terminal_event);
-        // If there are pending LA resolutions, and we're responding to a query here,
-        // we want to make sure to force a new task, as otherwise once we tell lang about
-        // the LA resolution there wouldn't be any task to reply to with the result of iterating
-        // the workflow.
+        // LA results arriving while lang answers queries wait for the next WFT, but commands sent
+        // with the query responses can still resolve an LA here (ex: a try-cancel of a running LA,
+        // which resolves synchronously in Core). If so, force a new task, as otherwise once we tell
+        // lang about the LA resolution there wouldn't be any task to reply to with the result of
+        // iterating the workflow.
         if has_query_responses && machines_wft_response.have_pending_la_resolutions {
             force_new_wft = true;
         }
@@ -1437,18 +1454,30 @@ fn preprocess_command_sequence_old_behavior(
     (commands, query_results)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchedQueries {
+    None,
+    /// Queries that came with a WFT, whose responses complete it
+    Attached,
+    /// A legacy query, answered through the query API without touching the workflow machines
+    Legacy,
+}
+
 /// Drains pending queries from the workflow task and appends them to the activation's jobs
-fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
+fn put_queries_in_act(
+    act: &mut WorkflowActivation,
+    wft: &mut OutstandingTask,
+) -> DispatchedQueries {
     // Nothing to do if there are no pending queries
     if wft.pending_queries.is_empty() {
-        return;
+        return DispatchedQueries::None;
     }
 
     let has_legacy = wft.has_pending_legacy_query();
     // Cannot dispatch legacy query if there are any other jobs - which can happen if, ex, a local
     // activity resolves while we've gotten a legacy query after heartbeating.
     if has_legacy && !act.jobs.is_empty() {
-        return;
+        return DispatchedQueries::None;
     }
 
     debug!(queries=?wft.pending_queries, "Dispatching queries");
@@ -1457,6 +1486,11 @@ fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
         .drain(..)
         .map(|q| workflow_activation_job::Variant::QueryWorkflow(q).into());
     act.jobs.extend(query_jobs);
+    if has_legacy {
+        DispatchedQueries::Legacy
+    } else {
+        DispatchedQueries::Attached
+    }
 }
 fn sink_heartbeat_timeout_start(
     run_id: String,
@@ -1542,10 +1576,15 @@ impl WorkflowManager {
         messages: Vec<IncomingProtocolMessage>,
         preparing_legacy_query: bool,
     ) -> Result<WorkflowActivation> {
+        // A legacy query task is not a WFT: results waiting for the next WFT must not reach lang
+        // in the query pass, or lang would receive them before that WFT's events, unlike replay.
+        let is_legacy_query_task = preparing_legacy_query && update.wft_started_id == 0;
         self.machines
             .new_work_from_server(update, messages, preparing_legacy_query)?;
-        self.awaiting_next_wft = false;
-        self.apply_deferred_local_resolutions()?;
+        if !is_legacy_query_task {
+            self.awaiting_next_wft = false;
+            self.apply_deferred_local_resolutions()?;
+        }
         self.get_next_activation()
     }
 
@@ -1559,8 +1598,15 @@ impl WorkflowManager {
     /// local activity or side effect
     fn notify_of_local_result(&mut self, resolved: LocalResolution) -> Result<()> {
         if self.awaiting_activation_completion || self.awaiting_next_wft {
+            debug!(
+                seq = resolved.seq(),
+                awaiting_activation_completion = self.awaiting_activation_completion,
+                awaiting_next_wft = self.awaiting_next_wft,
+                "Deferring local resolution"
+            );
             self.deferred_local_resolutions.push(resolved);
         } else {
+            debug!(resolution=?resolved, "Applying local resolution");
             self.machines.local_resolution(resolved)?;
         }
         Ok(())
@@ -1632,9 +1678,22 @@ impl WorkflowManager {
         self.apply_deferred_local_resolutions()
     }
 
-    /// Must be called once the current WFT's completion has been reported to server.
+    /// Must be called once the current WFT's completion has been, or is certain to be, reported to
+    /// server (completions with query responses always are).
     fn wft_completion_reported(&mut self) {
         self.awaiting_next_wft = true;
+    }
+
+    /// Must be called when lang is sent the queries that came with the current WFT. Their
+    /// responses complete the WFT, so LA results arriving before lang answers them are deferred,
+    /// as during any other activation. Otherwise their markers would be recorded in this WFT while
+    /// lang only receives them in the next one, alongside that WFT's own jobs, which is not where
+    /// replay delivers them.
+    ///
+    /// Not called for legacy queries: their responses don't go through the machines, so nothing
+    /// would clear the flag, and they can't carry commands that results would need to follow.
+    fn attached_queries_dispatched(&mut self) {
+        self.awaiting_activation_completion = true;
     }
 
     fn apply_deferred_local_resolutions(&mut self) -> Result<()> {
@@ -1642,9 +1701,18 @@ impl WorkflowManager {
             return Ok(());
         }
         for resolution in mem::take(&mut self.deferred_local_resolutions) {
+            debug!(resolution=?resolution, "Applying deferred local resolution");
             self.machines.local_resolution(resolution)?;
         }
         Ok(())
+    }
+
+    /// Sequence numbers of local activities whose results arrived but have not been applied yet
+    fn deferred_local_activity_seqs(&self) -> Vec<u32> {
+        self.deferred_local_resolutions
+            .iter()
+            .map(LocalResolution::seq)
+            .collect()
     }
 }
 

@@ -1505,6 +1505,12 @@ pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
 }
 impl LocalResolution {
+    fn seq(&self) -> u32 {
+        match self {
+            LocalResolution::LocalActivity(lar) => lar.seq,
+        }
+    }
+
     fn is_la_cancel_confirmation(&self) -> bool {
         match self {
             LocalResolution::LocalActivity(lar) => {
