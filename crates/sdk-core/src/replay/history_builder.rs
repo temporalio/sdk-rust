@@ -508,7 +508,7 @@ impl TestHistoryBuilder {
             })
             .expect("Must have wft scheduled event");
         let attrs = WorkflowExecutionUpdateAcceptedEventAttributes {
-            accepted_request_message_id: format!("{}/request", &protocol_instance_id),
+            accepted_request_message_id: format!("{}/request", protocol_instance_id),
             accepted_request_sequencing_event_id: last_wft_scheduled_id,
             accepted_request: Some(update::v1::Request {
                 meta: Some(update::v1::Meta {

@@ -13,8 +13,9 @@ help: the trait `From<Two>` is not implemented for `One`
 note: required by a bound in `temporalio_common::fsm_trait::TransitionResult::<Sm, Ds>::from`
   --> $WORKSPACE/crates/common/src/fsm_trait.rs
    |
+   | impl<Sm, Ds> TransitionResult<Sm, Ds>
+...
    |     pub fn from<CurrentState>(current_state: CurrentState) -> Self
-   |            ---- required by a bound in this associated function
    |     where
    |         CurrentState: Into<Ds>,
    |                       ^^^^^^^^ required by this bound in `TransitionResult::<Sm, Ds>::from`

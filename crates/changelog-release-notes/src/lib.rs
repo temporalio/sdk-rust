@@ -322,7 +322,7 @@ pub fn check_fragments(
         )?;
         let fields: Vec<_> = changed.split('\0').filter(|s| !s.is_empty()).collect();
         let mut added = false;
-        for pair in fields.chunks_exact(2) {
+        for pair in fields.as_chunks::<2>().0 {
             if pair[0] == "D" || pair[1] == directory.join("README.md").to_string_lossy() {
                 continue;
             }
