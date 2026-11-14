@@ -135,7 +135,7 @@ async fn legacy_query(#[case] include_history: bool) {
         ))
         .await
         .unwrap();
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[rstest::rstest]
@@ -223,7 +223,7 @@ async fn new_queries(#[values(1, 3)] num_queries: usize) {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -274,7 +274,7 @@ async fn legacy_query_failure_on_wft_failure() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[rstest::rstest]
@@ -318,7 +318,6 @@ async fn query_failure_because_nondeterminism(#[values(true, false)] legacy: boo
     let mut mock = build_mock_pollers(mock);
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = 10;
-        wc.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mock);
 
@@ -328,7 +327,7 @@ async fn query_failure_because_nondeterminism(#[values(true, false)] legacy: boo
         .await
         .unwrap();
     core.handle_eviction().await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[rstest::rstest]
@@ -411,7 +410,7 @@ async fn legacy_query_after_complete(#[values(false, true)] full_history: bool) 
         }
     }
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 enum QueryHists {
@@ -524,7 +523,7 @@ async fn query_cache_miss_causes_page_fetch_dont_reply_wft_too_early(
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -613,7 +612,7 @@ async fn query_replay_with_continue_as_new_doesnt_reply_empty_command() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -662,7 +661,7 @@ async fn legacy_query_response_gets_not_found_not_fatal() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -730,7 +729,7 @@ async fn legacy_query_too_large_responds_with_failure() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -933,7 +932,7 @@ async fn legacy_query_combined_with_timer_fire_repro() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1113,5 +1112,5 @@ async fn queries_arent_lost_in_buffer_void(#[values(false, true)] buffered_becau
     );
     core.complete_execution(&task.run_id).await;
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }

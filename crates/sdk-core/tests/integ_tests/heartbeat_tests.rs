@@ -22,7 +22,7 @@ use temporalio_sdk::{
 use temporalio_sdk_core::{
     prost_dur,
     replay::DEFAULT_ACTIVITY_TYPE,
-    test_help::{WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd},
+    test_help::{WorkerExt, WorkerTestHelpers, schedule_activity_cmd},
 };
 use tokio::time::sleep;
 
@@ -207,7 +207,7 @@ async fn many_act_fails_with_heartbeats() {
     );
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]

@@ -73,7 +73,7 @@ use temporalio_sdk_core::{
     WorkerValidationError, WorkerVersioningStrategy, WorkflowSlotKind, init_worker, prost_dur,
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
-        FakeWfResponses, MockPollCfg, ResponseType, build_mock_pollers, drain_pollers_and_shutdown,
+        FakeWfResponses, MockPollCfg, ResponseType, WorkerExt, build_mock_pollers,
         hist_to_poll_resp, mock_worker, mock_worker_client,
     },
 };
@@ -186,7 +186,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
     tokio::join!(async { inner.run().await.unwrap() }, async move {
         notify.notified().await;
         let worker = starter.get_core_worker().await.clone();
-        drain_pollers_and_shutdown(&worker).await;
+        worker.drain_pollers_and_shutdown_ref().await;
     });
 }
 
@@ -1648,7 +1648,7 @@ async fn shutdown_worker_not_retried() {
     let wf_type = "shutdown_worker_not_retried";
     let mut starter = CoreWfStarter::new_with_overrides(wf_type, None, Some(client));
     let worker = starter.get_core_worker().await;
-    drain_pollers_and_shutdown(&worker).await;
+    worker.drain_pollers_and_shutdown_ref().await;
     assert_eq!(shutdown_call_count.load(Ordering::Relaxed), 1);
 }
 

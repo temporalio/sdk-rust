@@ -546,7 +546,7 @@ mod tests {
             .await
             .expect("worker heartbeat was not recorded in time")
             .expect("heartbeat sender was dropped");
-        worker.drain_activity_poller_and_shutdown().await;
+        worker.drain_pollers_and_shutdown().await;
 
         assert_eq!(3, heartbeat_count.load(Ordering::Relaxed));
     }
@@ -600,7 +600,7 @@ mod tests {
             .await
             .expect("worker heartbeat was not recorded in time")
             .expect("heartbeat sender was dropped");
-        worker.drain_activity_poller_and_shutdown().await;
+        worker.drain_pollers_and_shutdown().await;
 
         assert!(
             reported_autoscaling,

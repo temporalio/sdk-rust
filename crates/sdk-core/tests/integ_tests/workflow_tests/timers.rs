@@ -17,7 +17,7 @@ use temporalio_sdk::{CancellableFuture, WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{
     prost_dur,
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
-    test_help::{MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown, start_timer_cmd},
+    test_help::{MockPollCfg, WorkerExt, WorkerTestHelpers, start_timer_cmd},
 };
 
 #[workflow]
@@ -73,7 +73,7 @@ async fn timer_workflow_manual() {
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]

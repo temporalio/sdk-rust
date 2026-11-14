@@ -88,11 +88,7 @@ async fn after_shutdown_of_worker_get_shutdown_err() {
             .await
             .unwrap();
 
-        // Shutdown proceeds if the only outstanding activations are evictions
-        assert_matches!(
-            worker.poll_workflow_activation().await.unwrap_err(),
-            PollError::ShutDown
-        );
+        worker.drain_workflow_poller().await;
     });
 }
 
@@ -122,11 +118,7 @@ async fn shutdown_worker_can_complete_pending_activation() {
             ))
             .await
             .unwrap();
-        // Shutdown proceeds if the only outstanding activations are evictions
-        assert_matches!(
-            worker.poll_workflow_activation().await.unwrap_err(),
-            PollError::ShutDown
-        );
+        worker.drain_workflow_poller().await;
     });
 }
 
@@ -222,11 +214,7 @@ async fn complete_with_task_not_found_during_shutdown() {
         complete_order.borrow_mut().push(2);
     };
     let poll_fut = async {
-        // This will return shutdown once the completion goes through
-        assert_matches!(
-            core.poll_workflow_activation().await.unwrap_err(),
-            PollError::ShutDown
-        );
+        core.drain_workflow_poller().await;
     };
     let complete_fut = async {
         core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
@@ -243,6 +231,30 @@ async fn complete_with_task_not_found_during_shutdown() {
 
 #[tokio::test]
 async fn complete_eviction_after_shutdown_doesnt_panic() {
+    let core = build_fake_worker("fakeid", canned_histories::single_timer("1"), [1]);
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert!(eviction.is_only_eviction());
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id.clone()))
+        .await
+        .unwrap();
+    core.shutdown().await;
+
+    assert_matches!(
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+            .await,
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_eviction_completion() {
     let t = canned_histories::single_timer("1");
     let mut mh = build_mock_pollers(MockPollCfg::from_resp_batches(
         "fakeid",
@@ -266,10 +278,16 @@ async fn complete_eviction_after_shutdown_doesnt_panic() {
         res.jobs[0].variant,
         Some(workflow_activation_job::Variant::RemoveFromCache(_))
     );
-    core.shutdown().await;
+    let shutdown = core.shutdown();
+    tokio::pin!(shutdown);
+    assert!(futures_util::poll!(&mut shutdown).is_pending());
+    // Round-tripping through the workflow stream after requesting shutdown proves the run is
+    // retained for its uncompleted eviction, independently of the ShutdownWorker RPC handle.
+    assert_eq!(core.cached_workflows().await, 1);
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(res.run_id))
         .await
         .unwrap();
+    shutdown.await;
 }
 
 #[tokio::test]
@@ -369,8 +387,7 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
     }
 
     let t = canned_histories::single_timer("1");
-    let mut mh =
-        MockPollCfg::from_resp_batches("fakeid", t, [1.into(), ResponseType::AllHistory], mock);
+    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
     mh.enforce_correct_number_of_polls = false;
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|w| w.max_cached_workflows = if use_cache { 1 } else { 0 });
@@ -393,11 +410,7 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
             .await
             .unwrap();
 
-        // Shutdown proceeds if the only outstanding activations are evictions
-        assert_matches!(
-            worker.poll_workflow_activation().await.unwrap_err(),
-            PollError::ShutDown
-        );
+        worker.drain_pollers_and_shutdown_ref().await;
     });
 }
 

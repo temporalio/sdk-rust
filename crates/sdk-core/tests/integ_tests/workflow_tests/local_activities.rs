@@ -70,9 +70,9 @@ use temporalio_sdk_core::{
     },
     test_help::{
         LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_mock_pollers, drain_pollers_and_shutdown, hist_to_poll_resp,
-        mock_worker, mock_worker_client, query_ok, schedule_activity_cmd,
-        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
+        WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client,
+        query_ok, schedule_activity_cmd, schedule_local_activity_cmd, single_hist_mock_sg,
+        start_timer_cmd,
     },
 };
 use tokio::{
@@ -3128,7 +3128,6 @@ async fn local_activity_after_wf_complete_is_discarded(#[case] old_heartbeat_his
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = 1;
-        wc.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mock);
 
@@ -3735,7 +3734,7 @@ async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     );
     core.complete_execution(&resolve_third.run_id).await;
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 
     let mut all_reported = vec![];
     while let Some(cmds) = reported_commands.pop() {
@@ -3911,7 +3910,7 @@ async fn eviction_with_buffered_la_marker_replays_only_completed_la() {
         }] if resolution.seq == 2
     );
     core.complete_execution(&resolved.run_id).await;
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 
     assert_eq!(
         execution_counts,

@@ -1182,21 +1182,11 @@ pub(crate) fn build_fake_sdk_with_options(
     mock_cfg: MockPollCfg,
     options_mutator: impl FnOnce(&mut WorkerOptions),
 ) -> temporalio_sdk::Worker {
-    let mut mock = build_mock_pollers(mock_cfg);
-    mock.worker_cfg(|c| {
-        c.max_cached_workflows = 1;
-        c.ignore_evicts_on_shutdown = false;
-    });
-    let core = mock_worker(mock);
-    let client_options = ClientOptions::new(core.get_config().namespace.clone())
-        .data_converter(DataConverter::default())
-        .build();
-    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
-        .worker_interceptor(FailOnNondeterminismInterceptor {})
-        .build();
-    options_mutator(&mut worker_options);
-    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
-        .expect("mock worker options are valid")
+    build_fake_sdk_intercepted_with_options(
+        mock_cfg,
+        FailOnNondeterminismInterceptor {},
+        options_mutator,
+    )
 }
 
 pub(crate) fn build_fake_sdk_intercepted_with_options(
@@ -1207,7 +1197,6 @@ pub(crate) fn build_fake_sdk_intercepted_with_options(
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|c| {
         c.max_cached_workflows = 1;
-        c.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mock);
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
