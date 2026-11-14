@@ -56,12 +56,14 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
+            common::v1::WorkflowExecution,
             enums::v1::{ActivityTaskFailedCause, ApplicationErrorCategory, EventType},
             failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
             workflowservice::v1::{
                 GetSystemInfoResponse, PollActivityTaskQueueResponse,
                 RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
-                RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedResponse,
+                RespondActivityTaskCanceledRequest, RespondActivityTaskCanceledResponse,
+                RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
                 RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
                 RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
             },
@@ -398,8 +400,8 @@ async fn many_concurrent_heartbeat_cancels() {
         .returning(move |_, _| async move { Ok(Default::default()) }.boxed());
     mock_client
         .expect_record_activity_heartbeat()
-        .returning(move |tt, _| {
-            let calls = match calls_map.entry(tt) {
+        .returning(move |task, _| {
+            let calls = match calls_map.entry(task.task_token) {
                 Entry::Occupied(mut e) => {
                     *e.get_mut() += 1;
                     *e.get()
@@ -973,6 +975,155 @@ async fn activity_cancellation_still_flushes_latest_heartbeat() {
     core.drain_pollers_and_shutdown().await;
 }
 
+#[rstest]
+#[case::workflow_activity(Some("wf-1"), "workflow:wf-1")]
+#[case::standalone_activity(None, "activity:act1")]
+#[tokio::test]
+async fn activity_rpcs_carry_resource_id(
+    #[case] workflow_id: Option<&str>,
+    #[case] expected: &str,
+) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sent_clone = sent.clone();
+    let service_override = CallbackBasedGrpcService {
+        callback: Arc::new(move |request| {
+            let sent = sent_clone.clone();
+            Box::pin(async move {
+                let (resource_id, proto) = match request.rpc.as_str() {
+                    "GetSystemInfo" => (None, GetSystemInfoResponse::default().encode_to_vec()),
+                    "ShutdownWorker" => (None, ShutdownWorkerResponse::default().encode_to_vec()),
+                    "RecordActivityTaskHeartbeat" => (
+                        Some(
+                            RecordActivityTaskHeartbeatRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RecordActivityTaskHeartbeatResponse::default().encode_to_vec(),
+                    ),
+                    "RespondActivityTaskCompleted" => (
+                        Some(
+                            RespondActivityTaskCompletedRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RespondActivityTaskCompletedResponse::default().encode_to_vec(),
+                    ),
+                    "RespondActivityTaskFailed" => (
+                        Some(
+                            RespondActivityTaskFailedRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RespondActivityTaskFailedResponse::default().encode_to_vec(),
+                    ),
+                    "RespondActivityTaskCanceled" => (
+                        Some(
+                            RespondActivityTaskCanceledRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RespondActivityTaskCanceledResponse::default().encode_to_vec(),
+                    ),
+                    rpc => panic!("unexpected RPC: {rpc}"),
+                };
+                if let Some(resource_id) = resource_id {
+                    sent.lock().unwrap().push((request.rpc, resource_id));
+                }
+                Ok(GrpcSuccessResponse {
+                    headers: Default::default(),
+                    proto,
+                })
+            })
+        }),
+    };
+    let connection = Connection::connect(
+        ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let client = WorkerClientBag::new(
+        SharedReplaceableClient::new(connection),
+        "namespace".to_string(),
+        WorkerVersioningStrategy::None {
+            build_id: String::new(),
+        },
+        Uuid::new_v4(),
+    );
+    let task = |task_token| PollActivityTaskQueueResponse {
+        task_token: vec![task_token],
+        activity_id: "act1".to_string(),
+        workflow_execution: workflow_id.map(|workflow_id| WorkflowExecution {
+            workflow_id: workflow_id.to_string(),
+            ..Default::default()
+        }),
+        heartbeat_timeout: Some(prost_dur!(from_secs(10))),
+        ..Default::default()
+    };
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        client,
+        [task(1).into(), task(2).into(), task(3).into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![1].into()],
+    });
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::fail("Ahh".into())),
+    })
+    .await
+    .unwrap();
+
+    // The second heartbeat is throttled, so it is only sent by the flush on cancellation.
+    let act = core.poll_activity_task().await.unwrap();
+    for detail in [1_u8, 2] {
+        core.record_activity_heartbeat(ActivityHeartbeat {
+            task_token: act.task_token.clone(),
+            details: vec![vec![detail].into()],
+        });
+    }
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
+
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .map(|(rpc, _)| rpc.as_str())
+            .sorted()
+            .collect_vec(),
+        [
+            "RecordActivityTaskHeartbeat",
+            "RecordActivityTaskHeartbeat",
+            "RecordActivityTaskHeartbeat",
+            "RespondActivityTaskCanceled",
+            "RespondActivityTaskCompleted",
+            "RespondActivityTaskFailed",
+        ]
+    );
+    assert!(
+        sent.iter().all(|(_, resource_id)| resource_id == expected),
+        "{sent:?}"
+    );
+}
+
 /// Builds a tonic `Status` carrying a `PayloadLimitViolation` source, exactly as the gRPC client
 /// layer produces when an outbound payload exceeds the error limit.
 fn payload_too_large_status() -> tonic::Status {
@@ -1202,10 +1353,11 @@ async fn oversized_heartbeat_fails_activity() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, cause, failure, last_heartbeat_details| {
+        |task, cause, failure, last_heartbeat_details| {
             assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert!(last_heartbeat_details.is_none());
+            assert_eq!(task.resource_id, "activity:act1");
             Ok(RespondActivityTaskFailedResponse::default())
         },
     );
@@ -1608,8 +1760,8 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
             Ok(RecordActivityTaskHeartbeatResponse::default())
         });
     mock_client.expect_fail_activity_task().times(3).returning(
-        |task_token, _, _, last_heartbeat_details| {
-            if task_token.borrow() == [1] {
+        |task, _, _, last_heartbeat_details| {
+            if task.task_token.borrow() == [1] {
                 assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             } else {
                 assert!(last_heartbeat_details.is_none());

@@ -3,7 +3,7 @@ use crate::{
     abstractions::take_cell::TakeCell,
     worker::{
         activities::{PendingActivityCancel, make_payloads_too_large_failure},
-        client::{WorkerClient, payload_limit_violation_from},
+        client::{TaskInfo, WorkerClient, payload_limit_violation_from},
     },
 };
 use futures_util::StreamExt;
@@ -58,6 +58,7 @@ struct ValidActivityHeartbeat {
     details: Vec<Payload>,
     throttle_interval: Duration,
     timeout_resetter: Option<Arc<Notify>>,
+    resource_id: String,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,7 @@ enum HeartbeatExecutorAction {
     Report {
         task_token: TaskToken,
         details: Vec<Payload>,
+        resource_id: String,
     },
 }
 
@@ -145,9 +147,19 @@ impl ActivityHeartbeatManager {
                                 },
                             };
                             }
-                            HeartbeatExecutorAction::Report { task_token: tt, details } => {
+                            HeartbeatExecutorAction::Report {
+                                task_token: tt,
+                                details,
+                                resource_id,
+                            } => {
                                 match sg
-                                    .record_activity_heartbeat(tt.clone(), details.into_payloads())
+                                    .record_activity_heartbeat(
+                                        TaskInfo {
+                                            task_token: tt.clone(),
+                                            resource_id: resource_id.clone(),
+                                        },
+                                        details.into_payloads(),
+                                    )
                                     .await
                                 {
                                     Ok(RecordActivityTaskHeartbeatResponse {
@@ -200,7 +212,10 @@ impl ActivityHeartbeatManager {
                                             // signal the server uses.
                                             if let Err(fe) = sg
                                                 .fail_activity_task(
-                                                    tt.clone(),
+                                                    TaskInfo {
+                                                        task_token: tt.clone(),
+                                                        resource_id,
+                                                    },
                                                     ActivityTaskFailedCause::PayloadsTooLarge,
                                                     Some(make_payloads_too_large_failure(violation)),
                                                     None,
@@ -250,6 +265,7 @@ impl ActivityHeartbeatManager {
         hb: ActivityHeartbeat,
         throttle_interval: Duration,
         timeout_resetter: Option<Arc<Notify>>,
+        resource_id: String,
     ) -> Result<(), ActivityHeartbeatError> {
         self.heartbeat_tx
             .send(HeartbeatAction::SendHeartbeat(ValidActivityHeartbeat {
@@ -257,6 +273,7 @@ impl ActivityHeartbeatManager {
                 details: hb.details,
                 throttle_interval,
                 timeout_resetter,
+                resource_id,
             }))
             .expect("Receive half of the heartbeats event channel must not be dropped");
 
@@ -304,6 +321,7 @@ struct ActivityHeartbeatState {
     throttle_interval: Duration,
     throttled_cancellation_token: Option<CancellationToken>,
     timeout_resetter: Option<Arc<Notify>>,
+    resource_id: String,
 }
 
 impl ActivityHeartbeatState {
@@ -360,11 +378,13 @@ impl HeartbeatStreamState {
                     is_record_in_flight: true,
                     throttled_cancellation_token: None,
                     timeout_resetter: hb.timeout_resetter,
+                    resource_id: hb.resource_id.clone(),
                 };
                 e.insert(state);
                 Some(HeartbeatExecutorAction::Report {
                     task_token: hb.task_token,
                     details: hb.details,
+                    resource_id: hb.resource_id,
                 })
             }
             Entry::Occupied(mut o) => {
@@ -413,6 +433,7 @@ impl HeartbeatStreamState {
                     Some(HeartbeatExecutorAction::Report {
                         task_token: tt,
                         details,
+                        resource_id: state.resource_id.clone(),
                     })
                 } else {
                     // Nothing to report, forget this task token
@@ -445,6 +466,7 @@ impl HeartbeatStreamState {
                 return Some(HeartbeatExecutorAction::Report {
                     task_token: tt,
                     details: last_deets,
+                    resource_id: state.resource_id,
                 });
             } else if state.is_record_in_flight {
                 self.tt_needs_flush.insert(tt, on_complete);
@@ -634,6 +656,7 @@ mod test {
             // Mimic the same delay we would apply in activity task manager
             throttle_interval,
             None,
+            String::new(),
         )
         .expect("hearbeat recording should not fail");
     }

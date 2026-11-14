@@ -454,6 +454,7 @@ impl ManagedRun {
             {
                 ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
                     info.task_token,
+                    info.workflow_id,
                     info.attempt,
                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                     Failure::application_failure(reason, true).into(),
@@ -483,6 +484,7 @@ impl ManagedRun {
             self.reply_to_complete(
                 ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                     task_token,
+                    workflow_id: self.wfm.machines.workflow_id.clone(),
                     action: ActivationAction::RespondLegacyQuery {
                         result: Box::new(qr),
                     },
@@ -684,6 +686,7 @@ impl ManagedRun {
         self.reply_to_complete(
             ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
                 tt,
+                self.wfm.machines.workflow_id.clone(),
                 attempt,
                 cause,
                 failure,
@@ -1194,6 +1197,7 @@ impl ManagedRun {
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
         let outstanding_las = self.wfm.machines.outstanding_local_activity_count() > 0;
+        let workflow_id = self.wfm.machines.workflow_id.clone();
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
@@ -1242,6 +1246,7 @@ impl ManagedRun {
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                 task_token: data.task_token,
+                workflow_id,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
                     commands,

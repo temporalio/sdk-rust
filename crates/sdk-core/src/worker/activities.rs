@@ -20,7 +20,7 @@ use crate::{
     worker::{
         ActivitySlotKind, PollError,
         activities::activity_heartbeat_manager::ActivityHeartbeatError,
-        client::{WorkerClient, payload_limit_violation_from},
+        client::{TaskInfo, WorkerClient, payload_limit_violation_from},
     },
 };
 use activity_heartbeat_manager::ActivityHeartbeatManager;
@@ -126,6 +126,9 @@ struct RemoteInFlightActInfo {
     timeout_resetter: Option<Arc<Notify>>,
     /// The most recent heartbeat received from lang, independently of whether it has been sent.
     last_heartbeat_details: Option<Vec<Payload>>,
+    /// Sent on every RPC for this activity so proxies can identify it without decoding the task
+    /// token: `workflow:<workflow_id>`, or `activity:<activity_id>` for a standalone activity.
+    resource_id: String,
     /// The permit from the max concurrent semaphore
     _permit: UsedMeteredSemPermit<ActivitySlotKind>,
 }
@@ -135,6 +138,13 @@ impl RemoteInFlightActInfo {
         permit: UsedMeteredSemPermit<ActivitySlotKind>,
     ) -> Self {
         let wec = poll_resp.workflow_execution.clone().unwrap_or_default();
+        let resource_id = if !wec.workflow_id.is_empty() {
+            format!("workflow:{}", wec.workflow_id)
+        } else if !poll_resp.activity_id.is_empty() {
+            format!("activity:{}", poll_resp.activity_id)
+        } else {
+            String::new()
+        };
         Self {
             base: InFlightActInfo {
                 activity_type: poll_resp.activity_type.clone().unwrap_or_default().name,
@@ -150,6 +160,7 @@ impl RemoteInFlightActInfo {
             local_timeouts_task: None,
             timeout_resetter: None,
             last_heartbeat_details: None,
+            resource_id,
             _permit: permit,
         }
     }
@@ -364,6 +375,10 @@ impl WorkerActivityTasks {
             Span::current().record("run_id", act_info.base.workflow_run_id);
             act_metrics.act_execution_latency(act_info.base.start_time.elapsed());
             let known_not_found = act_info.known_not_found;
+            let task_info = TaskInfo {
+                task_token: task_token.clone(),
+                resource_id: act_info.resource_id,
+            };
 
             if let Some(jh) = act_info.local_timeouts_task {
                 jh.abort()
@@ -403,7 +418,7 @@ impl WorkerActivityTasks {
                     aer::Status::Completed(ar::Success { result }) => {
                         // If the gRPC layer rejects an oversized result, report the activity task as failed.
                         match client
-                            .complete_activity_task(task_token.clone(), result.map(Into::into))
+                            .complete_activity_task(task_info.clone(), result.map(Into::into))
                             .await
                         {
                             Ok(_) => {
@@ -425,7 +440,7 @@ impl WorkerActivityTasks {
                                         .act_execution_failed();
                                     client
                                         .fail_activity_task(
-                                            task_token.clone(),
+                                            task_info.clone(),
                                             ActivityTaskFailedCause::PayloadsTooLarge,
                                             Some(make_payloads_too_large_failure(violation)),
                                             last_heartbeat_details.clone(),
@@ -469,7 +484,7 @@ impl WorkerActivityTasks {
                         };
                         client
                             .fail_activity_task(
-                                task_token.clone(),
+                                task_info.clone(),
                                 cause,
                                 failure,
                                 last_heartbeat_details,
@@ -497,7 +512,7 @@ impl WorkerActivityTasks {
                             };
                             client
                                 .fail_activity_task(
-                                    task_token.clone(),
+                                    task_info.clone(),
                                     cause,
                                     Some(failure),
                                     last_heartbeat_details,
@@ -521,7 +536,7 @@ impl WorkerActivityTasks {
                                 None
                             };
                             match client
-                                .cancel_activity_task(task_token.clone(), details)
+                                .cancel_activity_task(task_info.clone(), details)
                                 .await
                             {
                                 Ok(_) => None,
@@ -534,7 +549,7 @@ impl WorkerActivityTasks {
                                             .act_execution_failed();
                                         client
                                             .fail_activity_task(
-                                                task_token.clone(),
+                                                task_info.clone(),
                                                 ActivityTaskFailedCause::PayloadsTooLarge,
                                                 Some(make_payloads_too_large_failure(violation)),
                                                 last_heartbeat_details,
@@ -574,14 +589,18 @@ impl WorkerActivityTasks {
         details: ActivityHeartbeat,
     ) -> Result<(), ActivityHeartbeatError> {
         // TODO: Propagate these back as cancels. Silent fails is too nonobvious
-        let (heartbeat_timeout, timeout_resetter) = {
+        let (heartbeat_timeout, timeout_resetter, resource_id) = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
             let task_token: TaskToken = details.task_token.clone().into();
             let at_info = outstanding_activity_tasks
                 .get_mut(&task_token)
                 .ok_or(ActivityHeartbeatError::UnknownActivity)?;
             at_info.last_heartbeat_details = Some(details.details.clone());
-            (at_info.heartbeat_timeout, at_info.timeout_resetter.clone())
+            (
+                at_info.heartbeat_timeout,
+                at_info.timeout_resetter.clone(),
+                at_info.resource_id.clone(),
+            )
         };
         let heartbeat_timeout: Duration = heartbeat_timeout
             // We treat None as 0 (even though heartbeat_timeout is never set to None by the server)
@@ -602,7 +621,7 @@ impl WorkerActivityTasks {
         let throttle_interval =
             std::cmp::min(throttle_interval, self.max_heartbeat_throttle_interval);
         self.heartbeat_manager
-            .record(details, throttle_interval, timeout_resetter)
+            .record(details, throttle_interval, timeout_resetter, resource_id)
     }
 
     /// Returns a handle that the workflows management side can use to interact with this manager
