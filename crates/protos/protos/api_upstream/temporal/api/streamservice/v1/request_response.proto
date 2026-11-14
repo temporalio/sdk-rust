@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package temporal.api.streamservice.v1;
+
+option go_package = "go.temporal.io/api/streamservice/v1;streamservice";
+option java_package = "io.temporal.api.streamservice.v1";
+option java_multiple_files = true;
+option java_outer_classname = "RequestResponseProto";
+option ruby_package = "Temporalio::Api::StreamService::V1";
+option csharp_namespace = "Temporalio.Api.StreamService.V1";
+
+// The messages of the Stream service. An SDK Store (Redis or memory) and the server answer the
+// same five operations with them. A field that is only read by the server says so.
+
+import "google/protobuf/duration.proto";
+
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/stream/v1/message.proto";
+
+// Experimental. Might change in the future.
+// Creates the Stream. When the Stream exists, FAIL fails with ALREADY_EXISTS, and USE_EXISTING
+// gets it with created false. A retry of the create that made the Stream, with the same
+// request_id, gets created true. Each policy fails with CLOSED on a closed Stream and EXPIRED on
+// an expired one. A create takes no Retention. The Store config holds it, as a namespace holds
+// the Retention of its Workflows.
+// (-- api-linter: core::0133=disabled
+//     aip.dev/not-precedent: The request identifies a Stream by namespace and ref. --)
+message CreateStreamRequest {
+    // The caller's namespace. Only read by the server. The SDK sets it, and the SDK Stores don't
+    // read it.
+    string namespace = 1;
+    // Required. The ref of the Stream to create. Its id is the Stream id, and is never empty.
+    temporal.api.stream.v1.StreamRef stream_ref = 2;
+    // What the create does when the Stream exists. Unspecified is FAIL.
+    temporal.api.enums.v1.StreamIdConflictPolicy id_conflict_policy = 3;
+    // Unique for each create call, and the same on its retries. The Store keeps the request_id of
+    // the create that made the Stream, so a retry after a lost answer doesn't get ALREADY_EXISTS.
+    string request_id = 4;
+}
+
+// Experimental. Might change in the future.
+// The Stream that a create made or got.
+message CreateStreamResponse {
+    // The ref of the Stream, which the caller passes on as data. The SDK sets the name of the
+    // Store that it picked, also when the request left the name empty. The server gives the ref
+    // back as the request had it, since it doesn't know that name.
+    temporal.api.stream.v1.StreamRef ref = 1;
+    // False when USE_EXISTING got a Stream that existed.
+    bool created = 2;
+}
+
+// Experimental. Might change in the future.
+// Appends one batch of Records as one Producer. The Store writes a resent batch, with the same
+// Producer, epoch and sequence, only once.
+message AppendRecordsRequest {
+    // The caller's namespace. Only read by the server. The SDK sets it, and the SDK Stores don't
+    // read it.
+    string namespace = 1;
+    // Required.
+    temporal.api.stream.v1.StreamRef ref = 2;
+    // Required. The Producer of the batch. An append and a close of one Producer carry the same
+    // Producer, so the Store orders each write the same way.
+    temporal.api.stream.v1.Producer producer = 3;
+    // The batch number in this epoch. With the Producer and epoch it is the dedupe key. Zero takes
+    // the next number of the epoch. Such a batch has no dedupe, so a retry writes it again.
+    int64 sequence = 4;
+    repeated temporal.api.stream.v1.AppendRecord records = 5;
+}
+
+// Experimental. Might change in the future.
+// Where the batch's Records are in the Stream.
+message AppendRecordsResponse {
+    bytes first_offset = 1;
+    bytes last_offset = 2;
+}
+
+// Experimental. Might change in the future.
+// Closes a Stream. Readers drain what is left, then end, and later appends fail with CLOSED. A
+// close writes no Record and carries no value, so code that has a last value publishes it first.
+message CloseStreamRequest {
+    // The caller's namespace. Only read by the server. The SDK sets it, and the SDK Stores don't
+    // read it.
+    string namespace = 1;
+    // Required.
+    temporal.api.stream.v1.StreamRef ref = 2;
+    // Required. The Producer that closes the Stream.
+    temporal.api.stream.v1.Producer producer = 3;
+}
+
+// Experimental. Might change in the future.
+// A close answers when the Store has the close. It gives nothing back.
+message CloseStreamResponse {
+}
+
+// Experimental. Might change in the future.
+// Reads one page of Records after an offset. At the end of the Stream, the read waits for a new
+// Record, so readers long poll.
+message ReadRecordsRequest {
+    // The caller's namespace. Only read by the server. The SDK sets it, and the SDK Stores don't
+    // read it.
+    string namespace = 1;
+    // Required.
+    temporal.api.stream.v1.StreamRef ref = 2;
+    // Read after this offset. It fails with OFFSET_TOO_HIGH if it is past the newest offset.
+    // Leave empty to read from the beginning. To read only new Records, a caller gets last_offset
+    // from a describe and reads after it.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
+    bytes from_offset = 3;
+    // The most Records in one page. Zero is 1000.
+    int32 max_records = 4;
+    // How long the read waits for a new Record before it answers with an empty page. Empty answers
+    // at once, and a wait longer than 60 s waits 60 s.
+    google.protobuf.Duration wait = 5;
+    // The most Record bytes in one page, so a page fits the caller's limit, such as a History
+    // marker. A larger Record still comes alone, so the read always moves on. Zero is no cap.
+    int64 max_bytes = 6;
+}
+
+// Experimental. Might change in the future.
+// One page of a read.
+message ReadRecordsResponse {
+    repeated temporal.api.stream.v1.StreamRecord records = 1;
+    // The last offset that this read covered, which is the offset of the newest Record of the
+    // page. The next read gives it as from_offset and starts after it. An empty page gives the
+    // request's from_offset, and that is empty when the request had none. So it is always
+    // known, and an empty value means that the next read starts as this one did.
+    bytes last_offset = 2;
+    // True when the Stream is closed and this read gave its last Record. It is the only sign of a
+    // close in a read, since a close stores no Record. A read of a closed Stream with no Record
+    // left answers at once with done.
+    bool done = 3;
+}
+
+// Experimental. Might change in the future.
+// Gets the status and the newest offset of a Stream.
+message DescribeStreamRequest {
+    // The caller's namespace. Only read by the server. The SDK sets it, and the SDK Stores don't
+    // read it.
+    string namespace = 1;
+    // Required.
+    temporal.api.stream.v1.StreamRef ref = 2;
+}
+
+// Experimental. Might change in the future.
+// The state of a Stream. It has no Retention, since the Retention is a setting of the Store and
+// not of one Stream.
+message DescribeStreamResponse {
+    temporal.api.enums.v1.StreamStatus status = 1;
+    // The newest offset, of a Record. Empty when the Stream has none.
+    bytes last_offset = 2;
+}
