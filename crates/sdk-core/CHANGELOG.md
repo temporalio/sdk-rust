@@ -36,6 +36,12 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* [lang-internal] Added the experimental `temporalio-streams` crate, the Stream runtime that a
+  language bridge links. It answers the five operations of the Stream service on a Stream Store,
+  through `StreamRuntime::call` with an operation name and the encoded request. Core's worker has no
+  Stream code.
+
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
   times out no longer fails workflow tasks with a nondeterminism error.
