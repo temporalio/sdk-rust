@@ -2619,6 +2619,16 @@ pub mod temporal {
                 include_proto_with_serde!("temporal.api.sdk.v1");
             }
         }
+        pub mod stream {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.stream.v1");
+            }
+        }
+        pub mod streamservice {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.streamservice.v1");
+            }
+        }
         pub mod taskqueue {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.taskqueue.v1");
