@@ -1,0 +1,459 @@
+// Draft. The Stream service as a System Nexus service, for the Streams API proposal. Each record
+// maps to a message of the protos under ../temporal/api (stream/v1, streamservice/v1 and the
+// Stream enums in enums/v1). This file is the source. Each SDK copies it and generates its Workflow
+// API and its client with nexgen (`--targets workflow,client --system-nexus`).
+package temporal:nexus@1.0.0;
+
+world system {
+  export stream-service;
+}
+
+/// @nexus.endpoint "__temporal_system"
+/// @nexus.service-name "temporal.api.streamservice.v1.StreamService"
+/// @nexus.experimental
+interface stream-service {
+  use nexus:temporal-types/model@1.0.0.{
+    duration,
+    placeholder,
+  };
+
+  /// The value type of a Stream's Records. A call's type argument sets it.
+  /// @nexus.type-parameter
+  type body-t = placeholder;
+
+  /// The value that `reduce` folds the Records into. A call's initial value sets it.
+  /// @nexus.type-parameter
+  type value-t = placeholder;
+
+  // The WIT has no named offset type yet, so this comment tells what each `list<u8>` offset holds.
+  // An offset is the opaque position of a Record in one Stream, and it is proto `bytes`. A caller
+  // never parses it. It only gives it back to a read, or compares two offsets of one Stream. They
+  // compare bytewise in the order of their Records, so a caller can tell which one is newer
+  // without a call to the Store.
+  // TODO: use `type stream-offset = list<u8>` once nexgen reads a named `list<u8>` as `bytes`.
+
+  /// @nexus.proto "google.protobuf.Timestamp"
+  record timestamp {
+    seconds: s64,
+    nanos: s32,
+  }
+
+  /// @nexus.doc "Identifies one Stream. The id is opaque to callers."
+  /// @nexus.proto "temporal.api.stream.v1.StreamRef"
+  /// @nexus.generic "body-t"
+  record stream-ref {
+    /// @nexus.doc "The Stream id, 1 to 4096 bytes."
+    id: string,
+    /// @nexus.doc "Registered Store name. With none, the SDK picks one. Only an SDK reads it."
+    store: option<string>,
+  }
+
+  /// @nexus.doc "A Workflow Task attempt of the run."
+  /// @nexus.proto "temporal.api.stream.v1.WorkflowTaskEpoch"
+  record workflow-task-epoch {
+    started-event-id: s64,
+    /// @nexus.doc "1 or more."
+    attempt: s32,
+    /// @nexus.doc "When the Workflow Task attempt started. It tells a reused started id apart."
+    started-time: option<timestamp>,
+  }
+
+  /// @nexus.doc "A Local Activity attempt. Its Workflow Task orders it first."
+  /// @nexus.proto "temporal.api.stream.v1.LocalActivityEpoch"
+  record local-activity-epoch {
+    /// @nexus.doc "The Workflow Task attempt that dispatched the Local Activity."
+    task: workflow-task-epoch,
+    /// @nexus.doc "The Local Activity's own attempt in that Workflow Task, 1 or more."
+    attempt: s32,
+  }
+
+  /// @nexus.doc "An Activity or Standalone Activity attempt."
+  /// @nexus.proto "temporal.api.stream.v1.ActivityEpoch"
+  record activity-epoch {
+    /// @nexus.doc "When the server scheduled this attempt. A reset makes it later."
+    attempt-scheduled-time: timestamp,
+    /// @nexus.doc "1 or more."
+    attempt: s32,
+  }
+
+  /// @nexus.doc "A Workflow run Producer."
+  /// @nexus.proto "temporal.api.stream.v1.WorkflowProducer"
+  record workflow-producer {
+    /// @nexus.doc "The run id of the Workflow run, not of its chain."
+    run-id: string,
+    // The Workflow Task of the write.
+    epoch: option<workflow-task-epoch>,
+  }
+
+  /// @nexus.doc "A Local Activity Producer."
+  /// @nexus.proto "temporal.api.stream.v1.LocalActivityProducer"
+  record local-activity-producer {
+    run-id: string,
+    epoch: local-activity-epoch,
+  }
+
+  /// @nexus.doc "An Activity Producer."
+  /// @nexus.proto "temporal.api.stream.v1.ActivityProducer"
+  record activity-producer {
+    /// @nexus.doc "The run of the Workflow that scheduled the Activity. Empty when standalone."
+    run-id: option<string>,
+    epoch: activity-epoch,
+  }
+
+  /// @nexus.doc "A client Producer. It has no run and no epoch, so nothing fences it."
+  /// @nexus.proto "temporal.api.stream.v1.ClientProducer"
+  record client-producer {
+  }
+
+  // The case is the kind of the Producer, so a kind sets only its own fields.
+  /// @nexus.doc "The kind of a Producer, with its run and epoch."
+  /// @nexus.proto "temporal.api.stream.v1.Producer.kind"
+  variant producer-kind {
+    workflow(workflow-producer),
+    local-activity(local-activity-producer),
+    workflow-activity(activity-producer),
+    standalone-activity(activity-producer),
+    client(client-producer),
+  }
+
+  /// @nexus.doc "The code that wrote a batch. A higher epoch fences and supersedes a lower one."
+  /// @nexus.proto "temporal.api.stream.v1.Producer"
+  record producer {
+    /// @nexus.doc "Stable across attempts, such as wf:<run id> for a Workflow run."
+    id: string,
+    // A newer server can send a kind that this SDK doesn't know. Then the kind is empty.
+    /// @nexus.doc "Required. The case is the kind of the Producer."
+    kind: option<producer-kind>,
+  }
+
+  /// @nexus.doc "One Record to append."
+  /// @nexus.proto "temporal.api.stream.v1.AppendRecord"
+  /// @nexus.flatten-in-api
+  record append-record {
+    /// @nexus.doc "The value."
+    body: body-t,
+  }
+
+  // An offset is ordered and unique in one Stream, and sparse. Offsets have gaps, so they don't
+  // count Records. A read gives its Stream, so the read checks the offset against that Stream.
+  // A read gives only Records. A close stores no Record, so the read response tells of it with
+  // done.
+  /// @nexus.doc "One Record that a Producer appended, as a read gives it."
+  /// @nexus.proto "temporal.api.stream.v1.StreamRecord"
+  record stream-record {
+    /// @nexus.doc "The value."
+    body: body-t,
+    producer: option<producer>,
+    /// @nexus.doc "The place of this Record in the Stream. Ordered and unique, with gaps."
+    offset: list<u8>,
+  }
+
+  /// Why a read of many pages ended.
+  enum stream-read-stop {
+    match,
+    done,
+    max-records,
+    max-bytes,
+    idle,
+    timeout,
+  }
+
+  // The SDK's support package builds this from many pages of one call. It has no proto message,
+  // since it never goes on the wire.
+  /// @nexus.doc "What one read of many pages gave."
+  record stream-read {
+    records: list<stream-record>,
+    /// @nexus.doc "Where the scan stopped. Give it as the from-offset of the next call."
+    last-offset: option<list<u8>>,
+    stop: stream-read-stop,
+    done: bool,
+  }
+
+  // A function of the caller stays in the process, so this signature is no operation.
+  record-predicate: func(%record: stream-record) -> bool;
+
+  /// @nexus.function signature="record-predicate"
+  type read-predicate = placeholder;
+
+  /// @nexus.doc "What one fold of many pages gave."
+  record stream-reduce {
+    value: value-t,
+    count: s32,
+    last-offset: option<list<u8>>,
+    stop: stream-read-stop,
+    done: bool,
+  }
+
+  fold-function: func(value: value-t, %record: stream-record) -> value-t;
+
+  fold-predicate: func(value: value-t, %record: stream-record) -> bool;
+
+  /// @nexus.function signature="fold-function"
+  type fold = placeholder;
+
+  /// @nexus.function signature="fold-predicate"
+  type fold-until = placeholder;
+
+  /// @nexus.doc
+  ///   "Create a Stream. If it exists, fail, or with use-existing get the open one."
+  /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamRequest"
+  record create-stream-request {
+    // Its field name isn't ref, so the created Stream takes its ref from the response.
+    /// @nexus.doc "The ref of the Stream to create. Its id is the Stream id."
+    /// @nexus.flatten-in-api
+    stream-ref: stream-ref,
+    /// @nexus.doc "What the create does when the Stream exists. Unspecified is fail."
+    id-conflict-policy: option<stream-id-conflict-policy>,
+    // A retry of the create that made the Stream sends the same id, so it doesn't fail as a
+    // conflict. In a Workflow the helper gives a deterministic id.
+    /// @nexus.doc "Unique for each create call, and the same on its retries."
+    /// @nexus.source python="request_id()" typescript="requestId()"
+    ///   dotnet="StreamWorkflowContext.RequestId()"
+    request-id: option<string>,
+    // Native only. The SDK sets it, and the SDK Stores don't read it.
+    /// @nexus.omit
+    namespace: placeholder,
+  }
+
+  /// What a create does when its Stream exists. Unspecified is fail.
+  /// @nexus.proto "temporal.api.enums.v1.StreamIdConflictPolicy"
+  enum stream-id-conflict-policy {
+    stream-id-conflict-policy-unspecified,
+    stream-id-conflict-policy-fail,
+    stream-id-conflict-policy-use-existing,
+  }
+
+  /// @nexus.proto "temporal.api.enums.v1.StreamStatus"
+  enum stream-status {
+    /// @nexus.fallback
+    stream-status-unspecified,
+    stream-status-open,
+    stream-status-closed,
+    stream-status-expired,
+  }
+
+  /// @nexus.doc
+  ///   "Append one batch. The Store keeps a resent batch once, by Producer, epoch and sequence."
+  /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsRequest"
+  record append-records-request {
+    ref: stream-ref,
+    records: list<append-record>,
+    // A call can pass its own Producer. A call that passes none gets the default, which the
+    // helper of each context picks for where it runs.
+    /// @nexus.doc "The Producer of the batch. Defaults to the Producer of the calling context."
+    /// @nexus.default targets="workflow" python="_support.workflow_producer()"
+    ///   typescript="support.workflowProducer()" dotnet="StreamWorkflowContext.Producer()"
+    /// @nexus.default targets="client" python="_support.default_producer()"
+    ///   typescript="support.defaultProducer()" dotnet="StreamActivityContext.Producer()"
+    producer: producer,
+    // A call that passes no sequence sends none. The Store then numbers the batch, so nothing
+    // dedupes it.
+    /// @nexus.doc
+    ///   "The batch number in this epoch. Empty takes the next one, and a retry writes it again."
+    sequence: option<s64>,
+    // Native only. The SDK sets it, and the SDK Stores don't read it.
+    /// @nexus.omit
+    namespace: placeholder,
+  }
+
+  /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsResponse"
+  record append-records-response {
+    first-offset: option<list<u8>>,
+    last-offset: option<list<u8>>,
+  }
+
+  // A close carries no value, so code that has a last value appends it first.
+  /// @nexus.doc "Close a Stream. Readers drain what is left, then end. Later appends are refused."
+  /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamRequest"
+  record close-stream-request {
+    ref: stream-ref,
+    /// @nexus.doc
+    ///   "The Producer that closes the Stream. Defaults to the Producer of the calling context."
+    /// @nexus.default targets="workflow" python="_support.workflow_producer()"
+    ///   typescript="support.workflowProducer()" dotnet="StreamWorkflowContext.Producer()"
+    /// @nexus.default targets="client" python="_support.default_producer()"
+    ///   typescript="support.defaultProducer()" dotnet="StreamActivityContext.Producer()"
+    producer: producer,
+    // Native only. The SDK sets it, and the SDK Stores don't read it.
+    /// @nexus.omit
+    namespace: placeholder,
+  }
+
+  /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamResponse"
+  record close-stream-response {
+  }
+
+  /// @nexus.doc "Read Records after an offset."
+  /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsRequest"
+  record read-records-request {
+    ref: stream-ref,
+    // To read only new Records, a caller gets last-offset from a describe and reads after it.
+    /// @nexus.doc "Read after this offset. Empty is the beginning. A too high offset fails."
+    from-offset: option<list<u8>>,
+    /// @nexus.doc "About this many Records per page, 1 to 1000."
+    max-records: option<s32>,
+    /// @nexus.doc "How long to wait for a new Record before an empty answer. At most 60 s."
+    wait: option<duration>,
+    /// @nexus.doc "The maximum Record bytes in a page. A larger Record is still returned alone."
+    max-bytes: option<s64>,
+    // Native only. The SDK sets it, and the SDK Stores don't read it.
+    /// @nexus.omit
+    namespace: placeholder,
+  }
+
+  /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsResponse"
+  record read-records-response {
+    records: list<stream-record>,
+    /// @nexus.doc "The last offset that this read covered. The next read starts after it."
+    last-offset: option<list<u8>>,
+    /// @nexus.doc "True when the Stream is closed and this read gave its last Record."
+    done: bool,
+  }
+
+  /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamRequest"
+  record describe-stream-request {
+    ref: stream-ref,
+    // Native only. The SDK sets it, and the SDK Stores don't read it.
+    /// @nexus.omit
+    namespace: placeholder,
+  }
+
+  /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamResponse"
+  record describe-stream-response {
+    status: option<stream-status>,
+    /// @nexus.doc "The newest offset, of a Record. Empty for none."
+    last-offset: option<list<u8>>,
+  }
+
+  // A stream never changes, since offsets are values that its methods return. Only a create's
+  // response sets created, so a stream built from a ref has none.
+  /// @nexus.doc "One Stream. Build it from a stream-ref, or get it from a create."
+  // TODO: implement @nexus.flatten-in-api param="ref".
+  resource %stream {
+    constructor(ref: stream-ref, created: option<bool>);
+
+    /// @nexus.doc "Append values, and return the offsets of the batch."
+    /// @nexus.operation "append-records"
+    /// @nexus.varargs "records"
+    append: func(
+      records: list<append-record>,
+      producer: option<producer>,
+      sequence: option<s64>,
+    ) -> append-records-response;
+
+    /// @nexus.doc "Close the Stream. Readers drain what is left, then end."
+    /// @nexus.operation "close-stream"
+    /// @nexus.close
+    close: func(producer: option<producer>);
+
+    // Workflow code reads with `take`, `filter` and `reduce`, not with a page read. So the
+    // Workflow target omits `read`, and the client target keeps it.
+    /// @nexus.doc "Read one page of Records. The poll iterator reads them all."
+    /// @nexus.operation "read-records"
+    /// @nexus.api-omit targets="workflow"
+    read: func(
+      from-offset: option<list<u8>>,
+      max-records: option<s32>,
+      wait: option<duration>,
+      max-bytes: option<s64>,
+    ) -> read-records-response;
+
+    /// @nexus.doc "Describe the Stream's status and newest offset."
+    /// @nexus.operation "describe-stream"
+    describe: func() -> describe-stream-response;
+
+    // The SDK's support package reads many pages in one call, so no operation binds these
+    // methods. It finds out where it runs, and Workflow code reads in one Local Activity.
+    /// @nexus.doc "Read every Record up to a stop."
+    /// @nexus.helper python="take_stream"
+    take: func(
+      timeout: duration,
+      until: option<read-predicate>,
+      from-offset: option<list<u8>>,
+      idle-timeout: option<duration>,
+      max-records: option<s32>,
+      max-bytes: option<s64>,
+    ) -> stream-read;
+
+    /// @nexus.doc "Read the Records that the predicate keeps, up to a stop."
+    /// @nexus.helper python="filter_stream"
+    filter: func(
+      predicate: read-predicate,
+      timeout: duration,
+      until: option<read-predicate>,
+      from-offset: option<list<u8>>,
+      idle-timeout: option<duration>,
+      max-records: option<s32>,
+      max-bytes: option<s64>,
+    ) -> stream-read;
+
+    /// @nexus.doc "Fold the Records into one value, up to a stop."
+    /// @nexus.helper python="reduce_stream"
+    reduce: func(
+      function: fold,
+      initial: value-t,
+      timeout: duration,
+      until: option<fold-until>,
+      from-offset: option<list<u8>>,
+      idle-timeout: option<duration>,
+      max-records: option<s32>,
+      max-bytes: option<s64>,
+    ) -> stream-reduce;
+  }
+
+  // With use-existing, created is false when the Stream existed.
+  /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamResponse"
+  type create-stream-result = own<%stream>;
+
+  // The Workflow API has no other way to create a Stream, so this function stays public.
+  /// @nexus.operation name="CreateStream"
+  create-stream: func(request: create-stream-request) -> create-stream-result;
+
+  /// @nexus.doc "Append one batch. Workflow code makes the call from a Local Activity."
+  /// @nexus.operation name="AppendRecords"
+  /// @nexus.api-omit
+  append-records: func(request: append-records-request) -> append-records-response;
+
+  /// @nexus.operation name="CloseStream"
+  /// @nexus.api-omit
+  close-stream: func(request: close-stream-request) -> close-stream-response;
+
+  // A WIT stream can't cross a Nexus call, so a read is a request and a response. The SDK's support
+  // helper builds the next request from a page for the poll iterator.
+  /// @nexus.doc
+  ///   "A long poll. NOT_FOUND for an uncreated Stream. Workflow code reads from a Local Activity."
+  /// @nexus.operation name="ReadRecords"
+  /// @nexus.poll python="next_read_request" items="records" python-resume="resume_read_request"
+  ///   targets="client"
+  /// @nexus.api-omit
+  // TODO: implement polling for typescript="nextReadRequest" dotnet="StreamPoll.NextReadRequest".
+  read-records: func(request: read-records-request) -> read-records-response;
+
+  /// @nexus.operation name="DescribeStream"
+  /// @nexus.api-omit
+  describe-stream: func(request: describe-stream-request) -> describe-stream-response;
+  /// @nexus.proto "temporal.api.enums.v1.StreamErrorReason"
+  enum stream-error-reason {
+    stream-error-reason-unspecified,
+    stream-error-reason-not-found,
+    stream-error-reason-expired,
+    stream-error-reason-closed,
+    stream-error-reason-fenced,
+    stream-error-reason-sequence-too-low,
+    stream-error-reason-seq-divergent,
+    stream-error-reason-not-owner,
+    stream-error-reason-format-too-new,
+    stream-error-reason-offset-too-high,
+    stream-error-reason-too-large,
+    stream-error-reason-invalid,
+    stream-error-reason-storage-unavailable,
+    stream-error-reason-unsupported,
+    stream-error-reason-already-exists,
+    stream-error-reason-storage-corrupt,
+  }
+
+  /// @nexus.proto "temporal.api.stream.v1.StreamErrorDetails"
+  record stream-error-details {
+    reason: option<stream-error-reason>,
+  }
+}
