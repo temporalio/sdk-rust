@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package temporal.api.enums.v1;
+
+option go_package = "go.temporal.io/api/enums/v1;enums";
+option java_package = "io.temporal.api.enums.v1";
+option java_multiple_files = true;
+option java_outer_classname = "StreamProto";
+option ruby_package = "Temporalio::Api::Enums::V1";
+option csharp_namespace = "Temporalio.Api.Enums.V1";
+
+// Experimental. Might change in the future.
+// The state of a Stream, as a describe gives it.
+// (-- api-linter: core::0216::synonyms=disabled
+//     aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
+enum StreamStatus {
+    STREAM_STATUS_UNSPECIFIED = 0;
+    STREAM_STATUS_OPEN = 1;
+    STREAM_STATUS_CLOSED = 2;
+    STREAM_STATUS_EXPIRED = 3;
+}
+
+// Experimental. Might change in the future.
+// What a create does when its Stream exists. Unspecified is FAIL, as for a Workflow start.
+enum StreamIdConflictPolicy {
+    STREAM_ID_CONFLICT_POLICY_UNSPECIFIED = 0;
+    // The create fails with ALREADY_EXISTS.
+    STREAM_ID_CONFLICT_POLICY_FAIL = 1;
+    // The create gets the open Stream, which keeps its own Retention.
+    STREAM_ID_CONFLICT_POLICY_USE_EXISTING = 2;
+}
+
+// Experimental. Might change in the future.
+// Why a Stream call failed. Each reason has one gRPC status code, and several reasons share a
+// code. So code matches on the reason, and not on the status code. An SDK raises one error type
+// that carries the reason.
+enum StreamErrorReason {
+    STREAM_ERROR_REASON_UNSPECIFIED = 0;
+    // Nobody created the Stream. NOT_FOUND.
+    STREAM_ERROR_REASON_NOT_FOUND = 1;
+    // The Stream's Retention or its last-write TTL passed. NOT_FOUND.
+    STREAM_ERROR_REASON_EXPIRED = 2;
+    // The Stream is closed. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_CLOSED = 3;
+    // The Producer's epoch is lower than the newest one. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_FENCED = 4;
+    // The batch has a lower `sequence` than the last one of its epoch. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_SEQUENCE_TOO_LOW = 5;
+    // The batch has the `sequence` of the last one of its epoch, and other content.
+    // FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_SEQ_DIVERGENT = 6;
+    // The caller may not create or close this Stream. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_NOT_OWNER = 7;
+    // A newer format version wrote the Stream. FAILED_PRECONDITION.
+    STREAM_ERROR_REASON_FORMAT_TOO_NEW = 8;
+    // The offset is past the newest offset, for example after a failover lost the newest Records.
+    // A read from it works again once the Stream has Records up to it. OUT_OF_RANGE.
+    STREAM_ERROR_REASON_OFFSET_TOO_HIGH = 9;
+    // A Record or a batch is over the Store's limit. INVALID_ARGUMENT.
+    STREAM_ERROR_REASON_TOO_LARGE = 10;
+    // The request is malformed. INVALID_ARGUMENT.
+    STREAM_ERROR_REASON_INVALID = 11;
+    // The Store failed or did not answer. A retry can succeed. UNAVAILABLE.
+    STREAM_ERROR_REASON_STORAGE_UNAVAILABLE = 12;
+    // The Store lacks a capability that the call needs. UNIMPLEMENTED.
+    STREAM_ERROR_REASON_UNSUPPORTED = 13;
+    // A create with the FAIL conflict policy is for a Stream that exists. ALREADY_EXISTS.
+    STREAM_ERROR_REASON_ALREADY_EXISTS = 14;
+    // The Store gave back data that isn't valid, such as a stored value with the wrong length. A
+    // retry reads the same data. DATA_LOSS.
+    STREAM_ERROR_REASON_STORAGE_CORRUPT = 15;
+}
