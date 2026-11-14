@@ -1,0 +1,25 @@
+{
+  "streams": [
+    {
+      "prefix": "temporal-streams",
+      "stream_id": "agent-1:run-1:turn-3",
+      "meta": "temporal-streams:{agent-1%3Arun-1%3Aturn-3}:meta",
+      "log": "temporal-streams:{agent-1%3Arun-1%3Aturn-3}:log",
+      "closed": "temporal-streams:{agent-1%3Arun-1%3Aturn-3}:closed"
+    },
+    {
+      "prefix": "p:x",
+      "stream_id": "a%3Ab%2Fc:r%251:%C3%A9%20name",
+      "meta": "p%3Ax:{a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:meta",
+      "log": "p%3Ax:{a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:log",
+      "closed": "p%3Ax:{a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:closed"
+    },
+    {
+      "prefix": "temporal-streams",
+      "stream_id": "{x}:a|b é",
+      "meta": "temporal-streams:{%7Bx%7D%3Aa%7Cb%20%C3%A9}:meta",
+      "log": "temporal-streams:{%7Bx%7D%3Aa%7Cb%20%C3%A9}:log",
+      "closed": "temporal-streams:{%7Bx%7D%3Aa%7Cb%20%C3%A9}:closed"
+    }
+  ]
+}
