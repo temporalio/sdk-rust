@@ -67,6 +67,10 @@ relevant information.
   run's last 100 failed or timed out workflow tasks. Retries that Core runs locally keep the
   value. Core leaves it unset for other activities.
 
+### Fixed
+* Cancelling a child workflow after it has continued-as-new now requests cancellation of the child's
+  latest run rather than the original run, so the cancellation takes effect.
+
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
   [yanked upstream for security issues](https://github.com/zip-rs/zip2/issues/1075#issuecomment-6209381974).
