@@ -1322,7 +1322,7 @@ async fn completions_carry_workflow_resource_id() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1351,7 +1351,7 @@ async fn task_failures_carry_workflow_resource_id() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]

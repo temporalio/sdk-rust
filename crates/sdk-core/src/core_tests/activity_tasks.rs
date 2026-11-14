@@ -1101,7 +1101,7 @@ async fn activity_rpcs_carry_resource_id(
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 
     let sent = sent.lock().unwrap();
     assert_eq!(
