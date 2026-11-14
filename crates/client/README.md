@@ -16,7 +16,7 @@ The simplest way to connect is to load connection settings from environment vari
 
 ```rust
 use temporalio_client::{
-    Client, Connection, WorkflowOptions, GetWorkflowResultOptions,
+    Client, ClientOptions, Connection, WorkflowStartOptions, WorkflowGetResultOptions,
     envconfig::LoadClientConfigProfileOptions,
 };
 
@@ -27,17 +27,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let connection = Connection::connect(conn_options).await?;
-    let client = Client::new(connection, client_options);
+    let client = Client::new(connection, client_options)?;
 
     // Start a workflow
     let handle = client.start_workflow(
         GreetingWorkflow::run,
         "World".to_string(),
-        WorkflowOptions::new("my-task-queue", "greeting-workflow-1").build()
+        WorkflowStartOptions::new("my-task-queue", "greeting-workflow-1").build()
     ).await?;
 
     // Wait for the result
-    let result = handle.get_result(GetWorkflowResultOptions::default()).await?;
+    let result = handle.get_result(WorkflowGetResultOptions::default()).await?;
     Ok(())
 }
 ```
@@ -51,7 +51,7 @@ supported variables and the TOML file format.
 ```rust
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions,
-    WorkflowOptions, GetWorkflowResultOptions, Url,
+    WorkflowStartOptions, WorkflowGetResultOptions, Url,
 };
 use std::str::FromStr;
 
@@ -64,17 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ).await?;
 
     // "default" is your namespace
-    let client = Client::new(connection, ClientOptions::new("default").build());
+    let client = Client::new(connection, ClientOptions::new("default").build())?;
 
     // Start a workflow
     let handle = client.start_workflow(
         GreetingWorkflow::run,
         "World".to_string(),
-        WorkflowOptions::new("my-task-queue", "greeting-workflow-1").build()
+        WorkflowStartOptions::new("my-task-queue", "greeting-workflow-1").build()
     ).await?;
 
     // Wait for the result
-    let result = handle.get_result(GetWorkflowResultOptions::default()).await?;
+    let result = handle.get_result(WorkflowGetResultOptions::default()).await?;
 
     Ok(())
 }
@@ -86,8 +86,8 @@ Once you have a workflow handle, you can interact with the running workflow:
 
 ```rust
 use temporalio_client::{
-    SignalOptions, QueryOptions, UpdateOptions,
-    StartUpdateOptions,
+    WorkflowSignalOptions, WorkflowQueryOptions, WorkflowExecuteUpdateOptions,
+    WorkflowStartUpdateOptions, RpcOptions,
     UntypedSignal,
 };
 use temporalio_common::data_converters::{PayloadConverter, RawValue};
@@ -96,16 +96,16 @@ use temporalio_common::data_converters::{PayloadConverter, RawValue};
 let handle = client.get_workflow_handle::<MyWorkflow>("workflow-id");
 
 // --- Signals (fire-and-forget messages) ---
-handle.signal(MyWorkflow::push_value, 42, SignalOptions::default()).await?;
+handle.signal(MyWorkflow::push_value, 42, WorkflowSignalOptions::default()).await?;
 
 // --- Queries (read workflow state) ---
 let values = handle
-    .query(MyWorkflow::get_values, (), QueryOptions::default())
+    .query(MyWorkflow::get_values, (), WorkflowQueryOptions::default())
     .await?;
 
 // --- Updates (modify state and get a result) ---
 let values = handle
-    .execute_update(MyWorkflow::add_wait_return, 100, UpdateOptions::default())
+    .execute_update(MyWorkflow::add_wait_return, 100, WorkflowExecuteUpdateOptions::default())
     .await?;
 
 // Start an update and wait for acceptance only
@@ -113,10 +113,10 @@ let update_handle = handle
     .start_update(
         MyWorkflow::add_wait_return,
         50,
-        StartUpdateOptions::default()
+        WorkflowStartUpdateOptions::default()
     )
     .await?;
-update_handle.get_result().await?;
+update_handle.get_result(RpcOptions::default()).await?;
 
 // --- Untyped interactions (when types aren't known at compile time) ---
 let pc = PayloadConverter::serde_json();
@@ -124,7 +124,7 @@ handle
     .signal(
         UntypedSignal::new("increment"),
         RawValue::from_value(&25i32, &pc),
-        SignalOptions::default(),
+        WorkflowSignalOptions::default(),
     )
     .await?;
 // UntypedQuery and UntypedUpdate work similarly
@@ -133,24 +133,24 @@ handle
 ### Cancelling and Terminating Workflows
 
 ```rust
-use temporalio_client::{CancelWorkflowOptions, TerminateWorkflowOptions};
+use temporalio_client::{WorkflowCancelOptions, WorkflowTerminateOptions};
 
 // Request cancellation (workflow can handle this gracefully)
-handle.cancel(CancelWorkflowOptions::builder().reason("No longer needed").build()).await?;
+handle.cancel(WorkflowCancelOptions::builder().reason("No longer needed").build()).await?;
 
 // Terminate immediately (workflow cannot intercept this)
-handle.terminate(TerminateWorkflowOptions::builder().reason("Emergency shutdown").build()).await?;
+handle.terminate(WorkflowTerminateOptions::builder().reason("Emergency shutdown").build()).await?;
 ```
 
 ### Listing Workflows
 
 ```rust
-use temporalio_client::ListWorkflowsOptions;
+use temporalio_client::WorkflowListOptions;
 use futures_util::StreamExt;
 
 let mut stream = client.list_workflows(
     "WorkflowType = 'GreetingWorkflow'",
-    ListWorkflowsOptions::builder().limit(10).build()
+    WorkflowListOptions::builder().limit(10).build()
 );
 
 while let Some(result) = stream.next().await {
