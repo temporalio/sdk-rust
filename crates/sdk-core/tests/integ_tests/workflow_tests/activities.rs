@@ -1767,7 +1767,7 @@ async fn activity_cancelled_after_heartbeat_times_out() {
     .unwrap();
 
     // Verify shutdown completes
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
     // Cleanup just in case
     starter
         .get_core_client()
@@ -1857,7 +1857,7 @@ async fn activity_failure_includes_latest_heartbeat_on_retry() {
     );
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[workflow]

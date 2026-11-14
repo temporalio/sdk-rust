@@ -1892,7 +1892,6 @@ async fn terminal_metric_not_recorded_on_rejected_completion() {
     core.complete_execution(&act.run_id).await;
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     // The workflow_completed metric should be recorded exactly once — only for
     // the successful server response, not for the rejected first attempt.
@@ -1968,7 +1967,6 @@ async fn wf_task_latency_recorded_on_dropped_wft() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     // Both WFT processing attempts should have recorded latency, even the dropped one
     eventually(
@@ -2044,7 +2042,6 @@ async fn wf_task_execution_failed_metric_includes_workflow_type() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     let metric_line = eventually(
         || {
@@ -2125,7 +2122,6 @@ async fn grpc_message_too_large_wf_task_execution_failed_metric_includes_workflo
     core.complete_execution(&act.run_id).await;
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     let metric_line = eventually(
         || {
@@ -2205,7 +2201,6 @@ async fn lang_reported_activity_failure_cause_reaches_metric() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     let metric_line = eventually(
         || {
@@ -2277,7 +2272,6 @@ async fn lang_reported_workflow_task_failure_cause_reaches_metric() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     let metric_line = eventually(
         || {
@@ -2355,7 +2349,6 @@ async fn payloads_too_large_activity_failure_reaches_metric() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 
     let metric_line = eventually(
         || {

@@ -186,7 +186,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
     tokio::join!(async { inner.run().await.unwrap() }, async move {
         notify.notified().await;
         let worker = starter.get_core_worker().await.clone();
-        worker.drain_pollers_and_shutdown().await;
+        worker.drain_pollers_and_shutdown_ref().await;
     });
 }
 
@@ -1648,7 +1648,7 @@ async fn shutdown_worker_not_retried() {
     let wf_type = "shutdown_worker_not_retried";
     let mut starter = CoreWfStarter::new_with_overrides(wf_type, None, Some(client));
     let worker = starter.get_core_worker().await;
-    worker.drain_pollers_and_shutdown().await;
+    worker.drain_pollers_and_shutdown_ref().await;
     assert_eq!(shutdown_call_count.load(Ordering::Relaxed), 1);
 }
 

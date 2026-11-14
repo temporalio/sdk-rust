@@ -128,7 +128,7 @@ async fn shutdown_aborts_actively_blocked_poll() {
     let tcore = core.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tcore.drain_pollers_and_shutdown().await;
+        tcore.drain_pollers_and_shutdown_ref().await;
     });
     assert_matches!(
         core.poll_workflow_activation().await.unwrap_err(),

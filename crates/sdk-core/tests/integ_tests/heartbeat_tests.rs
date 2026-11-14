@@ -207,7 +207,7 @@ async fn many_act_fails_with_heartbeats() {
     );
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]

@@ -547,7 +547,6 @@ mod tests {
             .expect("worker heartbeat was not recorded in time")
             .expect("heartbeat sender was dropped");
         worker.drain_pollers_and_shutdown().await;
-        worker.finalize_shutdown().await;
 
         assert_eq!(3, heartbeat_count.load(Ordering::Relaxed));
     }
@@ -602,7 +601,6 @@ mod tests {
             .expect("worker heartbeat was not recorded in time")
             .expect("heartbeat sender was dropped");
         worker.drain_pollers_and_shutdown().await;
-        worker.finalize_shutdown().await;
 
         assert!(
             reported_autoscaling,
@@ -809,7 +807,6 @@ mod tests {
             "control task queue must be enabled while the command worker is polling"
         );
         worker.drain_pollers_and_shutdown().await;
-        worker.finalize_shutdown().await;
         assert!(
             !client
                 .workers()

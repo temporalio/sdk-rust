@@ -983,12 +983,20 @@ macro_rules! prost_dur {
 #[async_trait]
 pub trait WorkerExt {
     /// Initiate shutdown, drain the pollers, and wait for shutdown to complete.
-    async fn drain_pollers_and_shutdown(&self);
+    async fn drain_pollers_and_shutdown(self);
+
+    /// Drain shutdown without consuming a worker that must remain available to the test.
+    async fn drain_pollers_and_shutdown_ref(&self);
 }
 
 #[async_trait]
 impl WorkerExt for Worker {
-    async fn drain_pollers_and_shutdown(&self) {
+    async fn drain_pollers_and_shutdown(self) {
+        self.drain_pollers_and_shutdown_ref().await;
+        self.finalize_shutdown().await;
+    }
+
+    async fn drain_pollers_and_shutdown_ref(&self) {
         self.initiate_shutdown();
         tokio::join!(
             async {

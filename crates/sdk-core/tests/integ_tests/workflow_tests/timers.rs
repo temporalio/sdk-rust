@@ -73,7 +73,7 @@ async fn timer_workflow_manual() {
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]

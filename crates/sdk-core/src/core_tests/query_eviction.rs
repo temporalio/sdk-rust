@@ -158,9 +158,12 @@ async fn preserves_queries_buffered_during_same_run_eviction(
         .await
         .unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(5), core.drain_pollers_and_shutdown())
-        .await
-        .expect("serviced queries must not prevent shutdown");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        core.drain_pollers_and_shutdown_ref(),
+    )
+    .await
+    .expect("serviced queries must not prevent shutdown");
     assert_eq!(core.available_wft_permits(), initial_permits);
     core.finalize_shutdown().await;
 }

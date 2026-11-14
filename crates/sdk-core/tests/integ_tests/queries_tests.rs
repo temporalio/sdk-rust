@@ -216,7 +216,7 @@ async fn query_after_execution_complete(#[case] do_evict: bool) {
         query_futs.push(do_workflow(true).map(|_| ()).boxed());
     }
     while query_futs.next().await.is_some() {}
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest]
@@ -464,7 +464,7 @@ async fn queries_handled_before_next_wft() {
         core.handle_eviction().await;
     };
     join!(join_all(query_futs), complete_fut);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]

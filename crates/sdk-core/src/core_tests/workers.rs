@@ -192,7 +192,6 @@ async fn can_shutdown_local_act_only_worker_when_act_polling() {
         }
     );
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -252,7 +251,6 @@ async fn complete_eviction_after_shutdown_doesnt_panic() {
             .await,
         Ok(())
     );
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -283,7 +281,8 @@ async fn shutdown_waits_for_eviction_completion() {
     let shutdown = core.shutdown();
     tokio::pin!(shutdown);
     assert!(futures_util::poll!(&mut shutdown).is_pending());
-    // This query follows the shutdown bump on the workflow stream, independently of the RPC.
+    // Round-tripping through the workflow stream after requesting shutdown proves the run is
+    // retained for its uncompleted eviction, independently of the ShutdownWorker RPC handle.
     assert_eq!(core.cached_workflows().await, 1);
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(res.run_id))
         .await
@@ -411,7 +410,7 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
             .await
             .unwrap();
 
-        worker.drain_pollers_and_shutdown().await;
+        worker.drain_pollers_and_shutdown_ref().await;
     });
 }
 
@@ -1388,7 +1387,6 @@ async fn validate_enables_auto_enroll_capability() {
     assert!(!caps.poller_autoscaling());
 
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1417,7 +1415,6 @@ async fn validate_without_auto_enroll_leaves_capabilities_off() {
     assert!(!caps.poller_autoscaling());
 
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

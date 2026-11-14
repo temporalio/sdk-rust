@@ -75,7 +75,6 @@ async fn finish(worker: crate::Worker, task: ActivityTask) {
     let resolved = worker.poll_workflow_activation().await.unwrap();
     worker.complete_execution(&resolved.run_id).await;
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 /// The time of a history event, in the form of the poll response's started time.

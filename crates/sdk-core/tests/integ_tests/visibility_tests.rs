@@ -90,7 +90,7 @@ async fn client_list_open_closed_workflow_executions() {
     // Complete workflow
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 
     // List above CLOSED workflow. Visibility doesn't always update immediately so we give this a
     // few tries.

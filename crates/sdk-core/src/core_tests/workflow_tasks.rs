@@ -885,7 +885,6 @@ async fn complete_activation_with_failure(
     )
     .await;
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
@@ -1187,7 +1186,7 @@ async fn lots_of_workflows() {
         }
     });
     join!(killer, poller);
-    worker.drain_pollers_and_shutdown().await;
+    worker.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
@@ -1266,7 +1265,6 @@ async fn complete_after_eviction() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1293,7 +1291,6 @@ async fn sends_appropriate_sticky_task_queue_responses() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1456,7 +1453,6 @@ async fn fail_wft_then_recover() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1491,7 +1487,6 @@ async fn default_wft_fail_cause_is_worker_unhandled() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1582,7 +1577,6 @@ async fn lang_slower_than_wft_timeouts() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -1725,7 +1719,7 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
     ))
     .await
     .unwrap();
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 fn la_cancel_mock_cfg() -> MockPollCfg {
@@ -1816,7 +1810,7 @@ async fn la_cancel_delivered_before_eviction_activation() {
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest::rstest]
@@ -1939,7 +1933,7 @@ async fn eviction_requested_during_activation_cancels_la_before_evicting(
         advance_fut!(wf_poll);
     }
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2061,7 +2055,7 @@ async fn abandoned_la_cancel_delivered_before_workflow_completion_eviction() {
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest]
@@ -2170,7 +2164,7 @@ async fn la_results_during_withheld_eviction_do_not_surface(
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2290,7 +2284,7 @@ async fn la_success_after_its_cancel_is_polled_does_not_surface(
         advance_fut!(wf_poll);
     }
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2343,7 +2337,7 @@ async fn queued_la_cancelled_by_eviction_does_not_surface() {
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    core.drain_pollers_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2521,7 +2515,6 @@ async fn tries_cancel_of_completed_activity() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -2574,7 +2567,7 @@ async fn failing_wft_doesnt_eat_permit_forever() {
         ))
         .await
         .unwrap();
-    worker.drain_pollers_and_shutdown().await;
+    worker.drain_pollers_and_shutdown_ref().await;
     assert_eq!(worker.available_wft_permits(), Some(2));
 }
 
@@ -2666,7 +2659,6 @@ async fn cache_miss_will_fetch_history() {
         .unwrap();
     assert_eq!(worker.outstanding_workflow_tasks().await, 0);
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -2756,7 +2748,6 @@ async fn tasks_from_completion_are_delivered() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -2810,7 +2801,6 @@ async fn pagination_works_with_tasks_from_completion() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -2992,7 +2982,6 @@ async fn eviction_waits_until_replay_finished() {
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -3059,7 +3048,6 @@ async fn autocompletes_wft_no_work() {
     );
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -3141,7 +3129,6 @@ async fn no_race_acquiring_permits() {
     let r = worker.poll_workflow_activation().await.unwrap();
     worker.complete_execution(&r.run_id).await;
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -3193,7 +3180,6 @@ async fn continue_as_new_preserves_some_values() {
         .await
         .unwrap();
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[rstest]
@@ -3407,7 +3393,6 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -3452,7 +3437,6 @@ async fn lang_internal_flags() {
     assert_matches!(act.available_internal_flags.as_slice(), [1, 2]);
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -3547,7 +3531,6 @@ async fn core_internal_flags() {
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -3653,7 +3636,6 @@ async fn _do_post_terminal_commands_test(
     .unwrap();
 
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
 }
 
 // Lang expects to always see jobs in this order:
@@ -3817,7 +3799,6 @@ async fn poller_wont_poll_until_lang_polls() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
     // Nothing should've appeared here or we did poll
     assert!(rx.recv().is_err());
 }
@@ -3905,7 +3886,6 @@ async fn use_compatible_version_flag(
         .await
         .unwrap();
     worker.drain_pollers_and_shutdown().await;
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -4206,7 +4186,6 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
     // Mock only expects 1 task failure, and would fail here if we spammed
     // Every attempt counts as a failure though, even the unreported ones
     assert_eq!(
@@ -4279,7 +4258,6 @@ async fn payloads_too_large_doesnt_spam_task_fails() {
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(
@@ -4337,7 +4315,6 @@ async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
         PollError::ShutDown
     );
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(
@@ -4414,7 +4391,6 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
             .unwrap();
     }
     core.drain_pollers_and_shutdown().await;
-    core.finalize_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(
