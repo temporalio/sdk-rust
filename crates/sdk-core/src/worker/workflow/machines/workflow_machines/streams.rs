@@ -344,6 +344,15 @@ impl StreamCalls {
             let stream = entry.stream.unwrap_or_default();
             let seq = entry.seq;
             let bad = |what: &str| fatal!("The Stream marker entry of read {seq} is bad: {what}");
+            // A run that was cached when its history came, and left the cache before it replayed
+            // it, gets markers with no Records read. Giving no Records would be a wrong replay.
+            if entry.count > 0 && entry.records.is_empty() {
+                return Err(WFMachinesError::Stream(format!(
+                    "StreamReplayError: Stream `{}` in Store `{}`: the Records of the marker of \
+                     read {seq} were not read",
+                    stream.id, stream.store
+                )));
+            }
             if entry
                 .page_counts
                 .iter()
