@@ -44,7 +44,13 @@ relevant information.
 * [lang-internal] Added the experimental `temporalio-streams` crate, the Stream runtime for Core
   and the language bridges. `StreamRuntime` answers the five operations of the Stream service on
   a `StreamStore`, and checks each request and each answer. A bridge implements `StreamStore` for
-  a Store that is written in its language. Core's worker has no Stream code.
+  a Store that is written in its language.
+* [lang-internal] Experimental: Workflow code can read and append a Stream directly. A Worker takes
+  its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store name. Lang starts a read with
+  `StartStreamRead`, stops it with `CloseStreamRead`, and appends with `AppendToStream`. The results
+  come in the `ResolveStreamRead` and `ResolveStreamAppend` jobs. Core calls the Store itself and
+  records one `core_stream` marker for each Workflow Task in which Workflow code got a result, which
+  a replay gives back in the same activations.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
