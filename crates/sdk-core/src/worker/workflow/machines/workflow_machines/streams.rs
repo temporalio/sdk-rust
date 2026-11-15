@@ -546,7 +546,8 @@ impl StreamCalls {
     }
 
     /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
-    /// results must not reach Workflow code.
+    /// results must not reach Workflow code. It keeps the results that history holds, so that a
+    /// replayed marker event still finds one that Workflow code never got.
     pub(super) fn stop_all(&mut self) {
         for read in self.reads.values_mut().filter(|read| read.open) {
             read.open = false;
@@ -558,6 +559,11 @@ impl StreamCalls {
             self.requests.push(StreamRequest::Cancel(append.call_id));
         }
         self.append_queues.clear();
+    }
+
+    /// Drops the results that history holds. A failed Workflow Task evicts the run, and a forced
+    /// failure of the Workflow must not meet them.
+    pub(super) fn drop_held(&mut self) {
         self.held.clear();
     }
 
