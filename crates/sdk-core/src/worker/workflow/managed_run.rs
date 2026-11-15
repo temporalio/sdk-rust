@@ -343,7 +343,7 @@ impl ManagedRun {
             if let Some(id) = reset_last_started_to {
                 self.wfm.machines.reset_last_started_id(id);
             }
-            // History has the task now, so the closes that it recorded run. A speculative task
+            // History has the task, so the closes that it recorded run. A speculative task
             // that the server dropped recorded nothing.
             if accepted && reset_last_started_to.is_none() {
                 let closes = self.wfm.machines.stream_intents_taken();

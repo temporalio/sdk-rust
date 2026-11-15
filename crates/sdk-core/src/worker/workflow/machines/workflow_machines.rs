@@ -451,13 +451,13 @@ impl WorkflowMachines {
         }
     }
 
-    /// True if Workflow code asked for a close that no completion carries yet.
+    /// True if Workflow code asked for a close that no completion carries.
     pub(crate) fn has_pending_close_intents(&self) -> bool {
         self.stream_calls.has_pending_intents()
     }
 
     /// The server took the completion of this Workflow Task, so History has the intents of its
-    /// closes. Returns the closes to run now.
+    /// closes. Returns the closes to run at once.
     pub(crate) fn stream_intents_taken(&mut self) -> Vec<StreamRequest> {
         self.stream_calls.intents_taken()
     }
