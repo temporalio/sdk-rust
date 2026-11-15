@@ -52,23 +52,50 @@ use tracing::Span;
 
 /// The Stream runtimes of a Worker, by the name of the Store that each serves. A Workflow call on
 /// a Stream uses the runtime of its `StreamRef.store`.
-#[derive(Clone, Debug, Default)]
-pub struct StreamRuntimes(HashMap<String, Arc<StreamRuntime>>);
+#[derive(Clone, Debug)]
+pub struct StreamRuntimes {
+    runtimes: HashMap<String, Arc<StreamRuntime>>,
+    /// False for a replay Worker, which reads the Store only for the Records of a marker.
+    calls_stores: bool,
+}
+
+impl Default for StreamRuntimes {
+    fn default() -> Self {
+        Self::new([])
+    }
+}
 
 impl StreamRuntimes {
     /// Builds the set from pairs of a Store name and its runtime.
     pub fn new(runtimes: impl IntoIterator<Item = (String, Arc<StreamRuntime>)>) -> Self {
-        Self(runtimes.into_iter().collect())
+        Self {
+            runtimes: runtimes.into_iter().collect(),
+            calls_stores: true,
+        }
+    }
+
+    /// The runtimes of a replay Worker. It reads the Records of a marker, and never makes a live
+    /// call, so a call that history leaves open stays open there.
+    pub(crate) fn for_replay(self) -> Self {
+        Self {
+            calls_stores: false,
+            ..self
+        }
+    }
+
+    /// False for a replay Worker, which makes no live call.
+    pub(crate) fn calls_stores(&self) -> bool {
+        self.calls_stores
     }
 
     /// The runtime of the Store `store`, if the Worker has one.
     pub fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
-        self.0.get(store)
+        self.runtimes.get(store)
     }
 
     /// True if the Worker has no Stream runtime.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.runtimes.is_empty()
     }
 }
 
