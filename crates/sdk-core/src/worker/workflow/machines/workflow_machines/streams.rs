@@ -126,9 +126,19 @@ pub(super) struct StreamCalls {
     /// False while the run replays. A call then waits for its results from history, and the
     /// Worker runs it only once replay ends.
     live: bool,
+    /// False on a replay Worker, where a run never goes live and a call that history leaves open
+    /// stays open, as a Local Activity does there.
+    calls_stores: bool,
 }
 
 impl StreamCalls {
+    pub(super) fn new(calls_stores: bool) -> Self {
+        Self {
+            calls_stores,
+            ..Default::default()
+        }
+    }
+
     pub(super) fn start_read(
         &mut self,
         attrs: StartStreamRead,
@@ -180,7 +190,7 @@ impl StreamCalls {
     /// Runs the calls that replay left open, from where Workflow code is. Returns the Stores that
     /// they use, so that the caller can check that the Worker has their runtimes.
     pub(super) fn go_live(&mut self) -> Vec<String> {
-        if self.live {
+        if self.live || !self.calls_stores {
             return vec![];
         }
         self.live = true;
