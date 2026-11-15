@@ -13,6 +13,7 @@
 //! request before the Store sees it, and the answer to a create, an append, a read or a describe
 //! after it. The checks are the same for every Store.
 
+pub mod digest;
 mod dispatch;
 pub mod epoch;
 mod error;

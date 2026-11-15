@@ -42,6 +42,12 @@ read or a describe after it. The checks are the same for every Store.
 - An answer that breaks these rules, a create with no ref, or a describe with no status fails with
   `Reason::StorageCorrupt`.
 
+## The digest of a read
+
+`digest::records_digest` gives a 16-byte digest of the Records that a read gave. Core keeps it in
+History when a Workflow reads a Stream, and checks it when a replay reads the same Records again.
+`testdata/record_digests.json` has the shared vectors. `examples/gen_vectors.rs` writes them too.
+
 ## The order of epochs
 
 `epoch::epoch_key` gives the epoch of a Producer as 40 bytes that compare in order. A Store fences

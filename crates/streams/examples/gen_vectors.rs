@@ -1,13 +1,14 @@
-//! Writes the golden vectors of the epoch keys to `testdata/epochs.json`.
+//! Writes the golden vectors of the epoch keys and of the digest of a read to `testdata/`.
 //!
-//! This is a second implementation of the epoch key. It calls none of the crate's own code, so
-//! the crate's test checks `epoch_key` against values it did not compute. Run it from any
-//! directory:
+//! This is a second implementation of both. It calls none of the crate's own code, so the crate's
+//! tests check `epoch_key` and `records_digest` against values they did not compute. Run it from
+//! any directory:
 //!
 //! ```text
 //! cargo run -p temporalio-streams --example gen_vectors
 //! ```
 
+use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
 /// A JSON value that keeps the order of its keys, so the file does not depend on a map type.
@@ -39,6 +40,7 @@ impl Json {
         match self {
             Json::Str(text) => quote_json(out, text),
             Json::Int(value) => out.push_str(&value.to_string()),
+            Json::Arr(items) if items.is_empty() => out.push_str("[]"),
             Json::Obj(fields) if fields.is_empty() => out.push_str("{}"),
             Json::Arr(items) => {
                 out.push_str("[\n");
@@ -76,7 +78,8 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
-/// Quotes a string. Every string of the file is a key, a kind or hex, so none needs an escape.
+/// Quotes a string. Every string of the files is a key, a kind, a case name or hex, so none needs
+/// an escape.
 fn quote_json(out: &mut String, text: &str) {
     out.push('"');
     out.push_str(text);
@@ -189,7 +192,199 @@ fn epochs() -> Json {
     )
 }
 
+/// The body of a Record. A key that a case leaves out is `None`, which is not the same as empty.
+#[derive(Default)]
+struct Record {
+    metadata: Option<Vec<(&'static str, Vec<u8>)>>,
+    data: Option<Vec<u8>>,
+    external_payloads: Option<Vec<i64>>,
+}
+
+impl Record {
+    fn json(&self) -> Json {
+        let mut fields = Vec::new();
+        if let Some(metadata) = &self.metadata {
+            let entries = metadata
+                .iter()
+                .map(|(key, value)| (*key, Json::str(hex(value))))
+                .collect();
+            fields.push(("metadata", Json::Obj(entries)));
+        }
+        if let Some(data) = &self.data {
+            fields.push(("data", Json::str(hex(data))));
+        }
+        if let Some(sizes) = &self.external_payloads {
+            let sizes = sizes.iter().map(|size| Json::int(*size)).collect();
+            fields.push(("external_payloads", Json::Arr(sizes)));
+        }
+        Json::Obj(fields)
+    }
+}
+
+fn hash_part(out: &mut Sha256, data: &[u8]) {
+    out.update((data.len() as u64).to_be_bytes());
+    out.update(data);
+}
+
+/// The body part of a Record, as the digest hashes it.
+fn hash_body(out: &mut Sha256, record: &Record) {
+    // A Record with none of these keys has no body.
+    if record.metadata.is_none() && record.data.is_none() && record.external_payloads.is_none() {
+        out.update([0u8]);
+        return;
+    }
+    out.update([1u8]);
+    let mut metadata: Vec<(&[u8], &[u8])> = record
+        .metadata
+        .iter()
+        .flatten()
+        .map(|(key, value)| (key.as_bytes(), value.as_slice()))
+        .collect();
+    metadata.sort();
+    out.update((metadata.len() as u64).to_be_bytes());
+    for (key, value) in metadata {
+        hash_part(out, key);
+        hash_part(out, value);
+    }
+    hash_part(out, record.data.as_deref().unwrap_or(&[]));
+    let external = record.external_payloads.as_deref().unwrap_or(&[]);
+    out.update((external.len() as u64).to_be_bytes());
+    for size in external {
+        out.update(size.to_be_bytes());
+    }
+}
+
+/// A Record that a read gave, with its wire offset and its encoded Producer.
+struct ReadRecord {
+    offset: Vec<u8>,
+    producer: Option<Vec<u8>>,
+    body: Record,
+}
+
+/// The digest of the Records of a read, as the first 16 bytes of the SHA-256. A tag byte `R`
+/// starts it, then each Record gives its offset, its Producer and its body.
+fn records_digest(records: &[ReadRecord]) -> Vec<u8> {
+    let mut out = Sha256::new();
+    out.update(b"R");
+    for record in records {
+        hash_part(&mut out, &record.offset);
+        match &record.producer {
+            Some(producer) => {
+                out.update([1u8]);
+                hash_part(&mut out, producer);
+            }
+            None => out.update([0u8]),
+        }
+        hash_body(&mut out, &record.body);
+    }
+    out.finalize()[..16].to_vec()
+}
+
+/// One protobuf field, with a one-byte length, which is all these short values need.
+fn proto_field(number: u8, wire_type: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![(number << 3) | wire_type];
+    if wire_type == 2 {
+        out.push(value.len() as u8);
+    }
+    out.extend_from_slice(value);
+    out
+}
+
+/// The encoded Producer `wf:<run>` of kind Workflow, in Workflow Task `started_event_id`,
+/// attempt 1.
+fn workflow_producer(run: &str, started_event_id: u8) -> Vec<u8> {
+    let epoch = [
+        proto_field(1, 0, &[started_event_id]),
+        proto_field(2, 0, &[1]),
+    ]
+    .concat();
+    let workflow = [proto_field(1, 2, run.as_bytes()), proto_field(2, 2, &epoch)].concat();
+    [
+        proto_field(1, 2, format!("wf:{run}").as_bytes()),
+        proto_field(2, 2, &workflow),
+    ]
+    .concat()
+}
+
+fn record_digests() -> Json {
+    let offset = |value: u64| value.to_be_bytes().to_vec();
+    let hello = |offset: Vec<u8>| ReadRecord {
+        offset,
+        producer: Some(workflow_producer("r1", 3)),
+        body: Record {
+            data: Some(b"hello".to_vec()),
+            ..Record::default()
+        },
+    };
+    let bare = ReadRecord {
+        offset: offset(2),
+        producer: None,
+        body: Record::default(),
+    };
+    let other_task = ReadRecord {
+        producer: Some(workflow_producer("r1", 9)),
+        ..hello(offset(1))
+    };
+    let cases = [
+        ("no records", vec![]),
+        ("one record", vec![hello(offset(1))]),
+        ("one record at another offset", vec![hello(offset(2))]),
+        ("one record of another task", vec![other_task]),
+        ("no Producer and no body", vec![bare]),
+        (
+            "two records",
+            vec![
+                hello(offset(1)),
+                ReadRecord {
+                    offset: offset(1 << 21),
+                    producer: Some(workflow_producer("r1", 3)),
+                    body: Record {
+                        metadata: Some(vec![("encoding", b"binary/plain".to_vec())]),
+                        data: Some(vec![]),
+                        ..Record::default()
+                    },
+                },
+            ],
+        ),
+    ];
+    let sums: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|(_, records)| records_digest(records))
+        .collect();
+    assert_ne!(sums[1], sums[2]);
+    assert_ne!(sums[1], sums[3]);
+    Json::Arr(
+        cases
+            .iter()
+            .zip(&sums)
+            .map(|((name, records), sum)| {
+                let records = records
+                    .iter()
+                    .map(|record| {
+                        let mut fields = vec![("offset", Json::str(hex(&record.offset)))];
+                        if let Some(producer) = &record.producer {
+                            fields.push(("producer", Json::str(hex(producer))));
+                        }
+                        fields.push(("body", record.body.json()));
+                        Json::Obj(fields)
+                    })
+                    .collect();
+                Json::Obj(vec![
+                    ("name", Json::str(*name)),
+                    ("records", Json::Arr(records)),
+                    ("digest", Json::str(hex(sum))),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
-    fs::write(dir.join("epochs.json"), epochs().pretty()).unwrap();
+    for (name, value) in [
+        ("epochs.json", epochs()),
+        ("record_digests.json", record_digests()),
+    ] {
+        fs::write(dir.join(name), value.pretty()).unwrap();
+    }
 }
