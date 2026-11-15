@@ -1,13 +1,19 @@
-//! The golden vectors of the epoch keys. `examples/gen_vectors.rs` writes them from a second
-//! implementation, so this test checks the keys against values that the crate did not compute.
+//! The golden vectors of the epoch keys and of the digest of a read. `examples/gen_vectors.rs`
+//! writes them from a second implementation, so these tests check the crate against values that it
+//! did not compute.
 
+use prost::Message;
 use prost_types::Timestamp;
 use serde_json::Value;
+use temporalio_common::protos::temporal::api::common::v1::{
+    Payload, payload::ExternalPayloadDetails,
+};
 use temporalio_streams::{
+    digest::records_digest,
     epoch::{epoch_key, task_key, task_of},
     proto::{
         ActivityEpoch, ActivityProducer, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        Producer, StreamRecord, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
     },
 };
 
@@ -80,4 +86,54 @@ fn hex(text: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
         .collect()
+}
+
+/// The body of a vector Record. A Record with none of these keys has no body.
+fn body(r: &Value) -> Option<Payload> {
+    ["metadata", "data", "external_payloads"]
+        .iter()
+        .any(|key| r.get(key).is_some())
+        .then(|| Payload {
+            metadata: r["metadata"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(key, value)| (key.clone(), hex(value.as_str().unwrap())))
+                .collect(),
+            data: hex(r["data"].as_str().unwrap_or_default()),
+            external_payloads: r["external_payloads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|size| ExternalPayloadDetails {
+                    size_bytes: size.as_i64().unwrap(),
+                })
+                .collect(),
+        })
+}
+
+#[test]
+fn records_digests_match() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/record_digests.json");
+    let cases: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for case in cases.as_array().unwrap() {
+        let records: Vec<_> = case["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| StreamRecord {
+                offset: hex(text(r, "offset")),
+                producer: r.get("producer").map(|bytes| {
+                    Producer::decode(hex(bytes.as_str().unwrap()).as_slice()).unwrap()
+                }),
+                body: body(&r["body"]),
+            })
+            .collect();
+        assert_eq!(
+            records_digest(&records).to_vec(),
+            hex(text(case, "digest")),
+            "{}",
+            text(case, "name")
+        );
+    }
 }
