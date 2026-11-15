@@ -24,7 +24,9 @@ use temporalio_common::protos::{
         ActivityTaskCompletion,
         activity_result::ActivityExecutionResult,
         common::StreamReadStop,
-        external_data::{StreamAppendEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry},
+        external_data::{
+            StreamAppendEntry, StreamCloseEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry,
+        },
         workflow_activation::{
             ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, WorkflowActivation,
             resolve_stream_append, workflow_activation_job,
@@ -2970,4 +2972,215 @@ async fn a_workflow_that_completes_with_its_close_still_closes_the_stream() {
         ]
     );
     assert!(!sent[0].force_create_new_workflow_task);
+}
+
+fn intent_entry(seq: u32, id: &str) -> StreamCloseEntry {
+    StreamCloseEntry {
+        seq,
+        stream: Some(stream(id)),
+        intent_epoch: Some(task_epoch(3)),
+        ..Default::default()
+    }
+}
+
+fn close_result_entry(seq: u32, id: &str, failure: Option<Failure>) -> StreamCloseEntry {
+    StreamCloseEntry {
+        seq,
+        stream: Some(stream(id)),
+        resolved: true,
+        failure,
+        activation: 0,
+        ..Default::default()
+    }
+}
+
+fn closes_only(closes: Vec<StreamCloseEntry>) -> StreamMarkerData {
+    StreamMarkerData {
+        reads: vec![],
+        appends: vec![],
+        closes,
+    }
+}
+
+/// A history whose first task recorded `intent`, whose second one, if any, gave `result`, and
+/// whose last task a signal starts.
+fn close_history(intent: StreamCloseEntry, result: Option<StreamCloseEntry>) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    stream_marker_event(&mut t, 4, &closes_only(vec![intent]));
+    if let Some(result) = result {
+        t.add_full_wf_task();
+        stream_marker_event(&mut t, 8, &closes_only(vec![result]));
+    }
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// A Worker that is gone after History recorded the intent of a close. A new Worker replays the
+/// intent, sends the close with the task in hand, and gives the result.
+#[tokio::test]
+async fn a_new_worker_sends_a_recorded_close() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = close_history(intent_entry(1, "s"), None);
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let (next, close) = until_closed(&worker).await;
+    assert!(close.failed.is_none(), "{:?}", close.failed);
+    assert!(stream_is_closed(&runtime, "s"));
+    worker.complete_execution(&next.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    let sent = sent.lock();
+    let data = marker(&sent[0]).unwrap();
+    assert_eq!(data.closes.len(), 1);
+    assert!(data.closes[0].resolved);
+}
+
+/// A replay of a History with an intent and its result calls no Store, and gives the result in
+/// the activation that the marker has.
+#[tokio::test]
+async fn a_replay_of_a_close_and_its_result_calls_no_store() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = close_history(intent_entry(1, "s"), Some(close_result_entry(1, "s", None)));
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(closes(&replayed).len(), 1);
+    assert_eq!(replayed.jobs.len(), 1);
+    complete(&worker, &replayed, vec![]).await;
+    let live = worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&live) && closes(&live).is_empty());
+    worker.complete_execution(&live.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(
+        !stream_is_closed(&runtime, "s"),
+        "the replay closed the Stream"
+    );
+}
+
+/// A replay Worker with an intent and no result sends nothing, and the close stays open there.
+#[tokio::test]
+async fn a_replay_worker_sends_no_recorded_close() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = close_history(intent_entry(1, "s"), None);
+    let run_id = t.get_orig_run_id().to_string();
+    let worker = replay_worker(t, runtimes(&runtime));
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
+        "{jobs:?}"
+    );
+    assert!(
+        !jobs.iter().any(|job| job.starts_with("ResolveStreamClose")),
+        "{jobs:?}"
+    );
+    assert!(!stream_is_closed(&runtime, "s"));
+}
+
+/// A refused close replays its failure from History, with no Store call.
+#[tokio::test]
+async fn a_refused_close_replays_its_failure() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let failure = Failure {
+        message: "stream_fenced: the epoch is lower than the newest one of the Producer"
+            .to_string(),
+        ..Default::default()
+    };
+    let t = close_history(
+        intent_entry(1, "s"),
+        Some(close_result_entry(1, "s", Some(failure.clone()))),
+    );
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(closes(&replayed)[0].failed.as_ref(), Some(&failure));
+    complete(&worker, &replayed, vec![]).await;
+    let live = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&live.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(!stream_is_closed(&runtime, "s"));
+}
+
+/// Replays a History with the intent of close 1 of Stream `s`, with Workflow code that sends
+/// `commands` in its first activation. Returns the cause and message of the failed task.
+async fn replay_close_history(
+    commands: Vec<workflow_command::Variant>,
+) -> (WorkflowTaskFailedCause, String) {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = close_history(intent_entry(1, "s"), None);
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, commands).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1, "the replay should fail");
+    failed[0].clone()
+}
+
+/// An intent in History with no close in Workflow code is a non-determinism error.
+#[tokio::test]
+async fn a_close_entry_with_no_call_is_nondeterministic() {
+    let (cause, message) = replay_close_history(vec![]).await;
+    assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(
+        message.contains("History has a Stream result of close 1 that Workflow code never got"),
+        "{message}"
+    );
+}
+
+/// A close of another Stream than History has is a non-determinism error.
+#[tokio::test]
+async fn a_close_of_another_stream_is_nondeterministic() {
+    let (cause, message) = replay_close_history(vec![close_cmd(1, "other", "r").into()]).await;
+    assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(
+        message.contains("Stream close 1 closes Stream `other`"),
+        "{message}"
+    );
+}
+
+/// A replayed close with no Store name takes the Store of its entry, so a replay Worker with no
+/// runtime replays it.
+#[tokio::test]
+async fn a_replayed_close_with_no_store_name_takes_the_store_of_history() {
+    let t = close_history(intent_entry(1, "s"), Some(close_result_entry(1, "s", None)));
+    let run_id = t.get_orig_run_id().to_string();
+    let worker = replay_worker(t, StreamRuntimes::default());
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let close = CloseStream {
+        stream: unnamed("s"),
+        ..close_cmd(1, "s", &run_id)
+    };
+    complete(&worker, &first, vec![close.into()]).await;
+    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        jobs.iter().any(|job| job == "ResolveStreamClose(1)"),
+        "{jobs:?}"
+    );
+    assert!(
+        jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
+        "{jobs:?}"
+    );
+    assert!(
+        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
+        "{jobs:?}"
+    );
 }
