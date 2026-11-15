@@ -307,7 +307,7 @@ impl WFStream {
             // A new run replays its history, so the markers in it need their Records. A cached run
             // has every marker it meets already, so it reads none.
             pwft.paginator.hydrate_new_run();
-            if pwft.work.update.needs_stream_records() {
+            if pwft.work.stream_replay_error.is_none() && pwft.work.update.needs_stream_records() {
                 return Err(HistoryFetchReq::StreamRecords(
                     Box::new(pwft),
                     self.history_fetch_refcounter.clone(),

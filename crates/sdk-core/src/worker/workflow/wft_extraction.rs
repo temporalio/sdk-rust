@@ -146,6 +146,12 @@ impl WFTExtractor {
                             let runtimes = pwft.paginator.stream_runtimes().clone();
                             match pwft.work.update.read_stream_records(&runtimes).await {
                                 Ok(()) => WFTExtractorOutput::FetchResult(*pwft, rc),
+                                // A replay Worker fails the run instead, so that lang sees the
+                                // eviction and the replay of this history ends.
+                                Err(err) if !runtimes.calls_stores() => {
+                                    pwft.work.stream_replay_error = Some(err.message().to_string());
+                                    WFTExtractorOutput::FetchResult(*pwft, rc)
+                                }
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,

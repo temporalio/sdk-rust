@@ -1048,6 +1048,10 @@ struct PreparedWFT {
     query_requests: Vec<QueryWorkflow>,
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
+    /// Set on a replay Worker when the Records of a marker couldn't be read. The run then fails
+    /// with it, so that lang gets the eviction and the replay ends, as for a non-determinism
+    /// error.
+    stream_replay_error: Option<String>,
 }
 
 impl PreparedWFT {
