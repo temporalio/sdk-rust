@@ -429,7 +429,9 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
                 }
             }
         }
-        if stop.is_none() && response.done && page.len() == given {
+        // A read that took the last Record of a closed Stream is done, also when that Record
+        // filled a cap, so that Workflow code knows that nothing more comes.
+        if response.done && page.len() == given {
             stop = Some(StreamReadStop::Done);
         }
         if stop.is_none() && bytes_left == Some(0) {
