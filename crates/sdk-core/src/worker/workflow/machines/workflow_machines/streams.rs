@@ -722,6 +722,7 @@ impl StreamCalls {
         Some(StreamMarkerData {
             reads,
             appends: std::mem::take(&mut self.marker_appends),
+            closes: vec![],
         })
     }
 }

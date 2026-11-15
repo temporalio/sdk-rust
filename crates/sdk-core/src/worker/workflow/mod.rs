@@ -1654,6 +1654,7 @@ enum WFCommandVariant {
     StartStreamRead(StartStreamRead),
     CloseStreamRead(CloseStreamRead),
     AppendToStream(AppendToStream),
+    CloseStream(CloseStream),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1718,6 +1719,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::StartStreamRead(s) => WFCommandVariant::StartStreamRead(s),
             workflow_command::Variant::CloseStreamRead(s) => WFCommandVariant::CloseStreamRead(s),
             workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
+            workflow_command::Variant::CloseStream(s) => WFCommandVariant::CloseStream(s),
         };
         Ok(Self {
             variant,

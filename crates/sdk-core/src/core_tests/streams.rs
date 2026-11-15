@@ -1242,6 +1242,7 @@ async fn replay_reads_records_from_the_store() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
 
@@ -1289,6 +1290,7 @@ async fn replay_from_history_calls_no_store() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let run = start(
         t,
@@ -1358,6 +1360,7 @@ fn one_page(records: &[StreamRecord]) -> (StreamMarkerData, String) {
         StreamMarkerData {
             reads: vec![entry],
             appends: vec![],
+            closes: vec![],
         },
         range,
     )
@@ -1428,6 +1431,7 @@ async fn append_replay_calls_no_store() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![],
         appends: vec![appended.clone()],
+        closes: vec![],
     });
     let run_id = t.get_orig_run_id().to_string();
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
@@ -1472,6 +1476,7 @@ async fn open_read_resumes_after_replay() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
 
@@ -1517,6 +1522,7 @@ async fn resumed_read_keeps_its_deadline() {
     let mut t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
     for event_id in 1..=5 {
@@ -1565,6 +1571,7 @@ async fn close_ends_a_read_in_replay() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
 
@@ -1668,6 +1675,7 @@ async fn worker_with_no_cache_runs_reads_and_appends() {
         &StreamMarkerData {
             reads: vec![entry],
             appends: vec![],
+            closes: vec![],
         },
     );
     t.add_timer_fired(timer, "1".to_string());
@@ -2296,6 +2304,7 @@ async fn a_replay_worker_needs_no_runtime_for_an_open_read() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let worker = replay_worker(t, StreamRuntimes::default());
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -2342,6 +2351,7 @@ async fn a_replay_worker_reads_a_marker_from_the_store() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let worker = replay_worker(t, runtimes(&runtime));
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -2389,6 +2399,7 @@ async fn a_cached_run_reads_no_marker_of_a_full_history() {
         &StreamMarkerData {
             reads: vec![elsewhere],
             appends: vec![],
+            closes: vec![],
         },
     );
     t.add_we_signaled("go", vec![]);
@@ -2510,6 +2521,7 @@ async fn a_replayed_read_with_no_store_name_takes_the_store_of_history() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
+        closes: vec![],
     });
     let worker = replay_worker(t, StreamRuntimes::default());
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -2549,6 +2561,7 @@ async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![],
         appends: vec![appended],
+        closes: vec![],
     });
     let run_id = t.get_orig_run_id().to_string();
     let worker = replay_worker(t, StreamRuntimes::default());
