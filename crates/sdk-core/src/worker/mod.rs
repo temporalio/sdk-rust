@@ -41,6 +41,7 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+pub use workflow::StreamRuntimes;
 
 use crate::{
     ActivityHeartbeat,
@@ -291,6 +292,13 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// The Stream runtimes of this Worker, by the name of the Store that each serves. Workflow
+    /// code reads and appends a Stream through the runtime of its Store, and a call on a Store with
+    /// no runtime here fails the Workflow Task.
+    /// NOTE: Experimental
+    #[builder(default)]
+    pub stream_runtimes: StreamRuntimes,
 
     /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
     /// oversized payloads are still warned about, and the server still rejects them. When unset, an

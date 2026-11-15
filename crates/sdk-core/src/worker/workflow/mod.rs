@@ -7,12 +7,14 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
+mod streams;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;
 
 pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
+pub use streams::StreamRuntimes;
 
 use crate::{
     MetricsContext, WorkerConfig,
@@ -37,6 +39,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
+            streams::StreamManager,
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -188,6 +191,13 @@ impl Workflows {
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
+        // The subsystems of a Worker are built inside its runtime, as the pollers spawn there too.
+        // Stream calls run on it, so that Store work never holds up the workflow processing thread.
+        let stream_manager = Arc::new(StreamManager::new(
+            basics.worker_config.stream_runtimes.clone(),
+            tokio::runtime::Handle::current(),
+            local_tx.clone(),
+        ));
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let max_eager_activity_reservations_per_workflow_task = basics
@@ -249,6 +259,7 @@ impl Workflows {
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
+                        stream_manager,
                     );
 
                     while let Some(output) = stream.next().await {
@@ -1503,6 +1514,7 @@ impl ValidatedCompletion {
 #[derive(Debug)]
 pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
+    Stream(streams::StreamResolution),
 }
 impl LocalResolution {
     fn is_la_cancel_confirmation(&self) -> bool {
@@ -1510,6 +1522,7 @@ impl LocalResolution {
             LocalResolution::LocalActivity(lar) => {
                 matches!(lar.result, LocalActivityExecutionResult::Cancelled(_))
             }
+            LocalResolution::Stream(_) => false,
         }
     }
 }
@@ -1748,6 +1761,10 @@ pub(crate) enum WFMachinesError {
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
+    /// A Stream call that the Worker can't serve. The text is the whole message, so that a
+    /// failed Workflow Task names the cause in its own words.
+    #[error("{0}")]
+    Stream(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1782,7 +1799,7 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
         }
     }
 
@@ -1858,8 +1875,9 @@ impl LocalActivityRequestSink for LAReqSink {
 /// 4. signals/updates
 /// 5. all others
 /// 6. local activity resolutions
-/// 7. queries
-/// 8. evictions
+/// 7. Stream results, reads before appends, each by seq
+/// 8. queries
+/// 9. evictions
 ///
 /// See the [WorkflowActivation] docstring for more detail
 ///
@@ -1888,22 +1906,26 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
         // Unwrapping is fine here since we'll never issue empty variants
         let j1v = j1.variant.as_ref().unwrap();
         let j2v = j2.variant.as_ref().unwrap();
-        fn variant_ordinal(v: &workflow_activation_job::Variant) -> u8 {
+        fn variant_ordinal(v: &workflow_activation_job::Variant) -> (u8, u8, u32) {
             match v {
-                workflow_activation_job::Variant::InitializeWorkflow(_) => 0,
-                workflow_activation_job::Variant::NotifyHasPatch(_) => 1,
-                workflow_activation_job::Variant::UpdateRandomSeed(_) => 2,
-                workflow_activation_job::Variant::SignalWorkflow(_) => 3,
-                workflow_activation_job::Variant::DoUpdate(_) => 3,
-                workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
+                workflow_activation_job::Variant::InitializeWorkflow(_) => (0, 0, 0),
+                workflow_activation_job::Variant::NotifyHasPatch(_) => (1, 0, 0),
+                workflow_activation_job::Variant::UpdateRandomSeed(_) => (2, 0, 0),
+                workflow_activation_job::Variant::SignalWorkflow(_) => (3, 0, 0),
+                workflow_activation_job::Variant::DoUpdate(_) => (3, 0, 0),
+                workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => (5, 0, 0),
+                // Stream results come in the order of their calls, not of their arrival, so that
+                // a replay gives the same order.
+                workflow_activation_job::Variant::ResolveStreamRead(r) => (6, 0, r.seq),
+                workflow_activation_job::Variant::ResolveStreamAppend(r) => (6, 1, r.seq),
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.
-                workflow_activation_job::Variant::QueryWorkflow(_) => 6,
+                workflow_activation_job::Variant::QueryWorkflow(_) => (7, 0, 0),
                 // Also shouldn't ever end up anywhere but the end by construction, but no harm in
                 // double-checking.
-                workflow_activation_job::Variant::RemoveFromCache(_) => 7,
-                _ => 4,
+                workflow_activation_job::Variant::RemoveFromCache(_) => (8, 0, 0),
+                _ => (4, 0, 0),
             }
         }
         variant_ordinal(j1v).cmp(&variant_ordinal(j2v))

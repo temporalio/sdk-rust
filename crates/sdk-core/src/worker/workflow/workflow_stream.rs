@@ -5,6 +5,7 @@ use crate::{
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
+        streams::StreamManager,
         wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
         *,
     },
@@ -67,6 +68,7 @@ impl WFStream {
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        stream_manager: Arc<StreamManager>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let all_inputs = stream::select_with_strategy(
             local_rx.map(Into::into),
@@ -78,13 +80,19 @@ impl WFStream {
             // Priority always goes to the local stream
             |_: &mut ()| PollNext::Left,
         );
-        Self::build_internal(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(
+            all_inputs,
+            basics,
+            local_activity_request_sink,
+            stream_manager,
+        )
     }
 
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        stream_manager: Arc<StreamManager>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
@@ -93,6 +101,7 @@ impl WFStream {
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
                 basics.server_capabilities,
                 local_activity_request_sink,
+                stream_manager,
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
