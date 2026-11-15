@@ -2,7 +2,7 @@
 //! Task. A call has no command or event of its own, so it needs no state machine.
 
 use crate::worker::workflow::{
-    OutgoingJob, WFMachinesError, fatal,
+    OutgoingJob, WFMachinesError, fatal, nondeterminism,
     streams::{
         AppendSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
         StreamResolution, next_call_id,
@@ -18,8 +18,8 @@ use temporalio_common::protos::{
     coresdk::{
         external_data::{StreamAppendEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry},
         workflow_activation::{
-            ResolveStreamAppend, ResolveStreamRead, StreamReadEnd, resolve_stream_append,
-            workflow_activation_job,
+            ResolveStreamAppend, ResolveStreamRead, StreamAppended, StreamReadEnd,
+            resolve_stream_append, workflow_activation_job,
         },
         workflow_commands::{AppendToStream, StartStreamRead},
     },
@@ -38,14 +38,42 @@ pub(super) enum StreamJob {
 
 struct Read {
     call_id: u64,
+    seq: u32,
     stream: StreamRef,
     from_offset: Vec<u8>,
     records_in_history: bool,
+    deadline: Option<SystemTime>,
+    idle_timeout: Duration,
+    max_records: u32,
+    max_bytes: u64,
     flow: Arc<ReadFlow>,
     /// The offset of the last Record that Workflow code got, or `from_offset`.
     last_offset: Vec<u8>,
+    /// The Records, and their bytes, that Workflow code got.
+    delivered: (u32, u64),
     /// False once the read ended or was closed.
     open: bool,
+    /// True once the Worker runs the read. A replayed read takes its results from history.
+    dispatched: bool,
+}
+
+impl Read {
+    /// The read to run from where Workflow code is, with what is left of its caps.
+    fn spec(&self) -> ReadSpec {
+        let (records, bytes) = self.delivered;
+        ReadSpec {
+            call_id: self.call_id,
+            seq: self.seq,
+            stream: self.stream.clone(),
+            from_offset: self.last_offset.clone(),
+            deadline: self.deadline,
+            idle_timeout: self.idle_timeout,
+            records_left: (self.max_records > 0).then(|| self.max_records.saturating_sub(records)),
+            bytes_left: (self.max_bytes > 0).then(|| self.max_bytes.saturating_sub(bytes)),
+            took_a_record: records > 0,
+            flow: self.flow.clone(),
+        }
+    }
 }
 
 struct Append {
@@ -54,6 +82,22 @@ struct Append {
     /// Taken when the append is dispatched.
     spec: Option<AppendSpec>,
     resolved: bool,
+}
+
+/// A result that history has for a call, which waits for its activation in a replay.
+struct Held {
+    seq: u32,
+    activation: u32,
+    stream: StreamRef,
+    result: HeldResult,
+}
+
+enum HeldResult {
+    Read {
+        from_offset: Vec<u8>,
+        page: ResolveStreamRead,
+    },
+    Append(resolve_stream_append::Status),
 }
 
 /// What one read gave Workflow code in the current Workflow Task.
@@ -77,6 +121,11 @@ pub(super) struct StreamCalls {
     requests: Vec<StreamRequest>,
     marker_reads: Vec<ReadEntryBuilder>,
     marker_appends: Vec<StreamAppendEntry>,
+    /// The results of the markers of history that wait for Workflow code, in marker order.
+    held: Vec<Held>,
+    /// False while the run replays. A call then waits for its results from history, and the
+    /// Worker runs it only once replay ends.
+    live: bool,
 }
 
 impl StreamCalls {
@@ -91,41 +140,76 @@ impl StreamCalls {
         if self.reads.contains_key(&attrs.seq) {
             return Err(fatal!("Stream read {} was started twice", attrs.seq));
         }
-        let call_id = next_call_id();
-        let flow = Arc::new(ReadFlow::default());
         let duration = |value: Option<prost_types::Duration>| {
             value
                 .and_then(|value| Duration::try_from(value).ok())
                 .filter(|value| !value.is_zero())
         };
-        // The bound counts from the Workflow time of the start, so no restart can stretch it.
+        // The bound counts from the Workflow time of the start, which a replay has too, so no
+        // restart can stretch it.
         let deadline = duration(attrs.timeout)
             .map(|timeout| workflow_time.unwrap_or_else(SystemTime::now) + timeout);
-        self.requests.push(StreamRequest::Read(ReadSpec {
-            call_id,
+        let read = Read {
+            call_id: next_call_id(),
             seq: attrs.seq,
-            stream: stream.clone(),
-            from_offset: attrs.from_offset.clone(),
+            stream,
+            last_offset: attrs.from_offset.clone(),
+            from_offset: attrs.from_offset,
+            records_in_history: attrs.records_in_history,
             deadline,
             idle_timeout: duration(attrs.idle_timeout).unwrap_or(DEFAULT_IDLE_TIMEOUT),
             max_records: attrs.max_records,
             max_bytes: attrs.max_bytes,
-            took_a_record: false,
-            flow: flow.clone(),
-        }));
-        self.reads.insert(
-            attrs.seq,
-            Read {
-                call_id,
-                stream,
-                last_offset: attrs.from_offset.clone(),
-                from_offset: attrs.from_offset,
-                records_in_history: attrs.records_in_history,
-                flow,
-                open: true,
-            },
-        );
+            flow: Arc::new(ReadFlow::default()),
+            delivered: (0, 0),
+            open: true,
+            dispatched: self.live,
+        };
+        if self.live {
+            self.requests.push(StreamRequest::Read(read.spec()));
+        }
+        self.reads.insert(attrs.seq, read);
         Ok(())
+    }
+
+    /// True once replay ended, so that the Worker runs new calls.
+    pub(super) fn is_live(&self) -> bool {
+        self.live
+    }
+
+    /// Runs the calls that replay left open, from where Workflow code is. Returns the Stores that
+    /// they use, so that the caller can check that the Worker has their runtimes.
+    pub(super) fn go_live(&mut self) -> Vec<String> {
+        if self.live {
+            return vec![];
+        }
+        self.live = true;
+        let mut stores = vec![];
+        let mut reads: Vec<_> = self
+            .reads
+            .values_mut()
+            .filter(|read| read.open && !read.dispatched)
+            .collect();
+        reads.sort_by_key(|read| read.seq);
+        for read in reads {
+            read.dispatched = true;
+            read.call_id = next_call_id();
+            stores.push(read.stream.store.clone());
+            self.requests.push(StreamRequest::Read(read.spec()));
+        }
+        let mut heads: Vec<_> = self
+            .append_queues
+            .values()
+            .filter_map(|queue| queue.front().copied())
+            .collect();
+        heads.sort();
+        for seq in heads {
+            if let Some(append) = self.appends.get(&seq) {
+                stores.push(append.stream.store.clone());
+            }
+            self.dispatch_append(seq);
+        }
+        stores
     }
 
     /// Stops a read. Returns true if it was still open, so that its pending Records are dropped.
@@ -138,7 +222,9 @@ impl StreamCalls {
             return Ok(false);
         }
         read.open = false;
-        self.requests.push(StreamRequest::Cancel(read.call_id));
+        if read.dispatched {
+            self.requests.push(StreamRequest::Cancel(read.call_id));
+        }
         Ok(true)
     }
 
@@ -188,7 +274,7 @@ impl StreamCalls {
                 resolved: false,
             },
         );
-        if runs_now {
+        if runs_now && self.live {
             self.dispatch_append(seq);
         }
         Ok(())
@@ -228,7 +314,9 @@ impl StreamCalls {
                 let key = (append.stream.store.clone(), append.stream.id.clone());
                 if let Some(queue) = self.append_queues.get_mut(&key) {
                     queue.retain(|queued| *queued != seq);
-                    if let Some(next) = queue.front().copied() {
+                    if let Some(next) = queue.front().copied()
+                        && self.live
+                    {
                         self.dispatch_append(next);
                     }
                 }
@@ -238,6 +326,223 @@ impl StreamCalls {
                 }))
             }
         }
+    }
+
+    /// Holds the results of a marker of history, each for its activation in the Workflow Task.
+    pub(super) fn insert_peeked(&mut self, data: StreamMarkerData) -> Result<()> {
+        for entry in data.reads {
+            let stream = entry.stream.unwrap_or_default();
+            let seq = entry.seq;
+            let bad = |what: &str| fatal!("The Stream marker entry of read {seq} is bad: {what}");
+            if entry
+                .page_counts
+                .iter()
+                .map(|count| *count as usize)
+                .sum::<usize>()
+                != entry.records.len()
+                || entry.page_counts.len() != entry.page_activations.len()
+            {
+                return Err(bad("its pages don't match its Records"));
+            }
+            let mut records = entry.records.into_iter();
+            let mut activation = 0u32;
+            let mut pages = vec![];
+            for (at, (count, gap)) in entry
+                .page_counts
+                .iter()
+                .zip(entry.page_activations.iter())
+                .enumerate()
+            {
+                activation = if at == 0 { *gap } else { activation + *gap };
+                let page: Vec<_> = records.by_ref().take(*count as usize).collect();
+                pages.push((activation, page));
+            }
+            let end = entry.end.map(|end| {
+                (
+                    end.activation,
+                    StreamReadEnd {
+                        last_offset: end.last_offset,
+                        stop: end.stop,
+                        done: end.done,
+                        failure: end.failure,
+                    },
+                )
+            });
+            let mut end = end;
+            let last = pages.len().checked_sub(1);
+            for (at, (activation, records)) in pages.into_iter().enumerate() {
+                // An end in the activation of the last page came in the same job.
+                let with_end = if Some(at) == last
+                    && end.as_ref().is_some_and(|(ended, _)| *ended == activation)
+                {
+                    end.take().map(|(_, end)| end)
+                } else {
+                    None
+                };
+                self.held.push(Held {
+                    seq,
+                    activation,
+                    stream: stream.clone(),
+                    result: HeldResult::Read {
+                        from_offset: entry.from_offset.clone(),
+                        page: ResolveStreamRead {
+                            seq,
+                            records,
+                            end: with_end,
+                        },
+                    },
+                });
+            }
+            if let Some((activation, end)) = end {
+                self.held.push(Held {
+                    seq,
+                    activation,
+                    stream: stream.clone(),
+                    result: HeldResult::Read {
+                        from_offset: entry.from_offset.clone(),
+                        page: ResolveStreamRead {
+                            seq,
+                            records: vec![],
+                            end: Some(end),
+                        },
+                    },
+                });
+            }
+        }
+        for entry in data.appends {
+            let status = match entry.failure {
+                Some(failure) => resolve_stream_append::Status::Failed(failure),
+                None => resolve_stream_append::Status::Appended(StreamAppended {
+                    first_offset: entry.first_offset,
+                    last_offset: entry.last_offset,
+                }),
+            };
+            self.held.push(Held {
+                seq: entry.seq,
+                activation: entry.activation,
+                stream: entry.stream.unwrap_or_default(),
+                result: HeldResult::Append(status),
+            });
+        }
+        Ok(())
+    }
+
+    /// Takes the held results that Workflow code gets in activation `current`, or that it gets
+    /// late, of calls that it started. With `include_held`, it takes those of later activations
+    /// too, for a replay that made fewer activations than its first run.
+    pub(super) fn take_held(&mut self, current: u32, include_held: bool) -> Result<Vec<StreamJob>> {
+        let mut jobs = vec![];
+        let mut at = 0;
+        while at < self.held.len() {
+            let held = &self.held[at];
+            let started = match held.result {
+                HeldResult::Read { .. } => self.reads.contains_key(&held.seq),
+                HeldResult::Append(_) => self.appends.contains_key(&held.seq),
+            };
+            if !started || (held.activation > current && !include_held) {
+                at += 1;
+                continue;
+            }
+            let held = self.held.remove(at);
+            jobs.push(self.apply_held(held)?);
+        }
+        Ok(jobs)
+    }
+
+    fn apply_held(&mut self, held: Held) -> Result<StreamJob> {
+        let Held {
+            seq,
+            stream,
+            result,
+            ..
+        } = held;
+        let differs = |call: &StreamRef| call.store != stream.store || call.id != stream.id;
+        match result {
+            HeldResult::Read { from_offset, page } => {
+                let read = self
+                    .reads
+                    .get_mut(&seq)
+                    .expect("take_held checked the read");
+                if differs(&read.stream) || read.from_offset != from_offset {
+                    return Err(nondeterminism!(
+                        "Stream read {seq} reads Stream `{}` in Store `{}`, but history has a \
+                         read of Stream `{}` in Store `{}`, or from another offset",
+                        read.stream.id,
+                        read.stream.store,
+                        stream.id,
+                        stream.store
+                    ));
+                }
+                if !read.open {
+                    return Err(nondeterminism!(
+                        "History has a result of Stream read {seq} after the read ended"
+                    ));
+                }
+                if page.end.is_some() {
+                    read.open = false;
+                }
+                Ok(StreamJob::Read(page))
+            }
+            HeldResult::Append(status) => {
+                let append = self
+                    .appends
+                    .get_mut(&seq)
+                    .expect("take_held checked the append");
+                if differs(&append.stream) {
+                    return Err(nondeterminism!(
+                        "Stream append {seq} writes Stream `{}` in Store `{}`, but history has an \
+                         append to Stream `{}` in Store `{}`",
+                        append.stream.id,
+                        append.stream.store,
+                        stream.id,
+                        stream.store
+                    ));
+                }
+                if append.resolved {
+                    return Err(nondeterminism!(
+                        "History has a second result of Stream append {seq}"
+                    ));
+                }
+                append.resolved = true;
+                append.spec = None;
+                let key = (append.stream.store.clone(), append.stream.id.clone());
+                if let Some(queue) = self.append_queues.get_mut(&key) {
+                    queue.retain(|queued| *queued != seq);
+                }
+                Ok(StreamJob::Append(ResolveStreamAppend {
+                    seq,
+                    status: Some(status),
+                }))
+            }
+        }
+    }
+
+    /// Fails when history has results of a marker that Workflow code never got. A replayed
+    /// marker event comes after every activation of its Workflow Task.
+    pub(super) fn check_marker_consumed(&self) -> Result<()> {
+        match self.held.first() {
+            Some(held) => Err(nondeterminism!(
+                "History has a Stream result of {} {} that Workflow code never got",
+                match held.result {
+                    HeldResult::Read { .. } => "read",
+                    HeldResult::Append(_) => "append",
+                },
+                held.seq
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// True if history has results that wait for their activation.
+    pub(super) fn has_held(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Clears what Workflow code got in the last Workflow Task, when the next one begins. A
+    /// replayed task has no marker to write, and a live one wrote its marker already.
+    pub(super) fn wft_applied(&mut self) {
+        self.marker_reads.clear();
+        self.marker_appends.clear();
     }
 
     /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
@@ -253,6 +558,7 @@ impl StreamCalls {
             self.requests.push(StreamRequest::Cancel(append.call_id));
         }
         self.append_queues.clear();
+        self.held.clear();
     }
 
     pub(super) fn drain_requests(&mut self) -> Vec<StreamRequest> {
@@ -263,11 +569,19 @@ impl StreamCalls {
         !self.requests.is_empty()
     }
 
+    /// The reads that the Worker runs. A replayed read that waits for history holds no task.
     pub(super) fn open_reads(&self) -> usize {
-        self.reads.values().filter(|read| read.open).count()
+        self.reads
+            .values()
+            .filter(|read| read.open && read.dispatched)
+            .count()
     }
 
+    /// The appends that have no result, once replay ended.
     pub(super) fn open_appends(&self) -> usize {
+        if !self.live {
+            return 0;
+        }
         self.appends.values().filter(|a| !a.resolved).count()
     }
 
@@ -330,7 +644,9 @@ impl StreamCalls {
             entry.page_activations.push(activation);
             entry.records.extend(page.records.iter().cloned());
             read.last_offset.clone_from(&last.offset);
-            let bytes = page.records.iter().map(Message::encoded_len).sum();
+            let bytes: usize = page.records.iter().map(Message::encoded_len).sum();
+            read.delivered.0 += page.records.len() as u32;
+            read.delivered.1 += bytes as u64;
             read.flow.delivered(bytes);
         }
         if let Some(StreamReadEnd {

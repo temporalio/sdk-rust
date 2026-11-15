@@ -6,7 +6,10 @@ use super::{
     EventInfo, HistEventData, StateMachine, TransitionResult, WFMachinesAdapter, fsm,
     workflow_machines::MachineResponse,
 };
-use crate::worker::workflow::{WFMachinesError, nondeterminism};
+use crate::worker::workflow::{
+    WFMachinesError, nondeterminism,
+    streams::{STREAM_MARKER_DATA_KEY, stream_marker_payload_of},
+};
 use prost::Message;
 use std::collections::HashMap;
 use temporalio_common::protos::{
@@ -19,9 +22,6 @@ use temporalio_common::protos::{
         history::v1::{HistoryEvent, MarkerRecordedEventAttributes, history_event},
     },
 };
-
-/// The marker detail that holds the encoded [StreamMarkerData].
-pub(crate) const STREAM_MARKER_DATA_KEY: &str = "data";
 
 fsm! {
     pub(super) name StreamMarkerMachine;
@@ -131,4 +131,10 @@ impl TryFrom<HistEventData> for StreamMarkerMachineEvents {
             ))
         }
     }
+}
+
+/// The data of a `core_stream` marker event, or `None` if it has none that decodes.
+pub(super) fn stream_marker_data(event: &HistoryEvent) -> Option<StreamMarkerData> {
+    let payload = stream_marker_payload_of(event)?;
+    StreamMarkerData::decode(payload.data.as_slice()).ok()
 }
