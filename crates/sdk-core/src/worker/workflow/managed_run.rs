@@ -189,7 +189,8 @@ impl ManagedRun {
         }
         let start_time = Instant::now();
 
-        let work = pwft.work;
+        let mut work = pwft.work;
+        let stream_replay_error = work.stream_replay_error.take();
         debug!(
             task_token = %&work.task_token,
             update = ?work.update,
@@ -240,6 +241,9 @@ impl ManagedRun {
         if let Some(waiting) = self.waiting_on_la.as_mut() {
             waiting.hb_timeout_handle.abort();
             waiting.heartbeat_timeout_pending = false;
+        }
+        if let Some(message) = stream_replay_error {
+            return Err(WFMachinesError::Stream(message).into());
         }
 
         if was_legacy_query

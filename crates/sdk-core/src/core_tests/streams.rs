@@ -2409,3 +2409,71 @@ async fn a_cached_run_reads_no_marker_of_a_full_history() {
     assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
     assert_eq!(run.sent.lock().len(), 2);
 }
+
+/// Replays the history of a marker of read 1 of Stream `s` on a replay Worker, and returns the
+/// message of the eviction that ends it. The replay Worker must end the history, and not feed it
+/// again.
+async fn replay_worker_eviction(data: StreamMarkerData, runtimes: StreamRuntimes) -> String {
+    let worker = replay_worker(replayed_read_history(&data), runtimes);
+    let evicted = tokio::time::timeout(Duration::from_secs(5), worker.poll_workflow_activation())
+        .await
+        .expect("the replay Worker gave no activation")
+        .unwrap();
+    let Some(workflow_activation_job::Variant::RemoveFromCache(evict)) =
+        evicted.jobs.first().and_then(|job| job.variant.clone())
+    else {
+        panic!("Expected an eviction, got {:?}", evicted.jobs);
+    };
+    assert_eq!(evicted.jobs.len(), 1);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(evicted.run_id))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(5), worker.poll_workflow_activation())
+        .await
+        .expect("the replay Worker didn't end the history");
+    assert!(
+        next.is_err(),
+        "the replay Worker fed the history again: {next:?}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    evict.message
+}
+
+/// A replay Worker with no runtime for the Store of a marker evicts the run with the
+/// `StreamReplayError`, and ends the history.
+#[tokio::test]
+async fn a_replay_worker_with_no_runtime_ends_the_history() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, range) = one_page(&all_records(&runtime, "s").await);
+    let message = replay_worker_eviction(data, StreamRuntimes::default()).await;
+    assert!(
+        message.contains(&format!(
+            "StreamReplayError: {range}: this Worker has no Stream runtime for the Store `mem`"
+        )),
+        "{message}"
+    );
+}
+
+/// A replay Worker whose Store lost the Records of a marker evicts the run with the
+/// `StreamReplayError`, and ends the history.
+#[tokio::test]
+async fn a_replay_worker_whose_records_are_gone_ends_the_history() {
+    let options = MemoryStreamOptions {
+        retention: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let runtime = MemoryStreamRuntime::new(STORE, options, None);
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, range) = one_page(&all_records(&runtime, "s").await);
+    close(&runtime, "s").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let message = replay_worker_eviction(data, runtimes(&runtime)).await;
+    assert!(
+        message.contains(&format!("StreamReplayError: {range}: stream_expired")),
+        "{message}"
+    );
+}
