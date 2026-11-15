@@ -5,7 +5,7 @@ use crate::{
         client::WorkerClient,
         workflow::{
             CacheMissFetchReq, PermittedWFT, PreparedWFT, StreamRuntimes,
-            streams::hydrate_stream_markers,
+            streams::{hydrate_stream_markers, needs_stream_records},
         },
     },
 };
@@ -75,6 +75,19 @@ impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
     }
+
+    /// True if a marker of the update counts Records that it doesn't hold.
+    pub(crate) fn needs_stream_records(&self) -> bool {
+        needs_stream_records(&self.events)
+    }
+
+    /// Reads the Records that the markers of the update count from the Store.
+    pub(crate) async fn read_stream_records(
+        &mut self,
+        runtimes: &StreamRuntimes,
+    ) -> Result<(), tonic::Status> {
+        hydrate_stream_markers(&mut self.events, runtimes).await
+    }
 }
 
 #[derive(Debug)]
@@ -102,10 +115,9 @@ pub(crate) struct HistoryPaginator {
     chunking_disabled: bool,
     /// The Worker's Stream runtimes, which a replay reads the Records of its markers with.
     streams: StreamRuntimes,
-    /// True if the paginator reads history from its first event. Only such a history is replayed
-    /// by a new run, whose markers need their Records. An incremental one holds the markers that
-    /// the cached run wrote and still has.
-    from_start: bool,
+    /// True if the run of this history is new to the cache, so that it replays the markers that
+    /// it gives, which need their Records. A cached run has every marker it meets already.
+    hydrate: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +142,16 @@ impl From<Vec<u8>> for NextPageToken {
 }
 
 impl HistoryPaginator {
+    /// Makes the paginator read the Records of the markers in its later pages, for a run that is
+    /// new to the cache.
+    pub(super) fn hydrate_new_run(&mut self) {
+        self.hydrate = true;
+    }
+
+    pub(super) fn stream_runtimes(&self) -> &StreamRuntimes {
+        &self.streams
+    }
+
     /// Use a new poll response to create a new [WFTPaginator], returning it and the
     /// [PreparedWFT] extracted from it that can be fed into workflow state.
     pub(super) async fn from_poll(
@@ -201,7 +223,7 @@ impl HistoryPaginator {
             final_events: req.original_wft.work.update.events,
             chunking_disabled: false,
             streams: req.original_wft.paginator.streams.clone(),
-            from_start: true,
+            hydrate: true,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -219,8 +241,6 @@ impl HistoryPaginator {
         client: Arc<dyn WorkerClient>,
     ) -> Self {
         let next_page_token = next_page_token.into();
-        let from_start = matches!(next_page_token, NextPageToken::FetchFromStart)
-            || initial_history.events.first().map(|e| e.event_id) == Some(1);
         let (event_queue, final_events) =
             if matches!(next_page_token, NextPageToken::FetchFromStart) {
                 (VecDeque::new(), initial_history.events)
@@ -239,7 +259,7 @@ impl HistoryPaginator {
             id_of_last_event_in_last_extracted_update: None,
             chunking_disabled: false,
             streams: StreamRuntimes::default(),
-            from_start,
+            hydrate: false,
         }
     }
 
@@ -341,7 +361,7 @@ impl HistoryPaginator {
             #[cfg(debug_assertions)]
             update.assert_contiguous();
             let mut update = update;
-            if self.from_start {
+            if self.hydrate {
                 hydrate_stream_markers(&mut update.events, &self.streams).await?;
             }
             return Ok(update);

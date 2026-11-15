@@ -51,6 +51,9 @@ pub(crate) type WFTStreamIn = Result<
 pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
+    /// A task of a run that is new to the cache, whose markers need their Records read from the
+    /// Store before the run replays them.
+    StreamRecords(Box<PermittedWFT>, Arc<HistfetchRC>),
 }
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
 #[derive(Debug)]
@@ -128,6 +131,24 @@ impl WFTExtractor {
                             };
                             match HistoryPaginator::from_fetchreq(req, client).await {
                                 Ok(r) => WFTExtractorOutput::FetchResult(r, rc),
+                                Err(err) => WFTExtractorOutput::FailedFetch {
+                                    run_id,
+                                    err,
+                                    auto_reply_fail: Some(fail_info),
+                                },
+                            }
+                        }
+                        HistoryFetchReq::StreamRecords(mut pwft, rc) => {
+                            let run_id = pwft.work.execution.run_id.clone();
+                            let fail_info = UnstoredWftFailInfo {
+                                task_token: pwft.work.task_token.clone(),
+                                workflow_id: pwft.work.execution.workflow_id.clone(),
+                                attempt: pwft.work.attempt,
+                                workflow_type: pwft.work.workflow_type.clone(),
+                            };
+                            let runtimes = pwft.paginator.stream_runtimes().clone();
+                            match pwft.work.update.read_stream_records(&runtimes).await {
+                                Ok(()) => WFTExtractorOutput::FetchResult(*pwft, rc),
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,
