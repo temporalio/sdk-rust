@@ -44,6 +44,7 @@ use temporalio_common::protos::{
     temporal::api::{
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
+        stream::v1::WorkflowTaskEpoch,
     },
 };
 use tokio::sync::oneshot;
@@ -810,6 +811,7 @@ impl ManagedRun {
             if self.wfm.machines.outstanding_local_work() == 0 {
                 Ok(None)
             } else if self.wfm.machines.outstanding_local_activity_count() == 0
+                && self.wfm.machines.outstanding_stream_appends() == 0
                 && self.wfm.machines.has_server_commands()
             {
                 // Only reads are left. A command for the server must not wait for a read, so
@@ -1293,14 +1295,22 @@ impl ManagedRun {
     }
 
     /// Starts and stops the Stream calls that the machines asked for. Calls wait while the run has
-    /// no Workflow Task.
+    /// no Workflow Task, since an append writes with the task as its epoch.
     fn dispatch_stream_requests(&mut self) {
-        if self.wft.is_none() || !self.wfm.machines.has_stream_requests() {
+        let Some(wft) = self.wft.as_ref() else {
+            return;
+        };
+        if !self.wfm.machines.has_stream_requests() {
             return;
         }
+        let epoch = WorkflowTaskEpoch {
+            started_event_id: wft.info.started_event_id,
+            attempt: i32::try_from(wft.info.attempt).unwrap_or(i32::MAX),
+            started_time: wft.info.started_time.map(Into::into),
+        };
         let requests = self.wfm.machines.drain_stream_requests();
         self.stream_manager
-            .dispatch(&self.wfm.machines.run_id, requests);
+            .dispatch(&self.wfm.machines.run_id, epoch, requests);
     }
 
     /// Stops the run's Stream calls and drops their results still on their way.

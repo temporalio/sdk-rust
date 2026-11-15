@@ -1,5 +1,5 @@
-//! Direct calls to Streams. Core reads a Stream on the Worker's Stream runtimes, in tasks on the
-//! Worker's runtime, and gives each result to the run as a [LocalResolution].
+//! Direct calls to Streams. Core reads and appends a Stream on the Worker's Stream runtimes, in
+//! tasks on the Worker's runtime, and gives each result to the run as a [LocalResolution].
 
 use crate::{
     abstractions::dbg_panic,
@@ -20,7 +20,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::protos::{
-    coresdk::{common::StreamReadStop, workflow_activation::StreamReadEnd},
+    coresdk::{
+        common::StreamReadStop,
+        workflow_activation::{StreamAppended, StreamReadEnd, resolve_stream_append},
+    },
     temporal::api::{
         common::v1::{Payload, Payloads},
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
@@ -28,7 +31,10 @@ use temporalio_common::protos::{
 };
 use temporalio_streams::{
     MAX_WAIT, Reason, StreamError, StreamRuntime,
-    proto::{ReadRecordsRequest, StreamRecord, StreamRef},
+    proto::{
+        AppendRecord, AppendRecordsRequest, Producer, ReadRecordsRequest, StreamRecord, StreamRef,
+        WorkflowTaskEpoch, producer::Kind,
+    },
 };
 use tokio::{
     runtime::Handle,
@@ -110,6 +116,7 @@ impl ReadFlow {
 #[derive(Debug)]
 pub(crate) enum StreamRequest {
     Read(ReadSpec),
+    Append(AppendSpec),
     Cancel(u64),
 }
 
@@ -132,6 +139,17 @@ pub(crate) struct ReadSpec {
     pub(crate) flow: Arc<ReadFlow>,
 }
 
+/// An append to run.
+#[derive(Debug)]
+pub(crate) struct AppendSpec {
+    pub(crate) call_id: u64,
+    pub(crate) seq: u32,
+    pub(crate) stream: StreamRef,
+    /// The Producer that lang sent, with no epoch.
+    pub(crate) producer: Producer,
+    pub(crate) bodies: Vec<Payload>,
+}
+
 /// The result of one step of a call.
 #[derive(Debug)]
 pub(crate) struct StreamResolution {
@@ -147,6 +165,7 @@ pub(crate) enum StreamCallResult {
         records: Vec<StreamRecord>,
         end: Option<StreamReadEnd>,
     },
+    Append(resolve_stream_append::Status),
 }
 
 /// Runs the Stream calls of a Worker's runs. Its tasks run on the Worker's runtime, not on the
@@ -173,8 +192,14 @@ impl StreamManager {
         }
     }
 
-    /// Starts or stops the calls of a run.
-    pub(crate) fn dispatch(&self, run_id: &str, requests: Vec<StreamRequest>) {
+    /// Starts or stops the calls of a run. `epoch` is the run's current Workflow Task, which an
+    /// append writes with.
+    pub(crate) fn dispatch(
+        &self,
+        run_id: &str,
+        epoch: WorkflowTaskEpoch,
+        requests: Vec<StreamRequest>,
+    ) {
         for request in requests {
             match request {
                 StreamRequest::Cancel(call_id) => {
@@ -189,7 +214,17 @@ impl StreamManager {
                             let sink = self.sink(run_id, call_id, seq);
                             self.spawn(run_id, call_id, read(runtime, spec, sink));
                         }
-                        None => self.no_runtime(run_id, call_id, seq),
+                        None => self.no_runtime(run_id, call_id, seq, true),
+                    }
+                }
+                StreamRequest::Append(spec) => {
+                    let (call_id, seq) = (spec.call_id, spec.seq);
+                    match self.runtime(&spec.stream) {
+                        Some(runtime) => {
+                            let sink = self.sink(run_id, call_id, seq);
+                            self.spawn(run_id, call_id, append(runtime, spec, epoch, sink));
+                        }
+                        None => self.no_runtime(run_id, call_id, seq, false),
                     }
                 }
             }
@@ -236,18 +271,22 @@ impl StreamManager {
 
     /// The machines check the Store of each call, so a call with no runtime only comes when the
     /// runtimes and the machines disagree. It still resolves, so that the run doesn't wait forever.
-    fn no_runtime(&self, run_id: &str, call_id: u64, seq: u32) {
+    fn no_runtime(&self, run_id: &str, call_id: u64, seq: u32, is_read: bool) {
         dbg_panic!("A Stream call reached the Worker with no runtime for its Store");
         let failure = Failure {
             message: "This Worker has no Stream runtime for the Store of the call".to_string(),
             ..Default::default()
         };
-        let result = StreamCallResult::Page {
-            records: vec![],
-            end: Some(StreamReadEnd {
-                failure: Some(failure),
-                ..Default::default()
-            }),
+        let result = if is_read {
+            StreamCallResult::Page {
+                records: vec![],
+                end: Some(StreamReadEnd {
+                    failure: Some(failure),
+                    ..Default::default()
+                }),
+            }
+        } else {
+            StreamCallResult::Append(resolve_stream_append::Status::Failed(failure))
         };
         (self.sink(run_id, call_id, seq))(result);
     }
@@ -398,6 +437,39 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
             None => {}
         }
     }
+}
+
+/// Appends the bodies as the run's Producer, with the Workflow Task as the epoch.
+async fn append(
+    runtime: Arc<StreamRuntime>,
+    spec: AppendSpec,
+    epoch: WorkflowTaskEpoch,
+    sink: impl Fn(StreamCallResult),
+) {
+    let mut producer = spec.producer;
+    if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
+        workflow.epoch = Some(epoch);
+    }
+    let request = AppendRecordsRequest {
+        namespace: String::new(),
+        r#ref: Some(spec.stream),
+        producer: Some(producer),
+        // The seq grows in a run, so the Store can refuse a resend of one batch in one epoch.
+        sequence: i64::from(spec.seq),
+        records: spec
+            .bodies
+            .into_iter()
+            .map(|body| AppendRecord { body: Some(body) })
+            .collect(),
+    };
+    let status = match runtime.append_records(request).await {
+        Ok(response) => resolve_stream_append::Status::Appended(StreamAppended {
+            first_offset: response.first_offset,
+            last_offset: response.last_offset,
+        }),
+        Err(error) => resolve_stream_append::Status::Failed(failure(&error)),
+    };
+    sink(StreamCallResult::Append(status));
 }
 
 fn proto_duration(duration: Duration) -> prost_types::Duration {
