@@ -91,7 +91,16 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
 /// field, or a field that the kind doesn't have, gives zero. So a client or a Producer with no
 /// kind gives an all-zero key. The runtime refuses a Workflow Producer with no epoch before a
 /// Store sees it.
+///
+/// A Workflow Producer with no epoch gives an all-ones key, so it orders after every Workflow Task
+/// of the run. Only its close sends no epoch, from an Activity that History recorded, so it is
+/// never the late write of a failed task.
 pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
+    if let Some(Kind::Workflow(workflow)) = kind
+        && workflow.epoch.is_none()
+    {
+        return [u8::MAX; EPOCH_KEY_LEN];
+    }
     let (scheduled, attempt) = match kind {
         Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
         Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
