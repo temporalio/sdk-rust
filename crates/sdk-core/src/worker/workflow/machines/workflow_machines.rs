@@ -80,7 +80,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
-            stream::v1::StreamRef,
+            stream::v1::{StreamRef, WorkflowTaskEpoch},
         },
     },
     worker::WorkerDeploymentVersion,
@@ -447,7 +447,19 @@ impl WorkflowMachines {
                 }
             }
             StreamJob::Append(result) => self.drive_me.send_job(result.into()),
+            StreamJob::Close(result) => self.drive_me.send_job(result.into()),
         }
+    }
+
+    /// True if Workflow code asked for a close that no completion carries yet.
+    pub(crate) fn has_pending_close_intents(&self) -> bool {
+        self.stream_calls.has_pending_intents()
+    }
+
+    /// The server took the completion of this Workflow Task, so History has the intents of its
+    /// closes. Returns the closes to run now.
+    pub(crate) fn stream_intents_taken(&mut self) -> Vec<StreamRequest> {
+        self.stream_calls.intents_taken()
     }
 
     /// Gives Workflow code the Stream results of history that its current activation gets, or,
@@ -492,6 +504,7 @@ impl WorkflowMachines {
     pub(crate) fn stop_stream_calls(&mut self) {
         self.stream_calls.stop_all();
         self.stream_calls.drop_held();
+        self.stream_calls.drop_intents();
         self.stream_calls.drain_requests();
     }
 
@@ -509,8 +522,8 @@ impl WorkflowMachines {
 
     /// Adds the marker `core_stream` of this Workflow Task to the commands, if Workflow code got a
     /// Stream result in it. It goes before the first terminal command, which must stay last.
-    fn seal_stream_marker(&mut self) {
-        let Some(data) = self.stream_calls.take_marker() else {
+    fn seal_stream_marker(&mut self, epoch: Option<WorkflowTaskEpoch>) {
+        let Some(data) = self.stream_calls.take_marker(epoch) else {
             return;
         };
         let (machine, attributes) = stream_marker(&data);
@@ -732,6 +745,7 @@ impl WorkflowMachines {
                     v.variant,
                     workflow_activation_job::Variant::ResolveStreamRead(_)
                         | workflow_activation_job::Variant::ResolveStreamAppend(_)
+                        | workflow_activation_job::Variant::ResolveStreamClose(_)
                 )
         })
     }
@@ -1878,8 +1892,9 @@ impl WorkflowMachines {
                         self.drive_me.drop_stream_read(attrs.seq);
                     }
                 }
-                WFCommandVariant::CloseStream(_) => {
-                    return Err(fatal!("This Worker can't close Streams yet"));
+                WFCommandVariant::CloseStream(attrs) => {
+                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.stream_calls.close(attrs)?;
                 }
                 WFCommandVariant::AppendToStream(attrs) => {
                     self.check_stream_call(attrs.stream.as_ref())?;
@@ -2113,8 +2128,8 @@ impl MachinesWFTResponseContent<'_> {
 
     /// Adds the marker of this Workflow Task to the commands. Call it only when the task completes
     /// with these commands.
-    pub(crate) fn seal_stream_marker(&mut self) {
-        self.me.seal_stream_marker();
+    pub(crate) fn seal_stream_marker(&mut self, epoch: Option<WorkflowTaskEpoch>) {
+        self.me.seal_stream_marker(epoch);
     }
 }
 
