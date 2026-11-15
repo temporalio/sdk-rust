@@ -2164,3 +2164,40 @@ async fn idle_time_skips_a_page_that_waits_for_a_task() {
     worker.drain_pollers_and_shutdown().await;
     assert!(sent.lock()[0].force_create_new_workflow_task);
 }
+
+/// No read task outlives its Worker, also one that paused because its run holds 4 MiB that no
+/// Workflow Task took.
+#[tokio::test]
+async fn no_read_outlives_its_worker() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    // The timer completes the task at once, so the read's pages wait for a task that never comes.
+    complete(
+        &worker,
+        &first,
+        vec![
+            read_with_idle(1, "s", Duration::from_secs(1)).into(),
+            timer_cmd(1),
+        ],
+    )
+    .await;
+    assert_eq!(sent.lock().len(), 1);
+    let big = "x".repeat(1 << 20);
+    for _ in 0..5 {
+        put(&runtime, "s", &[big.as_str()]).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    worker.drain_pollers_and_shutdown().await;
+    // Past the read's idle time, so only a paused read could still hold the runtime.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        Arc::strong_count(&runtime),
+        1,
+        "a Stream task still holds the runtime"
+    );
+}
