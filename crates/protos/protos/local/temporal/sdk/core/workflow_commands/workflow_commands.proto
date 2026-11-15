@@ -463,4 +463,6 @@ message AppendToStream {
     // The workflow's Producer, of kind workflow, with its id and run id and no epoch. Core sets the
     // epoch to the current workflow task.
     temporal.api.stream.v1.Producer producer = 4;
+    // The `sequence` of the Store request, as the caller gives it. Zero means Core uses `seq`.
+    int64 sequence = 5;
 }
