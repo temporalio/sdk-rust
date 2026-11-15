@@ -50,6 +50,7 @@ message PatchedMarkerData {
 message StreamMarkerData {
   repeated StreamReadEntry reads = 1;
   repeated StreamAppendEntry appends = 2;
+  repeated StreamCloseEntry closes = 3;
 }
 
 // What one read gave the workflow in one workflow task.
@@ -92,6 +93,20 @@ message StreamAppendEntry {
   temporal.api.stream.v1.StreamRef stream = 2;
   bytes first_offset = 3;
   bytes last_offset = 4;
+  temporal.api.failure.v1.Failure failure = 5;
+  // The activation in the task that got the result.
+  uint32 activation = 6;
+}
+
+// A close in one workflow task: its intent, in the task that asked for it, or its result, in the
+// task whose activation got it.
+message StreamCloseEntry {
+  uint32 seq = 1;
+  temporal.api.stream.v1.StreamRef stream = 2;
+  // Set on the intent, the epoch that Core closes with after the server took the task.
+  temporal.api.stream.v1.WorkflowTaskEpoch intent_epoch = 3;
+  // True on the result. `failure` is unset when the Stream is closed.
+  bool resolved = 4;
   temporal.api.failure.v1.Failure failure = 5;
   // The activation in the task that got the result.
   uint32 activation = 6;
