@@ -12,14 +12,18 @@ use crate::{
 };
 use parking_lot::Mutex;
 use prost::Message;
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use temporalio_common::protos::{
     constants::STREAM_MARKER_NAME,
     coresdk::{
         ActivityTaskCompletion,
         activity_result::ActivityExecutionResult,
         common::StreamReadStop,
-        external_data::StreamMarkerData,
+        external_data::{StreamAppendEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry},
         workflow_activation::{
             ResolveStreamAppend, ResolveStreamRead, WorkflowActivation, resolve_stream_append,
             workflow_activation_job,
@@ -32,7 +36,7 @@ use temporalio_common::protos::{
     },
     temporal::api::{
         command::v1::command::Attributes,
-        common::v1::Payload,
+        common::v1::{Payload, Payloads},
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         failure::v1::{Failure, failure::FailureInfo},
         history::v1::MarkerRecordedEventAttributes,
@@ -179,7 +183,28 @@ fn worker(
     runtime: &Arc<StreamRuntime>,
     expected_fails: usize,
 ) -> (Worker, Arc<Mutex<Vec<WorkflowTaskCompletion>>>) {
+    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime.clone())]);
+    let run = start(t, responses, runtimes, 1, expected_fails);
+    (run.worker, run.sent)
+}
+
+/// A Worker on a mock history, with what it sent to the server.
+struct Run {
+    worker: Worker,
+    sent: Arc<Mutex<Vec<WorkflowTaskCompletion>>>,
+    /// The cause and the message of each failed Workflow Task.
+    failed: Arc<Mutex<Vec<(WorkflowTaskFailedCause, String)>>>,
+}
+
+fn start(
+    t: TestHistoryBuilder,
+    responses: impl IntoIterator<Item = ResponseType>,
+    runtimes: StreamRuntimes,
+    cache: usize,
+    expected_fails: usize,
+) -> Run {
     let sent = Arc::new(Mutex::new(vec![]));
+    let failed = Arc::new(Mutex::new(vec![]));
     let mut cfg = MockPollCfg::from_resps(t, responses);
     cfg.num_expected_fails = expected_fails;
     let kept = sent.clone();
@@ -187,13 +212,26 @@ fn worker(
         kept.lock().push(completion.clone());
         Ok(Default::default())
     }));
+    cfg.num_expected_completions = Some((0..).into());
+    let kept = failed.clone();
+    cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        let message = failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+            .unwrap_or_default();
+        kept.lock().push((*cause, message));
+        true
+    });
     let mut mock = build_mock_pollers(cfg);
-    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime.clone())]);
     mock.worker_cfg(|wc| {
-        wc.max_cached_workflows = 1;
+        wc.max_cached_workflows = cache;
         wc.stream_runtimes = runtimes;
     });
-    (mock_worker(mock), sent)
+    Run {
+        worker: mock_worker(mock),
+        sent,
+        failed,
+    }
 }
 
 async fn complete(
@@ -1046,6 +1084,785 @@ async fn append_without_a_workflow_producer_fails_the_task() {
     complete(&worker, &first, vec![append.into()]).await;
     worker.drain_pollers_and_shutdown().await;
     assert!(all_records(&runtime, "s").await.is_empty());
+}
+
+// Replays. A test builds the marker that Core would have written, from the Records in the Store.
+
+/// One page of a read entry: its Records and its activation in the Workflow Task.
+struct Page<'a> {
+    records: &'a [StreamRecord],
+    activation: u32,
+}
+
+/// The marker entry of read `seq` of Stream `id`, with its pages and its end.
+fn read_entry(
+    seq: u32,
+    id: &str,
+    after_offset: Vec<u8>,
+    pages: &[Page<'_>],
+    end: Option<(StreamReadStop, u32)>,
+    records_in_history: bool,
+) -> StreamReadEntry {
+    let records: Vec<StreamRecord> = pages
+        .iter()
+        .flat_map(|page| page.records.iter().cloned())
+        .collect();
+    let last_offset = records
+        .last()
+        .map(|record| record.offset.clone())
+        .unwrap_or_default();
+    let mut before = 0;
+    let page_activations = pages
+        .iter()
+        .enumerate()
+        .map(|(at, page)| {
+            let gap = if at == 0 {
+                page.activation
+            } else {
+                page.activation - before
+            };
+            before = page.activation;
+            gap
+        })
+        .collect();
+    StreamReadEntry {
+        seq,
+        stream: Some(stream(id)),
+        from_offset: vec![],
+        end: end.map(|(stop, activation)| StreamReadEnded {
+            last_offset: if last_offset.is_empty() {
+                after_offset.clone()
+            } else {
+                last_offset.clone()
+            },
+            stop: stop as i32,
+            done: stop == StreamReadStop::Done,
+            failure: None,
+            activation,
+        }),
+        after_offset,
+        last_offset,
+        count: records.len() as u32,
+        digest: if records_in_history || records.is_empty() {
+            vec![]
+        } else {
+            records_digest(&records).to_vec()
+        },
+        page_counts: pages.iter().map(|page| page.records.len() as u32).collect(),
+        page_activations,
+        records: if records_in_history { records } else { vec![] },
+    }
+}
+
+/// A `core_stream` marker event with `data`.
+fn stream_marker_event(
+    t: &mut TestHistoryBuilder,
+    completed_event_id: i64,
+    data: &StreamMarkerData,
+) {
+    let payload = Payload {
+        metadata: HashMap::from([("encoding".to_string(), b"binary/protobuf".to_vec())]),
+        data: data.encode_to_vec(),
+        ..Default::default()
+    };
+    t.add(MarkerRecordedEventAttributes {
+        marker_name: STREAM_MARKER_NAME.to_string(),
+        details: HashMap::from([(
+            "data".to_string(),
+            Payloads {
+                payloads: vec![payload],
+            },
+        )]),
+        workflow_task_completed_event_id: completed_event_id,
+        ..Default::default()
+    });
+}
+
+/// A history whose first Workflow Task started read 1 of Stream `s` and recorded `data`. A signal
+/// starts the second task, so that Workflow code gets an activation in it.
+fn replayed_read_history(data: &StreamMarkerData) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    stream_marker_event(&mut t, 4, data);
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+fn runtimes(runtime: &Arc<StreamRuntime>) -> StreamRuntimes {
+    StreamRuntimes::new([(STORE.to_string(), runtime.clone())])
+}
+
+fn signaled(activation: &WorkflowActivation) -> bool {
+    activation.jobs.iter().any(|job| {
+        matches!(
+            job.variant,
+            Some(workflow_activation_job::Variant::SignalWorkflow(_))
+        )
+    })
+}
+
+/// A replay reads the Records that the marker counts from the Store, and gives them in the
+/// activation that the marker has.
+#[tokio::test]
+async fn replay_reads_records_from_the_store() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    close(&runtime, "s").await;
+    let records = all_records(&runtime, "s").await;
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(
+        1,
+        "s",
+        vec![],
+        &[page],
+        Some((StreamReadStop::Done, 1)),
+        false,
+    );
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    let read = &reads(&replayed)[0];
+    assert_eq!(texts(&read.records), ["a", "b"]);
+    assert_eq!(read.records, records);
+    assert_eq!(stop(read), StreamReadStop::Done);
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&live) && reads(&live).is_empty());
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(marker(&run.sent.lock()[0]).is_none());
+}
+
+/// A marker with its Records needs no Store, so a Worker with no runtime replays it.
+#[tokio::test]
+async fn replay_from_history_calls_no_store() {
+    let records: Vec<_> = ["a", "b"]
+        .iter()
+        .enumerate()
+        .map(|(at, text)| StreamRecord {
+            producer: Some(client()),
+            body: Some(body(text)),
+            offset: (at as u64 + 1).to_be_bytes().to_vec(),
+        })
+        .collect();
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(
+        1,
+        "s",
+        vec![],
+        &[page],
+        Some((StreamReadStop::Done, 1)),
+        true,
+    );
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let run = start(
+        t,
+        [ResponseType::AllHistory],
+        StreamRuntimes::default(),
+        1,
+        0,
+    );
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(reads(&replayed)[0].records, records);
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+}
+
+/// Replays a marker of read 1 of Stream `s` on `runtimes`, and returns the message of the failed
+/// Workflow Task.
+async fn failed_replay(data: StreamMarkerData, runtimes: StreamRuntimes) -> String {
+    let t = replayed_read_history(&data);
+    let run = start(t, [ResponseType::AllHistory], runtimes, 1, 1);
+    let polled = run.worker.poll_workflow_activation().await;
+    assert!(
+        polled.is_err(),
+        "The task should fail before any activation"
+    );
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].0,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    failed[0].1.clone()
+}
+
+/// The marker of a read of `records` from the start of Stream `s`, and the range in its messages.
+fn one_page(records: &[StreamRecord]) -> (StreamMarkerData, String) {
+    let page = Page {
+        records,
+        activation: 1,
+    };
+    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let range = format!(
+        "Stream `s` in Store `mem`, the Records after the start through offset {}",
+        records
+            .last()
+            .unwrap()
+            .offset
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    (
+        StreamMarkerData {
+            reads: vec![entry],
+            appends: vec![],
+        },
+        range,
+    )
+}
+
+/// The Records that a marker counts are gone after the Retention of their closed Stream.
+#[tokio::test]
+async fn replay_fails_when_records_are_gone() {
+    let options = MemoryStreamOptions {
+        retention: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let runtime = MemoryStreamRuntime::new(STORE, options, None);
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, range) = one_page(&all_records(&runtime, "s").await);
+    close(&runtime, "s").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let message = failed_replay(data, runtimes(&runtime)).await;
+    assert!(
+        message.starts_with(&format!("StreamReplayError: {range}: stream_expired")),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn replay_fails_on_digest_mismatch() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (mut data, range) = one_page(&all_records(&runtime, "s").await);
+    data.reads[0].digest[0] ^= 1;
+    let message = failed_replay(data, runtimes(&runtime)).await;
+    assert_eq!(
+        message,
+        format!("StreamReplayError: {range}: the digest of the Records differs")
+    );
+}
+
+#[tokio::test]
+async fn replay_fails_with_no_runtime() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, range) = one_page(&all_records(&runtime, "s").await);
+    let message = failed_replay(data, StreamRuntimes::default()).await;
+    assert_eq!(
+        message,
+        format!(
+            "StreamReplayError: {range}: this Worker has no Stream runtime for the Store `mem`"
+        )
+    );
+}
+
+/// A replayed append gives the result that history has, and writes nothing.
+#[tokio::test]
+async fn append_replay_calls_no_store() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let appended = StreamAppendEntry {
+        seq: 1,
+        stream: Some(stream("s")),
+        first_offset: 7u64.to_be_bytes().to_vec(),
+        last_offset: 8u64.to_be_bytes().to_vec(),
+        failure: None,
+        activation: 1,
+    };
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![],
+        appends: vec![appended.clone()],
+    });
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["x", "y"]).into()],
+    )
+    .await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    let Some(resolve_stream_append::Status::Appended(result)) = &appends(&replayed)[0].status
+    else {
+        panic!("The replayed append has no offsets");
+    };
+    assert_eq!(
+        (result.first_offset.clone(), result.last_offset.clone()),
+        (appended.first_offset, appended.last_offset)
+    );
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(all_records(&runtime, "s").await.len(), 0);
+}
+
+/// A read that history leaves open goes on live from its last offset, with what is left of its
+/// caps.
+#[tokio::test]
+async fn open_read_resumes_after_replay() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let records = all_records(&runtime, "s").await;
+    put(&runtime, "s", &["c", "d"]).await;
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        max_records: 3,
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&replayed)[0].records), ["a", "b"]);
+    complete(&run.worker, &replayed, vec![]).await;
+    let resumed = loop {
+        let live = run.worker.poll_workflow_activation().await.unwrap();
+        if let Some(read) = reads(&live).pop() {
+            break (live, read);
+        }
+        complete(&run.worker, &live, vec![]).await;
+    };
+    assert_eq!(texts(&resumed.1.records), ["c"]);
+    assert_eq!(stop(&resumed.1), StreamReadStop::MaxRecords);
+    run.worker.complete_execution(&resumed.0.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+
+    let entry = &marker(&run.sent.lock()[0]).unwrap().reads[0];
+    assert_eq!(entry.after_offset, records[1].offset);
+    assert_eq!(entry.count, 1);
+}
+
+/// A resumed read keeps the deadline of its start, which history dates, so a read that started
+/// an hour ago with a timeout of a minute ends at once.
+#[tokio::test]
+async fn resumed_read_keeps_its_deadline() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let records = all_records(&runtime, "s").await;
+    let page = Page {
+        records: &records[..1],
+        activation: 1,
+    };
+    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let mut t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    for event_id in 1..=5 {
+        t.modify_event(event_id, |event| {
+            event.event_time = Some(an_hour_ago.into())
+        });
+    }
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        timeout: Some(Duration::from_secs(60).try_into().unwrap()),
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&replayed)[0].records), ["a"]);
+    complete(&run.worker, &replayed, vec![]).await;
+    let ended = loop {
+        let live = run.worker.poll_workflow_activation().await.unwrap();
+        if let Some(read) = reads(&live).pop() {
+            break (live, read);
+        }
+        complete(&run.worker, &live, vec![]).await;
+    };
+    assert!(ended.1.records.is_empty());
+    assert_eq!(stop(&ended.1), StreamReadStop::Timeout);
+    assert_eq!(ended.1.end.as_ref().unwrap().last_offset, records[0].offset);
+    run.worker.complete_execution(&ended.0.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+}
+
+/// A close in a replay ends the read, so it doesn't go on live.
+#[tokio::test]
+async fn close_ends_a_read_in_replay() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    let records = all_records(&runtime, "s").await;
+    put(&runtime, "s", &["b"]).await;
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&replayed)[0].records), ["a"]);
+    complete(
+        &run.worker,
+        &replayed,
+        vec![CloseStreamRead { seq: 1 }.into()],
+    )
+    .await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&live) && reads(&live).is_empty());
+    // A read that went on would hold the task open, and the completion would wait for it.
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let sent = run.sent.lock();
+    assert_eq!(sent.len(), 1);
+    assert!(marker(&sent[0]).is_none());
+}
+
+/// A read of another Stream than history has is a non-determinism error.
+#[tokio::test]
+async fn other_stream_id_is_nondeterministic() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    let t = replayed_read_history(&data);
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "other").into()]).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed[0].0, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(
+        failed[0].1.contains("Stream read 1 reads Stream `other`"),
+        "{}",
+        failed[0].1
+    );
+}
+
+/// A result in history of a call that Workflow code never makes is a non-determinism error.
+#[tokio::test]
+async fn entry_with_no_call_is_nondeterministic() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    let t = replayed_read_history(&data);
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![]).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed[0].0, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(
+        failed[0]
+            .1
+            .contains("History has a Stream result of read 1 that Workflow code never got"),
+        "{}",
+        failed[0].1
+    );
+}
+
+/// A Worker with no cache replays every earlier Workflow Task, and still runs a read and an
+/// append to the end of the Workflow. The append is written once.
+#[tokio::test]
+async fn worker_with_no_cache_runs_reads_and_appends() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    create(&runtime, "out").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    close(&runtime, "s").await;
+    let records = all_records(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("1".to_string());
+    t.add_full_wf_task();
+    t.add_timer_started("2".to_string());
+    let page = Page {
+        records: &records,
+        activation: 0,
+    };
+    let entry = read_entry(
+        1,
+        "s",
+        vec![],
+        &[page],
+        Some((StreamReadStop::Done, 0)),
+        false,
+    );
+    stream_marker_event(
+        &mut t,
+        8,
+        &StreamMarkerData {
+            reads: vec![entry],
+            appends: vec![],
+        },
+    );
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let responses = [1, 2, 3].map(ResponseType::ToTaskNum);
+    let run = start(t, responses, runtimes(&runtime), 0, 0);
+
+    let timer = |seq| StartTimer {
+        seq,
+        start_to_fire_timeout: Some(Duration::from_secs(60).try_into().unwrap()),
+    };
+    loop {
+        let next = run.worker.poll_workflow_activation().await.unwrap();
+        let mut commands: Vec<workflow_command::Variant> = vec![];
+        let mut done = false;
+        for job in &next.jobs {
+            match &job.variant {
+                Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+                    commands.extend([read_cmd(1, "s").into(), timer(1).into()]);
+                }
+                Some(workflow_activation_job::Variant::ResolveStreamRead(read)) => {
+                    assert_eq!(texts(&read.records), ["a", "b"]);
+                    commands.push(timer(2).into());
+                }
+                Some(workflow_activation_job::Variant::FireTimer(_)) => {
+                    commands.push(append_cmd(1, "out", &run_id, &["a", "b"]).into());
+                }
+                Some(workflow_activation_job::Variant::ResolveStreamAppend(_)) => {
+                    commands.push(CompleteWorkflowExecution { result: None }.into());
+                    done = true;
+                }
+                _ => {}
+            }
+        }
+        complete(&run.worker, &next, commands).await;
+        if done {
+            break;
+        }
+    }
+    run.worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(texts(&all_records(&runtime, "out").await), ["a", "b"]);
+    let sent = run.sent.lock();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(command_types(&sent[0]), [CommandType::StartTimer]);
+    assert_eq!(
+        command_types(&sent[1]),
+        [CommandType::StartTimer, CommandType::RecordMarker]
+    );
+    assert_eq!(marker(&sent[1]).unwrap().reads[0], {
+        let page = Page {
+            records: &records,
+            activation: 0,
+        };
+        read_entry(
+            1,
+            "s",
+            vec![],
+            &[page],
+            Some((StreamReadStop::Done, 0)),
+            false,
+        )
+    });
+    assert_eq!(
+        command_types(&sent[2]),
+        [
+            CommandType::RecordMarker,
+            CommandType::CompleteWorkflowExecution
+        ]
+    );
+}
+
+/// The state of the Workflow of [replay_matches_live_activations], which lang would keep.
+#[derive(Default)]
+struct TwoReads {
+    appends: u32,
+    open_appends: u32,
+    ended_reads: u32,
+    local_activity_done: bool,
+}
+
+impl TwoReads {
+    /// The commands for an activation. Each page of a read gets an append of its Records.
+    fn activate(
+        &mut self,
+        activation: &WorkflowActivation,
+        run_id: &str,
+    ) -> (Vec<workflow_command::Variant>, bool) {
+        let mut commands = vec![];
+        for job in &activation.jobs {
+            match &job.variant {
+                Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+                    commands.push(schedule_local_activity_cmd(
+                        1,
+                        "1",
+                        ActivityCancellationType::TryCancel,
+                        Duration::from_secs(60),
+                    ));
+                    commands.push(read_cmd(1, "x").into());
+                    commands.push(read_cmd(2, "y").into());
+                }
+                Some(workflow_activation_job::Variant::ResolveStreamRead(read)) => {
+                    if !read.records.is_empty() {
+                        self.appends += 1;
+                        self.open_appends += 1;
+                        let texts = texts(&read.records);
+                        let texts: Vec<_> = texts.iter().map(String::as_str).collect();
+                        commands.push(append_cmd(self.appends, "out", run_id, &texts).into());
+                    }
+                    if read.end.is_some() {
+                        self.ended_reads += 1;
+                    }
+                }
+                Some(workflow_activation_job::Variant::ResolveStreamAppend(_)) => {
+                    self.open_appends -= 1;
+                }
+                Some(workflow_activation_job::Variant::ResolveActivity(_)) => {
+                    self.local_activity_done = true;
+                }
+                _ => {}
+            }
+        }
+        let done = self.ended_reads == 2 && self.open_appends == 0 && self.local_activity_done;
+        if done {
+            commands.push(CompleteWorkflowExecution { result: None }.into());
+        }
+        (commands, done)
+    }
+}
+
+/// A replay gives every page, end and append result in the activation of its first run, next to
+/// a Local Activity result, and writes nothing.
+#[tokio::test]
+async fn replay_matches_live_activations() {
+    let runtime = runtime();
+    for id in ["x", "y", "out"] {
+        create(&runtime, id).await;
+    }
+    put(&runtime, "x", &["x1", "x2"]).await;
+    put(&runtime, "y", &["y1"]).await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let replay = t.clone();
+    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+
+    let mut live = vec![];
+    let mut workflow = TwoReads::default();
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let (commands, _) = workflow.activate(&first, &run_id);
+    live.push(first.jobs.clone());
+    complete(&worker, &first, commands).await;
+    let task = worker.poll_activity_task().await.unwrap();
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+    // A second page of `x` comes while the first one is out with Workflow code.
+    put(&runtime, "x", &["x3"]).await;
+    close(&runtime, "x").await;
+    close(&runtime, "y").await;
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        let (commands, done) = workflow.activate(&next, &run_id);
+        live.push(next.jobs.clone());
+        complete(&worker, &next, commands).await;
+        if done {
+            break;
+        }
+    }
+    worker.drain_pollers_and_shutdown().await;
+    let written = all_records(&runtime, "out").await.len();
+    assert_eq!(written, 4);
+
+    let mut replay = replay;
+    replay.add_workflow_task_completed();
+    let completion = sent.lock()[0].clone();
+    for command in completion.commands {
+        match command.attributes {
+            Some(Attributes::RecordMarkerCommandAttributes(marker)) => {
+                replay.add(MarkerRecordedEventAttributes {
+                    marker_name: marker.marker_name,
+                    details: marker.details,
+                    workflow_task_completed_event_id: 4,
+                    header: marker.header,
+                    failure: marker.failure,
+                });
+            }
+            Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
+                replay.add_workflow_execution_completed();
+            }
+            other => panic!("The task sent an unexpected command: {other:?}"),
+        }
+    }
+    let run = start(replay, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
+    let mut replayed = vec![];
+    let mut workflow = TwoReads::default();
+    loop {
+        let next = run.worker.poll_workflow_activation().await.unwrap();
+        assert!(next.is_replaying);
+        let (commands, done) = workflow.activate(&next, &run_id);
+        replayed.push(next.jobs.clone());
+        complete(&run.worker, &next, commands).await;
+        if done {
+            break;
+        }
+    }
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(replayed, live);
+    assert_eq!(all_records(&runtime, "out").await.len(), written);
 }
 
 /// A non-zero `sequence` of an append goes to the Store as given, so a lower one is refused.

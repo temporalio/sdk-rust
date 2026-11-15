@@ -150,6 +150,8 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+    /// The Worker's Stream runtimes, for the markers of a task that a completion returns.
+    stream_runtimes: StreamRuntimes,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -206,11 +208,13 @@ impl Workflows {
         let default_versioning_behavior = basics.default_versioning_behavior;
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
+        let stream_runtimes = basics.worker_config.stream_runtimes.clone();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
+            stream_runtimes.clone(),
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang
@@ -304,6 +308,7 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+            stream_runtimes,
         }
     }
 
@@ -669,7 +674,13 @@ impl Workflows {
             .await;
 
         let maybe_pwft = if let Some(wft) = wft_from_complete {
-            match HistoryPaginator::from_poll(wft, self.client.clone()).await {
+            match HistoryPaginator::from_poll(
+                wft,
+                self.client.clone(),
+                self.stream_runtimes.clone(),
+            )
+            .await
+            {
                 Ok((paginator, wft)) => Some(WFTWithPaginator { wft, paginator }),
                 Err(e) => {
                     self.request_eviction(
@@ -2175,6 +2186,7 @@ mod tests {
         let (paginator, work) = HistoryPaginator::from_poll(
             validate_wft(response).unwrap(),
             Arc::new(mock_worker_client()),
+            StreamRuntimes::default(),
         )
         .await
         .unwrap();
