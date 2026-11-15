@@ -2,7 +2,7 @@
 //! history, and adds Records to the Store between its polls.
 
 use crate::{
-    StreamRuntimes, Worker,
+    StreamRuntimes, Worker, WorkflowErrorType,
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
@@ -1911,4 +1911,100 @@ async fn append_sends_the_sequence_that_lang_gives() {
         failure.message
     );
     assert_eq!(texts(&all_records(&runtime, "s").await), ["a"]);
+}
+
+/// Replays a history whose only Workflow Task has a page of read 1 of Stream `s` and completes the
+/// Workflow. Workflow code sends `commands` and the completion in its first activation. Returns the
+/// cause and message of the failed Workflow Task.
+async fn replay_last_task(
+    commands: Vec<workflow_command::Variant>,
+) -> (WorkflowTaskFailedCause, String) {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    stream_marker_event(&mut t, 4, &data);
+    t.add_workflow_execution_completed();
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let mut commands = commands;
+    commands.push(CompleteWorkflowExecution { result: None }.into());
+    complete(&run.worker, &first, commands).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1, "the replay should fail");
+    failed[0].clone()
+}
+
+/// A result in history with no call is a non-determinism error, also in the task that completes
+/// the Workflow.
+#[tokio::test]
+async fn a_result_with_no_call_in_the_last_task_is_nondeterministic() {
+    let (cause, message) = replay_last_task(vec![]).await;
+    assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(
+        message.contains("History has a Stream result of read 1 that Workflow code never got"),
+        "{message}"
+    );
+}
+
+/// A read of another Stream, or from another offset, is a non-determinism error, also in the task
+/// that completes the Workflow.
+#[tokio::test]
+async fn a_changed_read_in_the_last_task_is_nondeterministic() {
+    let (cause, message) = replay_last_task(vec![read_cmd(1, "other").into()]).await;
+    assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(
+        message.contains("Stream read 1 reads Stream `other`"),
+        "{message}"
+    );
+    let later = StartStreamRead {
+        from_offset: 1u64.to_be_bytes().to_vec(),
+        ..read_cmd(1, "s")
+    };
+    let (cause, message) = replay_last_task(vec![later.into()]).await;
+    assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(message.contains("or from another offset"), "{message}");
+}
+
+/// With non-determinism set to fail the Workflow, a changed read in the last task fails the
+/// Workflow. The results that history holds don't fail that forced completion again.
+#[tokio::test]
+async fn a_changed_read_can_fail_the_workflow() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed();
+    stream_marker_event(&mut t, 4, &data);
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut cfg = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
+    let kept = sent.clone();
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        kept.lock().push(completion.clone());
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.stream_runtimes = runtimes(&runtime);
+        wc.workflow_failure_errors = [WorkflowErrorType::Nondeterminism].into();
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![read_cmd(1, "other").into()]).await;
+    worker.drain_pollers_and_shutdown().await;
+    let sent = sent.lock();
+    assert_eq!(
+        command_types(&sent[0]),
+        [CommandType::FailWorkflowExecution]
+    );
 }

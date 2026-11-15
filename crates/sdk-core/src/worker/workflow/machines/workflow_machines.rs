@@ -491,6 +491,7 @@ impl WorkflowMachines {
     /// Workflow Task does it, so that no result of it reaches Workflow code.
     pub(crate) fn stop_stream_calls(&mut self) {
         self.stream_calls.stop_all();
+        self.stream_calls.drop_held();
         self.stream_calls.drain_requests();
     }
 
