@@ -10,6 +10,7 @@ use crate::{
     },
     worker::client::WorkflowTaskCompletion,
 };
+use futures_util::FutureExt;
 use parking_lot::Mutex;
 use prost::Message;
 use std::{
@@ -2062,4 +2063,104 @@ async fn a_cap_on_the_last_record_of_a_closed_stream_ends_done() {
             (2, StreamReadStop::Done, true)
         ]
     );
+}
+
+fn read_with_idle(seq: u32, id: &str, idle: Duration) -> StartStreamRead {
+    StartStreamRead {
+        idle_timeout: Some(idle.try_into().unwrap()),
+        ..read_cmd(seq, id)
+    }
+}
+
+fn timer_cmd(seq: u32) -> workflow_command::Variant {
+    StartTimer {
+        seq,
+        start_to_fire_timeout: Some(Duration::from_secs(60).try_into().unwrap()),
+    }
+    .into()
+}
+
+/// The idle time doesn't count while a read pauses for Workflow code to take its Records. A read
+/// that pauses at 4 MiB reads the Records that came during the pause.
+#[tokio::test]
+async fn idle_time_skips_a_paused_read() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(30));
+    t.add_workflow_task_scheduled_and_started();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![read_with_idle(1, "s", Duration::from_secs(1)).into()],
+    )
+    .await;
+    put(&runtime, "s", &["a"]).await;
+    let page = worker.poll_workflow_activation().await.unwrap();
+    let mut got = reads(&page)[0].records.len();
+    let big = "x".repeat(1 << 20);
+    for _ in 0..4 {
+        put(&runtime, "s", &[big.as_str()]).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for _ in 0..2 {
+        put(&runtime, "s", &[big.as_str()]).await;
+    }
+    // Workflow code holds the activation for 2 s, so the read pauses past its idle time.
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    complete(&worker, &page, vec![]).await;
+    let end = loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        let read = reads(&next).pop().unwrap();
+        got += read.records.len();
+        if let Some(end) = read.end.clone() {
+            worker.complete_execution(&next.run_id).await;
+            break end;
+        }
+        complete(&worker, &next, vec![]).await;
+    };
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(end.stop(), StreamReadStop::Idle);
+    assert_eq!(got, all_records(&runtime, "s").await.len());
+}
+
+/// The idle time doesn't count while a page waits for the next Workflow Task. Records that come
+/// in that wait join the page.
+#[tokio::test]
+async fn idle_time_skips_a_page_that_waits_for_a_task() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_timer_started("1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let next_task = tokio::time::sleep(Duration::from_millis(1500)).boxed();
+    let responses = [
+        ResponseType::ToTaskNum(1),
+        ResponseType::UntilResolved(next_task, 2),
+    ];
+    let (worker, sent) = worker(t, responses, &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![
+            read_with_idle(1, "s", Duration::from_millis(300)).into(),
+            timer_cmd(1),
+        ],
+    )
+    .await;
+    put(&runtime, "s", &["a"]).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    put(&runtime, "s", &["b"]).await;
+    let page = worker.poll_workflow_activation().await.unwrap();
+    let read = &reads(&page)[0];
+    assert_eq!(texts(&read.records), ["a", "b"]);
+    assert!(read.end.is_none(), "the read ended while its page waited");
+    worker.complete_execution(&page.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(sent.lock()[0].force_create_new_workflow_task);
 }

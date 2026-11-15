@@ -91,6 +91,8 @@ pub(crate) fn next_call_id() -> u64 {
 pub(crate) struct ReadFlow {
     undelivered: AtomicUsize,
     taken: Notify,
+    /// When an activation last took every Record that the read had sent.
+    all_taken_at: parking_lot::Mutex<Option<Instant>>,
 }
 
 impl ReadFlow {
@@ -109,7 +111,24 @@ impl ReadFlow {
         ) {
             held = now;
         }
+        if held <= bytes {
+            *self.all_taken_at.lock() = Some(Instant::now());
+        }
         self.taken.notify_one();
+    }
+
+    /// When the idle time of the read started to count, or `None` while Workflow code hasn't
+    /// taken all of its Records. The idle time counts only while the read waits for the Store, so
+    /// a page that waits for a Workflow Task or a paused read doesn't use it up.
+    fn idle_since(&self, last_record_at: Instant) -> Option<Instant> {
+        if self.undelivered.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        Some(
+            self.all_taken_at
+                .lock()
+                .map_or(last_record_at, |taken| taken.max(last_record_at)),
+        )
     }
 
     async fn wait_for_room(&self) {
@@ -345,7 +364,7 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
     let mut records_left = spec.records_left;
     let mut bytes_left = spec.bytes_left;
     let mut took_a_record = spec.took_a_record;
-    let mut idle_deadline = Instant::now() + spec.idle_timeout;
+    let mut last_record_at = Instant::now();
     let end = |last_offset: Vec<u8>, stop: StreamReadStop| StreamReadEnd {
         last_offset,
         stop: stop as i32,
@@ -370,16 +389,22 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
             });
             return;
         }
-        if idle_deadline <= now {
+        let idle_deadline = spec
+            .flow
+            .idle_since(last_record_at)
+            .map(|since| since + spec.idle_timeout);
+        if idle_deadline.is_some_and(|idle_deadline| idle_deadline <= now) {
             sink(StreamCallResult::Page {
                 records: vec![],
                 end: Some(end(last_offset, StreamReadStop::Idle)),
             });
             return;
         }
+        // While the idle time doesn't count, the read looks again after one idle timeout.
+        let idle_check = idle_deadline.unwrap_or(now + spec.idle_timeout);
         let wait_until = deadline
-            .unwrap_or(idle_deadline)
-            .min(idle_deadline)
+            .unwrap_or(idle_check)
+            .min(idle_check)
             .min(now + MAX_WAIT);
         let request = ReadRecordsRequest {
             namespace: String::new(),
@@ -438,7 +463,7 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
             stop = Some(StreamReadStop::MaxBytes);
         }
         if !page.is_empty() {
-            idle_deadline = Instant::now() + spec.idle_timeout;
+            last_record_at = Instant::now();
             spec.flow.sent(page_bytes);
         }
         match stop {
