@@ -102,7 +102,8 @@ fn check_task(task: &WorkflowTaskEpoch) -> StreamResult<()> {
 }
 
 /// Refuses a Producer that lacks a field the API requires. A Workflow Producer may close a Stream
-/// with no epoch, and the append checks its epoch itself. An epoch that it sends must order. A
+/// with no epoch, which orders after every Workflow Task of the run, and the append checks its
+/// epoch itself. An epoch that it sends must order. A
 /// Workflow Task's started time stays optional, since Core leaves it empty when the server gave the
 /// task none.
 pub fn check_required(producer: &Producer) -> StreamResult<()> {

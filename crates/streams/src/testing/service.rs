@@ -416,6 +416,52 @@ async fn a_workflow_appends_in_its_task_and_an_older_task_is_fenced() {
     }
 }
 
+/// A Workflow that appended in its Workflow Task closes the Stream with no epoch, from the
+/// Activity that History recorded, and the close orders after every task of the run. A close with
+/// an older epoch is still fenced, and an append after the close fails because the Stream is
+/// closed.
+async fn a_workflow_closes_with_no_epoch_after_its_appends() {
+    let in_task = |started_event_id| {
+        let mut producer = workflow("r1");
+        if let Some(Kind::Workflow(kind)) = producer.kind.as_mut() {
+            kind.epoch = Some(WorkflowTaskEpoch {
+                started_event_id,
+                attempt: 1,
+                started_time: None,
+            });
+        }
+        producer
+    };
+    let no_epoch = {
+        let mut producer = workflow("r1");
+        if let Some(Kind::Workflow(kind)) = producer.kind.as_mut() {
+            kind.epoch = None;
+        }
+        producer
+    };
+    for case in cases_for(Needs::CALLS).await {
+        case.create().await.unwrap();
+        case.append(in_task(9), 1, vec![record("a")]).await.unwrap();
+        let error = case.close(in_task(3)).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_fenced");
+        case.close(no_epoch.clone()).await.unwrap();
+        assert_eq!(
+            case.describe().await.unwrap().status,
+            StreamStatus::Closed as i32
+        );
+        let error = case
+            .append(in_task(15), 2, vec![record("b")])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::FailedPrecondition, "stream_closed")
+        );
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a"]);
+    }
+}
+
 /// A Producer id is opaque text. The runtime refuses an empty one and one over the limit, and
 /// takes any other, also with separators in it.
 async fn a_producer_id_is_opaque_but_not_empty_or_too_long() {
@@ -1013,6 +1059,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_producer_has_a_kind_and_a_workflow_appends_with_its_task),
     case!(a_workflow_appends_in_its_task_and_an_older_task_is_fenced),
+    case!(a_workflow_closes_with_no_epoch_after_its_appends),
     case!(a_producer_id_is_opaque_but_not_empty_or_too_long),
     case!(a_producer_id_of_any_text_or_the_longest_length_reads_back),
     case!(a_close_takes_a_producer_of_any_kind),
