@@ -1233,7 +1233,8 @@ impl ManagedRun {
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
             && (machines_wft_response.commands().peek().is_some()
-                || machines_wft_response.has_messages());
+                || machines_wft_response.has_messages()
+                || machines_wft_response.has_stream_results());
 
         let query_responses = data.query_responses;
         let has_query_responses = !query_responses.is_empty();
@@ -1267,6 +1268,7 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
+                machines_wft_response.seal_stream_marker();
                 (
                     machines_wft_response.commands().collect(),
                     machines_wft_response.messages(),
