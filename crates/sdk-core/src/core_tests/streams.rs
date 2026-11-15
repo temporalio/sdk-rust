@@ -3,10 +3,10 @@
 
 use crate::{
     StreamRuntimes, Worker, WorkflowErrorType,
-    replay::TestHistoryBuilder,
+    replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
         MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
-        schedule_local_activity_cmd,
+        schedule_local_activity_cmd, test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
 };
@@ -2200,4 +2200,136 @@ async fn no_read_outlives_its_worker() {
         1,
         "a Stream task still holds the runtime"
     );
+}
+
+/// A replay Worker on the history of one Workflow, with `runtimes`.
+fn replay_worker(t: TestHistoryBuilder, runtimes: StreamRuntimes) -> Worker {
+    let cfg = test_worker_cfg().stream_runtimes(runtimes).build().unwrap();
+    crate::init_replay_worker(ReplayWorkerInput::new(
+        cfg,
+        futures_util::stream::iter([HistoryForReplay::from(t)]),
+    ))
+    .unwrap()
+}
+
+/// Polls the activations that come within `wait`, completes each with no command, and returns
+/// their jobs.
+async fn activations_within(worker: &Worker, wait: Duration) -> Vec<String> {
+    let mut jobs = vec![];
+    while let Ok(Ok(next)) = tokio::time::timeout(wait, worker.poll_workflow_activation()).await {
+        jobs.extend(
+            next.jobs
+                .iter()
+                .filter_map(|job| job.variant.as_ref().map(|v| format!("{v}"))),
+        );
+        let _ = worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(next.run_id))
+            .await;
+    }
+    jobs
+}
+
+/// A replay Worker never calls a Store for a call that history leaves open. The call stays open,
+/// as a Local Activity does there.
+#[tokio::test]
+async fn a_replay_worker_never_writes_to_a_store() {
+    let runtime = runtime();
+    create(&runtime, "out").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let worker = replay_worker(t, runtimes(&runtime));
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![append_cmd(1, "out", &run_id, &["from-a-replay"]).into()],
+    )
+    .await;
+    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        !jobs
+            .iter()
+            .any(|job| job.starts_with("ResolveStreamAppend")),
+        "{jobs:?}"
+    );
+    assert!(all_records(&runtime, "out").await.is_empty());
+}
+
+/// A replay Worker needs no runtime for a read that history leaves open, when its marker holds
+/// the Records.
+#[tokio::test]
+async fn a_replay_worker_needs_no_runtime_for_an_open_read() {
+    let records = vec![StreamRecord {
+        producer: Some(client()),
+        body: Some(body("a")),
+        offset: 1u64.to_be_bytes().to_vec(),
+    }];
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(1, "s", vec![], &[page], None, true);
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let worker = replay_worker(t, StreamRuntimes::default());
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    complete(&worker, &first, vec![read.into()]).await;
+    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        jobs.iter().any(|job| job == "ResolveStreamRead(1)"),
+        "{jobs:?}"
+    );
+    assert!(
+        jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
+        "{jobs:?}"
+    );
+    assert!(
+        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
+        "{jobs:?}"
+    );
+}
+
+/// A replay Worker still reads the Records of a marker that has none from the Store.
+#[tokio::test]
+async fn a_replay_worker_reads_a_marker_from_the_store() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let records = all_records(&runtime, "s").await;
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(
+        1,
+        "s",
+        vec![],
+        &[page],
+        Some((StreamReadStop::Done, 1)),
+        false,
+    );
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let worker = replay_worker(t, runtimes(&runtime));
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let replayed = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(reads(&replayed)[0].records, records);
+    complete(&worker, &replayed, vec![]).await;
+    let _ = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
 }
