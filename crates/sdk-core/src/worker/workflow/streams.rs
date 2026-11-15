@@ -633,6 +633,19 @@ pub(crate) fn stream_marker_payload_of(event: &HistoryEvent) -> Option<&Payload>
     }
 }
 
+/// True if a `core_stream` marker among the events counts Records that it doesn't hold.
+pub(crate) fn needs_stream_records(events: &[HistoryEvent]) -> bool {
+    events.iter().any(|event| {
+        stream_marker_payload_of(event)
+            .and_then(|payload| StreamMarkerData::decode(payload.data.as_slice()).ok())
+            .is_some_and(|data| {
+                data.reads
+                    .iter()
+                    .any(|entry| entry.count > 0 && entry.records.is_empty())
+            })
+    })
+}
+
 /// True if the status comes from a failed hydrate.
 pub(crate) fn is_stream_replay_error(status: &tonic::Status) -> bool {
     status.metadata().contains_key(STREAM_REPLAY_ERROR_KEY)
