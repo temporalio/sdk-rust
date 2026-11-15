@@ -40,12 +40,14 @@ relevant information.
 * [lang-internal] Added the experimental `temporalio-streams` crate, the Stream runtime that a
   language bridge links. It answers the five operations of the Stream service on a Stream Store,
   through `StreamRuntime::call` with an operation name and the encoded request.
-* [lang-internal] Experimental: Workflow code can read and append a Stream directly. A Worker takes
-  its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store name. Lang starts a read with
-  `StartStreamRead`, stops it with `CloseStreamRead`, and appends with `AppendToStream`. The results
-  come in the `ResolveStreamRead` and `ResolveStreamAppend` jobs. Core calls the Store itself and
-  records one `core_stream` marker for each Workflow Task in which Workflow code got a result, which
-  a replay gives back in the same activations.
+* [lang-internal] Experimental: Workflow code can read, append and close a Stream directly. A Worker
+  takes its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store name. Lang starts a read
+  with `StartStreamRead`, stops it with `CloseStreamRead`, appends with `AppendToStream`, and closes
+  the Stream with `CloseStream`. The results come in the `ResolveStreamRead`, `ResolveStreamAppend`
+  and `ResolveStreamClose` jobs. Core calls the Store itself and records one `core_stream` marker
+  for each Workflow Task in which Workflow code got a result, which a replay gives back in the same
+  activations. A close takes effect only after the server took the task that asked for it, so its
+  result comes in a later task.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
