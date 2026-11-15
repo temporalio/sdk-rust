@@ -206,6 +206,15 @@ pub(crate) struct StreamManager {
     tasks: Arc<Mutex<HashMap<u64, (String, AbortHandle)>>>,
 }
 
+impl Drop for StreamManager {
+    /// Stops every call, so that no Store work outlives the Worker.
+    fn drop(&mut self) {
+        for (_, (_, handle)) in self.tasks.lock().drain() {
+            handle.abort();
+        }
+    }
+}
+
 impl StreamManager {
     pub(crate) fn new(
         runtimes: StreamRuntimes,
@@ -343,7 +352,15 @@ impl StreamManager {
             .lock()
             .insert(call_id, (run_id.to_string(), handle));
         let tasks = self.tasks.clone();
+        let local_tx = self.local_tx.clone();
         self.handle.spawn(async move {
+            // A call whose Worker is gone stops at once, also one that pauses for its run.
+            let call = async move {
+                tokio::select! {
+                    _ = call => {}
+                    _ = local_tx.closed() => {}
+                }
+            };
             // An aborted call was already removed by whoever aborted it.
             if Abortable::new(call, registration).await.is_ok() {
                 tasks.lock().remove(&call_id);
