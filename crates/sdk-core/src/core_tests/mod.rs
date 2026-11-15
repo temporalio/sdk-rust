@@ -5,6 +5,7 @@ mod nexus_operations;
 mod queries;
 mod query_eviction;
 mod replay_flag;
+mod streams;
 mod updates;
 mod workers;
 mod workflow_cancels;
