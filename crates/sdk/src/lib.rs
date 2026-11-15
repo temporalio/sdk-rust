@@ -935,6 +935,10 @@ impl RunStoreTargets {
             | workflow_command::Variant::ModifyWorkflowProperties(_)
             | workflow_command::Variant::UpdateResponse(_)
             | workflow_command::Variant::RequestCancelNexusOperation(_) => self.current(),
+            // This SDK issues no Stream command. Lang SDKs that do decide where append bodies go.
+            workflow_command::Variant::StartStreamRead(_)
+            | workflow_command::Variant::CloseStreamRead(_)
+            | workflow_command::Variant::AppendToStream(_) => self.current(),
         })
     }
 }
