@@ -321,9 +321,9 @@ async fn a_create_of_an_expired_stream_fails() {
     }
 }
 
-/// A Producer has a kind, a Workflow appends only through a Local Activity, and a Local Activity's
-/// epoch names the Workflow Task that dispatched it.
-async fn a_producer_has_a_kind_and_is_not_a_workflow() {
+/// A Producer has a kind, a Workflow appends only with its Workflow Task as the epoch, and a Local
+/// Activity's epoch names the Workflow Task that dispatched it.
+async fn a_producer_has_a_kind_and_a_workflow_appends_with_its_task() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
         let no_kind = Producer {
@@ -338,8 +338,23 @@ async fn a_producer_has_a_kind_and_is_not_a_workflow() {
             (error.code(), reason(&error).as_str()),
             (Code::InvalidArgument, "stream_invalid")
         );
-        let error = case.append(workflow("r1"), 1, vec![]).await.unwrap_err();
-        assert_eq!(error.code(), Code::InvalidArgument);
+        let mut no_epoch = workflow("r1");
+        let Some(Kind::Workflow(kind)) = no_epoch.kind.as_mut() else {
+            unreachable!()
+        };
+        kind.epoch = None;
+        let error = case
+            .append(no_epoch, 1, vec![record("x")])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::InvalidArgument, "stream_invalid")
+        );
+        assert!(
+            error.message.contains("Workflow Task as its epoch"),
+            "{error:?}"
+        );
         let no_task = Producer {
             id: "la:r1:call-1".to_string(),
             kind: Some(Kind::LocalActivity(LocalActivityProducer {
@@ -355,6 +370,49 @@ async fn a_producer_has_a_kind_and_is_not_a_workflow() {
             .await
             .unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
+    }
+}
+
+/// A Workflow appends with its Workflow Task as the epoch. A later task appends after it, and a
+/// write of an older task, such as a late one of a failed attempt, is fenced.
+async fn a_workflow_appends_in_its_task_and_an_older_task_is_fenced() {
+    let in_task = |started_event_id, attempt| {
+        let mut producer = workflow("r1");
+        if let Some(Kind::Workflow(kind)) = producer.kind.as_mut() {
+            kind.epoch = Some(WorkflowTaskEpoch {
+                started_event_id,
+                attempt,
+                started_time: None,
+            });
+        }
+        producer
+    };
+    for case in cases_for(Needs::CALLS).await {
+        case.create().await.unwrap();
+        let first = case
+            .append(in_task(3, 1), 1, vec![record("a")])
+            .await
+            .unwrap();
+        let retry = case
+            .append(in_task(3, 2), 2, vec![record("b")])
+            .await
+            .unwrap();
+        assert!(retry.first_offset > first.last_offset);
+        case.append(in_task(9, 1), 3, vec![record("c")])
+            .await
+            .unwrap();
+        for (task, sequence) in [(in_task(3, 2), 4), (in_task(8, 5), 5)] {
+            let error = case
+                .append(task, sequence, vec![record("x")])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (error.code(), reason(&error).as_str()),
+                (Code::FailedPrecondition, "stream_fenced")
+            );
+        }
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a", "b", "c"]);
     }
 }
 
@@ -953,7 +1011,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_a_closed_stream_fails),
     case!(a_close_writes_no_record_and_a_second_close_succeeds),
     case!(a_create_of_an_expired_stream_fails),
-    case!(a_producer_has_a_kind_and_is_not_a_workflow),
+    case!(a_producer_has_a_kind_and_a_workflow_appends_with_its_task),
+    case!(a_workflow_appends_in_its_task_and_an_older_task_is_fenced),
     case!(a_producer_id_is_opaque_but_not_empty_or_too_long),
     case!(a_producer_id_of_any_text_or_the_longest_length_reads_back),
     case!(a_close_takes_a_producer_of_any_kind),

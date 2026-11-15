@@ -101,9 +101,10 @@ fn check_task(task: &WorkflowTaskEpoch) -> StreamResult<()> {
     at_least_one(task.attempt, "Workflow Task")
 }
 
-/// Refuses a Producer that lacks a field the API requires. A Workflow Producer only closes a
-/// Stream, so it may send no epoch, but an epoch that it sends must order. A Workflow Task's
-/// started time stays optional, since Core leaves it empty when the server gave the task none.
+/// Refuses a Producer that lacks a field the API requires. A Workflow Producer may close a Stream
+/// with no epoch, and the append checks its epoch itself. An epoch that it sends must order. A
+/// Workflow Task's started time stays optional, since Core leaves it empty when the server gave the
+/// task none.
 pub fn check_required(producer: &Producer) -> StreamResult<()> {
     match producer.kind.as_ref() {
         Some(Kind::Workflow(workflow)) => {
@@ -309,7 +310,7 @@ mod tests {
 
     #[test]
     fn a_producer_with_its_required_fields_passes() {
-        // A Workflow Producer only closes, with no epoch, and a standalone Activity has no run.
+        // A Workflow Producer may close with no epoch, and a standalone Activity has no run.
         let workflow = producer(ProducerKind::Workflow, "wf:r", "r");
         let mut standalone = activity();
         let Some(Kind::WorkflowActivity(kind)) = standalone.kind.take() else {

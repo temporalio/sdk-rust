@@ -18,13 +18,15 @@ re-exports them, so a value needs no conversion between the crates.
   `examples/gen_vectors.rs` writes them from a second implementation, and the crate's tests read
   each file. Run it with `cargo run -p temporalio-streams --example gen_vectors`. It shares no
   code with the crate. Each Store reads `fields.json` through the shared Store suite.
-  `digests.json` is the golden of the crate's batch digest.
+  `digests.json` is the golden of the crate's batch digest, and `record_digests.json` the golden
+  of the digest of the Records that a read gave.
 
 A Stream id and a Producer id are opaque text. The caller builds both. The runtime refuses an
 empty id of either kind, and one over 4096 bytes. A Producer id names one Producer in one Stream.
 A Store keeps the fence of a Producer by kind and id, and an epoch has no run. So the id of a
 run-based kind must hold its run id. A caller that uses one id in two runs gets `FENCED` in the
-second run when that run's epoch is lower.
+second run when that run's epoch is lower. A Workflow Producer appends with its Workflow Task as
+the epoch, so a write of an older task gets `FENCED`. It may close a Stream with no epoch.
 
 ## The runtime
 
