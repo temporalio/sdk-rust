@@ -26,12 +26,12 @@ use temporalio_common::protos::{
         common::StreamReadStop,
         external_data::{StreamAppendEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry},
         workflow_activation::{
-            ResolveStreamAppend, ResolveStreamRead, WorkflowActivation, resolve_stream_append,
-            workflow_activation_job,
+            ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, WorkflowActivation,
+            resolve_stream_append, workflow_activation_job,
         },
         workflow_commands::{
-            ActivityCancellationType, AppendToStream, CloseStreamRead, CompleteWorkflowExecution,
-            StartStreamRead, StartTimer, workflow_command,
+            ActivityCancellationType, AppendToStream, CloseStream, CloseStreamRead,
+            CompleteWorkflowExecution, StartStreamRead, StartTimer, workflow_command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
@@ -49,8 +49,8 @@ use temporalio_streams::{
     digest::records_digest,
     proto::{
         AppendRecord, AppendRecordsRequest, ClientProducer, CloseStreamRequest,
-        CreateStreamRequest, Producer, ReadRecordsRequest, StreamRecord, StreamRef,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        CreateStreamRequest, DescribeStreamRequest, Producer, ReadRecordsRequest, StreamRecord,
+        StreamRef, StreamStatus, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
     },
 };
 
@@ -2609,4 +2609,365 @@ async fn a_replayed_read_of_another_store_is_nondeterministic() {
     let failed = run.failed.lock();
     assert_eq!(failed[0].0, WorkflowTaskFailedCause::NonDeterministicError);
     assert!(failed[0].1.contains("in Store `other`"), "{}", failed[0].1);
+}
+
+// Closes. A close takes effect only after History has the Workflow Task that asked for it.
+
+fn close_cmd(seq: u32, id: &str, run_id: &str) -> CloseStream {
+    CloseStream {
+        seq,
+        stream: Some(stream(id)),
+        producer: Some(workflow_producer(run_id)),
+    }
+}
+
+fn stream_is_closed(runtime: &StreamRuntime, id: &str) -> bool {
+    // The memory Store answers at once, so this works also inside a mock's sync closure.
+    let described = runtime
+        .describe_stream(DescribeStreamRequest {
+            r#ref: Some(stream(id)),
+            ..Default::default()
+        })
+        .now_or_never()
+        .expect("the memory Store answers at once")
+        .unwrap();
+    described.status == StreamStatus::Closed as i32
+}
+
+/// Waits up to 2 s for the Stream to close.
+async fn wait_closed(runtime: &StreamRuntime, id: &str) -> bool {
+    for _ in 0..40 {
+        if stream_is_closed(runtime, id) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+fn closes(activation: &WorkflowActivation) -> Vec<ResolveStreamClose> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|job| match &job.variant {
+            Some(workflow_activation_job::Variant::ResolveStreamClose(close)) => {
+                Some(close.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Polls until an activation has a close result, completing the others with no command.
+async fn until_closed(worker: &Worker) -> (WorkflowActivation, ResolveStreamClose) {
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        if let Some(close) = closes(&next).pop() {
+            return (next, close);
+        }
+        complete(worker, &next, vec![]).await;
+    }
+}
+
+fn task_epoch(started_event_id: i64) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id,
+        attempt: 1,
+        started_time: None,
+    }
+}
+
+/// A history whose first task completed with a marker event, and whose second one started.
+fn two_task_history() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    marker_event(&mut t, 4);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// An awaited close spans two Workflow Tasks. The first records the intent and calls no Store.
+/// The Stream closes after the server took that task, and the second task gets the result.
+#[tokio::test]
+async fn an_awaited_close_spans_two_tasks() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = two_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let open_at_completion = Arc::new(Mutex::new(vec![]));
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut cfg = MockPollCfg::from_resps(t, [1, 2].map(ResponseType::ToTaskNum));
+    let (kept, seen, store) = (sent.clone(), open_at_completion.clone(), runtime.clone());
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        seen.lock().push(!stream_is_closed(&store, "s"));
+        kept.lock().push(completion.clone());
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.stream_runtimes = runtimes(&runtime);
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let (next, close) = until_closed(&worker).await;
+    assert!(close.failed.is_none());
+    assert!(stream_is_closed(&runtime, "s"));
+    worker.complete_execution(&next.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let sent = sent.lock();
+    assert_eq!(*open_at_completion.lock(), [true, false]);
+    assert!(sent[0].force_create_new_workflow_task);
+    assert_eq!(command_types(&sent[0]), [CommandType::RecordMarker]);
+    let intent = &marker(&sent[0]).unwrap().closes[0];
+    assert_eq!((intent.seq, intent.resolved), (1, false));
+    let epoch = intent.intent_epoch.unwrap();
+    assert_eq!((epoch.started_event_id, epoch.attempt), (3, 1));
+    let result = &marker(&sent[1]).unwrap().closes[0];
+    assert_eq!(
+        (result.seq, result.resolved, result.activation),
+        (1, true, 0)
+    );
+    assert!(result.failure.is_none() && result.intent_epoch.is_none());
+}
+
+/// A Workflow Task that fails after its close command records no intent, so the Stream stays
+/// open and the retry can append.
+#[tokio::test]
+async fn a_failed_task_after_a_close_leaves_the_stream_open() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [1, 1].map(ResponseType::ToTaskNum), &runtime, 1);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    // The append holds the task open, so the close waits in it.
+    complete(
+        &worker,
+        &first,
+        vec![
+            append_cmd(1, "s", &run_id, &["a"]).into(),
+            close_cmd(1, "s", &run_id).into(),
+        ],
+    )
+    .await;
+    let appended = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(appends(&appended).len(), 1);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::fail(
+            appended.run_id.clone(),
+            Failure {
+                message: "Workflow code failed".to_string(),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let evict = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(evict.run_id))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!stream_is_closed(&runtime, "s"));
+
+    let retry = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &retry,
+        vec![append_cmd(1, "s", &run_id, &["b"]).into()],
+    )
+    .await;
+    let appended = worker.poll_workflow_activation().await.unwrap();
+    assert!(matches!(
+        appends(&appended)[0].status,
+        Some(resolve_stream_append::Status::Appended(_))
+    ));
+    worker.complete_execution(&appended.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(texts(&all_records(&runtime, "s").await), ["a", "b"]);
+    assert!(!stream_is_closed(&runtime, "s"));
+}
+
+/// The appends of the task of the intent are in the Stream before the close, and an append of
+/// the next task gets `stream_closed`.
+#[tokio::test]
+async fn appends_of_the_intent_task_come_before_the_close() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = two_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![
+            append_cmd(1, "s", &run_id, &["a"]).into(),
+            close_cmd(1, "s", &run_id).into(),
+        ],
+    )
+    .await;
+    let appended = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(appends(&appended).len(), 1);
+    complete(&worker, &appended, vec![]).await;
+    let (closed, close) = until_closed(&worker).await;
+    assert!(close.failed.is_none());
+    complete(
+        &worker,
+        &closed,
+        vec![append_cmd(2, "s", &run_id, &["b"]).into()],
+    )
+    .await;
+    let refused = worker.poll_workflow_activation().await.unwrap();
+    let Some(resolve_stream_append::Status::Failed(failure)) = &appends(&refused)[0].status else {
+        panic!("The append after the close should fail");
+    };
+    assert!(
+        failure.message.starts_with("stream_closed"),
+        "{}",
+        failure.message
+    );
+    worker.complete_execution(&refused.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(texts(&all_records(&runtime, "s").await), ["a"]);
+    let first_marker = marker(&sent.lock()[0]).unwrap();
+    assert_eq!(first_marker.appends.len(), 1);
+    assert_eq!(first_marker.closes.len(), 1);
+}
+
+/// A close of a Stream that is closed already is a success.
+#[tokio::test]
+async fn a_close_of_a_closed_stream_succeeds() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    close(&runtime, "s").await;
+    let t = two_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let (next, close) = until_closed(&worker).await;
+    assert!(close.failed.is_none(), "{:?}", close.failed);
+    worker.complete_execution(&next.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// A close of an older epoch than the fence of the Producer gives a failure.
+#[tokio::test]
+async fn a_refused_close_gives_a_failure() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = two_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let mut later = workflow_producer(&run_id);
+    if let Some(Kind::Workflow(workflow)) = later.kind.as_mut() {
+        workflow.epoch = Some(task_epoch(100));
+    }
+    runtime
+        .append_records(AppendRecordsRequest {
+            r#ref: Some(stream("s")),
+            producer: Some(later),
+            records: vec![AppendRecord {
+                body: Some(body("later")),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let (next, close) = until_closed(&worker).await;
+    let failure = close.failed.expect("the close should fail");
+    assert!(
+        failure.message.starts_with("stream_fenced"),
+        "{}",
+        failure.message
+    );
+    worker.complete_execution(&next.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(!stream_is_closed(&runtime, "s"));
+    let result = &marker(&sent.lock()[1]).unwrap().closes[0];
+    assert_eq!(result.failure.as_ref(), Some(&failure));
+}
+
+/// A close fails the Workflow Task when it has no Producer, or when the Worker has no runtime
+/// for its Store.
+#[tokio::test]
+async fn a_close_with_no_producer_or_no_runtime_fails_the_task() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let no_producer = CloseStream {
+        producer: None,
+        ..close_cmd(1, "s", "r")
+    };
+    let elsewhere = CloseStream {
+        stream: Some(StreamRef {
+            id: "s".to_string(),
+            store: "elsewhere".to_string(),
+        }),
+        ..close_cmd(1, "s", "r")
+    };
+    for (command, expected) in [
+        (no_producer, "Stream close 1 has no Producer"),
+        (
+            elsewhere,
+            "This Worker has no Stream runtime for the Store `elsewhere`",
+        ),
+    ] {
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_workflow_task_scheduled_and_started();
+        let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+        let first = run.worker.poll_workflow_activation().await.unwrap();
+        complete(&run.worker, &first, vec![command.into()]).await;
+        run.worker.drain_pollers_and_shutdown().await;
+        let failed = run.failed.lock();
+        assert!(failed[0].1.contains(expected), "{}", failed[0].1);
+    }
+    assert!(!stream_is_closed(&runtime, "s"));
+}
+
+/// A Workflow that completes in the task of its close, without awaiting it, still closes the
+/// Stream after the server took that task.
+#[tokio::test]
+async fn a_workflow_that_completes_with_its_close_still_closes_the_stream() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![
+            close_cmd(1, "s", &run_id).into(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ],
+    )
+    .await;
+    assert!(wait_closed(&runtime, "s").await, "the Stream didn't close");
+    worker.drain_pollers_and_shutdown().await;
+    let sent = sent.lock();
+    assert_eq!(
+        command_types(&sent[0]),
+        [
+            CommandType::RecordMarker,
+            CommandType::CompleteWorkflowExecution
+        ]
+    );
+    assert!(!sent[0].force_create_new_workflow_task);
 }
