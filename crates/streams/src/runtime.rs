@@ -69,10 +69,19 @@ pub(crate) fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
     Ok(id)
 }
 
-/// Checks the Producer of a close. Any kind may close.
+/// Checks the Producer of a close. Any kind may close, and a Workflow closes with its Workflow
+/// Task as the epoch, as it appends.
 fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
+    // With no epoch, a close from a failed Workflow Task would pass the fence.
+    if let Some(Kind::Workflow(workflow)) = producer.kind.as_ref()
+        && workflow.epoch.is_none()
+    {
+        return Err(StreamError::invalid(
+            "A close from a Workflow needs the Workflow Task as its epoch",
+        ));
+    }
     check_required(producer)?;
     Ok(producer)
 }

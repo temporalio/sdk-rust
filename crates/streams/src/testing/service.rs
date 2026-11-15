@@ -416,15 +416,14 @@ async fn a_workflow_appends_in_its_task_and_an_older_task_is_fenced() {
     }
 }
 
-/// A Workflow that appended in its Workflow Task closes the Stream with no epoch, from the
-/// Activity that History recorded, and the close orders after every task of the run. A close with
-/// an older epoch is still fenced, and an append after the close fails because the Stream is
-/// closed.
-async fn a_workflow_closes_with_no_epoch_after_its_appends() {
-    let in_task = |started_event_id| {
+/// A Workflow appends in one Workflow Task and closes in a later one. A close with no epoch is
+/// refused, since a close of a failed task would pass the fence. A close with an older epoch than
+/// the fence is fenced, and an append after the close fails because the Stream is closed.
+async fn a_workflow_closes_in_a_later_task_after_its_appends() {
+    let in_task = |started_event_id: Option<i64>| {
         let mut producer = workflow("r1");
         if let Some(Kind::Workflow(kind)) = producer.kind.as_mut() {
-            kind.epoch = Some(WorkflowTaskEpoch {
+            kind.epoch = started_event_id.map(|started_event_id| WorkflowTaskEpoch {
                 started_event_id,
                 attempt: 1,
                 started_time: None,
@@ -432,25 +431,28 @@ async fn a_workflow_closes_with_no_epoch_after_its_appends() {
         }
         producer
     };
-    let no_epoch = {
-        let mut producer = workflow("r1");
-        if let Some(Kind::Workflow(kind)) = producer.kind.as_mut() {
-            kind.epoch = None;
-        }
-        producer
-    };
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        case.append(in_task(9), 1, vec![record("a")]).await.unwrap();
-        let error = case.close(in_task(3)).await.unwrap_err();
+        case.append(in_task(Some(9)), 1, vec![record("a")])
+            .await
+            .unwrap();
+        let error = case.close(in_task(None)).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+        assert!(
+            error
+                .message
+                .contains("close from a Workflow needs the Workflow Task as its epoch"),
+            "{error:?}"
+        );
+        let error = case.close(in_task(Some(3))).await.unwrap_err();
         assert_eq!(reason(&error), "stream_fenced");
-        case.close(no_epoch.clone()).await.unwrap();
+        case.close(in_task(Some(15))).await.unwrap();
         assert_eq!(
             case.describe().await.unwrap().status,
             StreamStatus::Closed as i32
         );
         let error = case
-            .append(in_task(15), 2, vec![record("b")])
+            .append(in_task(Some(20)), 2, vec![record("b")])
             .await
             .unwrap_err();
         assert_eq!(
@@ -516,8 +518,8 @@ async fn a_producer_id_of_any_text_or_the_longest_length_reads_back() {
     }
 }
 
-/// A close takes a Producer of any kind. The Workflow Producer sends no epoch, as its close on a
-/// Store does. Only an append refuses a Workflow Producer.
+/// A close takes a Producer of any kind. A Workflow Producer closes with its Workflow Task as the
+/// epoch, as it appends.
 async fn a_close_takes_a_producer_of_any_kind() {
     let activity = ActivityProducer {
         run_id: "r1".to_string(),
@@ -529,7 +531,11 @@ async fn a_close_takes_a_producer_of_any_kind() {
     let kinds = [
         Kind::Workflow(WorkflowProducer {
             run_id: "r1".to_string(),
-            epoch: None,
+            epoch: Some(WorkflowTaskEpoch {
+                started_event_id: 3,
+                attempt: 1,
+                started_time: None,
+            }),
         }),
         Kind::LocalActivity(LocalActivityProducer {
             run_id: "r1".to_string(),
@@ -595,7 +601,7 @@ async fn a_write_with_a_missing_required_field_is_invalid() {
         );
         let error = case.close(no_epoch).await.unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
-        // A Workflow Producer may close with no epoch, but one that it sends must order.
+        // A Workflow Producer closes with an epoch, and the epoch must order.
         let mut no_task = workflow("r1");
         let Some(Kind::Workflow(kind)) = no_task.kind.as_mut() else {
             unreachable!()
@@ -1059,7 +1065,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_producer_has_a_kind_and_a_workflow_appends_with_its_task),
     case!(a_workflow_appends_in_its_task_and_an_older_task_is_fenced),
-    case!(a_workflow_closes_with_no_epoch_after_its_appends),
+    case!(a_workflow_closes_in_a_later_task_after_its_appends),
     case!(a_producer_id_is_opaque_but_not_empty_or_too_long),
     case!(a_producer_id_of_any_text_or_the_longest_length_reads_back),
     case!(a_close_takes_a_producer_of_any_kind),

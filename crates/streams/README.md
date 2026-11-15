@@ -27,8 +27,8 @@ empty id of either kind, and one over 4096 bytes. A Producer id names one Produc
 A Store keeps the fence of a Producer by kind and id, and an epoch has no run. So the id of a
 run-based kind must hold its run id. A caller that uses one id in two runs gets `FENCED` in the
 second run when that run's epoch is lower. A Workflow Producer appends with its Workflow Task as
-the epoch, so a write of an older task gets `FENCED`. It may close a Stream with no epoch, from an
-Activity that History recorded, and that close orders after every Workflow Task of the run.
+the epoch, so a write of an older task gets `FENCED`. It closes a Stream with an epoch too, since a
+close with none would pass the fence.
 
 ## The runtime
 

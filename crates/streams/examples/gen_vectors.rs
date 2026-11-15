@@ -173,8 +173,6 @@ struct Epoch {
     task_started_time: Option<(u64, u32)>,
     attempt_scheduled_time: Option<(u64, u32)>,
     attempt: Option<u32>,
-    /// A Workflow Producer that sends no epoch, as its close does.
-    no_epoch: bool,
 }
 
 impl Epoch {
@@ -211,12 +209,8 @@ impl Epoch {
         key
     }
 
-    /// 40 bytes, the task key and then the scheduled time and the attempt. A Workflow Producer
-    /// with no epoch is all ones, after every Workflow Task of the run.
+    /// 40 bytes, the task key and then the scheduled time and the attempt.
     fn key(&self) -> Vec<u8> {
-        if self.no_epoch {
-            return vec![0xff; 40];
-        }
         let (seconds, nanos) = self.attempt_scheduled_time.unwrap_or((0, 0));
         let mut key = self.task_key();
         key.extend(seconds.to_be_bytes());
@@ -252,13 +246,6 @@ fn epochs() -> Json {
             Epoch {
                 attempt_scheduled_time: Some((1760000001, 999999999)),
                 attempt: Some(2),
-                ..Epoch::default()
-            },
-        ),
-        (
-            "workflow_no_epoch",
-            Epoch {
-                no_epoch: true,
                 ..Epoch::default()
             },
         ),
