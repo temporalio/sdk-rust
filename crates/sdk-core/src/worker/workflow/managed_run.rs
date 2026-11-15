@@ -815,7 +815,7 @@ impl ManagedRun {
                 && self.wfm.machines.has_server_commands()
             {
                 // Only reads are left. A command for the server must not wait for a read, so
-                // the task completes now, and the read gives its next pages to the next task.
+                // the task completes at once, and the read gives its next pages to the next task.
                 Ok(Some(None))
             } else {
                 let wft_timeout: Duration = self
