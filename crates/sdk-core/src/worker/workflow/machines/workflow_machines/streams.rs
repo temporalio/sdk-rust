@@ -4,19 +4,22 @@
 use crate::worker::workflow::{
     OutgoingJob, WFMachinesError, fatal,
     streams::{
-        DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
+        AppendSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
         StreamResolution, next_call_id,
     },
 };
 use prost::Message;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use temporalio_common::protos::coresdk::{
-    workflow_activation::{ResolveStreamRead, workflow_activation_job},
-    workflow_commands::StartStreamRead,
+use temporalio_common::protos::{
+    coresdk::{
+        workflow_activation::{ResolveStreamAppend, ResolveStreamRead, workflow_activation_job},
+        workflow_commands::{AppendToStream, StartStreamRead},
+    },
+    temporal::api::stream::v1::{StreamRef, producer::Kind},
 };
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
@@ -25,6 +28,7 @@ type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) enum StreamJob {
     /// Records of a read, and its end if it ended. They join the read's pending job, if it has one.
     Read(ResolveStreamRead),
+    Append(ResolveStreamAppend),
 }
 
 struct Read {
@@ -36,9 +40,21 @@ struct Read {
     open: bool,
 }
 
+struct Append {
+    call_id: u64,
+    stream: StreamRef,
+    /// Taken when the append is dispatched.
+    spec: Option<AppendSpec>,
+    resolved: bool,
+}
+
 #[derive(Default)]
 pub(super) struct StreamCalls {
     reads: HashMap<u32, Read>,
+    appends: HashMap<u32, Append>,
+    /// The appends of each Stream that wait for the one before them, in call order. The first one
+    /// is the one that runs.
+    append_queues: HashMap<(String, String), VecDeque<u32>>,
     requests: Vec<StreamRequest>,
 }
 
@@ -102,6 +118,57 @@ impl StreamCalls {
         Ok(true)
     }
 
+    pub(super) fn append(&mut self, attrs: AppendToStream) -> Result<()> {
+        let seq = attrs.seq;
+        let stream = attrs
+            .stream
+            .ok_or_else(|| fatal!("Stream append {seq} has no Stream"))?;
+        let producer = attrs
+            .producer
+            .ok_or_else(|| fatal!("Stream append {seq} has no Producer"))?;
+        if !matches!(producer.kind, Some(Kind::Workflow(_))) {
+            return Err(fatal!(
+                "Stream append {seq} has a Producer that is not of kind Workflow"
+            ));
+        }
+        if self.appends.contains_key(&seq) {
+            return Err(fatal!("Stream append {seq} was issued twice"));
+        }
+        let call_id = next_call_id();
+        let spec = AppendSpec {
+            call_id,
+            seq,
+            stream: stream.clone(),
+            producer,
+            bodies: attrs.bodies,
+        };
+        let queue = self
+            .append_queues
+            .entry((stream.store.clone(), stream.id.clone()))
+            .or_default();
+        queue.push_back(seq);
+        let runs_now = queue.len() == 1;
+        self.appends.insert(
+            seq,
+            Append {
+                call_id,
+                stream,
+                spec: Some(spec),
+                resolved: false,
+            },
+        );
+        if runs_now {
+            self.dispatch_append(seq);
+        }
+        Ok(())
+    }
+
+    fn dispatch_append(&mut self, seq: u32) {
+        if let Some(spec) = self.appends.get_mut(&seq).and_then(|a| a.spec.take()) {
+            self.requests.push(StreamRequest::Append(spec));
+        }
+    }
+
     /// Applies a result. Returns the job it makes, or `None` when its call is gone, stopped or
     /// from an older dispatch.
     pub(super) fn resolve(&mut self, resolution: StreamResolution) -> Option<StreamJob> {
@@ -121,16 +188,40 @@ impl StreamCalls {
                 }
                 Some(StreamJob::Read(ResolveStreamRead { seq, records, end }))
             }
+            StreamCallResult::Append(status) => {
+                let append = self.appends.get_mut(&seq)?;
+                if append.call_id != call_id || append.resolved {
+                    return None;
+                }
+                append.resolved = true;
+                let key = (append.stream.store.clone(), append.stream.id.clone());
+                if let Some(queue) = self.append_queues.get_mut(&key) {
+                    queue.retain(|queued| *queued != seq);
+                    if let Some(next) = queue.front().copied() {
+                        self.dispatch_append(next);
+                    }
+                }
+                Some(StreamJob::Append(ResolveStreamAppend {
+                    seq,
+                    status: Some(status),
+                }))
+            }
         }
     }
 
-    /// Stops every read. A terminal command does it, as does a failed Workflow Task, whose
+    /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
     /// results must not reach Workflow code.
     pub(super) fn stop_all(&mut self) {
         for read in self.reads.values_mut().filter(|read| read.open) {
             read.open = false;
             self.requests.push(StreamRequest::Cancel(read.call_id));
         }
+        for append in self.appends.values_mut().filter(|a| !a.resolved) {
+            append.resolved = true;
+            append.spec = None;
+            self.requests.push(StreamRequest::Cancel(append.call_id));
+        }
+        self.append_queues.clear();
     }
 
     pub(super) fn drain_requests(&mut self) -> Vec<StreamRequest> {
@@ -143,6 +234,10 @@ impl StreamCalls {
 
     pub(super) fn open_reads(&self) -> usize {
         self.reads.values().filter(|read| read.open).count()
+    }
+
+    pub(super) fn open_appends(&self) -> usize {
+        self.appends.values().filter(|a| !a.resolved).count()
     }
 
     /// Notes the Stream jobs of an activation, which Workflow code gets now.
