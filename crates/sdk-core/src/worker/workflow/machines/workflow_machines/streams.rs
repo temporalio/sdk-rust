@@ -307,7 +307,7 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// True if Workflow code asked for a close that no completion carries yet. The task completes
+    /// True if Workflow code asked for a close that no completion carries. The task completes
     /// at once then, so that the Stream closes as soon as History has the intent.
     pub(super) fn has_pending_intents(&self) -> bool {
         self.closes
@@ -317,7 +317,7 @@ impl StreamCalls {
 
     /// The server took the completion that carries the sealed intents, so History has them. Each
     /// close waits in its Stream's queue, in front of every append of a later task. Returns the
-    /// closes that run now. A replay Worker runs none.
+    /// closes that run at once. A replay Worker runs none.
     pub(super) fn intents_taken(&mut self) -> Vec<StreamRequest> {
         let mut sealed: Vec<_> = self
             .closes
@@ -358,7 +358,7 @@ impl StreamCalls {
         self.dispatch_head(&key);
     }
 
-    /// Runs the call at the front of a Stream's queue, if it isn't running yet. Returns its Store.
+    /// Runs the call at the front of a Stream's queue, unless it runs already. Returns its Store.
     fn dispatch_head(&mut self, key: &(String, String)) -> Option<String> {
         match self.append_queues.get(key)?.front().copied()? {
             Queued::Append(seq) => {
