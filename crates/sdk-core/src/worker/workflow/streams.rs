@@ -8,7 +8,10 @@ use crate::{
         workflow_stream::{LocalInput, LocalInputs},
     },
 };
-use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
+use futures_util::{
+    StreamExt,
+    future::{AbortHandle, AbortRegistration, Abortable},
+};
 use parking_lot::Mutex;
 use prost::Message;
 use std::{
@@ -20,17 +23,21 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::protos::{
+    constants::STREAM_MARKER_NAME,
     coresdk::{
         common::StreamReadStop,
+        external_data::{StreamMarkerData, StreamReadEntry},
         workflow_activation::{StreamAppended, StreamReadEnd, resolve_stream_append},
     },
     temporal::api::{
         common::v1::{Payload, Payloads},
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+        history::v1::{HistoryEvent, history_event},
     },
 };
 use temporalio_streams::{
     MAX_WAIT, Reason, StreamError, StreamRuntime,
+    digest::records_digest,
     proto::{
         AppendRecord, AppendRecordsRequest, Producer, ReadRecordsRequest, StreamRecord, StreamRef,
         WorkflowTaskEpoch, producer::Kind,
@@ -130,10 +137,10 @@ pub(crate) struct ReadSpec {
     /// The Workflow time at which the read started, plus its `timeout`.
     pub(crate) deadline: Option<SystemTime>,
     pub(crate) idle_timeout: Duration,
-    /// Zero means no cap.
-    pub(crate) max_records: u32,
-    /// Zero means no cap.
-    pub(crate) max_bytes: u64,
+    /// The Records left under `max_records`, or `None` for no cap.
+    pub(crate) records_left: Option<u32>,
+    /// The bytes left under `max_bytes`, or `None` for no cap.
+    pub(crate) bytes_left: Option<u64>,
     /// True once Workflow code took a Record of the read, so the first-Record rule is spent.
     pub(crate) took_a_record: bool,
     pub(crate) flow: Arc<ReadFlow>,
@@ -335,8 +342,8 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
                 .unwrap_or_default()
     });
     let mut last_offset = spec.from_offset.clone();
-    let mut records_left = (spec.max_records > 0).then_some(spec.max_records);
-    let mut bytes_left = (spec.max_bytes > 0).then_some(spec.max_bytes);
+    let mut records_left = spec.records_left;
+    let mut bytes_left = spec.bytes_left;
     let mut took_a_record = spec.took_a_record;
     let mut idle_deadline = Instant::now() + spec.idle_timeout;
     let end = |last_offset: Vec<u8>, stop: StreamReadStop| StreamReadEnd {
@@ -345,6 +352,14 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
         done: stop == StreamReadStop::Done,
         failure: None,
     };
+    // A resumed read whose caps were spent before its Workflow Task failed ends at once.
+    if records_left == Some(0) {
+        sink(StreamCallResult::Page {
+            records: vec![],
+            end: Some(end(last_offset, StreamReadStop::MaxRecords)),
+        });
+        return;
+    }
     loop {
         spec.flow.wait_for_room().await;
         let now = Instant::now();
@@ -507,4 +522,181 @@ pub(crate) fn failure(error: &StreamError) -> Failure {
         )),
         ..Default::default()
     }
+}
+
+/// The marker detail that holds the encoded [StreamMarkerData].
+pub(crate) const STREAM_MARKER_DATA_KEY: &str = "data";
+/// The metadata key of a `tonic::Status` from a failed hydrate, so that the failed Workflow Task
+/// carries its message as is.
+pub(crate) const STREAM_REPLAY_ERROR_KEY: &str = "temporal-stream-replay-error";
+/// The Store reads that a hydrate runs at a time.
+const HYDRATE_CONCURRENCY: usize = 8;
+
+/// The encoded marker data of a `core_stream` marker event, if the event is one.
+pub(crate) fn stream_marker_payload(event: &mut HistoryEvent) -> Option<&mut Payload> {
+    match event.attributes.as_mut()? {
+        history_event::Attributes::MarkerRecordedEventAttributes(marker)
+            if marker.marker_name == STREAM_MARKER_NAME =>
+        {
+            marker
+                .details
+                .get_mut(STREAM_MARKER_DATA_KEY)
+                .and_then(|payloads| payloads.payloads.first_mut())
+        }
+        _ => None,
+    }
+}
+
+/// The encoded marker data of a `core_stream` marker event, if the event is one.
+pub(crate) fn stream_marker_payload_of(event: &HistoryEvent) -> Option<&Payload> {
+    match event.attributes.as_ref()? {
+        history_event::Attributes::MarkerRecordedEventAttributes(marker)
+            if marker.marker_name == STREAM_MARKER_NAME =>
+        {
+            marker
+                .details
+                .get(STREAM_MARKER_DATA_KEY)
+                .and_then(|payloads| payloads.payloads.first())
+        }
+        _ => None,
+    }
+}
+
+/// True if the status comes from a failed hydrate.
+pub(crate) fn is_stream_replay_error(status: &tonic::Status) -> bool {
+    status.metadata().contains_key(STREAM_REPLAY_ERROR_KEY)
+}
+
+/// Reads the Records of each `core_stream` marker that has their count and digest but not the
+/// Records themselves, and puts them in the marker. The machines are sync, so a replay reads the
+/// Store here, where history enters in async code, and gives them a marker that has its Records.
+pub(crate) async fn hydrate_stream_markers(
+    events: &mut [HistoryEvent],
+    runtimes: &StreamRuntimes,
+) -> Result<(), tonic::Status> {
+    let mut markers = vec![];
+    for (at, event) in events.iter_mut().enumerate() {
+        let Some(payload) = stream_marker_payload(event) else {
+            continue;
+        };
+        let data = StreamMarkerData::decode(payload.data.as_slice()).map_err(|error| {
+            replay_error(format!(
+                "StreamReplayError: a Stream marker is bad: {error}"
+            ))
+        })?;
+        if data
+            .reads
+            .iter()
+            .any(|entry| entry.count > 0 && entry.records.is_empty())
+        {
+            markers.push((at, data));
+        }
+    }
+    if markers.is_empty() {
+        return Ok(());
+    }
+    let reads: Vec<_> = markers
+        .iter()
+        .enumerate()
+        .flat_map(|(marker, (_, data))| {
+            data.reads
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.count > 0 && entry.records.is_empty())
+                .map(move |(entry, read)| (marker, entry, read.clone()))
+        })
+        .collect();
+    let results: Vec<_> =
+        futures_util::stream::iter(reads)
+            .map(|(marker, entry, read)| async move {
+                (marker, entry, read_range(runtimes, &read).await)
+            })
+            .buffer_unordered(HYDRATE_CONCURRENCY)
+            .collect()
+            .await;
+    for (marker, entry, records) in results {
+        markers[marker].1.reads[entry].records = records?;
+    }
+    for (at, data) in markers {
+        if let Some(payload) = stream_marker_payload(&mut events[at]) {
+            payload.data = data.encode_to_vec();
+        }
+    }
+    Ok(())
+}
+
+/// Reads the Records of one entry, with no wait, and checks them against the entry.
+async fn read_range(
+    runtimes: &StreamRuntimes,
+    entry: &StreamReadEntry,
+) -> Result<Vec<StreamRecord>, tonic::Status> {
+    let stream = entry.stream.clone().unwrap_or_default();
+    let fail = |cause: String| {
+        replay_error(format!(
+            "StreamReplayError: Stream `{}` in Store `{}`, the Records after {} through {}: {cause}",
+            stream.id,
+            stream.store,
+            offset_text(&entry.after_offset),
+            offset_text(&entry.last_offset),
+        ))
+    };
+    let runtime = runtimes.get(&stream.store).ok_or_else(|| {
+        fail(format!(
+            "this Worker has no Stream runtime for the Store `{}`",
+            stream.store
+        ))
+    })?;
+    let count = entry.count as usize;
+    let mut records: Vec<StreamRecord> = Vec::with_capacity(count);
+    let mut from_offset = entry.after_offset.clone();
+    while records.len() < count {
+        let left = count - records.len();
+        let response = runtime
+            .read_records(ReadRecordsRequest {
+                namespace: String::new(),
+                r#ref: Some(stream.clone()),
+                from_offset,
+                max_records: i32::try_from(left).unwrap_or(i32::MAX),
+                wait: None,
+                max_bytes: 0,
+            })
+            .await
+            .map_err(|error| fail(error.to_string()))?;
+        if response.records.is_empty() {
+            return Err(fail(format!(
+                "the Store has {} of the {count} Records",
+                records.len()
+            )));
+        }
+        from_offset = response.last_offset;
+        records.extend(response.records.into_iter().take(left));
+    }
+    let last = records.last().map(|record| record.offset.clone());
+    if last.as_ref() != Some(&entry.last_offset) {
+        return Err(fail(format!(
+            "the last Record is at {}",
+            offset_text(&last.unwrap_or_default())
+        )));
+    }
+    if records_digest(&records).as_slice() != entry.digest.as_slice() {
+        return Err(fail("the digest of the Records differs".to_string()));
+    }
+    Ok(records)
+}
+
+fn offset_text(offset: &[u8]) -> String {
+    if offset.is_empty() {
+        return "the start".to_string();
+    }
+    let hex: String = offset.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("offset {hex}")
+}
+
+fn replay_error(message: String) -> tonic::Status {
+    let mut status = tonic::Status::new(tonic::Code::DataLoss, message);
+    status.metadata_mut().insert(
+        STREAM_REPLAY_ERROR_KEY,
+        "true".parse().expect("valid metadata"),
+    );
+    status
 }
