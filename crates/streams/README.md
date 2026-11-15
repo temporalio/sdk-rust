@@ -3,7 +3,8 @@
 Experimental. The Stream runtime that the Temporal SDKs link into their bridges. It answers the five
 operations of the Stream service on a Store. A bridge builds the runtime per client, as a plain
 object, and calls `StreamRuntime::call` with an operation name and the encoded request. The call
-gives back the encoded response. Core has no Stream code.
+gives back the encoded response. A Worker also takes the runtimes, and reads and appends a
+Stream on them for Workflow code.
 
 ## Protos and shared vectors
 

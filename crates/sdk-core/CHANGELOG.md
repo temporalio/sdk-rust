@@ -33,6 +33,14 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* [lang-internal] Experimental: Workflow code can read and append a Stream directly. A Worker takes
+  its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store name. Lang starts a read with
+  `StartStreamRead`, stops it with `CloseStreamRead`, and appends with `AppendToStream`. The results
+  come in the `ResolveStreamRead` and `ResolveStreamAppend` jobs. Core calls the Store itself and
+  records one `core_stream` marker for each Workflow Task in which Workflow code got a result, which
+  a replay gives back in the same activations.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added
