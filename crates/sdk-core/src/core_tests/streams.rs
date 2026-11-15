@@ -2008,3 +2008,58 @@ async fn a_changed_read_can_fail_the_workflow() {
         [CommandType::FailWorkflowExecution]
     );
 }
+
+/// A read whose cap falls on the last Record of a closed Stream ends `Done`, so that Workflow code
+/// knows that the Stream is finished.
+#[tokio::test]
+async fn a_cap_on_the_last_record_of_a_closed_stream_ends_done() {
+    let runtime = runtime();
+    for id in ["records", "bytes"] {
+        create(&runtime, id).await;
+        put(&runtime, id, &["a", "b"]).await;
+        close(&runtime, id).await;
+    }
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let records = StartStreamRead {
+        max_records: 2,
+        ..read_cmd(1, "records")
+    };
+    // Room for both Records and not a byte more.
+    let both: u64 = all_records(&runtime, "bytes")
+        .await
+        .iter()
+        .map(|record| record.encoded_len() as u64)
+        .sum();
+    let bytes = StartStreamRead {
+        max_bytes: both,
+        ..read_cmd(2, "bytes")
+    };
+    complete(&worker, &first, vec![records.into(), bytes.into()]).await;
+    let mut ends = vec![];
+    while ends.len() < 2 {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        for read in reads(&next) {
+            if let Some(end) = read.end {
+                ends.push((read.seq, end.stop(), end.done));
+            }
+        }
+        if ends.len() == 2 {
+            worker.complete_execution(&next.run_id).await;
+        } else {
+            complete(&worker, &next, vec![]).await;
+        }
+    }
+    worker.drain_pollers_and_shutdown().await;
+    ends.sort_by_key(|end| end.0);
+    assert_eq!(
+        ends,
+        [
+            (1, StreamReadStop::Done, true),
+            (2, StreamReadStop::Done, true)
+        ]
+    );
+}
