@@ -204,10 +204,24 @@ fn start(
     cache: usize,
     expected_fails: usize,
 ) -> Run {
+    start_with(t, responses, runtimes, cache, expected_fails, false)
+}
+
+/// As [start]. With `interminable`, the mock poller doesn't end when it gave every task, so the
+/// Worker doesn't shut down before it handles the last one.
+fn start_with(
+    t: TestHistoryBuilder,
+    responses: impl IntoIterator<Item = ResponseType>,
+    runtimes: StreamRuntimes,
+    cache: usize,
+    expected_fails: usize,
+    interminable: bool,
+) -> Run {
     let sent = Arc::new(Mutex::new(vec![]));
     let failed = Arc::new(Mutex::new(vec![]));
     let mut cfg = MockPollCfg::from_resps(t, responses);
     cfg.num_expected_fails = expected_fails;
+    cfg.make_poll_stream_interminable = interminable;
     let kept = sent.clone();
     cfg.completion_mock_fn = Some(Box::new(move |completion| {
         kept.lock().push(completion.clone());
@@ -1302,8 +1316,13 @@ async fn replay_from_history_calls_no_store() {
 /// Workflow Task.
 async fn failed_replay(data: StreamMarkerData, runtimes: StreamRuntimes) -> String {
     let t = replayed_read_history(&data);
-    let run = start(t, [ResponseType::AllHistory], runtimes, 1, 1);
-    let polled = run.worker.poll_workflow_activation().await;
+    // The Records are read after the poll, so the poller must not end before the task fails.
+    let run = start_with(t, [ResponseType::AllHistory], runtimes, 1, 1, true);
+    let polled = tokio::time::timeout(
+        Duration::from_secs(2),
+        run.worker.poll_workflow_activation(),
+    )
+    .await;
     assert!(
         polled.is_err(),
         "The task should fail before any activation"
@@ -2332,4 +2351,61 @@ async fn a_replay_worker_reads_a_marker_from_the_store() {
     complete(&worker, &replayed, vec![]).await;
     let _ = activations_within(&worker, Duration::from_secs(1)).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+}
+
+/// A cached run that gets a full history doesn't read the markers that it has already. Here the
+/// marker in history names a Store that the Worker has no runtime for, so a read of it would fail
+/// the task.
+#[tokio::test]
+async fn a_cached_run_reads_no_marker_of_a_full_history() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let elsewhere = StreamReadEntry {
+        stream: Some(StreamRef {
+            id: "s".to_string(),
+            store: "elsewhere".to_string(),
+        }),
+        ..read_entry(
+            1,
+            "s",
+            vec![],
+            &[Page {
+                records: &[StreamRecord {
+                    offset: 1u64.to_be_bytes().to_vec(),
+                    ..Default::default()
+                }],
+                activation: 1,
+            }],
+            None,
+            false,
+        )
+    };
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(500));
+    t.add_full_wf_task();
+    stream_marker_event(
+        &mut t,
+        4,
+        &StreamMarkerData {
+            reads: vec![elsewhere],
+            appends: vec![],
+        },
+    );
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    // Both tasks come as a full history, as from the normal queue after a sticky timeout.
+    let responses = [1, 2].map(ResponseType::ToTaskNum);
+    let run = start(t, responses, runtimes(&runtime), 1, 0);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    put(&runtime, "s", &["a"]).await;
+    let page = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &page, vec![]).await;
+    // The heartbeat completes the first task, and the second one comes.
+    let signal = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&signal));
+    run.worker.complete_execution(&signal.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
+    assert_eq!(run.sent.lock().len(), 2);
 }
