@@ -322,9 +322,9 @@ fn stop(read: &ResolveStreamRead) -> StreamReadStop {
 ///
 /// A test drives a read over a heartbeat like this. History starts with a short Workflow Task
 /// timeout, and each task after the first starts with the marker event of the task before. The
-/// test adds Records to the Store, polls the page, and completes with no command. It then sleeps
-/// past 80 % of the task timeout, so that Core completes the task as a heartbeat, and adds the
-/// next Records, which come in the next task.
+/// test adds Records to the Store, polls the page, and completes with no command. It then polls
+/// until Core completes the task as a heartbeat at 80 % of the task timeout, and adds the next
+/// Records, which come in the next task.
 #[tokio::test]
 async fn read_spans_three_tasks() {
     let runtime = runtime();
@@ -348,9 +348,7 @@ async fn read_spans_three_tasks() {
     complete(&worker, &page, vec![]).await;
 
     // The heartbeat comes at 400 ms, and completes the first task with the marker of its page.
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    put(&runtime, "s", &["b", "c"]).await;
-    let page = worker.poll_workflow_activation().await.unwrap();
+    let page = poll_after_heartbeat(&worker, &sent, || put(&runtime, "s", &["b", "c"])).await;
     assert_eq!(texts(&reads(&page)[0].records), ["b", "c"]);
     let timer = StartTimer {
         seq: 1,
@@ -469,9 +467,7 @@ async fn heartbeat_runs_without_local_activities() {
     put(&runtime, "s", &["a"]).await;
     let page = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &page, vec![]).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    put(&runtime, "s", &["b"]).await;
-    let page = worker.poll_workflow_activation().await.unwrap();
+    let page = poll_after_heartbeat(&worker, &sent, || put(&runtime, "s", &["b"])).await;
     assert_eq!(texts(&reads(&page)[0].records), ["b"]);
     worker.complete_execution(&page.run_id).await;
     worker.drain_pollers_and_shutdown().await;
@@ -2166,7 +2162,12 @@ async fn idle_time_skips_a_page_that_waits_for_a_task() {
     t.add_full_wf_task();
     t.add_timer_started("1".to_string());
     t.add_workflow_task_scheduled_and_started();
-    let next_task = tokio::time::sleep(Duration::from_millis(1500)).boxed();
+    // The second task comes only after "b" is in, so the page can't go out with "a" alone.
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let next_task = async move {
+        released.await.ok();
+    }
+    .boxed();
     let responses = [
         ResponseType::ToTaskNum(1),
         ResponseType::UntilResolved(next_task, 2),
@@ -2183,8 +2184,10 @@ async fn idle_time_skips_a_page_that_waits_for_a_task() {
     )
     .await;
     put(&runtime, "s", &["a"]).await;
+    // Longer than the idle time, which must not end a read whose page waits for a task.
     tokio::time::sleep(Duration::from_millis(700)).await;
     put(&runtime, "s", &["b"]).await;
+    release.send(()).unwrap();
     let page = worker.poll_workflow_activation().await.unwrap();
     let read = &reads(&page)[0];
     assert_eq!(texts(&read.records), ["a", "b"]);
@@ -2222,13 +2225,11 @@ async fn no_read_outlives_its_worker() {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     worker.drain_pollers_and_shutdown().await;
-    // Past the read's idle time, so only a paused read could still hold the runtime.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(
-        Arc::strong_count(&runtime),
-        1,
-        "a Stream task still holds the runtime"
-    );
+    // A paused read would hold the runtime for good, so this wait would not end.
+    until("the end of every Stream task", || {
+        Arc::strong_count(&runtime) == 1
+    })
+    .await;
 }
 
 /// A replay Worker on the history of one Workflow, with `runtimes`.
@@ -2241,11 +2242,18 @@ fn replay_worker(t: TestHistoryBuilder, runtimes: StreamRuntimes) -> Worker {
     .unwrap()
 }
 
-/// Polls the activations that come within `wait`, completes each with no command, and returns
-/// their jobs.
-async fn activations_within(worker: &Worker, wait: Duration) -> Vec<String> {
+/// Polls every activation until the replay Worker ends the history, completes each with no
+/// command, and returns their jobs. The end of the history ends the wait, so a slow machine can't
+/// cut it short. The long bound only guards against a hang.
+async fn activations_until_the_end(worker: &Worker) -> Vec<String> {
     let mut jobs = vec![];
-    while let Ok(Ok(next)) = tokio::time::timeout(wait, worker.poll_workflow_activation()).await {
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(60), worker.poll_workflow_activation())
+            .await
+            .expect("the replay Worker didn't end the history");
+        let Ok(next) = next else {
+            return jobs;
+        };
         jobs.extend(
             next.jobs
                 .iter()
@@ -2255,7 +2263,6 @@ async fn activations_within(worker: &Worker, wait: Duration) -> Vec<String> {
             .complete_workflow_activation(WorkflowActivationCompletion::empty(next.run_id))
             .await;
     }
-    jobs
 }
 
 /// A replay Worker never calls a Store for a call that history leaves open. The call stays open,
@@ -2278,7 +2285,7 @@ async fn a_replay_worker_never_writes_to_a_store() {
         vec![append_cmd(1, "out", &run_id, &["from-a-replay"]).into()],
     )
     .await;
-    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let jobs = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
     assert!(
         !jobs
@@ -2315,7 +2322,7 @@ async fn a_replay_worker_needs_no_runtime_for_an_open_read() {
         ..read_cmd(1, "s")
     };
     complete(&worker, &first, vec![read.into()]).await;
-    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let jobs = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
     assert!(
         jobs.iter().any(|job| job == "ResolveStreamRead(1)"),
@@ -2361,7 +2368,7 @@ async fn a_replay_worker_reads_a_marker_from_the_store() {
     let replayed = worker.poll_workflow_activation().await.unwrap();
     assert_eq!(reads(&replayed)[0].records, records);
     complete(&worker, &replayed, vec![]).await;
-    let _ = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
 }
 
@@ -2428,7 +2435,7 @@ async fn a_cached_run_reads_no_marker_of_a_full_history() {
 /// again.
 async fn replay_worker_eviction(data: StreamMarkerData, runtimes: StreamRuntimes) -> String {
     let worker = replay_worker(replayed_read_history(&data), runtimes);
-    let evicted = tokio::time::timeout(Duration::from_secs(5), worker.poll_workflow_activation())
+    let evicted = tokio::time::timeout(Duration::from_secs(60), worker.poll_workflow_activation())
         .await
         .expect("the replay Worker gave no activation")
         .unwrap();
@@ -2442,7 +2449,7 @@ async fn replay_worker_eviction(data: StreamMarkerData, runtimes: StreamRuntimes
         .complete_workflow_activation(WorkflowActivationCompletion::empty(evicted.run_id))
         .await
         .unwrap();
-    let next = tokio::time::timeout(Duration::from_secs(5), worker.poll_workflow_activation())
+    let next = tokio::time::timeout(Duration::from_secs(60), worker.poll_workflow_activation())
         .await
         .expect("the replay Worker didn't end the history");
     assert!(
@@ -2533,7 +2540,7 @@ async fn a_replayed_read_with_no_store_name_takes_the_store_of_history() {
         ..read_cmd(1, "s")
     };
     complete(&worker, &first, vec![read.into()]).await;
-    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let jobs = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
     assert!(
         jobs.iter().any(|job| job == "ResolveStreamRead(1)"),
@@ -2573,7 +2580,7 @@ async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
         ..append_cmd(1, "s", &run_id, &["x"])
     };
     complete(&worker, &first, vec![append.into()]).await;
-    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let jobs = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
     assert!(
         jobs.iter().any(|job| job == "ResolveStreamAppend(1)"),
@@ -2636,15 +2643,58 @@ fn stream_is_closed(runtime: &StreamRuntime, id: &str) -> bool {
     described.status == StreamStatus::Closed as i32
 }
 
-/// Waits up to 2 s for the Stream to close.
-async fn wait_closed(runtime: &StreamRuntime, id: &str) -> bool {
-    for _ in 0..40 {
-        if stream_is_closed(runtime, id) {
-            return true;
+/// Waits for the Stream to close. A read that waits on the Store wakes at the close, so the wait
+/// ends with the close and not at a time. The long wait only guards against a hang.
+async fn wait_closed(runtime: &StreamRuntime, id: &str) {
+    let mut from_offset = vec![];
+    loop {
+        let read = runtime
+            .read_records(ReadRecordsRequest {
+                r#ref: Some(stream(id)),
+                from_offset: from_offset.clone(),
+                wait: Some(Duration::from_secs(60).try_into().unwrap()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if read.done {
+            return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !read.records.is_empty() || read.last_offset != from_offset,
+            "no close came in 60 s"
+        );
+        from_offset = read.last_offset;
     }
-    false
+}
+
+/// Polls an activation, runs `then` once the heartbeat has completed the task, and returns the
+/// activation. Core sends the heartbeat only while a poll waits, so the poll starts first.
+async fn poll_after_heartbeat<F: Future<Output = ()>>(
+    worker: &Worker,
+    sent: &Mutex<Vec<WorkflowTaskCompletion>>,
+    then: impl FnOnce() -> F,
+) -> WorkflowActivation {
+    let next = worker.poll_workflow_activation();
+    tokio::pin!(next);
+    tokio::select! {
+        _ = until("the heartbeat", || sent.lock().len() == 1) => {}
+        early = &mut next => panic!("an activation came before the heartbeat: {early:?}"),
+    }
+    then().await;
+    next.await.unwrap()
+}
+
+/// Waits until `condition` holds. It ends with the condition and not at a time, so a slow machine
+/// can't fail it. The long bound only guards against a hang.
+async fn until(what: &str, condition: impl Fn() -> bool) {
+    for _ in 0..6000 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what} didn't happen in 60 s");
 }
 
 fn closes(activation: &WorkflowActivation) -> Vec<ResolveStreamClose> {
@@ -2950,7 +3000,17 @@ async fn a_workflow_that_completes_with_its_close_still_closes_the_stream() {
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
     let run_id = t.get_orig_run_id().to_string();
-    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    // The mock poller stays alive, or its end would shut the Worker down, and a shutdown may stop
+    // the close.
+    let run = start_with(
+        t,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        1,
+        0,
+        true,
+    );
+    let (worker, sent) = (run.worker, run.sent);
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(
         &worker,
@@ -2961,7 +3021,7 @@ async fn a_workflow_that_completes_with_its_close_still_closes_the_stream() {
         ],
     )
     .await;
-    assert!(wait_closed(&runtime, "s").await, "the Stream didn't close");
+    wait_closed(&runtime, "s").await;
     worker.drain_pollers_and_shutdown().await;
     let sent = sent.lock();
     assert_eq!(
@@ -3077,7 +3137,7 @@ async fn a_replay_worker_sends_no_recorded_close() {
     let worker = replay_worker(t, runtimes(&runtime));
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
-    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let jobs = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
     assert!(
         jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
@@ -3169,7 +3229,7 @@ async fn a_replayed_close_with_no_store_name_takes_the_store_of_history() {
         ..close_cmd(1, "s", &run_id)
     };
     complete(&worker, &first, vec![close.into()]).await;
-    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let jobs = activations_until_the_end(&worker).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
     assert!(
         jobs.iter().any(|job| job == "ResolveStreamClose(1)"),
