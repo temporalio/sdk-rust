@@ -1,4 +1,5 @@
 mod local_acts;
+mod streams;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
@@ -6,10 +7,16 @@ use super::{
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
-    fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
-    patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
-    workflow_machines::local_acts::LocalActivityData,
+    fail_workflow_state_machine::fail_workflow,
+    local_activity_state_machine::new_local_activity,
+    patch_state_machine::has_change,
+    signal_external_state_machine::new_external_signal,
+    timer_state_machine::new_timer,
+    upsert_search_attributes_state_machine::upsert_search_attrs,
+    workflow_machines::{
+        local_acts::LocalActivityData,
+        streams::{StreamCalls, StreamJob},
+    },
     workflow_task_state_machine::WorkflowTaskMachine,
 };
 use crate::{
@@ -37,6 +44,7 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
+            streams::StreamRequest,
         },
     },
 };
@@ -66,10 +74,11 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{CommandType, EventType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
+            stream::v1::StreamRef,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -187,6 +196,8 @@ pub(crate) struct WorkflowMachines {
 
     /// Contains extra local-activity related data
     local_activity_data: LocalActivityData,
+    /// The Stream calls of the run, and what Workflow code got from them in this Workflow Task
+    stream_calls: StreamCalls,
 
     /// The workflow that is being driven by this instance of the machines
     drive_me: DrivenWorkflow,
@@ -332,6 +343,7 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
+            stream_calls: StreamCalls::default(),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -418,8 +430,51 @@ impl WorkflowMachines {
                 }
                 self.local_activity_data.done_executing(seq);
             }
+            LocalResolution::Stream(resolution) => match self.stream_calls.resolve(resolution) {
+                Some(StreamJob::Read(page)) => {
+                    if let Some(page) = self.drive_me.merge_stream_read(page) {
+                        self.drive_me.send_job(page.into());
+                    }
+                }
+                None => result_important = false,
+            },
         }
         Ok(result_important)
+    }
+
+    /// Takes the Stream calls that the Worker must start or stop.
+    pub(crate) fn drain_stream_requests(&mut self) -> Vec<StreamRequest> {
+        self.stream_calls.drain_requests()
+    }
+
+    /// True if there are Stream calls that the Worker must start or stop.
+    pub(crate) fn has_stream_requests(&self) -> bool {
+        self.stream_calls.has_requests()
+    }
+
+    /// The number of local calls that hold the Workflow Task open: Local Activities and Stream
+    /// reads.
+    pub(crate) fn outstanding_local_work(&self) -> usize {
+        self.outstanding_local_activity_count() + self.stream_calls.open_reads()
+    }
+
+    /// Stops every Stream call of the run, and drops the results still on their way. A failed
+    /// Workflow Task does it, so that no result of it reaches Workflow code.
+    pub(crate) fn stop_stream_calls(&mut self) {
+        self.stream_calls.stop_all();
+        self.stream_calls.drain_requests();
+    }
+
+    /// True if this Workflow Task has a command for the server, other than a marker. A marker asks
+    /// the server for nothing, so it never needs the task to complete early.
+    pub(crate) fn has_server_commands(&self) -> bool {
+        self.commands
+            .iter()
+            .chain(self.current_wf_task_commands.iter())
+            .any(|c| {
+                !self.machine(c.machine).is_final_state()
+                    && c.command.command_type() != CommandType::RecordMarker
+            })
     }
 
     /// Drain all queued local activities that need executing or cancellation
@@ -563,6 +618,7 @@ impl WorkflowMachines {
         });
         // Query-only activations are never recorded in history, so replay can't count them.
         if !all_query {
+            self.stream_calls.note_delivered(&jobs);
             self.local_activity_data.activation_dispatched();
         }
         let is_replaying = self.replaying || all_query;
@@ -617,10 +673,14 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn has_pending_la_resolutions(&self) -> bool {
-        self.drive_me
-            .peek_pending_jobs()
-            .iter()
-            .any(|v| v.variant.is_local_activity_resolution())
+        self.drive_me.peek_pending_jobs().iter().any(|v| {
+            v.variant.is_local_activity_resolution()
+                || matches!(
+                    v.variant,
+                    workflow_activation_job::Variant::ResolveStreamRead(_)
+                        | workflow_activation_job::Variant::ResolveStreamAppend(_)
+                )
+        })
     }
 
     pub(crate) fn get_metadata_for_wft_complete(&mut self) -> WorkflowTaskCompletedMetadata {
@@ -1739,12 +1799,38 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
-                WFCommandVariant::StartStreamRead(_)
-                | WFCommandVariant::CloseStreamRead(_)
-                | WFCommandVariant::AppendToStream(_) => {
-                    return Err(fatal!("This Worker can't read or append Streams"));
+                WFCommandVariant::StartStreamRead(attrs) => {
+                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.stream_calls.start_read(attrs, self.current_wf_time)?;
+                }
+                WFCommandVariant::CloseStreamRead(attrs) => {
+                    if self.stream_calls.close_read(attrs.seq)? {
+                        self.drive_me.drop_stream_read(attrs.seq);
+                    }
+                }
+                WFCommandVariant::AppendToStream(_) => {
+                    return Err(fatal!("This Worker can't append to Streams yet"));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Fails the Workflow Task for a Stream call that this Worker can't make. Nothing goes into
+    /// history, so a Worker with the runtime can run the task again.
+    fn check_stream_call(&self, stream: Option<&StreamRef>) -> Result<()> {
+        if self.replaying {
+            return Err(WFMachinesError::Stream(
+                "This Worker can't replay a Stream call yet".to_string(),
+            ));
+        }
+        let store = stream
+            .map(|stream| stream.store.as_str())
+            .unwrap_or_default();
+        if self.worker_config.stream_runtimes.get(store).is_none() {
+            return Err(WFMachinesError::Stream(format!(
+                "This Worker has no Stream runtime for the Store `{store}`"
+            )));
         }
         Ok(())
     }
@@ -1784,6 +1870,7 @@ impl WorkflowMachines {
         // Wipe out any pending / executing local activity data since we're about to terminate
         // and there's nothing to be done with them.
         self.local_activity_data.indicate_terminating();
+        self.stream_calls.stop_all();
     }
 
     /// Add a new command/machines for that command to the current workflow task
