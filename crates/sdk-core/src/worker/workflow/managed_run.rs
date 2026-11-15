@@ -336,11 +336,21 @@ impl ManagedRun {
 
         if let WFTReportStatus::Reported {
             reset_last_started_to,
+            accepted,
             ..
         } = report_status
         {
             if let Some(id) = reset_last_started_to {
                 self.wfm.machines.reset_last_started_id(id);
+            }
+            // History has the task now, so the closes that it recorded run. A speculative task
+            // that the server dropped recorded nothing.
+            if accepted && reset_last_started_to.is_none() {
+                let closes = self.wfm.machines.stream_intents_taken();
+                if !closes.is_empty() {
+                    self.stream_manager
+                        .dispatch(&self.wfm.machines.run_id, None, closes);
+                }
             }
             // Tell the LA manager that we're done with the WFT
             if let Some(ref local_act_request_sink) = self.local_activity_request_sink {
@@ -813,10 +823,12 @@ impl ManagedRun {
                 Ok(None)
             } else if self.wfm.machines.outstanding_local_activity_count() == 0
                 && self.wfm.machines.outstanding_stream_appends() == 0
-                && self.wfm.machines.has_server_commands()
+                && (self.wfm.machines.has_server_commands()
+                    || self.wfm.machines.has_pending_close_intents())
             {
-                // Only reads are left. A command for the server must not wait for a read, so
-                // the task completes at once, and the read gives its next pages to the next task.
+                // Only reads are left. A command for the server, or a close, must not wait for a
+                // read, so the task completes at once, and the read gives its next pages to the
+                // next task.
                 Ok(Some(None))
             } else {
                 let wft_timeout: Duration = self
@@ -839,10 +851,14 @@ impl ManagedRun {
                 if let Some(waiting) = self.waiting_on_la.take() {
                     waiting.hb_timeout_handle.abort();
                 }
+                // A close runs after the server took this task, and its result needs another
+                // one, unless the Workflow ends here.
+                let closing = self.wfm.machines.has_pending_close_intents()
+                    && !self.wfm.machines.workflow_is_finished();
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
                     data,
-                    completing_heartbeat_autocomplete,
+                    completing_heartbeat_autocomplete || closing,
                 )))
             }
             Ok(Some(None)) => {
@@ -1272,7 +1288,7 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                machines_wft_response.seal_stream_marker();
+                machines_wft_response.seal_stream_marker(self.wft.as_ref().map(task_epoch));
                 (
                     machines_wft_response.commands().collect(),
                     machines_wft_response.messages(),
@@ -1315,14 +1331,10 @@ impl ManagedRun {
         if !self.wfm.machines.has_stream_requests() {
             return;
         }
-        let epoch = WorkflowTaskEpoch {
-            started_event_id: wft.info.started_event_id,
-            attempt: i32::try_from(wft.info.attempt).unwrap_or(i32::MAX),
-            started_time: wft.info.started_time.map(Into::into),
-        };
+        let epoch = task_epoch(wft);
         let requests = self.wfm.machines.drain_stream_requests();
         self.stream_manager
-            .dispatch(&self.wfm.machines.run_id, epoch, requests);
+            .dispatch(&self.wfm.machines.run_id, Some(epoch), requests);
     }
 
     /// Stops the run's Stream calls and drops their results still on their way.
@@ -1844,6 +1856,15 @@ fn sorted(names: &[String]) -> Vec<String> {
     let mut v = names.to_vec();
     v.sort();
     v
+}
+
+/// The epoch of a Workflow Task, which an append and a close write with.
+fn task_epoch(wft: &OutstandingTask) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id: wft.info.started_event_id,
+        attempt: i32::try_from(wft.info.attempt).unwrap_or(i32::MAX),
+        started_time: wft.info.started_time.map(Into::into),
+    }
 }
 
 #[cfg(test)]

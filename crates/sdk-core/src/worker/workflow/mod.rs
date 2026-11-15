@@ -447,76 +447,78 @@ impl Workflows {
                 completion.sticky_attributes = sticky_attrs;
 
                 let mut reset_last_started_to = None;
-                self.handle_wft_reporting_errs(run_id, || async {
-                    match self
-                        .client
-                        .complete_workflow_task(completion, self.shutdown_token.clone())
-                        .await
-                    {
-                        Ok(response) => {
-                            if let Some(record) = maybe_record_terminal_metric.take() {
-                                record(&run_metrics);
+                let accepted = self
+                    .handle_wft_reporting_errs(run_id, || async {
+                        match self
+                            .client
+                            .complete_workflow_task(completion, self.shutdown_token.clone())
+                            .await
+                        {
+                            Ok(response) => {
+                                if let Some(record) = maybe_record_terminal_metric.take() {
+                                    record(&run_metrics);
+                                }
+                                if response.reset_history_event_id > 0 {
+                                    reset_last_started_to = Some(response.reset_history_event_id);
+                                }
+                                if let Some(wft) = response.workflow_task {
+                                    *wft_from_complete = Some(validate_wft(wft)?);
+                                }
+                                self.handle_eager_activities(
+                                    reserved_act_permits,
+                                    response.activity_tasks,
+                                );
                             }
-                            if response.reset_history_event_id > 0 {
-                                reset_last_started_to = Some(response.reset_history_event_id);
+                            Err(e) => {
+                                let cause_and_failure =
+                                    if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
+                                        // Completion exceeds the namespace's recombined size limit, so the
+                                        // worker failed it proactively rather than sending doomed pages.
+                                        Some((
+                                            WorkflowTaskFailedCause::RequestTooLarge,
+                                            make_request_too_large_failure(),
+                                        ))
+                                    } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) {
+                                        Some((
+                                            WorkflowTaskFailedCause::GrpcMessageTooLarge,
+                                            make_grpc_message_too_large_failure(),
+                                        ))
+                                    } else {
+                                        // Client layer rejected the completion for exceeding the worker's
+                                        // payload error limit.
+                                        payload_limit_violation_from(&e).map(|violation| {
+                                            (
+                                                WorkflowTaskFailedCause::PayloadsTooLarge,
+                                                make_payloads_too_large_failure(violation),
+                                            )
+                                        })
+                                    };
+                                if let Some((cause, failure)) = cause_and_failure {
+                                    self.handle_activation_failed(
+                                        run_id,
+                                        completion_time,
+                                        FailedActivationWFTReport::new(
+                                            task_token,
+                                            attempt,
+                                            cause,
+                                            failure,
+                                            WftFailureKind::Task,
+                                            &run_metrics,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                return Err(e);
                             }
-                            if let Some(wft) = response.workflow_task {
-                                *wft_from_complete = Some(validate_wft(wft)?);
-                            }
-                            self.handle_eager_activities(
-                                reserved_act_permits,
-                                response.activity_tasks,
-                            );
-                        }
-                        Err(e) => {
-                            let cause_and_failure =
-                                if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
-                                    // Completion exceeds the namespace's recombined size limit, so the
-                                    // worker failed it proactively rather than sending doomed pages.
-                                    Some((
-                                        WorkflowTaskFailedCause::RequestTooLarge,
-                                        make_request_too_large_failure(),
-                                    ))
-                                } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) {
-                                    Some((
-                                        WorkflowTaskFailedCause::GrpcMessageTooLarge,
-                                        make_grpc_message_too_large_failure(),
-                                    ))
-                                } else {
-                                    // Client layer rejected the completion for exceeding the worker's
-                                    // payload error limit.
-                                    payload_limit_violation_from(&e).map(|violation| {
-                                        (
-                                            WorkflowTaskFailedCause::PayloadsTooLarge,
-                                            make_payloads_too_large_failure(violation),
-                                        )
-                                    })
-                                };
-                            if let Some((cause, failure)) = cause_and_failure {
-                                self.handle_activation_failed(
-                                    run_id,
-                                    completion_time,
-                                    FailedActivationWFTReport::new(
-                                        task_token,
-                                        attempt,
-                                        cause,
-                                        failure,
-                                        WftFailureKind::Task,
-                                        &run_metrics,
-                                    ),
-                                )
-                                .await;
-                            }
-                            return Err(e);
-                        }
-                    };
+                        };
 
-                    Ok(())
-                })
-                .await;
+                        Ok(())
+                    })
+                    .await;
                 WFTReportStatus::Reported {
                     reset_last_started_to,
                     completion_time,
+                    accepted,
                 }
             }
             ServerCommandsWithWorkflowInfo {
@@ -529,6 +531,7 @@ impl Workflows {
                 WFTReportStatus::Reported {
                     reset_last_started_to: None,
                     completion_time,
+                    accepted: false,
                 }
             }
         }
@@ -580,6 +583,7 @@ impl Workflows {
         WFTReportStatus::Reported {
             reset_last_started_to: None,
             completion_time,
+            accepted: false,
         }
     }
 
@@ -795,7 +799,12 @@ impl Workflows {
 
     /// Handle server errors from either completing or failing a workflow task. Un-handleable errors
     /// trigger a workflow eviction and are logged.
-    async fn handle_wft_reporting_errs<T, Fut>(&self, run_id: &str, completer: impl FnOnce() -> Fut)
+    /// Returns true if the server took the report.
+    async fn handle_wft_reporting_errs<T, Fut>(
+        &self,
+        run_id: &str,
+        completer: impl FnOnce() -> Fut,
+    ) -> bool
     where
         Fut: Future<Output = Result<T, tonic::Status>>,
     {
@@ -818,9 +827,11 @@ impl Workflows {
                 }
             }
         }
+        let accepted = should_evict.is_none();
         if let Some(reason) = should_evict {
             self.request_eviction(run_id, "Error reporting WFT to server", reason);
         }
+        accepted
     }
 
     /// Sends a message to the workflow processing stream. Returns true if the message was sent
@@ -1358,6 +1369,8 @@ enum WFTReportStatus {
     Reported {
         reset_last_started_to: Option<i64>,
         completion_time: Instant,
+        /// True if the server took the completion of the Workflow Task, so History has it.
+        accepted: bool,
     },
     /// The WFT completion was not reported when finishing the activation, because there's still
     /// work to be done. EX: Running LAs.
@@ -1892,7 +1905,7 @@ impl LocalActivityRequestSink for LAReqSink {
 /// 4. signals/updates
 /// 5. all others
 /// 6. local activity resolutions
-/// 7. Stream results, reads before appends, each by seq
+/// 7. Stream results, reads, then appends, then closes, each by seq
 /// 8. queries
 /// 9. evictions
 ///
@@ -1935,6 +1948,7 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 // a replay gives the same order.
                 workflow_activation_job::Variant::ResolveStreamRead(r) => (6, 0, r.seq),
                 workflow_activation_job::Variant::ResolveStreamAppend(r) => (6, 1, r.seq),
+                workflow_activation_job::Variant::ResolveStreamClose(r) => (6, 2, r.seq),
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.

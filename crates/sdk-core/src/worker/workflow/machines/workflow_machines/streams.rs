@@ -4,8 +4,8 @@
 use crate::worker::workflow::{
     OutgoingJob, WFMachinesError, fatal, nondeterminism,
     streams::{
-        AppendSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
-        StreamResolution, next_call_id,
+        AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult,
+        StreamRequest, StreamResolution, next_call_id,
     },
 };
 use prost::Message;
@@ -16,14 +16,18 @@ use std::{
 };
 use temporalio_common::protos::{
     coresdk::{
-        external_data::{StreamAppendEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry},
-        workflow_activation::{
-            ResolveStreamAppend, ResolveStreamRead, StreamAppended, StreamReadEnd,
-            resolve_stream_append, workflow_activation_job,
+        external_data::{
+            StreamAppendEntry, StreamCloseEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry,
         },
-        workflow_commands::{AppendToStream, StartStreamRead},
+        workflow_activation::{
+            ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, StreamAppended,
+            StreamReadEnd, resolve_stream_append, workflow_activation_job,
+        },
+        workflow_commands::{AppendToStream, CloseStream, StartStreamRead},
     },
-    temporal::api::stream::v1::{StreamRecord, StreamRef, producer::Kind},
+    temporal::api::stream::v1::{
+        Producer, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
+    },
 };
 use temporalio_streams::digest::records_digest;
 
@@ -34,6 +38,38 @@ pub(super) enum StreamJob {
     /// Records of a read, and its end if it ended. They join the read's pending job, if it has one.
     Read(ResolveStreamRead),
     Append(ResolveStreamAppend),
+    Close(ResolveStreamClose),
+}
+
+/// A call that waits for the one before it on its Stream. The first one is the one that runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Queued {
+    Append(u32),
+    Close(u32),
+}
+
+/// Where the intent of a close is. The Worker closes the Stream only after History has the task
+/// that recorded the intent, so that a failed task closes nothing.
+#[derive(Clone, Copy)]
+enum Intent {
+    /// Workflow code asked for the close in this task.
+    Pending,
+    /// The completion of this task, with this epoch, carries the intent.
+    Sealed(WorkflowTaskEpoch),
+    /// History has the intent, from the completion that the server took or from a replay.
+    Recorded(Option<WorkflowTaskEpoch>),
+}
+
+struct Close {
+    call_id: u64,
+    stream: StreamRef,
+    producer: Producer,
+    intent: Intent,
+    /// True once the close waits in its Stream's queue or runs.
+    queued: bool,
+    /// True once the Worker runs the close.
+    dispatched: bool,
+    resolved: bool,
 }
 
 struct Read {
@@ -115,12 +151,14 @@ struct ReadEntryBuilder {
 pub(super) struct StreamCalls {
     reads: HashMap<u32, Read>,
     appends: HashMap<u32, Append>,
-    /// The appends of each Stream that wait for the one before them, in call order. The first one
-    /// is the one that runs.
-    append_queues: HashMap<(String, String), VecDeque<u32>>,
+    closes: HashMap<u32, Close>,
+    /// The appends and closes of each Stream that wait for the one before them, in call order.
+    /// The first one is the one that runs.
+    append_queues: HashMap<(String, String), VecDeque<Queued>>,
     requests: Vec<StreamRequest>,
     marker_reads: Vec<ReadEntryBuilder>,
     marker_appends: Vec<StreamAppendEntry>,
+    marker_closes: Vec<StreamCloseEntry>,
     /// The results of the markers of history that wait for Workflow code, in marker order.
     held: Vec<Held>,
     /// False while the run replays. A call then waits for its results from history, and the
@@ -207,19 +245,128 @@ impl StreamCalls {
             stores.push(read.stream.store.clone());
             self.requests.push(StreamRequest::Read(read.spec()));
         }
-        let mut heads: Vec<_> = self
-            .append_queues
-            .values()
-            .filter_map(|queue| queue.front().copied())
-            .collect();
-        heads.sort();
-        for seq in heads {
-            if let Some(append) = self.appends.get(&seq) {
-                stores.push(append.stream.store.clone());
+        let mut keys: Vec<_> = self.append_queues.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(store) = self.dispatch_head(&key) {
+                stores.push(store);
             }
-            self.dispatch_append(seq);
         }
         stores
+    }
+
+    /// Records a close, which the Worker runs only after History has this task.
+    pub(super) fn close(&mut self, attrs: CloseStream) -> Result<()> {
+        let seq = attrs.seq;
+        let stream = attrs
+            .stream
+            .ok_or_else(|| fatal!("Stream close {seq} has no Stream"))?;
+        let producer = attrs
+            .producer
+            .ok_or_else(|| fatal!("Stream close {seq} has no Producer"))?;
+        if !matches!(producer.kind, Some(Kind::Workflow(_))) {
+            return Err(fatal!(
+                "Stream close {seq} has a Producer that is not of kind Workflow"
+            ));
+        }
+        if self.closes.contains_key(&seq) {
+            return Err(fatal!("Stream close {seq} was issued twice"));
+        }
+        self.closes.insert(
+            seq,
+            Close {
+                call_id: next_call_id(),
+                stream,
+                producer,
+                intent: Intent::Pending,
+                queued: false,
+                dispatched: false,
+                resolved: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// True if Workflow code asked for a close that no completion carries yet. The task completes
+    /// at once then, so that the Stream closes as soon as History has the intent.
+    pub(super) fn has_pending_intents(&self) -> bool {
+        self.closes
+            .values()
+            .any(|close| matches!(close.intent, Intent::Pending))
+    }
+
+    /// The server took the completion that carries the sealed intents, so History has them. Each
+    /// close waits in its Stream's queue, in front of every append of a later task. Returns the
+    /// closes that run now. A replay Worker runs none.
+    pub(super) fn intents_taken(&mut self) -> Vec<StreamRequest> {
+        let mut sealed: Vec<_> = self
+            .closes
+            .iter()
+            .filter(|(_, close)| matches!(close.intent, Intent::Sealed(_)))
+            .map(|(seq, _)| *seq)
+            .collect();
+        sealed.sort();
+        for seq in sealed {
+            if let Some(close) = self.closes.get_mut(&seq)
+                && let Intent::Sealed(epoch) = close.intent
+            {
+                close.intent = Intent::Recorded(Some(epoch));
+            }
+            if self.calls_stores {
+                self.queue_close(seq);
+            }
+        }
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Drops the intents that History doesn't have, when their task fails.
+    pub(super) fn drop_intents(&mut self) {
+        self.closes
+            .retain(|_, close| matches!(close.intent, Intent::Recorded(_)));
+    }
+
+    fn queue_close(&mut self, seq: u32) {
+        let Some(close) = self.closes.get_mut(&seq) else {
+            return;
+        };
+        close.queued = true;
+        let key = (close.stream.store.clone(), close.stream.id.clone());
+        self.append_queues
+            .entry(key.clone())
+            .or_default()
+            .push_back(Queued::Close(seq));
+        self.dispatch_head(&key);
+    }
+
+    /// Runs the call at the front of a Stream's queue, if it isn't running yet. Returns its Store.
+    fn dispatch_head(&mut self, key: &(String, String)) -> Option<String> {
+        match self.append_queues.get(key)?.front().copied()? {
+            Queued::Append(seq) => {
+                let spec = self.appends.get_mut(&seq)?.spec.take()?;
+                let store = spec.stream.store.clone();
+                self.requests.push(StreamRequest::Append(spec));
+                Some(store)
+            }
+            Queued::Close(seq) => {
+                let close = self.closes.get_mut(&seq)?;
+                let Intent::Recorded(epoch) = close.intent else {
+                    return None;
+                };
+                if close.resolved || close.dispatched {
+                    return None;
+                }
+                close.dispatched = true;
+                let spec = CloseSpec {
+                    call_id: close.call_id,
+                    seq,
+                    stream: close.stream.clone(),
+                    producer: close.producer.clone(),
+                    epoch,
+                };
+                self.requests.push(StreamRequest::Close(spec));
+                Some(close.stream.store.clone())
+            }
+        }
     }
 
     /// Stops a read. Returns true if it was still open, so that its pending Records are dropped.
@@ -269,11 +416,9 @@ impl StreamCalls {
             },
             bodies: attrs.bodies,
         };
-        let queue = self
-            .append_queues
-            .entry((stream.store.clone(), stream.id.clone()))
-            .or_default();
-        queue.push_back(seq);
+        let stream_key = (stream.store.clone(), stream.id.clone());
+        let queue = self.append_queues.entry(stream_key.clone()).or_default();
+        queue.push_back(Queued::Append(seq));
         let runs_now = queue.len() == 1;
         self.appends.insert(
             seq,
@@ -285,14 +430,18 @@ impl StreamCalls {
             },
         );
         if runs_now && self.live {
-            self.dispatch_append(seq);
+            self.dispatch_head(&(stream_key.0, stream_key.1));
         }
         Ok(())
     }
 
-    fn dispatch_append(&mut self, seq: u32) {
-        if let Some(spec) = self.appends.get_mut(&seq).and_then(|a| a.spec.take()) {
-            self.requests.push(StreamRequest::Append(spec));
+    /// Takes a resolved call off its Stream's queue, and runs the next one once replay ended.
+    fn unqueue(&mut self, key: &(String, String), done: Queued) {
+        if let Some(queue) = self.append_queues.get_mut(key) {
+            queue.retain(|queued| *queued != done);
+        }
+        if self.live {
+            self.dispatch_head(key);
         }
     }
 
@@ -322,18 +471,21 @@ impl StreamCalls {
                 }
                 append.resolved = true;
                 let key = (append.stream.store.clone(), append.stream.id.clone());
-                if let Some(queue) = self.append_queues.get_mut(&key) {
-                    queue.retain(|queued| *queued != seq);
-                    if let Some(next) = queue.front().copied()
-                        && self.live
-                    {
-                        self.dispatch_append(next);
-                    }
-                }
+                self.unqueue(&key, Queued::Append(seq));
                 Some(StreamJob::Append(ResolveStreamAppend {
                     seq,
                     status: Some(status),
                 }))
+            }
+            StreamCallResult::Close(failed) => {
+                let close = self.closes.get_mut(&seq)?;
+                if close.call_id != call_id || close.resolved {
+                    return None;
+                }
+                close.resolved = true;
+                let key = (close.stream.store.clone(), close.stream.id.clone());
+                self.unqueue(&key, Queued::Close(seq));
+                Some(StreamJob::Close(ResolveStreamClose { seq, failed }))
             }
         }
     }
@@ -463,12 +615,12 @@ impl StreamCalls {
                 continue;
             }
             let held = self.held.remove(at);
-            jobs.push(self.apply_held(held)?);
+            jobs.extend(self.apply_held(held)?);
         }
         Ok(jobs)
     }
 
-    fn apply_held(&mut self, held: Held) -> Result<StreamJob> {
+    fn apply_held(&mut self, held: Held) -> Result<Option<StreamJob>> {
         let Held {
             seq,
             stream,
@@ -508,7 +660,7 @@ impl StreamCalls {
                 if page.end.is_some() {
                     read.open = false;
                 }
-                Ok(StreamJob::Read(page))
+                Ok(Some(StreamJob::Read(page)))
             }
             HeldResult::Append(status) => {
                 let append = self
@@ -536,12 +688,12 @@ impl StreamCalls {
                 append.resolved = true;
                 append.spec = None;
                 if let Some(queue) = self.append_queues.get_mut(&key) {
-                    queue.retain(|queued| *queued != seq);
+                    queue.retain(|queued| *queued != Queued::Append(seq));
                 }
-                Ok(StreamJob::Append(ResolveStreamAppend {
+                Ok(Some(StreamJob::Append(ResolveStreamAppend {
                     seq,
                     status: Some(status),
-                }))
+                })))
             }
         }
     }
@@ -572,6 +724,7 @@ impl StreamCalls {
     pub(super) fn wft_applied(&mut self) {
         self.marker_reads.clear();
         self.marker_appends.clear();
+        self.marker_closes.clear();
     }
 
     /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
@@ -587,7 +740,19 @@ impl StreamCalls {
             append.spec = None;
             self.requests.push(StreamRequest::Cancel(append.call_id));
         }
-        self.append_queues.clear();
+        // A close stays. History has its intent, or the completion with the terminal command
+        // carries it, and the Stream must close after it.
+        let mut keys = vec![];
+        for (key, queue) in self.append_queues.iter_mut() {
+            queue.retain(|queued| matches!(queued, Queued::Close(_)));
+            keys.push(key.clone());
+        }
+        self.append_queues.retain(|_, queue| !queue.is_empty());
+        if self.live {
+            for key in keys {
+                self.dispatch_head(&key);
+            }
+        }
     }
 
     /// Drops the results that history holds. A failed Workflow Task evicts the run, and a forced
@@ -612,12 +777,18 @@ impl StreamCalls {
             .count()
     }
 
-    /// The appends that have no result, once replay ended.
+    /// The appends that have no result, and the closes that wait in a queue or run, once replay
+    /// ended. A close holds a Workflow Task after the one of its intent, as an append does.
     pub(super) fn open_appends(&self) -> usize {
         if !self.live {
             return 0;
         }
         self.appends.values().filter(|a| !a.resolved).count()
+            + self
+                .closes
+                .values()
+                .filter(|close| close.queued && !close.resolved)
+                .count()
     }
 
     /// Notes the Stream jobs of an activation, which Workflow code gets at `activation` in the
@@ -649,6 +820,19 @@ impl StreamCalls {
                         None => {}
                     }
                     self.marker_appends.push(entry);
+                }
+                workflow_activation_job::Variant::ResolveStreamClose(result) => {
+                    let Some(close) = self.closes.get(&result.seq) else {
+                        continue;
+                    };
+                    self.marker_closes.push(StreamCloseEntry {
+                        seq: result.seq,
+                        stream: Some(close.stream.clone()),
+                        resolved: true,
+                        failure: result.failed.clone(),
+                        activation,
+                        ..Default::default()
+                    });
                 }
                 _ => {}
             }
@@ -701,16 +885,41 @@ impl StreamCalls {
         }
     }
 
-    /// True if Workflow code got a Stream result in this Workflow Task.
+    /// True if Workflow code got a Stream result in this Workflow Task, or asked for a close.
     pub(super) fn has_marker_entries(&self) -> bool {
-        !self.marker_reads.is_empty() || !self.marker_appends.is_empty()
+        !self.marker_reads.is_empty()
+            || !self.marker_appends.is_empty()
+            || !self.marker_closes.is_empty()
+            || self.has_pending_intents()
     }
 
-    /// The marker of this Workflow Task, if Workflow code got a Stream result in it. It clears the
-    /// entries, since the next task records its own.
-    pub(super) fn take_marker(&mut self) -> Option<StreamMarkerData> {
+    /// The marker of this Workflow Task, if Workflow code got a Stream result in it or asked for a
+    /// close. `epoch` is the task, which a close of the task closes with. It clears the entries,
+    /// since the next task records its own.
+    pub(super) fn take_marker(
+        &mut self,
+        epoch: Option<WorkflowTaskEpoch>,
+    ) -> Option<StreamMarkerData> {
         if !self.has_marker_entries() {
             return None;
+        }
+        let mut closes = std::mem::take(&mut self.marker_closes);
+        if let Some(epoch) = epoch {
+            let mut pending: Vec<_> = self
+                .closes
+                .iter_mut()
+                .filter(|(_, close)| matches!(close.intent, Intent::Pending))
+                .collect();
+            pending.sort_by_key(|(seq, _)| **seq);
+            for (seq, close) in pending {
+                close.intent = Intent::Sealed(epoch);
+                closes.push(StreamCloseEntry {
+                    seq: *seq,
+                    stream: Some(close.stream.clone()),
+                    intent_epoch: Some(epoch),
+                    ..Default::default()
+                });
+            }
         }
         let reads = std::mem::take(&mut self.marker_reads)
             .into_iter()
@@ -722,7 +931,7 @@ impl StreamCalls {
         Some(StreamMarkerData {
             reads,
             appends: std::mem::take(&mut self.marker_appends),
-            closes: vec![],
+            closes,
         })
     }
 }

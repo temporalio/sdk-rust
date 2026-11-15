@@ -39,8 +39,8 @@ use temporalio_streams::{
     MAX_WAIT, Reason, StreamError, StreamRuntime,
     digest::records_digest,
     proto::{
-        AppendRecord, AppendRecordsRequest, Producer, ReadRecordsRequest, StreamRecord, StreamRef,
-        WorkflowTaskEpoch, producer::Kind,
+        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, ReadRecordsRequest,
+        StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
     },
 };
 use tokio::{
@@ -170,6 +170,7 @@ impl ReadFlow {
 pub(crate) enum StreamRequest {
     Read(ReadSpec),
     Append(AppendSpec),
+    Close(CloseSpec),
     Cancel(u64),
 }
 
@@ -205,6 +206,19 @@ pub(crate) struct AppendSpec {
     pub(crate) bodies: Vec<Payload>,
 }
 
+/// A close to run, after the server took the Workflow Task that recorded it.
+#[derive(Debug)]
+pub(crate) struct CloseSpec {
+    pub(crate) call_id: u64,
+    pub(crate) seq: u32,
+    pub(crate) stream: StreamRef,
+    /// The Producer that lang sent, with no epoch.
+    pub(crate) producer: Producer,
+    /// The task that recorded the close, or `None` for the task in hand, when a replay sends again
+    /// a close that history recorded with no result.
+    pub(crate) epoch: Option<WorkflowTaskEpoch>,
+}
+
 /// The result of one step of a call.
 #[derive(Debug)]
 pub(crate) struct StreamResolution {
@@ -221,6 +235,8 @@ pub(crate) enum StreamCallResult {
         end: Option<StreamReadEnd>,
     },
     Append(resolve_stream_append::Status),
+    /// `None` when the Stream is closed.
+    Close(Option<Failure>),
 }
 
 /// Runs the Stream calls of a Worker's runs. Its tasks run on the Worker's runtime, not on the
@@ -229,15 +245,23 @@ pub(crate) struct StreamManager {
     runtimes: StreamRuntimes,
     handle: Handle,
     local_tx: UnboundedSender<LocalInput>,
-    /// The run and the abort handle of each running call, by its call id.
-    tasks: Arc<Mutex<HashMap<u64, (String, AbortHandle)>>>,
+    /// The run and the abort handle of each running call, by its call id, and whether the call
+    /// outlives its run.
+    tasks: Arc<Mutex<HashMap<u64, Task>>>,
+}
+
+struct Task {
+    run_id: String,
+    handle: AbortHandle,
+    /// True for a close, which History recorded, so that the end of its run doesn't stop it.
+    outlives_run: bool,
 }
 
 impl Drop for StreamManager {
     /// Stops every call, so that no Store work outlives the Worker.
     fn drop(&mut self) {
-        for (_, (_, handle)) in self.tasks.lock().drain() {
-            handle.abort();
+        for (_, task) in self.tasks.lock().drain() {
+            task.handle.abort();
         }
     }
 }
@@ -257,18 +281,18 @@ impl StreamManager {
     }
 
     /// Starts or stops the calls of a run. `epoch` is the run's current Workflow Task, which an
-    /// append writes with.
+    /// append writes with, or `None` when the run has no task in hand.
     pub(crate) fn dispatch(
         &self,
         run_id: &str,
-        epoch: WorkflowTaskEpoch,
+        epoch: Option<WorkflowTaskEpoch>,
         requests: Vec<StreamRequest>,
     ) {
         for request in requests {
             match request {
                 StreamRequest::Cancel(call_id) => {
-                    if let Some((_, handle)) = self.tasks.lock().remove(&call_id) {
-                        handle.abort();
+                    if let Some(task) = self.tasks.lock().remove(&call_id) {
+                        task.handle.abort();
                     }
                 }
                 StreamRequest::Read(spec) => {
@@ -276,30 +300,44 @@ impl StreamManager {
                     match self.runtime(&spec.stream) {
                         Some(runtime) => {
                             let sink = self.sink(run_id, call_id, seq);
-                            self.spawn(run_id, call_id, read(runtime, spec, sink));
+                            self.spawn(run_id, call_id, false, read(runtime, spec, sink));
                         }
-                        None => self.no_runtime(run_id, call_id, seq, true),
+                        None => self.no_runtime(run_id, call_id, seq, Call::Read),
                     }
                 }
                 StreamRequest::Append(spec) => {
                     let (call_id, seq) = (spec.call_id, spec.seq);
-                    match self.runtime(&spec.stream) {
-                        Some(runtime) => {
+                    match (self.runtime(&spec.stream), epoch) {
+                        (Some(runtime), Some(epoch)) => {
                             let sink = self.sink(run_id, call_id, seq);
-                            self.spawn(run_id, call_id, append(runtime, spec, epoch, sink));
+                            let call = append(runtime, spec, epoch, sink);
+                            self.spawn(run_id, call_id, false, call);
                         }
-                        None => self.no_runtime(run_id, call_id, seq, false),
+                        _ => self.no_runtime(run_id, call_id, seq, Call::Append),
+                    }
+                }
+                StreamRequest::Close(spec) => {
+                    let (call_id, seq) = (spec.call_id, spec.seq);
+                    match (self.runtime(&spec.stream), spec.epoch.or(epoch)) {
+                        (Some(runtime), Some(epoch)) => {
+                            let sink = self.sink(run_id, call_id, seq);
+                            let call = close(runtime, spec, epoch, sink);
+                            // History recorded the close, so the end of the run must not stop it.
+                            self.spawn(run_id, call_id, true, call);
+                        }
+                        _ => self.no_runtime(run_id, call_id, seq, Call::Close),
                     }
                 }
             }
         }
     }
 
-    /// Stops every call of the run. Results already on their way find no call and are dropped.
+    /// Stops every call of the run but its closes. Results already on their way find no call and
+    /// are dropped.
     pub(crate) fn cancel_run(&self, run_id: &str) {
-        self.tasks.lock().retain(|_, (run, handle)| {
-            if run == run_id {
-                handle.abort();
+        self.tasks.lock().retain(|_, task| {
+            if task.run_id == run_id && !task.outlives_run {
+                task.handle.abort();
                 false
             } else {
                 true
@@ -335,22 +373,24 @@ impl StreamManager {
 
     /// The machines check the Store of each call, so a call with no runtime only comes when the
     /// runtimes and the machines disagree. It still resolves, so that the run doesn't wait forever.
-    fn no_runtime(&self, run_id: &str, call_id: u64, seq: u32, is_read: bool) {
-        dbg_panic!("A Stream call reached the Worker with no runtime for its Store");
+    fn no_runtime(&self, run_id: &str, call_id: u64, seq: u32, call: Call) {
+        dbg_panic!("A Stream call reached the Worker with no runtime or no epoch");
         let failure = Failure {
             message: "This Worker has no Stream runtime for the Store of the call".to_string(),
             ..Default::default()
         };
-        let result = if is_read {
-            StreamCallResult::Page {
+        let result = match call {
+            Call::Read => StreamCallResult::Page {
                 records: vec![],
                 end: Some(StreamReadEnd {
                     failure: Some(failure),
                     ..Default::default()
                 }),
+            },
+            Call::Append => {
+                StreamCallResult::Append(resolve_stream_append::Status::Failed(failure))
             }
-        } else {
-            StreamCallResult::Append(resolve_stream_append::Status::Failed(failure))
+            Call::Close => StreamCallResult::Close(Some(failure)),
         };
         (self.sink(run_id, call_id, seq))(result);
     }
@@ -373,11 +413,22 @@ impl StreamManager {
         }
     }
 
-    fn spawn(&self, run_id: &str, call_id: u64, call: impl Future<Output = ()> + Send + 'static) {
+    fn spawn(
+        &self,
+        run_id: &str,
+        call_id: u64,
+        outlives_run: bool,
+        call: impl Future<Output = ()> + Send + 'static,
+    ) {
         let (handle, registration) = AbortHandle::new_pair();
-        self.tasks
-            .lock()
-            .insert(call_id, (run_id.to_string(), handle));
+        self.tasks.lock().insert(
+            call_id,
+            Task {
+                run_id: run_id.to_string(),
+                handle,
+                outlives_run,
+            },
+        );
         let tasks = self.tasks.clone();
         let local_tx = self.local_tx.clone();
         self.handle.spawn(async move {
@@ -525,6 +576,34 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
             None => {}
         }
     }
+}
+
+/// The kind of a call, for the failure of one that can't run.
+enum Call {
+    Read,
+    Append,
+    Close,
+}
+
+/// Closes the Stream as the run's Producer, with the Workflow Task that recorded the close as the
+/// epoch. A Stream that is closed already is a success.
+async fn close(
+    runtime: Arc<StreamRuntime>,
+    spec: CloseSpec,
+    epoch: WorkflowTaskEpoch,
+    sink: impl Fn(StreamCallResult),
+) {
+    let mut producer = spec.producer;
+    if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
+        workflow.epoch = Some(epoch);
+    }
+    let request = CloseStreamRequest {
+        namespace: String::new(),
+        r#ref: Some(spec.stream),
+        producer: Some(producer),
+    };
+    let result = runtime.close_stream(request).await.err();
+    sink(StreamCallResult::Close(result.map(|error| failure(&error))));
 }
 
 /// Appends the bodies as the run's Producer, with the Workflow Task as the epoch.
