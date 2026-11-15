@@ -475,6 +475,13 @@ impl StreamCalls {
             result,
             ..
         } = held;
+        // A call with no Store name takes the one of history. Lang sends no name when it has no
+        // Stream config to pick one from, as a replay Worker may run without one.
+        let adopt = |call: &mut StreamRef| {
+            if call.store.is_empty() {
+                call.store.clone_from(&stream.store);
+            }
+        };
         let differs = |call: &StreamRef| call.store != stream.store || call.id != stream.id;
         match result {
             HeldResult::Read { from_offset, page } => {
@@ -482,6 +489,7 @@ impl StreamCalls {
                     .reads
                     .get_mut(&seq)
                     .expect("take_held checked the read");
+                adopt(&mut read.stream);
                 if differs(&read.stream) || read.from_offset != from_offset {
                     return Err(nondeterminism!(
                         "Stream read {seq} reads Stream `{}` in Store `{}`, but history has a \
@@ -507,6 +515,9 @@ impl StreamCalls {
                     .appends
                     .get_mut(&seq)
                     .expect("take_held checked the append");
+                // The queue of the append is under the name that the call had.
+                let key = (append.stream.store.clone(), append.stream.id.clone());
+                adopt(&mut append.stream);
                 if differs(&append.stream) {
                     return Err(nondeterminism!(
                         "Stream append {seq} writes Stream `{}` in Store `{}`, but history has an \
@@ -524,7 +535,6 @@ impl StreamCalls {
                 }
                 append.resolved = true;
                 append.spec = None;
-                let key = (append.stream.store.clone(), append.stream.id.clone());
                 if let Some(queue) = self.append_queues.get_mut(&key) {
                     queue.retain(|queued| *queued != seq);
                 }
