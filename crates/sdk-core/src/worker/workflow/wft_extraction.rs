@@ -5,8 +5,8 @@ use crate::{
         WorkflowSlotKind,
         client::WorkerClient,
         workflow::{
-            CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, UnstoredWftFailInfo,
-            history_update::HistoryPaginator,
+            CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, StreamRuntimes,
+            UnstoredWftFailInfo, history_update::HistoryPaginator,
         },
     },
 };
@@ -62,11 +62,13 @@ impl WFTExtractor {
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
+        streams: StreamRuntimes,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
                 let client = client.clone();
+                let streams = streams.clone();
                 async move {
                     match stream_in {
                         Ok((wft, permit)) => {
@@ -77,21 +79,23 @@ impl WFTExtractor {
                                 attempt: wft.attempt,
                                 workflow_type: wft.workflow_type.clone(),
                             };
-                            Ok(match HistoryPaginator::from_poll(wft, client).await {
-                                Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
-                                    permit: permit.into_used(WorkflowSlotInfo {
-                                        workflow_type: prep.workflow_type.clone(),
-                                        is_sticky: prep.is_incremental(),
+                            Ok(
+                                match HistoryPaginator::from_poll(wft, client, streams).await {
+                                    Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
+                                        permit: permit.into_used(WorkflowSlotInfo {
+                                            workflow_type: prep.workflow_type.clone(),
+                                            is_sticky: prep.is_incremental(),
+                                        }),
+                                        work: prep,
+                                        paginator: pag,
                                     }),
-                                    work: prep,
-                                    paginator: pag,
-                                }),
-                                Err(err) => WFTExtractorOutput::FailedFetch {
-                                    run_id,
-                                    err,
-                                    auto_reply_fail: Some(fail_info),
+                                    Err(err) => WFTExtractorOutput::FailedFetch {
+                                        run_id,
+                                        err,
+                                        auto_reply_fail: Some(fail_info),
+                                    },
                                 },
-                            })
+                            )
                         }
                         Err(e) => Err(e),
                     }

@@ -11,7 +11,7 @@ use super::{
     local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change,
     signal_external_state_machine::new_external_signal,
-    stream_marker_state_machine::{is_stream_marker, stream_marker},
+    stream_marker_state_machine::{is_stream_marker, stream_marker, stream_marker_data},
     timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::{
@@ -67,6 +67,7 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::StreamMarkerData,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -432,16 +433,36 @@ impl WorkflowMachines {
                 self.local_activity_data.done_executing(seq);
             }
             LocalResolution::Stream(resolution) => match self.stream_calls.resolve(resolution) {
-                Some(StreamJob::Read(page)) => {
-                    if let Some(page) = self.drive_me.merge_stream_read(page) {
-                        self.drive_me.send_job(page.into());
-                    }
-                }
-                Some(StreamJob::Append(result)) => self.drive_me.send_job(result.into()),
+                Some(job) => self.push_stream_job(job),
                 None => result_important = false,
             },
         }
         Ok(result_important)
+    }
+
+    fn push_stream_job(&mut self, job: StreamJob) {
+        match job {
+            StreamJob::Read(page) => {
+                if let Some(page) = self.drive_me.merge_stream_read(page) {
+                    self.drive_me.send_job(page.into());
+                }
+            }
+            StreamJob::Append(result) => self.drive_me.send_job(result.into()),
+        }
+    }
+
+    /// Gives Workflow code the Stream results of history that its current activation gets, or,
+    /// with `include_held`, every one of a started call.
+    fn apply_stream_held(&mut self, include_held: bool) -> Result<()> {
+        if !self.stream_calls.has_held() {
+            return Ok(());
+        }
+        let current =
+            u32::try_from(self.local_activity_data.current_activation_index()).unwrap_or(u32::MAX);
+        for job in self.stream_calls.take_held(current, include_held)? {
+            self.push_stream_job(job);
+        }
+        Ok(())
     }
 
     /// Takes the Stream calls that the Worker must start or stop.
@@ -802,6 +823,7 @@ impl WorkflowMachines {
         }
         self.handle_driven_results(results)?;
         self.apply_local_activity_peeked_resolutions(false)?;
+        self.apply_stream_held(false)?;
         self.release_held_local_activity_resolutions_if_idle()?;
         self.prepare_commands()?;
         if self.workflow_is_finished()
@@ -852,6 +874,7 @@ impl WorkflowMachines {
         let num_events_to_process = events.len();
         if num_events_to_process > 0 {
             self.local_activity_data.wft_applied();
+            self.stream_calls.wft_applied();
         }
 
         // Process any WFT completed events in the next sequence, as well as peek ahead to the
@@ -1021,6 +1044,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
+            StreamMarker(StreamMarkerData),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -1050,6 +1074,10 @@ impl WorkflowMachines {
                     workflow_activation_job::Variant::NotifyHasPatch(NotifyHasPatch { patch_id })
                         .into(),
                 );
+            } else if is_stream_marker(e) {
+                let data = stream_marker_data(e)
+                    .ok_or_else(|| fatal!("Stream marker was unparsable: {e:?}"))?;
+                delayed_actions.push(DelayedAction::StreamMarker(data));
             } else if e.is_local_activity_marker() {
                 if let Some(la_dat) = e.clone().into_local_activity_marker_details() {
                     delayed_actions.push(DelayedAction::LocalActivityMarker(Box::new(la_dat)));
@@ -1092,8 +1120,12 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
+                DelayedAction::StreamMarker(data) => {
+                    self.stream_calls.insert_peeked(data)?;
+                }
             }
         }
+        self.apply_stream_held(false)?;
         self.release_held_local_activity_resolutions_if_idle()?;
 
         let pending_jobs = self.drive_me.peek_pending_jobs();
@@ -1103,6 +1135,9 @@ impl WorkflowMachines {
         // Wait until marker lookahead is applied before starting LAs without recorded results.
         // This also covers a live task whose started event was already consumed by a legacy query.
         if !self.replaying && !self.update_only_task {
+            for store in self.stream_calls.go_live() {
+                self.check_stream_runtime(&store)?;
+            }
             let mut resps = vec![];
             for (k, mach) in self.all_machines.iter_mut() {
                 if let Machines::LocalActivityMachine(lam) = mach {
@@ -1240,11 +1275,11 @@ impl WorkflowMachines {
         }
 
         // A marker that this run sent matches its command below. Any other one comes from a
-        // replay, which this Worker can't give to Workflow code yet.
+        // replay, which has no command for it. The lookahead gave its results to Workflow code,
+        // and every activation of its Workflow Task is done.
         if is_stream_marker(event) && !self.has_sent_stream_marker() {
-            return Err(WFMachinesError::Stream(
-                "This Worker can't replay the Stream results in history yet".to_string(),
-            ));
+            self.stream_calls.check_marker_consumed()?;
+            return Ok(EventHandlingOutcome::Normal);
         }
 
         let event_id = event.event_id;
@@ -1873,14 +1908,17 @@ impl WorkflowMachines {
     /// Fails the Workflow Task for a Stream call that this Worker can't make. Nothing goes into
     /// history, so a Worker with the runtime can run the task again.
     fn check_stream_call(&self, stream: Option<&StreamRef>) -> Result<()> {
-        if self.replaying {
-            return Err(WFMachinesError::Stream(
-                "This Worker can't replay a Stream call yet".to_string(),
-            ));
+        // A replayed call takes its results from history, so only a live one needs the runtime.
+        if !self.stream_calls.is_live() {
+            return Ok(());
         }
         let store = stream
             .map(|stream| stream.store.as_str())
             .unwrap_or_default();
+        self.check_stream_runtime(store)
+    }
+
+    fn check_stream_runtime(&self, store: &str) -> Result<()> {
         if self.worker_config.stream_runtimes.get(store).is_none() {
             return Err(WFMachinesError::Stream(format!(
                 "This Worker has no Stream runtime for the Store `{store}`"
@@ -2031,6 +2069,7 @@ impl WorkflowMachines {
             } else {
                 self.apply_local_activity_peeked_resolutions(true)?;
             }
+            self.apply_stream_held(true)?;
         }
         Ok(())
     }
