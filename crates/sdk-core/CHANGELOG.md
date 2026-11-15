@@ -49,6 +49,10 @@ relevant information.
   `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
   late completions of abandoned activities already were.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+* On a namespace with the `worker_poll_complete_on_shutdown` capability, a Worker no longer takes
+  about a minute to shut down when the server misses a poll that reaches it just after
+  `ShutdownWorker`. Core drops any poll that the server has not ended 2 seconds after the
+  `ShutdownWorker` call returns, also when that call fails.
 ### Changed
 * Workflow task completions and failures set `resource_id` to `workflow:<workflow_id>`, on every
   page of a paginated completion. Activity task completions, failures, cancellations, and

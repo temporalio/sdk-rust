@@ -1,0 +1,1 @@
+A Worker that shuts down right after it starts no longer waits about a minute when the server misses one of its polls. Polls that the server leaves open are dropped 2 seconds after the Worker has told the server it is shutting down.

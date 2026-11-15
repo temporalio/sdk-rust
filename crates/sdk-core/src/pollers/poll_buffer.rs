@@ -65,6 +65,16 @@ const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilde
     .with_max_delay(Duration::from_secs(15 * 60))
     .without_max_times();
 
+/// How long a poll may stay open after the `ShutdownWorker` RPC has returned, when the namespace
+/// lets the server complete polls on shutdown. After this time, Core drops the poll itself.
+///
+/// The server cancels a Worker's open polls before it answers `ShutdownWorker`, so their empty
+/// answers reach Core within milliseconds of that answer. A poll that hit a transient error around
+/// shutdown is retried by the client after 200 ms, or 1 s for `ResourceExhausted` (both +/- 20%),
+/// and the server rejects that retry at once. Two seconds covers one such retry plus network time.
+/// A poll that the server missed would otherwise stay open until it expires, about a minute later.
+pub(crate) const SHUTDOWN_POLL_GRACE: Duration = Duration::from_secs(2);
+
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
 
@@ -138,6 +148,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         options: WorkflowTaskOptions,
         heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
+        shutdown_rpc_done: CancellationToken,
     ) -> Self {
         let is_sticky = sticky_queue.is_some();
         let poll_scaler = PollScaler::new(
@@ -206,6 +217,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
             pre_permit_delay,
             post_poll_fn,
             capabilities,
+            shutdown_rpc_done,
         )
     }
 }
@@ -222,6 +234,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         options: ActivityTaskOptions,
         heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
+        shutdown_rpc_done: CancellationToken,
     ) -> Self {
         let pre_permit_delay = options
             .max_worker_acts_per_second
@@ -274,6 +287,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
             pre_permit_delay,
             None::<fn(&PollActivityTaskQueueResponse)>,
             capabilities,
+            shutdown_rpc_done,
         )
     }
 }
@@ -290,6 +304,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         heartbeat_state: PollerHeartbeatState,
         capabilities: Arc<NamespaceCapabilities>,
         worker_commands_queue: bool,
+        shutdown_rpc_done: CancellationToken,
     ) -> Self {
         let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
             Some(NoRetryOnMatching {
@@ -331,6 +346,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
             None::<fn() -> BoxFuture<'static, ()>>,
             None::<fn(&PollNexusTaskQueueResponse)>,
             capabilities,
+            shutdown_rpc_done,
         )
     }
 }
@@ -349,6 +365,7 @@ where
     T: TaskPollerResult + Send + Debug + 'static,
     SK: SlotKind + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new<FT, DelayFut, F>(
         poll_fn: impl Fn(Option<Duration>, Option<i32>) -> FT + Send + Sync + 'static,
         permit_dealer: MeteredPermitDealer<SK>,
@@ -357,6 +374,7 @@ where
         pre_permit_delay: Option<impl Fn() -> DelayFut + Send + Sync + 'static>,
         post_poll_fn: Option<impl Fn(&T) + Send + Sync + 'static>,
         capabilities: Arc<NamespaceCapabilities>,
+        shutdown_rpc_done: CancellationToken,
     ) -> Self
     where
         FT: Future<Output = pollers::Result<T>> + Send,
@@ -429,9 +447,25 @@ where
                         };
                     let target_pollers = Some(report_handle.target_pollers());
                     let capabilities = capabilities.clone();
+                    let shutdown_rpc_done = shutdown_rpc_done.clone();
                     let poll_task = tokio::spawn(async move {
                         let r = if capabilities.graceful_poll_shutdown() {
-                            pf(timeout_override, target_pollers).await
+                            // The server can miss a poll that reaches it just after
+                            // `ShutdownWorker`, and would then hold it until it expires.
+                            let missed_poll_cutoff = shutdown_rpc_done
+                                .cancelled()
+                                .then(|_| tokio::time::sleep(SHUTDOWN_POLL_GRACE));
+                            tokio::select! {
+                                r = pf(timeout_override, target_pollers) => r,
+                                _ = missed_poll_cutoff => {
+                                    debug!(
+                                        "Dropping a poll the server did not end within {:?} of \
+                                         ShutdownWorker",
+                                        SHUTDOWN_POLL_GRACE
+                                    );
+                                    return;
+                                }
+                            }
                         } else {
                             let poll_interruptor = shutdown.cancelled().then(|_| async move {
                                 if let Some(w) = poll_shutdown_interrupt_wait {
@@ -934,6 +968,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
 
         // Poll a bunch of times, "interrupting" it each time, we should only actually have polled
@@ -997,6 +1032,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
 
         pb.poll().await.unwrap().unwrap();
@@ -1034,6 +1070,7 @@ mod tests {
             },
             heartbeat_state.clone(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
 
         assert_eq!(heartbeat_state.target.load(), Some(expected));
@@ -1076,6 +1113,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
 
         // Should not see error, unwraps should get empty response
@@ -1153,6 +1191,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
 
         let first_task = pb.poll().await.expect("Should get first task");
@@ -1262,6 +1301,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         ));
 
         // Trigger the first poll to initialize and get the scaling decision
@@ -1346,6 +1386,7 @@ mod tests {
                 poller_autoscaling: true,
                 ..Default::default()
             })),
+            CancellationToken::new(),
         );
 
         let _ = pb.starter.send(());
@@ -1424,6 +1465,7 @@ mod tests {
                 worker_poll_complete_on_shutdown: graceful,
                 ..Default::default()
             })),
+            CancellationToken::new(),
         );
 
         let first = pb.poll().await.unwrap().unwrap();

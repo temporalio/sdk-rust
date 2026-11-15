@@ -1077,6 +1077,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
         WorkerActivityTasks::new(
             sem,
@@ -1164,6 +1165,7 @@ mod tests {
             },
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
+            CancellationToken::new(),
         );
         let atm = WorkerActivityTasks::new(
             sem.clone(),

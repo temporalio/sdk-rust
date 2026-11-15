@@ -449,6 +449,9 @@ pub struct Worker {
     capabilities: Arc<NamespaceCapabilities>,
     /// Handle for the spawned ShutdownWorker RPC task, awaited during shutdown.
     shutdown_rpc_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Cancelled once the ShutdownWorker RPC has returned, with or without an error. Pollers then
+    /// drop polls that the server has not ended within `SHUTDOWN_POLL_GRACE`.
+    shutdown_rpc_done: CancellationToken,
 }
 
 /// Namespace capabilities discovered via `describe_namespace`.
@@ -758,6 +761,7 @@ impl Worker {
 
         metrics.worker_registered();
         let shutdown_token = CancellationToken::new();
+        let shutdown_rpc_done = CancellationToken::new();
         let slot_context_data = Arc::new(PermitDealerContextData {
             task_queue: config.task_queue.clone(),
             worker_identity: client.identity(),
@@ -910,6 +914,7 @@ impl Worker {
         let worker_config = config.clone();
         let worker_client = client.clone();
         let worker_shutdown_token = shutdown_token.clone();
+        let worker_shutdown_rpc_done = shutdown_rpc_done.clone();
         let worker_local_act_mgr = local_act_mgr.clone();
         let worker_capabilities = capabilities.clone();
 
@@ -931,6 +936,7 @@ impl Worker {
                                 wf_poller_heartbeat.clone(),
                                 wf_sticky_poller_heartbeat.clone(),
                                 capabilities.clone(),
+                                &shutdown_rpc_done,
                             )
                             .boxed();
                             let stream = if !client.is_mock() {
@@ -968,6 +974,7 @@ impl Worker {
                                 },
                                 act_poller_heartbeat.clone(),
                                 capabilities.clone(),
+                                shutdown_rpc_done.clone(),
                             );
                             Some(Box::from(ap) as BoxedActPoller)
                         } else {
@@ -989,6 +996,7 @@ impl Worker {
                                 nexus_poller_heartbeat,
                                 capabilities.clone(),
                                 shared_namespace_worker,
+                                shutdown_rpc_done.clone(),
                             )) as BoxedNexusPoller)
                         } else {
                             None
@@ -1152,6 +1160,7 @@ impl Worker {
             status: worker_status,
             capabilities: worker_capabilities,
             shutdown_rpc_handle: Mutex::new(None),
+            shutdown_rpc_done: worker_shutdown_rpc_done,
         })
     }
 
@@ -1690,7 +1699,11 @@ impl Worker {
             .heartbeat_manager
             .as_ref()
             .and_then(|hm| (hm.heartbeat_callback)());
+        let shutdown_rpc_done = self.shutdown_rpc_done.clone();
         let handle = tokio::spawn(async move {
+            // A guard, so that pollers also stop waiting when the RPC fails, times out, or its task
+            // is dropped. The server may then never end their polls.
+            let _done_guard = shutdown_rpc_done.drop_guard();
             match client
                 .shutdown_worker(sticky_name, task_queue, task_queue_types, heartbeat)
                 .await

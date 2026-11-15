@@ -25,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 use futures_util::Future;
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use poll_buffer::MockPermittedPollBuffer;
+#[cfg(test)]
+pub(crate) use poll_buffer::SHUTDOWN_POLL_GRACE;
 
 pub(crate) type Result<T, E = tonic::Status> = std::result::Result<T, E>;
 

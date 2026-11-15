@@ -1,5 +1,7 @@
 use crate::{
-    CompleteNexusError, PollError, prost_dur,
+    CompleteNexusError, PollError,
+    pollers::SHUTDOWN_POLL_GRACE,
+    prost_dur,
     replay::canned_histories,
     test_help::{
         MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, ResponseType, WorkerExt,
@@ -10,20 +12,23 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, mock_manual_worker_client, mock_worker_client},
+            mocks::{
+                DEFAULT_TEST_CAPABILITIES, MockManualWorkerClient, mock_manual_worker_client,
+                mock_worker_client,
+            },
         },
     },
 };
-use futures_util::{FutureExt, future, stream, stream::StreamExt};
+use futures_util::{FutureExt, future, future::BoxFuture, stream, stream::StreamExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use temporalio_client::worker::ClientWorkerSet;
 use temporalio_common::{
@@ -65,6 +70,7 @@ use temporalio_common::{
     worker::WorkerTaskTypes,
 };
 use tokio::sync::{Barrier, Notify, watch};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -1356,6 +1362,334 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
         "ShutdownWorker RPC must be called during initiate_shutdown"
     );
 
+    worker.finalize_shutdown().await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PolledTaskType {
+    Workflow,
+    Activity,
+    Nexus,
+}
+
+/// Counts a poll as cut when its future is dropped before the mocked server answers it.
+struct CutPollCounter(Arc<AtomicUsize>);
+
+impl Drop for CutPollCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The time a missed-poll shutdown may take. It fails a test that waits for the poll to expire.
+const MISSED_POLL_TEST_TIMEOUT: Duration =
+    SHUTDOWN_POLL_GRACE.saturating_add(Duration::from_secs(3));
+
+/// A mock client like `mock_manual_worker_client`, built by hand because mockall matches
+/// expectations in creation order, so its `shutdown_worker` expectation could not be replaced.
+fn shutdown_poll_test_client(
+    poll_complete_on_shutdown: bool,
+    shutdown_rpc: impl Fn() -> Result<ShutdownWorkerResponse, tonic::Status> + Send + 'static,
+) -> MockManualWorkerClient {
+    let mut client = MockManualWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
+    client
+        .expect_capabilities()
+        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
+    client.expect_workers().returning(move || workers.clone());
+    client.expect_is_mock().returning(|| true);
+    client
+        .expect_sdk_name_and_version()
+        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
+    client
+        .expect_identity()
+        .returning(|| "test-identity".to_string());
+    client.expect_worker_grouping_key().returning(Uuid::new_v4);
+    client.expect_worker_instance_key().returning(Uuid::new_v4);
+    client.expect_describe_namespace().returning(move || {
+        async move {
+            Ok(DescribeNamespaceResponse {
+                namespace_info: Some(NamespaceInfo {
+                    capabilities: Some(Capabilities {
+                        worker_poll_complete_on_shutdown: poll_complete_on_shutdown,
+                        ..Capabilities::default()
+                    }),
+                    ..NamespaceInfo::default()
+                }),
+                ..DescribeNamespaceResponse::default()
+            })
+        }
+        .boxed()
+    });
+    client
+        .expect_shutdown_worker()
+        .returning(move |_, _, _, _| future::ready(shutdown_rpc()).boxed());
+    client
+}
+
+/// Every poll of `task_type` waits on `server_answer` and then returns an empty response.
+fn expect_empty_polls(
+    client: &mut MockManualWorkerClient,
+    task_type: PolledTaskType,
+    server_answer: impl Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+) {
+    let server_answer = Arc::new(server_answer);
+    match task_type {
+        PolledTaskType::Workflow => {
+            client
+                .expect_poll_workflow_task()
+                .returning(move |_, _| server_answer().map(|_| Ok(Default::default())).boxed());
+        }
+        PolledTaskType::Activity => {
+            client
+                .expect_poll_activity_task()
+                .returning(move |_, _| server_answer().map(|_| Ok(Default::default())).boxed());
+        }
+        PolledTaskType::Nexus => {
+            client
+                .expect_poll_nexus_task()
+                .returning(move |_, _| server_answer().map(|_| Ok(Default::default())).boxed());
+        }
+    }
+}
+
+fn shutdown_poll_test_worker(
+    client: MockManualWorkerClient,
+    task_type: PolledTaskType,
+) -> worker::Worker {
+    let mut cfg = test_worker_cfg()
+        .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
+        .nexus_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
+        .build()
+        .unwrap();
+    cfg.task_types = match task_type {
+        PolledTaskType::Workflow => WorkerTaskTypes::workflow_only(),
+        PolledTaskType::Activity => WorkerTaskTypes::activity_only(),
+        PolledTaskType::Nexus => WorkerTaskTypes::nexus_only(),
+    };
+    // A single poller per task type keeps the count of open polls exact.
+    cfg.max_cached_workflows = 0;
+    worker::Worker::new_test(cfg, client)
+}
+
+async fn poll_until_shutdown(worker: &worker::Worker, task_type: PolledTaskType) {
+    let err = match task_type {
+        PolledTaskType::Workflow => worker.poll_workflow_activation().await.map(|_| ()),
+        PolledTaskType::Activity => worker.poll_activity_task().await.map(|_| ()),
+        PolledTaskType::Nexus => worker.poll_nexus_task().await.map(|_| ()),
+    }
+    .unwrap_err();
+    assert_matches!(err, PollError::ShutDown);
+}
+
+/// Starts polling, initiates shutdown once a poll is open, and returns when shutdown completes.
+async fn shutdown_with_open_poll(
+    worker: &worker::Worker,
+    task_type: PolledTaskType,
+    poll_opened: &Notify,
+) {
+    tokio::join!(poll_until_shutdown(worker, task_type), async {
+        poll_opened.notified().await;
+        worker.initiate_shutdown();
+    });
+    worker.shutdown().await;
+}
+
+/// The server can miss a poll that reaches it just after `ShutdownWorker`, and then holds it until
+/// it expires. Core must cut such a poll shortly after the RPC returns, also when the RPC fails.
+#[rstest::rstest]
+#[tokio::test]
+async fn graceful_shutdown_cuts_poll_the_server_missed(
+    #[values(
+        PolledTaskType::Workflow,
+        PolledTaskType::Activity,
+        PolledTaskType::Nexus
+    )]
+    task_type: PolledTaskType,
+    #[values(true, false)] shutdown_rpc_succeeds: bool,
+) {
+    let rpc_returned_at = Arc::new(parking_lot::Mutex::new(None));
+    let rpc_returned_at_clone = rpc_returned_at.clone();
+    let mut client = shutdown_poll_test_client(true, move || {
+        *rpc_returned_at_clone.lock() = Some(Instant::now());
+        if shutdown_rpc_succeeds {
+            Ok(ShutdownWorkerResponse {})
+        } else {
+            Err(tonic::Status::internal("fake shutdown error"))
+        }
+    });
+    let poll_opened = Arc::new(Notify::new());
+    let cut_polls = Arc::new(AtomicUsize::new(0));
+    let (poll_opened_clone, cut_polls_clone) = (poll_opened.clone(), cut_polls.clone());
+    expect_empty_polls(&mut client, task_type, move || {
+        poll_opened_clone.notify_one();
+        let counter = CutPollCounter(cut_polls_clone.clone());
+        async move {
+            let _counter = counter;
+            future::pending::<()>().await
+        }
+        .boxed()
+    });
+    let worker = shutdown_poll_test_worker(client, task_type);
+    worker.validate().await.unwrap();
+
+    tokio::time::timeout(
+        MISSED_POLL_TEST_TIMEOUT,
+        shutdown_with_open_poll(&worker, task_type, &poll_opened),
+    )
+    .await
+    .expect("shutdown must not wait for a poll that the server missed");
+
+    let rpc_returned_at = rpc_returned_at.lock().expect("ShutdownWorker RPC was sent");
+    assert!(
+        rpc_returned_at.elapsed() >= SHUTDOWN_POLL_GRACE,
+        "the poll was cut before the server had its chance to end it"
+    );
+    assert_eq!(cut_polls.load(Ordering::SeqCst), 1);
+    worker.finalize_shutdown().await;
+}
+
+/// A poll that the server ends with an empty response must end shutdown as soon as it arrives, and
+/// Core must not cut it.
+#[rstest::rstest]
+#[tokio::test]
+async fn graceful_shutdown_waits_for_poll_the_server_ends(
+    #[values(
+        PolledTaskType::Workflow,
+        PolledTaskType::Activity,
+        PolledTaskType::Nexus
+    )]
+    task_type: PolledTaskType,
+) {
+    let server_ends_polls = CancellationToken::new();
+    let server_ends_polls_clone = server_ends_polls.clone();
+    let mut client = shutdown_poll_test_client(true, move || {
+        server_ends_polls_clone.cancel();
+        Ok(ShutdownWorkerResponse {})
+    });
+    let poll_opened = Arc::new(Notify::new());
+    let cut_polls = Arc::new(AtomicUsize::new(0));
+    let (poll_opened_clone, cut_polls_clone) = (poll_opened.clone(), cut_polls.clone());
+    expect_empty_polls(&mut client, task_type, move || {
+        poll_opened_clone.notify_one();
+        let counter = CutPollCounter(cut_polls_clone.clone());
+        let server_ends_polls = server_ends_polls.clone();
+        async move {
+            server_ends_polls.cancelled().await;
+            std::mem::forget(counter);
+        }
+        .boxed()
+    });
+    let worker = shutdown_poll_test_worker(client, task_type);
+    worker.validate().await.unwrap();
+
+    let started = Instant::now();
+    tokio::time::timeout(
+        MISSED_POLL_TEST_TIMEOUT,
+        shutdown_with_open_poll(&worker, task_type, &poll_opened),
+    )
+    .await
+    .expect("shutdown must complete once the server ends the poll");
+
+    assert!(started.elapsed() < SHUTDOWN_POLL_GRACE);
+    assert_eq!(cut_polls.load(Ordering::SeqCst), 0);
+    worker.finalize_shutdown().await;
+}
+
+/// The server may hand out a task on a poll just before it handles `ShutdownWorker`. The answer can
+/// arrive after the RPC has returned. Core must deliver that task to lang like any other, because a
+/// task that the server gave out and nobody runs only ends with a timeout on the server.
+#[tokio::test]
+async fn graceful_shutdown_delivers_task_that_arrives_in_grace_period() {
+    let rpc_returned = CancellationToken::new();
+    let rpc_returned_clone = rpc_returned.clone();
+    let mut client = shutdown_poll_test_client(true, move || {
+        rpc_returned_clone.cancel();
+        Ok(ShutdownWorkerResponse {})
+    });
+    let poll_opened = Arc::new(Notify::new());
+    let poll_opened_clone = poll_opened.clone();
+    client
+        .expect_poll_activity_task()
+        .times(1)
+        .returning(move |_, _| {
+            poll_opened_clone.notify_one();
+            let rpc_returned = rpc_returned.clone();
+            async move {
+                rpc_returned.cancelled().await;
+                // The answer leaves the server after `ShutdownWorker` and lands inside the grace.
+                tokio::time::sleep(SHUTDOWN_POLL_GRACE / 4).await;
+                Ok(create_test_activity_task())
+            }
+            .boxed()
+        });
+    client
+        .expect_complete_activity_task()
+        .times(1)
+        .returning(|_, _| async { Ok(RespondActivityTaskCompletedResponse::default()) }.boxed());
+    let worker = shutdown_poll_test_worker(client, PolledTaskType::Activity);
+    worker.validate().await.unwrap();
+
+    tokio::time::timeout(MISSED_POLL_TEST_TIMEOUT, async {
+        let (task, _) = tokio::join!(worker.poll_activity_task(), async {
+            poll_opened.notified().await;
+            worker.initiate_shutdown();
+        });
+        let task = task.expect("the task that arrived after ShutdownWorker must reach lang");
+        assert_eq!(task.task_token, b"act-task".to_vec());
+        worker
+            .complete_activity_task(ActivityTaskCompletion {
+                task_token: task.task_token,
+                result: Some(ActivityExecutionResult::ok(vec![1].into())),
+            })
+            .await
+            .unwrap();
+        poll_until_shutdown(&worker, PolledTaskType::Activity).await;
+        worker.shutdown().await;
+    })
+    .await
+    .expect("shutdown must complete after the task is done");
+    worker.finalize_shutdown().await;
+}
+
+/// Without `worker_poll_complete_on_shutdown`, Core cuts open polls as soon as shutdown starts, and
+/// the grace period does not apply.
+#[rstest::rstest]
+#[tokio::test]
+async fn shutdown_without_capability_cuts_polls_at_once(
+    #[values(
+        PolledTaskType::Workflow,
+        PolledTaskType::Activity,
+        PolledTaskType::Nexus
+    )]
+    task_type: PolledTaskType,
+) {
+    let mut client = shutdown_poll_test_client(false, || Ok(ShutdownWorkerResponse {}));
+    let poll_opened = Arc::new(Notify::new());
+    let cut_polls = Arc::new(AtomicUsize::new(0));
+    let (poll_opened_clone, cut_polls_clone) = (poll_opened.clone(), cut_polls.clone());
+    expect_empty_polls(&mut client, task_type, move || {
+        poll_opened_clone.notify_one();
+        let counter = CutPollCounter(cut_polls_clone.clone());
+        async move {
+            let _counter = counter;
+            future::pending::<()>().await
+        }
+        .boxed()
+    });
+    let worker = shutdown_poll_test_worker(client, task_type);
+    worker.validate().await.unwrap();
+
+    let started = Instant::now();
+    tokio::time::timeout(
+        MISSED_POLL_TEST_TIMEOUT,
+        shutdown_with_open_poll(&worker, task_type, &poll_opened),
+    )
+    .await
+    .expect("shutdown must cut open polls at once");
+
+    assert!(started.elapsed() < SHUTDOWN_POLL_GRACE);
+    assert_eq!(cut_polls.load(Ordering::SeqCst), 1);
     worker.finalize_shutdown().await;
 }
 
