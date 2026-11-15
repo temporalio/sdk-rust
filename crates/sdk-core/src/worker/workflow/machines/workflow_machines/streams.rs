@@ -25,8 +25,9 @@ use temporalio_common::protos::{
         },
         workflow_commands::{AppendToStream, CloseStream, StartStreamRead},
     },
-    temporal::api::stream::v1::{
-        Producer, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
+    temporal::api::{
+        failure::v1::Failure,
+        stream::v1::{Producer, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind},
     },
 };
 use temporalio_streams::digest::records_digest;
@@ -134,6 +135,9 @@ enum HeldResult {
         page: ResolveStreamRead,
     },
     Append(resolve_stream_append::Status),
+    /// The intent of a close, which gives no job.
+    CloseIntent,
+    CloseResult(Option<Failure>),
 }
 
 /// What one read gave Workflow code in the current Workflow Task.
@@ -244,6 +248,22 @@ impl StreamCalls {
             read.call_id = next_call_id();
             stores.push(read.stream.store.clone());
             self.requests.push(StreamRequest::Read(read.spec()));
+        }
+        // A close that history recorded with no result is sent again, with the task in hand.
+        let mut resent: Vec<_> = self
+            .closes
+            .iter()
+            .filter(|(_, close)| {
+                matches!(close.intent, Intent::Recorded(_)) && !close.queued && !close.resolved
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        resent.sort();
+        for seq in resent {
+            if let Some(close) = self.closes.get_mut(&seq) {
+                close.intent = Intent::Recorded(None);
+            }
+            self.queue_close(seq);
         }
         let mut keys: Vec<_> = self.append_queues.keys().cloned().collect();
         keys.sort();
@@ -595,6 +615,20 @@ impl StreamCalls {
                 result: HeldResult::Append(status),
             });
         }
+        for entry in data.closes {
+            // An intent gives no job, so any activation of its task takes it.
+            let (activation, result) = if entry.resolved {
+                (entry.activation, HeldResult::CloseResult(entry.failure))
+            } else {
+                (0, HeldResult::CloseIntent)
+            };
+            self.held.push(Held {
+                seq: entry.seq,
+                activation,
+                stream: entry.stream.unwrap_or_default(),
+                result,
+            });
+        }
         Ok(())
     }
 
@@ -609,6 +643,9 @@ impl StreamCalls {
             let started = match held.result {
                 HeldResult::Read { .. } => self.reads.contains_key(&held.seq),
                 HeldResult::Append(_) => self.appends.contains_key(&held.seq),
+                HeldResult::CloseIntent | HeldResult::CloseResult(_) => {
+                    self.closes.contains_key(&held.seq)
+                }
             };
             if !started || (held.activation > current && !include_held) {
                 at += 1;
@@ -695,7 +732,55 @@ impl StreamCalls {
                     status: Some(status),
                 })))
             }
+            HeldResult::CloseIntent => {
+                let close = self.held_close(seq, &stream)?;
+                if !matches!(close.intent, Intent::Pending) {
+                    return Err(nondeterminism!(
+                        "History has a second intent of Stream close {seq}"
+                    ));
+                }
+                close.intent = Intent::Recorded(None);
+                Ok(None)
+            }
+            HeldResult::CloseResult(failed) => {
+                let close = self.held_close(seq, &stream)?;
+                if close.resolved || matches!(close.intent, Intent::Pending) {
+                    return Err(nondeterminism!(
+                        "History has a result of Stream close {seq} with no intent before it, \
+                         or a second one"
+                    ));
+                }
+                close.resolved = true;
+                let key = (close.stream.store.clone(), close.stream.id.clone());
+                if let Some(queue) = self.append_queues.get_mut(&key) {
+                    queue.retain(|queued| *queued != Queued::Close(seq));
+                }
+                Ok(Some(StreamJob::Close(ResolveStreamClose { seq, failed })))
+            }
         }
+    }
+
+    /// The close of a held entry. A close with no Store name takes the one of history, and one of
+    /// another Stream is a non-determinism error.
+    fn held_close(&mut self, seq: u32, stream: &StreamRef) -> Result<&mut Close> {
+        let close = self
+            .closes
+            .get_mut(&seq)
+            .expect("take_held checked the close");
+        if close.stream.store.is_empty() {
+            close.stream.store.clone_from(&stream.store);
+        }
+        if close.stream.store != stream.store || close.stream.id != stream.id {
+            return Err(nondeterminism!(
+                "Stream close {seq} closes Stream `{}` in Store `{}`, but history has a close of \
+                 Stream `{}` in Store `{}`",
+                close.stream.id,
+                close.stream.store,
+                stream.id,
+                stream.store
+            ));
+        }
+        Ok(close)
     }
 
     /// Fails when history has results of a marker that Workflow code never got. A replayed
@@ -707,6 +792,7 @@ impl StreamCalls {
                 match held.result {
                     HeldResult::Read { .. } => "read",
                     HeldResult::Append(_) => "append",
+                    HeldResult::CloseIntent | HeldResult::CloseResult(_) => "close",
                 },
                 held.seq
             )),
