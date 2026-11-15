@@ -4605,6 +4605,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "prost-wkt-types",
+ "sha2 0.10.9",
  "temporalio-common",
  "thiserror 2.0.21",
  "tokio",

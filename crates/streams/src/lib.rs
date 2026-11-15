@@ -6,6 +6,7 @@
 //! [`StreamRuntime`] checks each Stream call and its answer, and passes the call to a
 //! [`StreamStore`]. A lang bridge implements [`StreamStore`] for a Store in its own language.
 
+pub mod digest;
 pub mod epoch;
 mod error;
 pub mod ids;
