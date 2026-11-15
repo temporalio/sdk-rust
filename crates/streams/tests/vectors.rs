@@ -47,10 +47,6 @@ fn kind_of(kind: &str, value: &Value) -> Option<Kind> {
             epoch: Some(task),
             ..Default::default()
         })),
-        "workflow_no_epoch" => Some(Kind::Workflow(WorkflowProducer {
-            run_id,
-            epoch: None,
-        })),
         "local_activity" => Some(Kind::LocalActivity(LocalActivityProducer {
             epoch: Some(LocalActivityEpoch {
                 task: Some(task),
