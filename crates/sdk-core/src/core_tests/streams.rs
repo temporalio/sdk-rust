@@ -158,6 +158,7 @@ fn append_cmd(seq: u32, id: &str, run_id: &str, texts: &[&str]) -> AppendToStrea
         stream: Some(stream(id)),
         bodies: texts.iter().map(|text| body(text)).collect(),
         producer: Some(workflow_producer(run_id)),
+        sequence: 0,
     }
 }
 
@@ -1045,4 +1046,52 @@ async fn append_without_a_workflow_producer_fails_the_task() {
     complete(&worker, &first, vec![append.into()]).await;
     worker.drain_pollers_and_shutdown().await;
     assert!(all_records(&runtime, "s").await.is_empty());
+}
+
+/// A non-zero `sequence` of an append goes to the Store as given, so a lower one is refused.
+#[tokio::test]
+async fn append_sends_the_sequence_that_lang_gives() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let with = |seq, sequence, text| AppendToStream {
+        sequence,
+        ..append_cmd(seq, "s", &run_id, &[text])
+    };
+    complete(
+        &worker,
+        &first,
+        vec![with(1, 10, "a").into(), with(2, 3, "b").into()],
+    )
+    .await;
+    let mut results = vec![];
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        results.extend(appends(&next));
+        if results.len() == 2 {
+            worker.complete_execution(&next.run_id).await;
+            break;
+        }
+        complete(&worker, &next, vec![]).await;
+    }
+    worker.drain_pollers_and_shutdown().await;
+    assert!(matches!(
+        results[0].status,
+        Some(resolve_stream_append::Status::Appended(_))
+    ));
+    let Some(resolve_stream_append::Status::Failed(failure)) = &results[1].status else {
+        panic!("The lower sequence should fail");
+    };
+    assert!(
+        failure.message.starts_with("stream_sequence_too_low"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(texts(&all_records(&runtime, "s").await), ["a"]);
 }
