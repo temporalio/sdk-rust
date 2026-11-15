@@ -147,6 +147,8 @@ pub(crate) struct AppendSpec {
     pub(crate) stream: StreamRef,
     /// The Producer that lang sent, with no epoch.
     pub(crate) producer: Producer,
+    /// The `sequence` of the request.
+    pub(crate) sequence: i64,
     pub(crate) bodies: Vec<Payload>,
 }
 
@@ -454,8 +456,7 @@ async fn append(
         namespace: String::new(),
         r#ref: Some(spec.stream),
         producer: Some(producer),
-        // The seq grows in a run, so the Store can refuse a resend of one batch in one epoch.
-        sequence: i64::from(spec.seq),
+        sequence: spec.sequence,
         records: spec
             .bodies
             .into_iter()
