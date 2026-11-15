@@ -2,7 +2,10 @@ use crate::{
     protosext::ValidPollWFTQResponse,
     worker::{
         client::WorkerClient,
-        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
+        workflow::{
+            CacheMissFetchReq, PermittedWFT, PreparedWFT, StreamRuntimes,
+            streams::hydrate_stream_markers,
+        },
     },
 };
 use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
@@ -94,6 +97,12 @@ pub(crate) struct HistoryPaginator {
     /// These are events that should be returned once pagination has finished. This only happens
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
+    /// The Worker's Stream runtimes, which a replay reads the Records of its markers with.
+    streams: StreamRuntimes,
+    /// True if the paginator reads history from its first event. Only such a history is replayed
+    /// by a new run, whose markers need their Records. An incremental one holds the markers that
+    /// the cached run wrote and still has.
+    from_start: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +132,7 @@ impl HistoryPaginator {
     pub(super) async fn from_poll(
         wft: ValidPollWFTQResponse,
         client: Arc<dyn WorkerClient>,
+        streams: StreamRuntimes,
     ) -> Result<(Self, PreparedWFT), tonic::Status> {
         let empty_hist = wft.history.events.is_empty();
         let npt = if empty_hist {
@@ -139,6 +149,7 @@ impl HistoryPaginator {
             npt,
             client,
         );
+        paginator.streams = streams;
         if empty_hist && wft.legacy_query.is_none() && wft.query_requests.is_empty() {
             return Err(EMPTY_TASK_ERR.clone());
         }
@@ -184,6 +195,8 @@ impl HistoryPaginator {
             event_queue: Default::default(),
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
+            streams: req.original_wft.paginator.streams.clone(),
+            from_start: true,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -201,6 +214,8 @@ impl HistoryPaginator {
         client: Arc<dyn WorkerClient>,
     ) -> Self {
         let next_page_token = next_page_token.into();
+        let from_start = matches!(next_page_token, NextPageToken::FetchFromStart)
+            || initial_history.events.first().map(|e| e.event_id) == Some(1);
         let (event_queue, final_events) =
             if matches!(next_page_token, NextPageToken::FetchFromStart) {
                 (VecDeque::new(), initial_history.events)
@@ -217,6 +232,8 @@ impl HistoryPaginator {
             previous_wft_started_id,
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
+            streams: StreamRuntimes::default(),
+            from_start,
         }
     }
 
@@ -314,6 +331,10 @@ impl HistoryPaginator {
                 update.events.last().map(|e| e.event_id);
             #[cfg(debug_assertions)]
             update.assert_contiguous();
+            let mut update = update;
+            if self.from_start {
+                hydrate_stream_markers(&mut update.events, &self.streams).await?;
+            }
             return Ok(update);
         }
     }
