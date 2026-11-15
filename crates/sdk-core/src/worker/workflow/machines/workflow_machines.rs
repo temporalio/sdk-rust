@@ -1897,6 +1897,9 @@ impl WorkflowMachines {
                         self.drive_me.drop_stream_read(attrs.seq);
                     }
                 }
+                WFCommandVariant::CloseStream(_) => {
+                    return Err(fatal!("This Worker can't close Streams yet"));
+                }
                 WFCommandVariant::AppendToStream(attrs) => {
                     self.check_stream_call(attrs.stream.as_ref())?;
                     self.stream_calls.append(attrs)?;

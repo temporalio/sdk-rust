@@ -59,6 +59,7 @@ message WorkflowCommand {
         StartStreamRead start_stream_read = 23;
         CloseStreamRead close_stream_read = 24;
         AppendToStream append_to_stream = 25;
+        CloseStream close_stream = 26;
     }
 }
 
@@ -465,4 +466,15 @@ message AppendToStream {
     temporal.api.stream.v1.Producer producer = 4;
     // The `sequence` of the Store request, as the caller gives it. Zero means Core uses `seq`.
     int64 sequence = 5;
+}
+
+// Close a Stream. Core records the intent in this workflow task, closes the Stream after the
+// server took the task, and gives the result in a `ResolveStreamClose` job of a later task.
+message CloseStream {
+    // Lang's incremental sequence number of Stream closes, used as the close's identifier
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The workflow's Producer, of kind workflow, with its id and run id and no epoch. Core sets the
+    // epoch to the workflow task that recorded the close.
+    temporal.api.stream.v1.Producer producer = 3;
 }
