@@ -144,6 +144,27 @@ interface stream-service {
     offset: list<u8>,
   }
 
+  /// Why a Workflow read of a Stream ended.
+  enum stream-read-stop {
+    /// The Stream is closed, and the read gave its last Record.
+    done,
+    /// The read gave `max-records` Records.
+    max-records,
+    /// The next Record would pass `max-bytes`.
+    max-bytes,
+    /// No Record came for `idle-timeout`.
+    idle,
+    /// `timeout` passed since the read started.
+    timeout,
+  }
+
+  // The SDK's support package writes this class by hand, since it is an async iterator that
+  // Workflow code can close. It never goes on the wire, so it has no proto message.
+  /// One Workflow read of a Stream. It gives each Record as it arrives.
+  /// @nexus.support-type python="StreamReading"
+  /// @nexus.generic "body-t"
+  type stream-reading = placeholder;
+
   /// @nexus.doc
   ///   "Create a Stream. If it exists, fail, or with use-existing get the open one."
   /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamRequest"
@@ -296,8 +317,8 @@ interface stream-service {
     /// @nexus.close
     close: func(producer: option<producer>);
 
-    // In this release Workflow code can't read a Stream. So the Workflow target omits `read`, and
-    // the client target keeps it.
+    // Workflow code reads with `iter`, not with a page read. So the Workflow target omits `read`,
+    // and the client target keeps it.
     /// @nexus.doc "Read one page of Records. The poll iterator reads them all."
     /// @nexus.operation "read-records"
     /// @nexus.api-omit targets="workflow"
@@ -311,6 +332,20 @@ interface stream-service {
     /// @nexus.doc "Describe the Stream's status and newest offset."
     /// @nexus.operation "describe-stream"
     describe: func() -> describe-stream-response;
+
+    // Core reads the Store inside the Workflow Task and gives each page to Workflow code, so no
+    // operation binds this method. The read starts at the first step of the loop, so `iter`
+    // takes no await, and the loop can read where and why the read ended. A read keeps the
+    // Workflow Task open, so other events reach the Workflow at the next Workflow Task.
+    /// @nexus.doc "Read each Record as it arrives, up to a stop."
+    /// @nexus.helper python="iter_stream" targets="workflow" sync=true
+    iter: func(
+      timeout: option<duration>,
+      from-offset: option<list<u8>>,
+      idle-timeout: option<duration>,
+      max-records: option<s32>,
+      max-bytes: option<s64>,
+    ) -> stream-reading;
   }
 
   // With use-existing, created is false when the Stream existed.
@@ -321,7 +356,7 @@ interface stream-service {
   /// @nexus.operation name="CreateStream"
   create-stream: func(request: create-stream-request) -> create-stream-result;
 
-  /// @nexus.doc "Append one batch. Workflow code makes the call from a Local Activity."
+  /// @nexus.doc "Append one batch. For Workflow code, Core or a Local Activity makes the call."
   /// @nexus.operation name="AppendRecords"
   /// @nexus.api-omit
   append-records: func(request: append-records-request) -> append-records-response;
@@ -333,7 +368,7 @@ interface stream-service {
   // A WIT stream can't cross a Nexus call, so a read is a request and a response. The SDK's support
   // helper builds the next request from a page for the poll iterator.
   /// @nexus.doc
-  ///   "A long poll. NOT_FOUND for an uncreated Stream. Workflow code reads from a Local Activity."
+  ///   "A long poll. NOT_FOUND for an uncreated Stream. Workflow code reads with `iter`."
   /// @nexus.operation name="ReadRecords"
   /// @nexus.poll python="next_read_request" items="records" python-resume="resume_read_request"
   ///   targets="client"
