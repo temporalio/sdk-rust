@@ -86,7 +86,16 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
 /// The key of an epoch. It is the [task_of] key, then the attempt's scheduled seconds and nanos
 /// and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't have is zero, and a Producer
 /// with no case is all zeros.
+///
+/// A Workflow Producer with no epoch is all ones, so it orders after every Workflow Task of the
+/// run. Only its close sends no epoch, from an Activity that History recorded, so it is never the
+/// late write of a failed task.
 pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
+    if let Some(Kind::Workflow(workflow)) = kind
+        && workflow.epoch.is_none()
+    {
+        return [u8::MAX; EPOCH_KEY_LEN];
+    }
     let (scheduled, attempt) = match kind {
         Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
         Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
