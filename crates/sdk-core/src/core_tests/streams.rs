@@ -2477,3 +2477,123 @@ async fn a_replay_worker_whose_records_are_gone_ends_the_history() {
         "{message}"
     );
 }
+
+/// A Stream of no Store name, as lang sends it when it has no Stream config to pick one from.
+fn unnamed(id: &str) -> Option<StreamRef> {
+    Some(StreamRef {
+        id: id.to_string(),
+        store: String::new(),
+    })
+}
+
+/// In a replay, a read with no Store name takes the Store of its entry in history, so a replay
+/// Worker with no runtime replays a marker that holds its Records.
+#[tokio::test]
+async fn a_replayed_read_with_no_store_name_takes_the_store_of_history() {
+    let records = vec![StreamRecord {
+        producer: Some(client()),
+        body: Some(body("a")),
+        offset: 1u64.to_be_bytes().to_vec(),
+    }];
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(
+        1,
+        "s",
+        vec![],
+        &[page],
+        Some((StreamReadStop::Done, 1)),
+        true,
+    );
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+    });
+    let worker = replay_worker(t, StreamRuntimes::default());
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        stream: unnamed("s"),
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    complete(&worker, &first, vec![read.into()]).await;
+    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        jobs.iter().any(|job| job == "ResolveStreamRead(1)"),
+        "{jobs:?}"
+    );
+    assert!(
+        jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
+        "{jobs:?}"
+    );
+    assert!(
+        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
+        "{jobs:?}"
+    );
+}
+
+/// In a replay, an append with no Store name takes the Store of its entry in history.
+#[tokio::test]
+async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
+    let appended = StreamAppendEntry {
+        seq: 1,
+        stream: Some(stream("s")),
+        first_offset: 7u64.to_be_bytes().to_vec(),
+        last_offset: 7u64.to_be_bytes().to_vec(),
+        failure: None,
+        activation: 1,
+    };
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![],
+        appends: vec![appended],
+    });
+    let run_id = t.get_orig_run_id().to_string();
+    let worker = replay_worker(t, StreamRuntimes::default());
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let append = AppendToStream {
+        stream: unnamed("s"),
+        ..append_cmd(1, "s", &run_id, &["x"])
+    };
+    complete(&worker, &first, vec![append.into()]).await;
+    let jobs = activations_within(&worker, Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        jobs.iter().any(|job| job == "ResolveStreamAppend(1)"),
+        "{jobs:?}"
+    );
+    assert!(
+        jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
+        "{jobs:?}"
+    );
+    assert!(
+        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
+        "{jobs:?}"
+    );
+}
+
+/// A replayed call that names another Store than history is still a non-determinism error.
+#[tokio::test]
+async fn a_replayed_read_of_another_store_is_nondeterministic() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    let t = replayed_read_history(&data);
+    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        stream: Some(StreamRef {
+            id: "s".to_string(),
+            store: "other".to_string(),
+        }),
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed[0].0, WorkflowTaskFailedCause::NonDeterministicError);
+    assert!(failed[0].1.contains("in Store `other`"), "{}", failed[0].1);
+}
