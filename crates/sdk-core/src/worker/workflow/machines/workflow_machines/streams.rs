@@ -1,5 +1,5 @@
-//! The Stream calls of a run. A call has no command or event of its own, so it needs no state
-//! machine.
+//! The Stream calls of a run, and the marker that records what Workflow code got in one Workflow
+//! Task. A call has no command or event of its own, so it needs no state machine.
 
 use crate::worker::workflow::{
     OutgoingJob, WFMachinesError, fatal,
@@ -16,11 +16,16 @@ use std::{
 };
 use temporalio_common::protos::{
     coresdk::{
-        workflow_activation::{ResolveStreamAppend, ResolveStreamRead, workflow_activation_job},
+        external_data::{StreamAppendEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry},
+        workflow_activation::{
+            ResolveStreamAppend, ResolveStreamRead, StreamReadEnd, resolve_stream_append,
+            workflow_activation_job,
+        },
         workflow_commands::{AppendToStream, StartStreamRead},
     },
-    temporal::api::stream::v1::{StreamRef, producer::Kind},
+    temporal::api::stream::v1::{StreamRecord, StreamRef, producer::Kind},
 };
+use temporalio_streams::digest::records_digest;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
@@ -33,6 +38,9 @@ pub(super) enum StreamJob {
 
 struct Read {
     call_id: u64,
+    stream: StreamRef,
+    from_offset: Vec<u8>,
+    records_in_history: bool,
     flow: Arc<ReadFlow>,
     /// The offset of the last Record that Workflow code got, or `from_offset`.
     last_offset: Vec<u8>,
@@ -48,6 +56,17 @@ struct Append {
     resolved: bool,
 }
 
+/// What one read gave Workflow code in the current Workflow Task.
+struct ReadEntryBuilder {
+    seq: u32,
+    after_offset: Vec<u8>,
+    records: Vec<StreamRecord>,
+    page_counts: Vec<u32>,
+    /// The activation of each page, by its index in the task.
+    page_activations: Vec<u32>,
+    end: Option<StreamReadEnded>,
+}
+
 #[derive(Default)]
 pub(super) struct StreamCalls {
     reads: HashMap<u32, Read>,
@@ -56,6 +75,8 @@ pub(super) struct StreamCalls {
     /// is the one that runs.
     append_queues: HashMap<(String, String), VecDeque<u32>>,
     requests: Vec<StreamRequest>,
+    marker_reads: Vec<ReadEntryBuilder>,
+    marker_appends: Vec<StreamAppendEntry>,
 }
 
 impl StreamCalls {
@@ -83,7 +104,7 @@ impl StreamCalls {
         self.requests.push(StreamRequest::Read(ReadSpec {
             call_id,
             seq: attrs.seq,
-            stream,
+            stream: stream.clone(),
             from_offset: attrs.from_offset.clone(),
             deadline,
             idle_timeout: duration(attrs.idle_timeout).unwrap_or(DEFAULT_IDLE_TIMEOUT),
@@ -96,7 +117,10 @@ impl StreamCalls {
             attrs.seq,
             Read {
                 call_id,
-                last_offset: attrs.from_offset,
+                stream,
+                last_offset: attrs.from_offset.clone(),
+                from_offset: attrs.from_offset,
+                records_in_history: attrs.records_in_history,
                 flow,
                 open: true,
             },
@@ -240,17 +264,150 @@ impl StreamCalls {
         self.appends.values().filter(|a| !a.resolved).count()
     }
 
-    /// Notes the Stream jobs of an activation, which Workflow code gets now.
-    pub(super) fn note_delivered(&mut self, jobs: &[OutgoingJob]) {
+    /// Notes the Stream jobs of an activation, which Workflow code gets at `activation` in the
+    /// Workflow Task. The marker of the task records them.
+    pub(super) fn note_delivered(&mut self, jobs: &[OutgoingJob], activation: u32) {
         for job in jobs {
-            if let workflow_activation_job::Variant::ResolveStreamRead(page) = &job.variant
-                && let Some(read) = self.reads.get_mut(&page.seq)
-                && let Some(last) = page.records.last()
-            {
-                read.last_offset.clone_from(&last.offset);
-                let bytes = page.records.iter().map(Message::encoded_len).sum();
-                read.flow.delivered(bytes);
+            match &job.variant {
+                workflow_activation_job::Variant::ResolveStreamRead(page) => {
+                    self.note_page(page, activation);
+                }
+                workflow_activation_job::Variant::ResolveStreamAppend(result) => {
+                    let Some(append) = self.appends.get(&result.seq) else {
+                        continue;
+                    };
+                    let mut entry = StreamAppendEntry {
+                        seq: result.seq,
+                        stream: Some(append.stream.clone()),
+                        activation,
+                        ..Default::default()
+                    };
+                    match &result.status {
+                        Some(resolve_stream_append::Status::Appended(appended)) => {
+                            entry.first_offset.clone_from(&appended.first_offset);
+                            entry.last_offset.clone_from(&appended.last_offset);
+                        }
+                        Some(resolve_stream_append::Status::Failed(failure)) => {
+                            entry.failure = Some(failure.clone());
+                        }
+                        None => {}
+                    }
+                    self.marker_appends.push(entry);
+                }
+                _ => {}
             }
         }
+    }
+
+    fn note_page(&mut self, page: &ResolveStreamRead, activation: u32) {
+        let Some(read) = self.reads.get_mut(&page.seq) else {
+            return;
+        };
+        let at = match self.marker_reads.iter().position(|e| e.seq == page.seq) {
+            Some(at) => at,
+            None => {
+                self.marker_reads.push(ReadEntryBuilder {
+                    seq: page.seq,
+                    after_offset: read.last_offset.clone(),
+                    records: vec![],
+                    page_counts: vec![],
+                    page_activations: vec![],
+                    end: None,
+                });
+                self.marker_reads.len() - 1
+            }
+        };
+        let entry = &mut self.marker_reads[at];
+        if let Some(last) = page.records.last() {
+            entry.page_counts.push(page.records.len() as u32);
+            entry.page_activations.push(activation);
+            entry.records.extend(page.records.iter().cloned());
+            read.last_offset.clone_from(&last.offset);
+            let bytes = page.records.iter().map(Message::encoded_len).sum();
+            read.flow.delivered(bytes);
+        }
+        if let Some(StreamReadEnd {
+            last_offset,
+            stop,
+            done,
+            failure,
+        }) = &page.end
+        {
+            entry.end = Some(StreamReadEnded {
+                last_offset: last_offset.clone(),
+                stop: *stop,
+                done: *done,
+                failure: failure.clone(),
+                activation,
+            });
+        }
+    }
+
+    /// True if Workflow code got a Stream result in this Workflow Task.
+    pub(super) fn has_marker_entries(&self) -> bool {
+        !self.marker_reads.is_empty() || !self.marker_appends.is_empty()
+    }
+
+    /// The marker of this Workflow Task, if Workflow code got a Stream result in it. It clears the
+    /// entries, since the next task records its own.
+    pub(super) fn take_marker(&mut self) -> Option<StreamMarkerData> {
+        if !self.has_marker_entries() {
+            return None;
+        }
+        let reads = std::mem::take(&mut self.marker_reads)
+            .into_iter()
+            .filter_map(|entry| {
+                let read = self.reads.get(&entry.seq)?;
+                Some(read_entry(read, entry))
+            })
+            .collect();
+        Some(StreamMarkerData {
+            reads,
+            appends: std::mem::take(&mut self.marker_appends),
+        })
+    }
+}
+
+fn read_entry(read: &Read, entry: ReadEntryBuilder) -> StreamReadEntry {
+    let count = entry.records.len() as u32;
+    let last_offset = entry
+        .records
+        .last()
+        .map(|record| record.offset.clone())
+        .unwrap_or_default();
+    let (digest, records) = if read.records_in_history {
+        (vec![], entry.records)
+    } else if count > 0 {
+        (records_digest(&entry.records).to_vec(), vec![])
+    } else {
+        (vec![], vec![])
+    };
+    let mut before = 0;
+    let page_activations = entry
+        .page_activations
+        .into_iter()
+        .enumerate()
+        .map(|(at, activation)| {
+            let coded = if at == 0 {
+                activation
+            } else {
+                activation - before
+            };
+            before = activation;
+            coded
+        })
+        .collect();
+    StreamReadEntry {
+        seq: entry.seq,
+        stream: Some(read.stream.clone()),
+        from_offset: read.from_offset.clone(),
+        after_offset: entry.after_offset,
+        last_offset,
+        count,
+        digest,
+        records,
+        page_counts: entry.page_counts,
+        page_activations,
+        end: entry.end,
     }
 }

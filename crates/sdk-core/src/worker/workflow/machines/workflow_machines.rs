@@ -11,6 +11,7 @@ use super::{
     local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change,
     signal_external_state_machine::new_external_signal,
+    stream_marker_state_machine::{is_stream_marker, stream_marker},
     timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::{
@@ -485,6 +486,40 @@ impl WorkflowMachines {
             })
     }
 
+    /// Adds the marker `core_stream` of this Workflow Task to the commands, if Workflow code got a
+    /// Stream result in it. It goes before the first terminal command, which must stay last.
+    fn seal_stream_marker(&mut self) {
+        let Some(data) = self.stream_calls.take_marker() else {
+            return;
+        };
+        let (machine, attributes) = stream_marker(&data);
+        let key = self.all_machines.insert(machine.into());
+        self.machine_is_core_created.insert(key, ());
+        match self
+            .machine_mut(key)
+            .handle_command(CommandType::RecordMarker)
+        {
+            Ok(responses) => {
+                if let Err(error) = self.process_machine_responses(key, responses) {
+                    dbg_panic!("The Stream marker could not take its command: {error}");
+                }
+            }
+            Err(error) => dbg_panic!("The Stream marker could not take its command: {error}"),
+        }
+        let at = self
+            .commands
+            .iter()
+            .position(|c| is_terminal_command(c.command.command_type()))
+            .unwrap_or(self.commands.len());
+        self.commands.insert(
+            at,
+            CommandAndMachine {
+                command: ProtoCommand::new(attributes, CommandAnnotations::default()),
+                machine: key,
+            },
+        );
+    }
+
     /// Drain all queued local activities that need executing or cancellation
     pub(crate) fn drain_queued_local_activities(&mut self) -> Vec<LocalActRequest> {
         self.local_activity_data
@@ -626,7 +661,9 @@ impl WorkflowMachines {
         });
         // Query-only activations are never recorded in history, so replay can't count them.
         if !all_query {
-            self.stream_calls.note_delivered(&jobs);
+            let activation = self.local_activity_data.current_activation_index();
+            self.stream_calls
+                .note_delivered(&jobs, u32::try_from(activation).unwrap_or(u32::MAX));
             self.local_activity_data.activation_dispatched();
         }
         let is_replaying = self.replaying || all_query;
@@ -1200,6 +1237,14 @@ impl WorkflowMachines {
                      wrong type! {event:?}"
                 ));
             }
+        }
+
+        // A marker that this run sent matches its command below. Any other one comes from a
+        // replay, which this Worker can't give to Workflow code yet.
+        if is_stream_marker(event) && !self.has_sent_stream_marker() {
+            return Err(WFMachinesError::Stream(
+                "This Worker can't replay the Stream results in history yet".to_string(),
+            ));
         }
 
         let event_id = event.event_id;
@@ -1844,6 +1889,13 @@ impl WorkflowMachines {
         Ok(())
     }
 
+    /// True if a marker that this run sent still waits for its event.
+    fn has_sent_stream_marker(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|c| matches!(self.machine(c.machine), Machines::StreamMarkerMachine(_)))
+    }
+
     fn get_machine_key(&self, id: CommandID) -> Result<MachineKey> {
         Ok(*self
             .id_to_machine
@@ -2040,6 +2092,17 @@ impl MachinesWFTResponseContent<'_> {
     pub(crate) fn metadata_for_complete(&mut self) -> WorkflowTaskCompletedMetadata {
         self.me.get_metadata_for_wft_complete()
     }
+
+    /// True if Workflow code got a Stream result in this Workflow Task, which its marker records.
+    pub(crate) fn has_stream_results(&self) -> bool {
+        self.me.stream_calls.has_marker_entries()
+    }
+
+    /// Adds the marker of this Workflow Task to the commands. Call it only when the task completes
+    /// with these commands.
+    pub(crate) fn seal_stream_marker(&mut self) {
+        self.me.seal_stream_marker();
+    }
 }
 
 fn str_to_randomness_seed(run_id: &str) -> u64 {
@@ -2124,4 +2187,14 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+fn is_terminal_command(command_type: CommandType) -> bool {
+    matches!(
+        command_type,
+        CommandType::CompleteWorkflowExecution
+            | CommandType::FailWorkflowExecution
+            | CommandType::CancelWorkflowExecution
+            | CommandType::ContinueAsNewWorkflowExecution
+    )
 }
