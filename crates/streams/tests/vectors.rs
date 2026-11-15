@@ -1,19 +1,21 @@
 //! The shared test vectors, which `examples/gen_vectors.rs` writes from a second implementation.
 //! The crate's README says which other side reads each file.
 
+use prost::Message;
 use prost_types::Timestamp;
 use serde_json::Value;
 use temporalio_common::protos::temporal::api::common::v1::{
     Payload, payload::ExternalPayloadDetails,
 };
 use temporalio_streams::{
-    digest::batch_digest,
+    digest::{batch_digest, records_digest},
     epoch::{epoch_key, task_key, task_of},
     ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
-        LocalActivityProducer, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        LocalActivityProducer, Producer, StreamRecord, WorkflowProducer, WorkflowTaskEpoch,
+        producer::Kind,
     },
 };
 
@@ -114,6 +116,30 @@ fn hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
+/// The body of a vector Record. A Record with none of these keys has no body.
+fn body(r: &Value) -> Option<Payload> {
+    ["metadata", "data", "external_payloads"]
+        .iter()
+        .any(|key| r.get(key).is_some())
+        .then(|| Payload {
+            metadata: r["metadata"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(key, value)| (key.clone(), hex(value.as_str().unwrap())))
+                .collect(),
+            data: hex(r["data"].as_str().unwrap_or_default()),
+            external_payloads: r["external_payloads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|size| ExternalPayloadDetails {
+                    size_bytes: size.as_i64().unwrap(),
+                })
+                .collect(),
+        })
+}
+
 #[test]
 fn batch_digests_match() {
     for case in load("digests.json").as_array().unwrap() {
@@ -121,32 +147,34 @@ fn batch_digests_match() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| AppendRecord {
-                // A record with none of these keys has no body.
-                body: ["metadata", "data", "external_payloads"]
-                    .iter()
-                    .any(|key| r.get(key).is_some())
-                    .then(|| Payload {
-                        metadata: r["metadata"]
-                            .as_object()
-                            .into_iter()
-                            .flatten()
-                            .map(|(key, value)| (key.clone(), hex(value.as_str().unwrap())))
-                            .collect(),
-                        data: hex(r["data"].as_str().unwrap_or_default()),
-                        external_payloads: r["external_payloads"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .map(|size| ExternalPayloadDetails {
-                                size_bytes: size.as_i64().unwrap(),
-                            })
-                            .collect(),
-                    }),
-            })
+            .map(|r| AppendRecord { body: body(r) })
             .collect();
         assert_eq!(
             batch_digest(&records).to_vec(),
+            hex(text(case, "digest")),
+            "{}",
+            text(case, "name")
+        );
+    }
+}
+
+#[test]
+fn records_digests_match() {
+    for case in load("record_digests.json").as_array().unwrap() {
+        let records: Vec<_> = case["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| StreamRecord {
+                offset: hex(text(r, "offset")),
+                producer: r.get("producer").map(|bytes| {
+                    Producer::decode(hex(bytes.as_str().unwrap()).as_slice()).unwrap()
+                }),
+                body: body(&r["body"]),
+            })
+            .collect();
+        assert_eq!(
+            records_digest(&records).to_vec(),
             hex(text(case, "digest")),
             "{}",
             text(case, "name")

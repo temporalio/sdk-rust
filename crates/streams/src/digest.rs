@@ -1,12 +1,19 @@
-//! The content digest of a batch. Each dedupe entry stores it, so that a resend with the same
-//! `sequence` and other content fails instead of being dropped without an error. The Store compares
-//! the digest that this function gives, and `testdata/digests.json` has its expected values.
+//! The content digests of the crate. A dedupe entry stores the digest of its batch, so that a resend
+//! with the same `sequence` and other content fails instead of being dropped without an error. The
+//! Store compares the digest that [batch_digest] gives, and `testdata/digests.json` has its expected
+//! values. Core records the digest of the Records that a read gave, and checks it when it reads
+//! them again in a replay. `testdata/record_digests.json` has the values of [records_digest].
 
-use crate::proto::AppendRecord;
+use crate::proto::{AppendRecord, StreamRecord};
+use prost::Message;
 use sha2::{Digest, Sha256};
+use temporalio_common::protos::temporal::api::common::v1::Payload;
 
-/// The length of a [batch_digest].
+/// The length of a [batch_digest] and of a [records_digest].
 pub const DIGEST_LEN: usize = 16;
+
+/// The first byte of a [records_digest], so that it never equals a [batch_digest] of other input.
+const RECORDS_TAG: u8 = b'R';
 
 /// The first 16 bytes of a SHA-256 over the Records in order. Each part has its length before it,
 /// so that two different batches never hash the same bytes. The metadata is hashed in key order,
@@ -14,25 +21,53 @@ pub const DIGEST_LEN: usize = 16;
 pub fn batch_digest(records: &[AppendRecord]) -> [u8; DIGEST_LEN] {
     let mut hasher = Sha256::new();
     for record in records {
-        // A Record with no body and one with an empty body are two different stored Records.
-        let Some(body) = &record.body else {
-            hasher.update([0]);
-            continue;
-        };
-        hasher.update([1]);
-        let mut metadata: Vec<_> = body.metadata.iter().collect();
-        metadata.sort();
-        hasher.update((metadata.len() as u64).to_be_bytes());
-        for (key, value) in metadata {
-            part(&mut hasher, key.as_bytes());
-            part(&mut hasher, value);
-        }
-        part(&mut hasher, &body.data);
-        hasher.update((body.external_payloads.len() as u64).to_be_bytes());
-        for external in &body.external_payloads {
-            hasher.update(external.size_bytes.to_be_bytes());
-        }
+        body(&mut hasher, record.body.as_ref());
     }
+    finish(hasher)
+}
+
+/// The first 16 bytes of a SHA-256 over Records that a read gave, in order. It covers each Record's
+/// wire offset, its encoded Producer and its body, the body as [batch_digest] hashes it. A Producer
+/// has no map field, so its encoding is the same each time.
+pub fn records_digest(records: &[StreamRecord]) -> [u8; DIGEST_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update([RECORDS_TAG]);
+    for record in records {
+        part(&mut hasher, &record.offset);
+        match &record.producer {
+            Some(producer) => {
+                hasher.update([1]);
+                part(&mut hasher, &producer.encode_to_vec());
+            }
+            None => hasher.update([0]),
+        }
+        body(&mut hasher, record.body.as_ref());
+    }
+    finish(hasher)
+}
+
+fn body(hasher: &mut Sha256, body: Option<&Payload>) {
+    // A Record with no body and one with an empty body are two different stored Records.
+    let Some(body) = body else {
+        hasher.update([0]);
+        return;
+    };
+    hasher.update([1]);
+    let mut metadata: Vec<_> = body.metadata.iter().collect();
+    metadata.sort();
+    hasher.update((metadata.len() as u64).to_be_bytes());
+    for (key, value) in metadata {
+        part(hasher, key.as_bytes());
+        part(hasher, value);
+    }
+    part(hasher, &body.data);
+    hasher.update((body.external_payloads.len() as u64).to_be_bytes());
+    for external in &body.external_payloads {
+        hasher.update(external.size_bytes.to_be_bytes());
+    }
+}
+
+fn finish(hasher: Sha256) -> [u8; DIGEST_LEN] {
     let mut digest = [0; DIGEST_LEN];
     digest.copy_from_slice(&hasher.finalize()[..DIGEST_LEN]);
     digest

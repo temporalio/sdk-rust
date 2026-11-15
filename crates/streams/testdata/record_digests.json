@@ -1,0 +1,79 @@
+[
+  {
+    "name": "no records",
+    "records": [],
+    "digest": "8c2574892063f995fdf756bce07f46c1"
+  },
+  {
+    "name": "one record",
+    "records": [
+      {
+        "offset": "0000000000000001",
+        "producer": "0a0577663a7231120a0a027231120408031001",
+        "body": {
+          "data": "68656c6c6f"
+        }
+      }
+    ],
+    "digest": "ff3c4b8606b66c9c29c2bf23ad1ca8f6"
+  },
+  {
+    "name": "one record at another offset",
+    "records": [
+      {
+        "offset": "0000000000000002",
+        "producer": "0a0577663a7231120a0a027231120408031001",
+        "body": {
+          "data": "68656c6c6f"
+        }
+      }
+    ],
+    "digest": "4b42ad54b21a08972114dc5b45c9f932"
+  },
+  {
+    "name": "one record of another task",
+    "records": [
+      {
+        "offset": "0000000000000001",
+        "producer": "0a0577663a7231120a0a027231120408091001",
+        "body": {
+          "data": "68656c6c6f"
+        }
+      }
+    ],
+    "digest": "b01d768732b17ae13eb0da7b9a039c33"
+  },
+  {
+    "name": "no Producer and no body",
+    "records": [
+      {
+        "offset": "0000000000000002",
+        "body": {}
+      }
+    ],
+    "digest": "b886d25c6cc809cecbbeb169467ca01a"
+  },
+  {
+    "name": "two records",
+    "records": [
+      {
+        "offset": "0000000000000001",
+        "producer": "0a0577663a7231120a0a027231120408031001",
+        "body": {
+          "data": "68656c6c6f"
+        }
+      },
+      {
+        "offset": "0000000000200000",
+        "producer": "0a0577663a7231120a0a027231120408031001",
+        "body": {
+          "metadata": {
+            "encoding": "62696e6172792f706c61696e"
+          },
+          "data": ""
+        }
+      }
+    ],
+    "digest": "a0c2461e634355cfb4be20a64407e634"
+  }
+]
