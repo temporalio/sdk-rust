@@ -3,7 +3,8 @@
 Experimental. The Stream runtime that the Temporal SDKs link into their bridges. It answers the five
 operations of the Stream service on a Store. A bridge builds the runtime per client, as a plain
 object, and calls `StreamRuntime::call` with an operation name and the encoded request. The call
-gives back the encoded response. Core has no Stream code.
+gives back the encoded response. A Worker also takes the runtimes, and reads and appends a
+Stream on them for Workflow code.
 
 ## Protos and shared vectors
 
@@ -18,7 +19,8 @@ re-exports them, so a value needs no conversion between the crates.
   `examples/gen_vectors.rs` writes them from a second implementation, and the crate's tests read
   each file. Run it with `cargo run -p temporalio-streams --example gen_vectors`. It shares no
   code with the crate. Each Store reads `fields.json` through the shared Store suite.
-  `digests.json` is the golden of the crate's batch digest.
+  `digests.json` is the golden of the crate's batch digest, and `record_digests.json` the golden
+  of the digest of the Records that a read gave.
 
 A Stream id and a Producer id are opaque text. The caller builds both. The runtime refuses an
 empty id of either kind, and one over 4096 bytes. A Producer id names one Producer in one Stream.
