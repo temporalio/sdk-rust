@@ -14,6 +14,7 @@ import "temporal/api/failure/v1/message.proto";
 import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
@@ -141,6 +142,10 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A read of a Stream gave Records, ended, or both.
+        ResolveStreamRead resolve_stream_read = 17;
+        // An append to a Stream resolved.
+        ResolveStreamAppend resolve_stream_append = 18;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -425,4 +430,39 @@ message RemoveFromCache {
         WORKFLOW_EXECUTION_ENDING = 10;
     }
     EvictionReason reason = 2;
+}
+
+// The Records that a read of a Stream gave since its last job, and its end if it ended.
+message ResolveStreamRead {
+    // The sequence number of the `StartStreamRead`
+    uint32 seq = 1;
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
+    // Set on the last job of a read.
+    StreamReadEnd end = 3;
+}
+
+message StreamReadEnd {
+    // The offset of the last Record that the workflow got, or `from_offset` if it got none.
+    bytes last_offset = 1;
+    // Why the read ended. Unspecified when it failed.
+    coresdk.common.StreamReadStop stop = 2;
+    // True if the Stream is closed and the read gave its last Record.
+    bool done = 3;
+    // Set if the read failed.
+    temporal.api.failure.v1.Failure failure = 4;
+}
+
+// The result of an `AppendToStream`.
+message ResolveStreamAppend {
+    // The sequence number of the `AppendToStream`
+    uint32 seq = 1;
+    oneof status {
+        StreamAppended appended = 2;
+        temporal.api.failure.v1.Failure failed = 3;
+    }
+}
+
+message StreamAppended {
+    bytes first_offset = 1;
+    bytes last_offset = 2;
 }

@@ -16,6 +16,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
@@ -55,6 +56,9 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        StartStreamRead start_stream_read = 23;
+        CloseStreamRead close_stream_read = 24;
+        AppendToStream append_to_stream = 25;
     }
 }
 
@@ -419,4 +423,44 @@ message ScheduleNexusOperation {
 message RequestCancelNexusOperation {
     // Lang's incremental sequence number as passed to `ScheduleNexusOperation`
     uint32 seq = 1;
+}
+
+// Start a read of a Stream. Core reads the Store itself and gives each page of Records to the
+// workflow in a `ResolveStreamRead` job, until the read ends or the workflow closes it.
+message StartStreamRead {
+    // Lang's incremental sequence number of Stream reads, used as the read's identifier
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The read starts after this offset. Empty means the start of the Stream.
+    bytes from_offset = 3;
+    // The longest time the read may take. Unset means no bound.
+    google.protobuf.Duration timeout = 4;
+    // The read ends when no Record comes for this long. Unset means one second.
+    google.protobuf.Duration idle_timeout = 5;
+    // The most Records the read gives. Zero means no cap.
+    uint32 max_records = 6;
+    // The most bytes of Records the read gives. The first Record is always given. Zero means no
+    // cap.
+    uint64 max_bytes = 7;
+    // If set, the Records go into the workflow history, so a replay reads no Store.
+    bool records_in_history = 8;
+}
+
+// Stop a read that `StartStreamRead` started. The workflow gets no job for it.
+message CloseStreamRead {
+    // Lang's sequence number as passed to `StartStreamRead`
+    uint32 seq = 1;
+}
+
+// Append Records to a Stream. Core calls the Store itself and gives the result in a
+// `ResolveStreamAppend` job.
+message AppendToStream {
+    // Lang's incremental sequence number of Stream appends, used as the append's identifier
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The bodies of the Records, in order
+    repeated temporal.api.common.v1.Payload bodies = 3;
+    // The workflow's Producer, of kind workflow, with its id and run id and no epoch. Core sets the
+    // epoch to the current workflow task.
+    temporal.api.stream.v1.Producer producer = 4;
 }

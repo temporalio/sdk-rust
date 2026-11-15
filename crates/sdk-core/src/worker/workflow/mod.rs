@@ -1606,6 +1606,9 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    StartStreamRead(StartStreamRead),
+    CloseStreamRead(CloseStreamRead),
+    AppendToStream(AppendToStream),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1667,6 +1670,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::StartStreamRead(s) => WFCommandVariant::StartStreamRead(s),
+            workflow_command::Variant::CloseStreamRead(s) => WFCommandVariant::CloseStreamRead(s),
+            workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
         };
         Ok(Self {
             variant,
