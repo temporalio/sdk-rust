@@ -152,8 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "coresdk.workflow_commands.WorkflowCommand.variant",
             "#[derive(::derive_more::Display)]",
         )
-        // All external data is useful to be able to JSON serialize, so it can render in web UI
-        .type_attribute(".coresdk.external_data", ALWAYS_SERDE)
+        // The marker data that Core writes as JSON must serialize, so it can render in web UI. The
+        // Stream marker is binary, and it holds API types that serialize only with the feature.
+        .type_attribute(
+            ".coresdk.external_data.LocalActivityMarkerData",
+            ALWAYS_SERDE,
+        )
+        .type_attribute(".coresdk.external_data.PatchedMarkerData", ALWAYS_SERDE)
         .field_attribute(
             "coresdk.external_data.LocalActivityMarkerData.complete_time",
             "#[serde(with = \"sdk_helpers::opt_timestamp\")]",
