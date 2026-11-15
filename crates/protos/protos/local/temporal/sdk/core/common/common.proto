@@ -15,6 +15,21 @@ message NamespacedWorkflowExecution {
     string run_id = 3;
 }
 
+// Why a read of a Stream ended. A read that failed has no stop.
+enum StreamReadStop {
+    STREAM_READ_STOP_UNSPECIFIED = 0;
+    // The Stream is closed, and the read gave its last Record.
+    STREAM_READ_STOP_DONE = 1;
+    // The read gave `max_records` Records.
+    STREAM_READ_STOP_MAX_RECORDS = 2;
+    // The next Record would pass `max_bytes`.
+    STREAM_READ_STOP_MAX_BYTES = 3;
+    // No Record came for `idle_timeout`.
+    STREAM_READ_STOP_IDLE = 4;
+    // `timeout` passed since the read started.
+    STREAM_READ_STOP_TIMEOUT = 5;
+}
+
 // An indication of user's intent concerning what Build ID versioning approach should be used for
 // a specific command
 enum VersioningIntent {
