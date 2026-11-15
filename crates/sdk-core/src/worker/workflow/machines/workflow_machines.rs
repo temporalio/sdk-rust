@@ -1739,6 +1739,11 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
+                WFCommandVariant::StartStreamRead(_)
+                | WFCommandVariant::CloseStreamRead(_)
+                | WFCommandVariant::AppendToStream(_) => {
+                    return Err(fatal!("This Worker can't read or append Streams"));
+                }
             }
         }
         Ok(())
