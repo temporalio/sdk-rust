@@ -436,6 +436,7 @@ impl WorkflowMachines {
                         self.drive_me.send_job(page.into());
                     }
                 }
+                Some(StreamJob::Append(result)) => self.drive_me.send_job(result.into()),
                 None => result_important = false,
             },
         }
@@ -452,10 +453,17 @@ impl WorkflowMachines {
         self.stream_calls.has_requests()
     }
 
-    /// The number of local calls that hold the Workflow Task open: Local Activities and Stream
-    /// reads.
+    /// The number of local calls that hold the Workflow Task open: Local Activities, and Stream
+    /// reads and appends.
     pub(crate) fn outstanding_local_work(&self) -> usize {
-        self.outstanding_local_activity_count() + self.stream_calls.open_reads()
+        self.outstanding_local_activity_count()
+            + self.stream_calls.open_reads()
+            + self.stream_calls.open_appends()
+    }
+
+    /// The number of Stream appends that have no result yet.
+    pub(crate) fn outstanding_stream_appends(&self) -> usize {
+        self.stream_calls.open_appends()
     }
 
     /// Stops every Stream call of the run, and drops the results still on their way. A failed
@@ -1808,8 +1816,9 @@ impl WorkflowMachines {
                         self.drive_me.drop_stream_read(attrs.seq);
                     }
                 }
-                WFCommandVariant::AppendToStream(_) => {
-                    return Err(fatal!("This Worker can't append to Streams yet"));
+                WFCommandVariant::AppendToStream(attrs) => {
+                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.stream_calls.append(attrs)?;
                 }
             }
         }
