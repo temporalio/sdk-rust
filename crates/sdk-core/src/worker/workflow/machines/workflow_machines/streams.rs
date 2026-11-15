@@ -164,6 +164,13 @@ impl StreamCalls {
             seq,
             stream: stream.clone(),
             producer,
+            // The caller's own sequence goes to the Store as given. With none, the append's seq,
+            // which grows in a run, lets the Store refuse a resend in one epoch.
+            sequence: if attrs.sequence != 0 {
+                attrs.sequence
+            } else {
+                i64::from(seq)
+            },
             bodies: attrs.bodies,
         };
         let queue = self
