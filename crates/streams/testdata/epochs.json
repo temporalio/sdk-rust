@@ -39,6 +39,12 @@
     "task_key": "000000000000000000000000000000000000000000000000"
   },
   {
+    "kind": "workflow_no_epoch",
+    "epoch": {},
+    "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "task_key": "000000000000000000000000000000000000000000000000"
+  },
+  {
     "kind": "client",
     "epoch": {},
     "key": "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
