@@ -43,7 +43,13 @@ relevant information.
   [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
 * [lang-internal] Added the experimental `temporalio-streams` crate. `StreamRuntime` checks each
   Stream call and passes it to a `StreamStore`, which a bridge implements for a Store in its own
-  language. Core's worker doesn't use it.
+  language.
+* [lang-internal] Experimental: Workflow code can read and append a Stream directly. A Worker takes
+  its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store name. Lang starts a read with
+  `StartStreamRead`, stops it with `CloseStreamRead`, and appends with `AppendToStream`. The results
+  come in the `ResolveStreamRead` and `ResolveStreamAppend` jobs. Core calls the Store itself and
+  records one `core_stream` marker for each Workflow Task in which Workflow code got a result, which
+  a replay gives back in the same activations.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
