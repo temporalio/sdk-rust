@@ -1320,11 +1320,19 @@ mod tests {
         let to_allocate: usize = (half_total).saturating_sub(cur_used) as usize;
         let _buf = black_box(vec![1u8; to_allocate]);
 
-        // Refresh synchronously so the assertion cannot race the background sampler.
-        sys_info.inner.refresh();
-
-        let percentage = sys_info.used_mem_percent();
-        let diff = (percentage - expected_percentage).abs();
+        // Refresh synchronously so the assertion cannot race the background sampler. The kernel
+        // updates the cgroup's memory stats with a delay, so the allocation may not show in the
+        // first read.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (percentage, diff) = loop {
+            sys_info.inner.refresh();
+            let percentage = sys_info.used_mem_percent();
+            let diff = (percentage - expected_percentage).abs();
+            if diff < 0.2 || Instant::now() >= deadline {
+                break (percentage, diff);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
 
         assert!(
             diff < 0.2,
