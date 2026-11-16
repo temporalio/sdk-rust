@@ -195,8 +195,14 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         // The subsystems of a Worker are built inside its runtime, as the pollers spawn there too.
         // Stream calls run on it, so that Store work never holds up the workflow processing thread.
+        // The runtimes carry the Worker's metrics, which a replay's reads of the Store count in.
+        let stream_runtimes = basics
+            .worker_config
+            .stream_runtimes
+            .clone()
+            .with_metrics(&basics.metrics);
         let stream_manager = Arc::new(StreamManager::new(
-            basics.worker_config.stream_runtimes.clone(),
+            stream_runtimes.clone(),
             tokio::runtime::Handle::current(),
             local_tx.clone(),
         ));
@@ -208,7 +214,6 @@ impl Workflows {
         let default_versioning_behavior = basics.default_versioning_behavior;
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
-        let stream_runtimes = basics.worker_config.stream_runtimes.clone();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,

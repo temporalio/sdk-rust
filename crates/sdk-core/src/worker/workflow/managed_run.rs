@@ -348,8 +348,12 @@ impl ManagedRun {
             if accepted && reset_last_started_to.is_none() {
                 let closes = self.wfm.machines.stream_intents_taken();
                 if !closes.is_empty() {
-                    self.stream_manager
-                        .dispatch(&self.wfm.machines.run_id, None, closes);
+                    self.stream_manager.dispatch(
+                        &self.wfm.machines.run_id,
+                        None,
+                        closes,
+                        &self.metrics,
+                    );
                 }
             }
             // Tell the LA manager that we're done with the WFT
@@ -1333,8 +1337,12 @@ impl ManagedRun {
         }
         let epoch = task_epoch(wft);
         let requests = self.wfm.machines.drain_stream_requests();
-        self.stream_manager
-            .dispatch(&self.wfm.machines.run_id, Some(epoch), requests);
+        self.stream_manager.dispatch(
+            &self.wfm.machines.run_id,
+            Some(epoch),
+            requests,
+            &self.metrics,
+        );
     }
 
     /// Stops the run's Stream calls and drops their results still on their way.

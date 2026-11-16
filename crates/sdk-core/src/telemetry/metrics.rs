@@ -28,6 +28,8 @@ pub(crate) struct MetricsContext {
     meter: TemporalMeter,
     instruments: Arc<Instruments>,
     in_memory_metrics: Option<Arc<WorkerHeartbeatMetrics>>,
+    /// False for the no-op meter, so that a call site can skip work that only a metric needs.
+    has_meter: bool,
 }
 
 #[derive(Clone)]
@@ -67,6 +69,18 @@ struct Instruments {
     sticky_cache_miss: Counter,
     sticky_cache_size: Gauge,
     sticky_cache_forced_evictions: Counter,
+    stream_read_total: Counter,
+    stream_read_failed: Counter,
+    stream_read_records: Counter,
+    stream_append_total: Counter,
+    stream_append_failed: Counter,
+    stream_append_latency: HistogramDuration,
+    stream_close_total: Counter,
+    stream_close_failed: Counter,
+    stream_close_latency: HistogramDuration,
+    stream_replay_read_total: Counter,
+    stream_replay_read_failed: Counter,
+    stream_replay_read_latency: HistogramDuration,
 }
 
 struct HeartbeatLabel {
@@ -109,6 +123,7 @@ impl MetricsContext {
             instruments,
             meter,
             in_memory_metrics,
+            has_meter: false,
         }
     }
 
@@ -135,6 +150,7 @@ impl MetricsContext {
                 instruments: Arc::new(instruments),
                 meter,
                 in_memory_metrics,
+                has_meter: true,
             }
         } else {
             Self::no_op()
@@ -158,7 +174,13 @@ impl MetricsContext {
             instruments: Arc::new(instruments),
             meter: tm,
             in_memory_metrics: self.in_memory_metrics.clone(),
+            has_meter: self.has_meter,
         }
+    }
+
+    /// False for a context on the no-op meter.
+    pub(crate) fn has_meter(&self) -> bool {
+        self.has_meter
     }
 
     pub(crate) fn in_memory_meter(&self) -> Option<Arc<WorkerHeartbeatMetrics>> {
@@ -269,6 +291,63 @@ impl MetricsContext {
 
     pub(crate) fn la_executed(&self) {
         self.instruments.la_total.adds(1);
+    }
+
+    /// Core started a Direct read of a Stream
+    pub(crate) fn stream_read_started(&self) {
+        self.instruments.stream_read_total.adds(1);
+    }
+
+    /// A Direct read of a Stream ended with a failure
+    pub(crate) fn stream_read_failed(&self) {
+        self.instruments.stream_read_failed.adds(1);
+    }
+
+    /// Core gave Records of a Direct read to Workflow code
+    pub(crate) fn stream_read_records(&self, records: u64) {
+        self.instruments.stream_read_records.adds(records);
+    }
+
+    /// Core sent a Direct append to a Store
+    pub(crate) fn stream_append_started(&self) {
+        self.instruments.stream_append_total.adds(1);
+    }
+
+    /// A Direct append ended with a failure
+    pub(crate) fn stream_append_failed(&self) {
+        self.instruments.stream_append_failed.adds(1);
+    }
+
+    pub(crate) fn stream_append_latency(&self, dur: Duration) {
+        self.instruments.stream_append_latency.records(dur);
+    }
+
+    /// Core sent a Direct close to a Store
+    pub(crate) fn stream_close_started(&self) {
+        self.instruments.stream_close_total.adds(1);
+    }
+
+    /// A Direct close ended with a failure
+    pub(crate) fn stream_close_failed(&self) {
+        self.instruments.stream_close_failed.adds(1);
+    }
+
+    pub(crate) fn stream_close_latency(&self, dur: Duration) {
+        self.instruments.stream_close_latency.records(dur);
+    }
+
+    /// A replay read the Records of a marker entry from the Store again
+    pub(crate) fn stream_replay_read_started(&self) {
+        self.instruments.stream_replay_read_total.adds(1);
+    }
+
+    /// A replay could not read or check the Records of a marker entry
+    pub(crate) fn stream_replay_read_failed(&self) {
+        self.instruments.stream_replay_read_failed.adds(1);
+    }
+
+    pub(crate) fn stream_replay_read_latency(&self, dur: Duration) {
+        self.instruments.stream_replay_read_latency.records(dur);
     }
 
     /// A nexus long poll timed out
@@ -556,6 +635,72 @@ impl Instruments {
                 description: "Current number of cached workflows".into(),
                 unit: "".into(),
             }),
+            stream_read_total: meter.counter(MetricParameters {
+                name: "stream_read_total".into(),
+                description: "Count of Direct Stream reads that Core started for Workflow code"
+                    .into(),
+                unit: "".into(),
+            }),
+            stream_read_failed: meter.counter(MetricParameters {
+                name: "stream_read_failed".into(),
+                description: "Count of Direct Stream reads that ended with a failure".into(),
+                unit: "".into(),
+            }),
+            stream_read_records: meter.counter(MetricParameters {
+                name: "stream_read_records".into(),
+                description: "Count of Records that Direct Stream reads gave to Workflow code"
+                    .into(),
+                unit: "".into(),
+            }),
+            stream_append_total: meter.counter(MetricParameters {
+                name: "stream_append_total".into(),
+                description: "Count of Direct Stream appends that Core sent to a Store".into(),
+                unit: "".into(),
+            }),
+            stream_append_failed: meter.counter(MetricParameters {
+                name: "stream_append_failed".into(),
+                description: "Count of Direct Stream appends that ended with a failure".into(),
+                unit: "".into(),
+            }),
+            stream_append_latency: meter.histogram_duration(MetricParameters {
+                name: "stream_append_latency".into(),
+                unit: "duration".into(),
+                description: "Histogram of Direct Stream append latencies".into(),
+            }),
+            stream_close_total: meter.counter(MetricParameters {
+                name: "stream_close_total".into(),
+                description: "Count of Direct Stream closes that Core sent to a Store".into(),
+                unit: "".into(),
+            }),
+            stream_close_failed: meter.counter(MetricParameters {
+                name: "stream_close_failed".into(),
+                description: "Count of Direct Stream closes that ended with a failure".into(),
+                unit: "".into(),
+            }),
+            stream_close_latency: meter.histogram_duration(MetricParameters {
+                name: "stream_close_latency".into(),
+                unit: "duration".into(),
+                description: "Histogram of Direct Stream close latencies".into(),
+            }),
+            stream_replay_read_total: meter.counter(MetricParameters {
+                name: "stream_replay_read_total".into(),
+                description:
+                    "Count of Stream marker entries whose Records a replay read from the Store"
+                        .into(),
+                unit: "".into(),
+            }),
+            stream_replay_read_failed: meter.counter(MetricParameters {
+                name: "stream_replay_read_failed".into(),
+                description:
+                    "Count of Stream marker entries that a replay could not read or check".into(),
+                unit: "".into(),
+            }),
+            stream_replay_read_latency: meter.histogram_duration(MetricParameters {
+                name: "stream_replay_read_latency".into(),
+                unit: "duration".into(),
+                description: "Histogram of the latencies of a replay's read of a Stream marker entry"
+                    .into(),
+            }),
             sticky_cache_forced_evictions: meter.counter(MetricParameters {
                 name: "sticky_cache_total_forced_eviction".into(),
                 description: "Count of evictions of cached workflows".into(),
@@ -639,6 +784,26 @@ impl Instruments {
             .update_attributes(new_attributes.clone());
         self.sticky_cache_forced_evictions
             .update_attributes(new_attributes.clone());
+        for counter in [
+            &mut self.stream_read_total,
+            &mut self.stream_read_failed,
+            &mut self.stream_read_records,
+            &mut self.stream_append_total,
+            &mut self.stream_append_failed,
+            &mut self.stream_close_total,
+            &mut self.stream_close_failed,
+            &mut self.stream_replay_read_total,
+            &mut self.stream_replay_read_failed,
+        ] {
+            counter.update_attributes(new_attributes.clone());
+        }
+        for histogram in [
+            &mut self.stream_append_latency,
+            &mut self.stream_close_latency,
+            &mut self.stream_replay_read_latency,
+        ] {
+            histogram.update_attributes(new_attributes.clone());
+        }
     }
 }
 
@@ -750,6 +915,7 @@ const KEY_POLLER_TYPE: &str = "poller_type";
 const KEY_WORKER_TYPE: &str = "worker_type";
 const KEY_EAGER: &str = "eager";
 const KEY_TASK_FAILURE_TYPE: &str = "failure_reason";
+const KEY_STREAM_STORE: &str = "stream_store";
 
 pub(crate) fn workflow_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "workflow_task")
@@ -783,6 +949,11 @@ pub(crate) fn local_activity_worker_type() -> MetricKeyValue {
 }
 pub(crate) fn nexus_worker_type() -> MetricKeyValue {
     MetricKeyValue::new(KEY_WORKER_TYPE, "NexusWorker")
+}
+/// The Store of a Direct Stream call. A metric never gets the Stream id, a Producer id or an
+/// offset, since those have no bound.
+pub(crate) fn stream_store(store: &str) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_STREAM_STORE, store.to_string())
 }
 pub(crate) fn eager(is_eager: bool) -> MetricKeyValue {
     MetricKeyValue::new(KEY_EAGER, is_eager)
@@ -1257,7 +1428,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 35;
+        let num_metrics = 47;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],

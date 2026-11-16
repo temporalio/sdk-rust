@@ -692,8 +692,11 @@ impl WorkflowMachines {
         // Query-only activations are never recorded in history, so replay can't count them.
         if !all_query {
             let activation = self.local_activity_data.current_activation_index();
-            self.stream_calls
-                .note_delivered(&jobs, u32::try_from(activation).unwrap_or(u32::MAX));
+            self.stream_calls.note_delivered(
+                &jobs,
+                u32::try_from(activation).unwrap_or(u32::MAX),
+                &self.metrics,
+            );
             self.local_activity_data.activation_dispatched();
         }
         let is_replaying = self.replaying || all_query;

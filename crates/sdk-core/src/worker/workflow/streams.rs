@@ -3,6 +3,7 @@
 
 use crate::{
     abstractions::dbg_panic,
+    telemetry::metrics::{MetricsContext, stream_store, workflow_type},
     worker::workflow::{
         LocalResolution, LocalResolutionMsg,
         workflow_stream::{LocalInput, LocalInputs},
@@ -52,11 +53,18 @@ use tracing::Span;
 
 /// The Stream runtimes of a Worker, by the name of the Store that each serves. A Workflow call on
 /// a Stream uses the runtime of its `StreamRef.store`.
-#[derive(Clone, Debug)]
+#[derive(Clone, derive_more::Debug)]
 pub struct StreamRuntimes {
     runtimes: HashMap<String, Arc<StreamRuntime>>,
     /// False for a replay Worker, which reads the Store only for the Records of a marker.
     calls_stores: bool,
+    /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
+    /// with no meter, so that it builds no attributes for a read.
+    #[debug(skip)]
+    metrics: Option<MetricsContext>,
+    /// The Workflow type of the run whose history these runtimes read, which the Worker's metrics
+    /// lack.
+    workflow_type: Option<String>,
 }
 
 impl Default for StreamRuntimes {
@@ -71,7 +79,36 @@ impl StreamRuntimes {
         Self {
             runtimes: runtimes.into_iter().collect(),
             calls_stores: true,
+            metrics: None,
+            workflow_type: None,
         }
+    }
+
+    /// The runtimes with the Worker's metrics, for a replay's reads of the Store.
+    pub(crate) fn with_metrics(self, metrics: &MetricsContext) -> Self {
+        Self {
+            metrics: metrics.has_meter().then(|| metrics.clone()),
+            ..self
+        }
+    }
+
+    /// The runtimes for the history of a run of `workflow_type`, so that a replay's reads count
+    /// under it.
+    pub(crate) fn for_run(mut self, workflow_type: &str) -> Self {
+        if self.metrics.is_some() {
+            self.workflow_type = Some(workflow_type.to_string());
+        }
+        self
+    }
+
+    /// The metrics of a replay's read of `store`, or `None` with no meter.
+    fn replay_metrics(&self, store: &str) -> Option<MetricsContext> {
+        let metrics = self.metrics.as_ref()?;
+        let run = self
+            .workflow_type
+            .iter()
+            .map(|ty| workflow_type(ty.clone()));
+        Some(metrics.with_new_attrs(run.chain([stream_store(store)])))
     }
 
     /// The runtimes of a replay Worker. It reads the Records of a marker, and never makes a live
@@ -109,6 +146,13 @@ static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 /// instance of a run never matches a call of a newer one.
 pub(crate) fn next_call_id() -> u64 {
     NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The metrics of a run's call to `store`, or `None` for a Worker with no meter, so that such a
+/// Worker builds no attributes for a call.
+pub(crate) fn store_metrics(run: &MetricsContext, store: &str) -> Option<MetricsContext> {
+    run.has_meter()
+        .then(|| run.with_new_attrs([stream_store(store)]))
 }
 
 /// The Records that a read gave to the run and that no activation took yet.
@@ -286,12 +330,13 @@ impl StreamManager {
     }
 
     /// Starts or stops the calls of a run. `epoch` is the run's current Workflow Task, which an
-    /// append writes with, or `None` when the run has no task in hand.
+    /// append writes with, or `None` when the run has no task in hand. `metrics` are the run's.
     pub(crate) fn dispatch(
         &self,
         run_id: &str,
         epoch: Option<WorkflowTaskEpoch>,
         requests: Vec<StreamRequest>,
+        metrics: &MetricsContext,
     ) {
         for request in requests {
             match request {
@@ -305,7 +350,12 @@ impl StreamManager {
                     match self.runtime(&spec.stream) {
                         Some(runtime) => {
                             let sink = self.sink(run_id, call_id, seq);
-                            self.spawn(run_id, call_id, false, read(runtime, spec, sink));
+                            let metrics = store_metrics(metrics, &spec.stream.store);
+                            if let Some(metrics) = &metrics {
+                                metrics.stream_read_started();
+                            }
+                            let call = read(runtime, spec, sink, metrics);
+                            self.spawn(run_id, call_id, false, call);
                         }
                         None => self.no_runtime(run_id, call_id, seq, Call::Read),
                     }
@@ -315,7 +365,11 @@ impl StreamManager {
                     match (self.runtime(&spec.stream), epoch) {
                         (Some(runtime), Some(epoch)) => {
                             let sink = self.sink(run_id, call_id, seq);
-                            let call = append(runtime, spec, epoch, sink);
+                            let timer = CallTimer::start(metrics, &spec.stream.store);
+                            if let Some(timer) = &timer {
+                                timer.metrics.stream_append_started();
+                            }
+                            let call = append(runtime, spec, epoch, sink, timer);
                             self.spawn(run_id, call_id, false, call);
                         }
                         _ => self.no_runtime(run_id, call_id, seq, Call::Append),
@@ -326,7 +380,11 @@ impl StreamManager {
                     match (self.runtime(&spec.stream), spec.epoch.or(epoch)) {
                         (Some(runtime), Some(epoch)) => {
                             let sink = self.sink(run_id, call_id, seq);
-                            let call = close(runtime, spec, epoch, sink);
+                            let timer = CallTimer::start(metrics, &spec.stream.store);
+                            if let Some(timer) = &timer {
+                                timer.metrics.stream_close_started();
+                            }
+                            let call = close(runtime, spec, epoch, sink, timer);
                             // History recorded the close, so the end of the run must not stop it.
                             self.spawn(run_id, call_id, true, call);
                         }
@@ -453,7 +511,12 @@ impl StreamManager {
 }
 
 /// Reads until the first stop, and sends each response with Records as one page at once.
-async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamCallResult)) {
+async fn read(
+    runtime: Arc<StreamRuntime>,
+    spec: ReadSpec,
+    sink: impl Fn(StreamCallResult),
+    metrics: Option<MetricsContext>,
+) {
     let deadline = spec.deadline.map(|deadline| {
         Instant::now()
             + deadline
@@ -520,6 +583,9 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
         let response = match runtime.read_records(request).await {
             Ok(response) => response,
             Err(error) => {
+                if let Some(metrics) = &metrics {
+                    metrics.stream_read_failed();
+                }
                 sink(StreamCallResult::Page {
                     records: vec![],
                     end: Some(StreamReadEnd {
@@ -603,6 +669,22 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
     }
 }
 
+/// The metrics of an append or a close, and when Core started it.
+struct CallTimer {
+    metrics: MetricsContext,
+    started: Instant,
+}
+
+impl CallTimer {
+    /// `None` for a Worker with no meter, which then reads no clock for a call.
+    fn start(run: &MetricsContext, store: &str) -> Option<Self> {
+        store_metrics(run, store).map(|metrics| Self {
+            metrics,
+            started: Instant::now(),
+        })
+    }
+}
+
 /// The kind of a call, for the failure of one that can't run.
 enum Call {
     Read,
@@ -617,6 +699,7 @@ async fn close(
     spec: CloseSpec,
     epoch: WorkflowTaskEpoch,
     sink: impl Fn(StreamCallResult),
+    timer: Option<CallTimer>,
 ) {
     let mut producer = spec.producer;
     if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
@@ -628,6 +711,12 @@ async fn close(
         producer: Some(producer),
     };
     let result = runtime.close_stream(request).await.err();
+    if let Some(timer) = timer {
+        timer.metrics.stream_close_latency(timer.started.elapsed());
+        if result.is_some() {
+            timer.metrics.stream_close_failed();
+        }
+    }
     sink(StreamCallResult::Close(result.map(|error| failure(&error))));
 }
 
@@ -637,6 +726,7 @@ async fn append(
     spec: AppendSpec,
     epoch: WorkflowTaskEpoch,
     sink: impl Fn(StreamCallResult),
+    timer: Option<CallTimer>,
 ) {
     let mut producer = spec.producer;
     if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
@@ -660,6 +750,12 @@ async fn append(
         }),
         Err(error) => resolve_stream_append::Status::Failed(failure(&error)),
     };
+    if let Some(timer) = timer {
+        timer.metrics.stream_append_latency(timer.started.elapsed());
+        if matches!(status, resolve_stream_append::Status::Failed(_)) {
+            timer.metrics.stream_append_failed();
+        }
+    }
     sink(StreamCallResult::Append(status));
 }
 
@@ -813,8 +909,30 @@ pub(crate) async fn hydrate_stream_markers(
     Ok(())
 }
 
-/// Reads the Records of one entry, with no wait, and checks them against the entry.
+/// Reads the Records of one entry and checks them, and counts the read in the metrics.
 async fn read_range(
+    runtimes: &StreamRuntimes,
+    entry: &StreamReadEntry,
+) -> Result<Vec<StreamRecord>, tonic::Status> {
+    let store = entry
+        .stream
+        .as_ref()
+        .map_or("", |stream| stream.store.as_str());
+    let Some(metrics) = runtimes.replay_metrics(store) else {
+        return read_and_check(runtimes, entry).await;
+    };
+    metrics.stream_replay_read_started();
+    let started = Instant::now();
+    let records = read_and_check(runtimes, entry).await;
+    metrics.stream_replay_read_latency(started.elapsed());
+    if records.is_err() {
+        metrics.stream_replay_read_failed();
+    }
+    records
+}
+
+/// Reads the Records of one entry, with no wait, and checks them against the entry.
+async fn read_and_check(
     runtimes: &StreamRuntimes,
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {

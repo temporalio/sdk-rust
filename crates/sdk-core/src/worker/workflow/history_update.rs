@@ -171,7 +171,7 @@ impl HistoryPaginator {
             npt,
             client,
         );
-        paginator.streams = streams;
+        paginator.streams = streams.for_run(&wft.workflow_type);
         if empty_hist && wft.legacy_query.is_none() && wft.query_requests.is_empty() {
             return Err(EMPTY_TASK_ERR.clone());
         }
