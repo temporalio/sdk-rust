@@ -5,8 +5,8 @@ use crate::{
     StreamRuntimes, Worker, WorkflowErrorType,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
-        MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
-        schedule_local_activity_cmd, test_worker_cfg,
+        CounterRecordingMeter, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
+        build_mock_pollers, mock_worker, schedule_local_activity_cmd, test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
 };
@@ -14,7 +14,7 @@ use futures_util::FutureExt;
 use parking_lot::Mutex;
 use prost::Message;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -219,6 +219,27 @@ fn start_with(
     expected_fails: usize,
     interminable: bool,
 ) -> Run {
+    start_metered(
+        t,
+        responses,
+        runtimes,
+        cache,
+        expected_fails,
+        interminable,
+        None,
+    )
+}
+
+/// As [start_with], with `meter` as the Worker's meter if it is given.
+fn start_metered(
+    t: TestHistoryBuilder,
+    responses: impl IntoIterator<Item = ResponseType>,
+    runtimes: StreamRuntimes,
+    cache: usize,
+    expected_fails: usize,
+    interminable: bool,
+    meter: Option<&Arc<CounterRecordingMeter>>,
+) -> Run {
     let sent = Arc::new(Mutex::new(vec![]));
     let failed = Arc::new(Mutex::new(vec![]));
     let mut cfg = MockPollCfg::from_resps(t, responses);
@@ -244,6 +265,9 @@ fn start_with(
         wc.max_cached_workflows = cache;
         wc.stream_runtimes = runtimes;
     });
+    if let Some(meter) = meter {
+        mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    }
     Run {
         worker: mock_worker(mock),
         sent,
@@ -3350,4 +3374,425 @@ async fn a_replayed_close_with_no_store_name_takes_the_store_of_history() {
         !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
         "{jobs:?}"
     );
+}
+
+/// A Worker with a meter, on a history of one Workflow Task, whose poller stays alive.
+fn metered(
+    t: TestHistoryBuilder,
+    responses: impl IntoIterator<Item = ResponseType>,
+    runtimes: StreamRuntimes,
+) -> (Run, Arc<CounterRecordingMeter>) {
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let run = start_metered(t, responses, runtimes, 1, 0, true, Some(&meter));
+    (run, meter)
+}
+
+fn one_task_history() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// The labels of the Store `mem`.
+const MEM: &[(&str, &str)] = &[("stream_store", STORE)];
+
+/// The total of each counter, in the order of `names`, for the Store `mem`.
+fn totals(meter: &CounterRecordingMeter, names: &[&str]) -> Vec<u64> {
+    names
+        .iter()
+        .map(|name| meter.counter_total(name, MEM))
+        .collect()
+}
+
+/// Polls and completes activations with no command until every Stream call of the run has its
+/// result, and returns the last activation.
+async fn until_resolved(worker: &Worker, reads: usize, appends: usize) -> WorkflowActivation {
+    let (mut ended, mut appended) = (0, 0);
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        ended += self::reads(&next)
+            .iter()
+            .filter(|read| read.end.is_some())
+            .count();
+        appended += self::appends(&next).len();
+        if ended == reads && appended == appends {
+            return next;
+        }
+        complete(worker, &next, vec![]).await;
+    }
+}
+
+/// A read counts once when Core starts it, and counts each Record that Workflow code got.
+#[tokio::test]
+async fn a_read_counts_its_start_and_its_records() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    close(&runtime, "s").await;
+    let (run, meter) = metered(
+        one_task_history(),
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let last = until_resolved(&run.worker, 1, 0).await;
+    run.worker.complete_execution(&last.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(
+            &meter,
+            &[
+                "stream_read_total",
+                "stream_read_records",
+                "stream_read_failed"
+            ]
+        ),
+        [1, 2, 0]
+    );
+}
+
+/// An append counts once when Core sends it, and its latency gets one value.
+#[tokio::test]
+async fn an_append_counts_its_start_and_its_latency() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (run, meter) = metered(t, [ResponseType::AllHistory], runtimes(&runtime));
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    let last = until_resolved(&run.worker, 0, 1).await;
+    run.worker.complete_execution(&last.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(&meter, &["stream_append_total", "stream_append_failed"]),
+        [1, 0]
+    );
+    assert_eq!(meter.duration_count("stream_append_latency", MEM), 1);
+}
+
+/// A close counts once when Core sends it, after the server took the task of its intent, and its
+/// latency gets one value.
+#[tokio::test]
+async fn a_close_counts_its_start_and_its_latency() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let t = two_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (run, meter) = metered(t, [1, 2].map(ResponseType::ToTaskNum), runtimes(&runtime));
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let (next, close) = until_closed(&run.worker).await;
+    assert!(close.failed.is_none());
+    run.worker.complete_execution(&next.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(&meter, &["stream_close_total", "stream_close_failed"]),
+        [1, 0]
+    );
+    assert_eq!(meter.duration_count("stream_close_latency", MEM), 1);
+}
+
+/// A replay that reads the Records of a marker from the Store counts the entry and its latency,
+/// and counts no read.
+#[tokio::test]
+async fn a_replay_counts_its_read_of_a_marker_entry() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    let (run, meter) = metered(
+        replayed_read_history(&data),
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&replayed)[0].records), ["a", "b"]);
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    // The read goes on live, which counts as a start, with no Record yet.
+    complete(&run.worker, &live, vec![]).await;
+    put(&runtime, "s", &["c"]).await;
+    let page = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&page)[0].records), ["c"]);
+    run.worker.complete_execution(&page.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(
+            &meter,
+            &[
+                "stream_replay_read_total",
+                "stream_replay_read_failed",
+                "stream_read_total",
+                "stream_read_records",
+            ]
+        ),
+        [1, 0, 1, 1]
+    );
+    assert_eq!(meter.duration_count("stream_replay_read_latency", MEM), 1);
+}
+
+/// A read, an append, a close and a replay's read of a marker entry that fail each count as
+/// failed.
+#[tokio::test]
+async fn each_failed_call_counts_as_failed() {
+    let runtime = runtime();
+    create(&runtime, "closed").await;
+    close(&runtime, "closed").await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (run, meter) = metered(t, [ResponseType::AllHistory], runtimes(&runtime));
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![
+            read_cmd(1, "missing").into(),
+            append_cmd(1, "closed", &run_id, &["a"]).into(),
+        ],
+    )
+    .await;
+    let last = until_resolved(&run.worker, 1, 1).await;
+    run.worker.complete_execution(&last.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(
+            &meter,
+            &[
+                "stream_read_total",
+                "stream_read_failed",
+                "stream_append_total",
+                "stream_append_failed",
+            ]
+        ),
+        [1, 1, 1, 1]
+    );
+
+    // A write of a later Workflow Task of the run raises the fence over the task of the close.
+    create(&runtime, "fenced").await;
+    let t = two_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let mut later = workflow_producer(&run_id);
+    if let Some(Kind::Workflow(workflow)) = later.kind.as_mut() {
+        workflow.epoch = Some(task_epoch(100));
+    }
+    runtime
+        .append_records(AppendRecordsRequest {
+            r#ref: Some(stream("fenced")),
+            producer: Some(later),
+            records: vec![AppendRecord {
+                body: Some(body("later")),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (run, meter) = metered(t, [1, 2].map(ResponseType::ToTaskNum), runtimes(&runtime));
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![close_cmd(1, "fenced", &run_id).into()],
+    )
+    .await;
+    let (next, close) = until_closed(&run.worker).await;
+    assert!(close.failed.is_some());
+    run.worker.complete_execution(&next.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(&meter, &["stream_close_total", "stream_close_failed"]),
+        [1, 1]
+    );
+
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (mut data, _) = one_page(&all_records(&runtime, "s").await);
+    data.reads[0].digest[0] ^= 1;
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let run = start_metered(
+        replayed_read_history(&data),
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        1,
+        1,
+        true,
+        Some(&meter),
+    );
+    // The task fails before any activation, so the poll ends when the failure is in.
+    tokio::select! {
+        _ = until("the failed task", || run.failed.lock().len() == 1) => {}
+        polled = run.worker.poll_workflow_activation() => panic!("an activation came: {polled:?}"),
+    }
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(
+            &meter,
+            &["stream_replay_read_total", "stream_replay_read_failed"]
+        ),
+        [1, 1]
+    );
+    assert_eq!(meter.duration_count("stream_replay_read_latency", MEM), 1);
+}
+
+/// A read, an append and a close that a replay gives from History count nothing, and neither does
+/// a replay of a marker that holds its Records.
+#[tokio::test]
+async fn replayed_calls_count_nothing() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let meter = Arc::new(CounterRecordingMeter::default());
+
+    put(&runtime, "s", &["a"]).await;
+    let records = all_records(&runtime, "s").await;
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(
+        1,
+        "s",
+        vec![],
+        &[page],
+        Some((StreamReadStop::Done, 1)),
+        true,
+    );
+    let read_history = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+        closes: vec![],
+    });
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    let appended = StreamAppendEntry {
+        seq: 1,
+        stream: Some(stream("s")),
+        first_offset: 7u64.to_be_bytes().to_vec(),
+        last_offset: 8u64.to_be_bytes().to_vec(),
+        failure: None,
+        activation: 1,
+    };
+    let append_history = replayed_read_history(&StreamMarkerData {
+        reads: vec![],
+        appends: vec![appended],
+        closes: vec![],
+    });
+    let append_run = append_history.get_orig_run_id().to_string();
+    let close_events = close_history(intent_entry(1, "s"), Some(close_result_entry(1, "s", None)));
+    let close_run = close_events.get_orig_run_id().to_string();
+    for (t, command) in [
+        (read_history, workflow_command::Variant::from(read)),
+        (
+            append_history,
+            append_cmd(1, "s", &append_run, &["x"]).into(),
+        ),
+        (close_events, close_cmd(1, "s", &close_run).into()),
+    ] {
+        let run = start_metered(
+            t,
+            [ResponseType::AllHistory],
+            runtimes(&runtime),
+            1,
+            0,
+            true,
+            Some(&meter),
+        );
+        let first = run.worker.poll_workflow_activation().await.unwrap();
+        complete(&run.worker, &first, vec![command]).await;
+        let mut next = run.worker.poll_workflow_activation().await.unwrap();
+        while next.is_replaying {
+            complete(&run.worker, &next, vec![]).await;
+            next = run.worker.poll_workflow_activation().await.unwrap();
+        }
+        assert!(signaled(&next));
+        run.worker.complete_execution(&next.run_id).await;
+        run.worker.drain_pollers_and_shutdown().await;
+    }
+    // The meter took the metrics of the three Workers.
+    assert_eq!(meter.counter_total("worker_start", &[]), 3);
+    let names = [
+        "stream_read_total",
+        "stream_read_records",
+        "stream_append_total",
+        "stream_close_total",
+        "stream_replay_read_total",
+    ];
+    assert_eq!(totals(&meter, &names), [0; 5]);
+    assert!(
+        names
+            .iter()
+            .all(|name| meter.counter_labels(name).is_empty()),
+        "a replay counted a call"
+    );
+}
+
+/// The Stream metrics have the attributes of the run's Local Activity metrics but the Activity
+/// type, plus the Store of the call, and never a Stream id, a Producer id or an offset.
+#[tokio::test]
+async fn stream_metrics_have_the_store_of_the_call() {
+    let mem = runtime();
+    create(&mem, "s").await;
+    let other = MemoryStreamRuntime::new("other", MemoryStreamOptions::default(), None);
+    let in_other = StreamRef {
+        id: "s".to_string(),
+        store: "other".to_string(),
+    };
+    other
+        .create_stream(CreateStreamRequest {
+            stream_ref: Some(in_other.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let runtimes = StreamRuntimes::new([
+        (STORE.to_string(), mem.clone()),
+        ("other".to_string(), other.clone()),
+    ]);
+    let (run, meter) = metered(t, [ResponseType::AllHistory], runtimes);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let to_other = AppendToStream {
+        stream: Some(in_other),
+        ..append_cmd(2, "s", &run_id, &["b"])
+    };
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into(), to_other.into()],
+    )
+    .await;
+    let last = until_resolved(&run.worker, 0, 2).await;
+    run.worker.complete_execution(&last.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    for store in [STORE, "other"] {
+        let labels = [("stream_store", store)];
+        assert_eq!(
+            meter.counter_total("stream_append_total", &labels),
+            1,
+            "{store}"
+        );
+        assert_eq!(
+            meter.duration_count("stream_append_latency", &labels),
+            1,
+            "{store}"
+        );
+    }
+    let expected = HashSet::from(["namespace", "task_queue", "workflow_type", "stream_store"]);
+    for labels in meter.counter_labels("stream_append_total") {
+        let keys: HashSet<&str> = labels.keys().map(String::as_str).collect();
+        assert_eq!(keys, expected, "{labels:?}");
+        assert_eq!(labels["workflow_type"], "default_wf_type", "{labels:?}");
+    }
 }
