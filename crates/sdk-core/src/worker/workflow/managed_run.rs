@@ -665,8 +665,6 @@ impl ManagedRun {
             return None;
         };
 
-        // A failed task writes no marker, so no result of its Stream calls may reach Workflow code.
-        self.stop_stream_calls();
         let message = format!("Workflow activation completion failed: {:?}", failure);
         // We don't want to fail queries that could otherwise be retried
         let is_no_report_query_fail = self.pending_work_is_legacy_query()
@@ -679,6 +677,9 @@ impl ManagedRun {
         let rur = if is_no_report_query_fail {
             None
         } else {
+            // A failed task writes no marker, so no result of its Stream calls may reach Workflow
+            // code. A query that failed with no report keeps the run, and with it its calls.
+            self.stop_stream_calls();
             // Blow up any cached data associated with the workflow
             self.request_eviction(RequestEvictMsg {
                 run_id: self.run_id().to_string(),
