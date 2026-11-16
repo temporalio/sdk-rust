@@ -496,6 +496,11 @@ impl WorkflowMachines {
     }
 
     /// The number of Stream appends that have no result yet.
+    /// True if Workflow code ever started a Stream call in this run.
+    pub(crate) fn has_stream_calls(&self) -> bool {
+        self.stream_calls.has_calls()
+    }
+
     pub(crate) fn outstanding_stream_appends(&self) -> usize {
         self.stream_calls.open_appends()
     }
