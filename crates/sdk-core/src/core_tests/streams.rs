@@ -2,7 +2,7 @@
 //! history, and adds Records to the Store between its polls.
 
 use crate::{
-    StreamRuntimes, Worker, WorkflowErrorType,
+    StreamRuntimes, Worker, WorkerConfig, WorkflowErrorType,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
         CounterRecordingMeter, MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt,
@@ -182,15 +182,6 @@ fn append_cmd(seq: u32, id: &str, run_id: &str, texts: &[&str]) -> AppendToStrea
     }
 }
 
-/// A `core_stream` marker event, as the server records the marker that Core sent.
-fn marker_event(t: &mut TestHistoryBuilder, completed_event_id: i64) {
-    t.add(MarkerRecordedEventAttributes {
-        marker_name: STREAM_MARKER_NAME.to_string(),
-        workflow_task_completed_event_id: completed_event_id,
-        ..Default::default()
-    });
-}
-
 /// Runs a Worker on the history, with the runtime and a cache of one run, and keeps every
 /// completion that it sends.
 fn worker(
@@ -290,6 +281,84 @@ fn start_metered(
     }
 }
 
+/// A Worker on a mock server that gives each task that a completion forces inline, with the events
+/// that the completion wrote, as a real server does. So History has the real marker of each task.
+/// `t` is the history up to the first task. `observe` sees each completion as the server takes it,
+/// and `configure` sets the Worker's config after its cache and runtimes.
+fn served(
+    t: TestHistoryBuilder,
+    runtimes: StreamRuntimes,
+    meter: Option<&Arc<CounterRecordingMeter>>,
+    mut observe: impl FnMut(&WorkflowTaskCompletion) + Send + 'static,
+    configure: impl FnOnce(&mut WorkerConfig),
+) -> Run {
+    let sent = Arc::new(Mutex::new(vec![]));
+    let failed = Arc::new(Mutex::new(vec![]));
+    let mut history = t.clone();
+    let mut cfg = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
+    cfg.make_poll_stream_interminable = true;
+    cfg.num_expected_completions = Some((0..).into());
+    let kept = sent.clone();
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        observe(completion);
+        kept.lock().push(completion.clone());
+        history.add_workflow_task_completed();
+        let completed = history.current_event_id();
+        for command in &completion.commands {
+            match &command.attributes {
+                Some(Attributes::RecordMarkerCommandAttributes(marker)) => {
+                    history.add(MarkerRecordedEventAttributes {
+                        marker_name: marker.marker_name.clone(),
+                        details: marker.details.clone(),
+                        workflow_task_completed_event_id: completed,
+                        ..Default::default()
+                    });
+                }
+                Some(Attributes::StartTimerCommandAttributes(timer)) => {
+                    history.add_timer_started(timer.timer_id.clone());
+                }
+                Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
+                    history.add_workflow_execution_completed();
+                }
+                _ => {}
+            }
+        }
+        let workflow_task = completion.force_create_new_workflow_task.then(|| {
+            history.add_workflow_task_scheduled_and_started();
+            let mut task = hist_to_poll_resp(&history, "fake_wf_id", ResponseType::AllHistory).resp;
+            task.attempt = 1;
+            task
+        });
+        Ok(RespondWorkflowTaskCompletedResponse {
+            workflow_task,
+            ..Default::default()
+        })
+    }));
+    let kept = failed.clone();
+    cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        let message = failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+            .unwrap_or_default();
+        kept.lock().push((*cause, message));
+        true
+    });
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.stream_runtimes = runtimes;
+        configure(wc);
+    });
+    if let Some(meter) = meter {
+        mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    }
+    Run {
+        worker: mock_worker(mock),
+        sent,
+        failed,
+    }
+}
+
 async fn complete(
     worker: &Worker,
     activation: &WorkflowActivation,
@@ -370,14 +439,9 @@ async fn read_spans_three_tasks() {
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(500));
-    t.add_full_wf_task();
-    marker_event(&mut t, 4);
-    t.add_full_wf_task();
-    t.add_by_type(EventType::TimerStarted);
-    marker_event(&mut t, 8);
     t.add_workflow_task_scheduled_and_started();
-    let responses = [1, 2, 3].map(ResponseType::ToTaskNum);
-    let (worker, sent) = worker(t, responses, &runtime, 0);
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
+    let (worker, sent) = (run.worker, run.sent);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
@@ -480,27 +544,10 @@ async fn heartbeat_runs_without_local_activities() {
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(300));
-    t.add_full_wf_task();
-    marker_event(&mut t, 4);
     t.add_workflow_task_scheduled_and_started();
-    let responses = [1, 2].map(ResponseType::ToTaskNum);
-    let sent = Arc::new(Mutex::new(vec![]));
-    let mut cfg = MockPollCfg::from_resps(t, responses);
-    // The poller stays alive, as the end of a poller begins a shutdown, which stops the read.
-    cfg.make_poll_stream_interminable = true;
-    let kept = sent.clone();
-    cfg.completion_mock_fn = Some(Box::new(move |completion| {
-        kept.lock().push(completion.clone());
-        Ok(Default::default())
-    }));
-    let mut mock = build_mock_pollers(cfg);
-    let runtimes = unbatched([(STORE.to_string(), runtime.clone())]);
-    mock.worker_cfg(|wc| {
-        wc.max_cached_workflows = 1;
-        wc.task_types = WorkerTaskTypes::workflow_only();
-        wc.stream_runtimes = runtimes;
-    });
-    let worker = mock_worker(mock);
+    let workflow_only = |wc: &mut WorkerConfig| wc.task_types = WorkerTaskTypes::workflow_only();
+    let run = served(t, runtimes(&runtime), None, |_| {}, workflow_only);
+    let (worker, sent) = (run.worker, run.sent);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
@@ -1354,15 +1401,13 @@ async fn failed_replay(data: StreamMarkerData, runtimes: StreamRuntimes) -> Stri
     let t = replayed_read_history(&data);
     // The Records are read after the poll, so the poller must not end before the task fails.
     let run = start_with(t, [ResponseType::AllHistory], runtimes, 1, 1, true);
-    let polled = tokio::time::timeout(
-        Duration::from_secs(2),
-        run.worker.poll_workflow_activation(),
-    )
-    .await;
-    assert!(
-        polled.is_err(),
-        "The task should fail before any activation"
-    );
+    // The task fails before any activation, so the poll waits while the failure comes in.
+    tokio::select! {
+        _ = until("the failed task", || run.failed.lock().len() == 1) => {}
+        polled = run.worker.poll_workflow_activation() => {
+            panic!("The task should fail before any activation: {polled:?}")
+        }
+    }
     run.worker.drain_pollers_and_shutdown().await;
     let failed = run.failed.lock();
     assert_eq!(failed.len(), 1);
@@ -2285,56 +2330,56 @@ async fn a_read_with_a_zero_idle_timeout_gives_what_is_there() {
     }
 }
 
-/// The idle time doesn't count while a read pauses for Workflow code to take its Records. A read
-/// that pauses at its `read_ahead_bytes` reads the Records that came during the pause.
+/// The idle time doesn't count while a read pauses for Workflow code to take its Records. The pause
+/// lasts twice the idle time, and the read finds nothing new after it. So it must wait on the
+/// Store for its idle time before it ends with `Idle`. A read that counted the pause would end
+/// with no wait on the Store.
 #[tokio::test]
 async fn idle_time_skips_a_paused_read() {
-    let (runtime, served) = counted_runtime();
+    let gave = Arc::new(Mutex::new(vec![]));
+    let waits = Arc::new(AtomicUsize::new(0));
+    let store = WatchedStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        gave: gave.clone(),
+        waits: waits.clone(),
+        closes: Default::default(),
+    };
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
-    t.add_wfe_started_with_wft_timeout(Duration::from_secs(30));
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
     t.add_workflow_task_scheduled_and_started();
     let runtimes = runtimes(&runtime).with_read_ahead_bytes(SMALL_READ_AHEAD);
-    let run = start(t, [ResponseType::AllHistory], runtimes, 1, 0);
-    let worker = run.worker;
+    let worker = start(t, [ResponseType::AllHistory], runtimes, 1, 0).worker;
     let first = worker.poll_workflow_activation().await.unwrap();
-    complete(
-        &worker,
-        &first,
-        vec![read_with_idle(1, "s", Duration::from_secs(1)).into()],
-    )
-    .await;
+    let idle = Duration::from_millis(500);
+    complete(&worker, &first, vec![read_with_idle(1, "s", idle).into()]).await;
     put(&runtime, "s", &["a"]).await;
     let page = worker.poll_workflow_activation().await.unwrap();
-    let mut got = reads(&page)[0].records.len();
-    let big = "x".repeat(1 << 10);
-    for _ in 0..4 {
-        put(&runtime, "s", &[big.as_str()]).await;
-    }
-    // Four Records of 1 KiB pass the bound, so the read pauses once the Store gave them.
-    until("the read of four Records", || {
-        served.load(Ordering::Acquire) >= 5
+    // One Record passes the bound alone. The read takes it and pauses in the same poll on this
+    // thread, so it waits for room by the time the Store gave the Record.
+    let big = "x".repeat(5 << 10);
+    put(&runtime, "s", &[big.as_str()]).await;
+    let given = || gave.lock().iter().map(|(_, count)| count).sum::<usize>();
+    until("the read of the large Record", || given() == 2).await;
+    let before = waits.load(Ordering::Acquire);
+    // Workflow code holds the page for at least twice the idle time. Only a lower bound matters,
+    // so a slow machine can't fail the test.
+    tokio::time::sleep(idle * 2).await;
+    complete(&worker, &page, vec![]).await;
+    let held = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(reads(&held)[0].records.len(), 1);
+    complete(&worker, &held, vec![]).await;
+    until("the read's wait on the Store after its pause", || {
+        waits.load(Ordering::Acquire) > before
     })
     .await;
-    for _ in 0..2 {
-        put(&runtime, "s", &[big.as_str()]).await;
-    }
-    // Workflow code holds the activation for 2 s, so the read pauses past its idle time.
-    tokio::time::sleep(Duration::from_millis(1700)).await;
-    complete(&worker, &page, vec![]).await;
-    let end = loop {
-        let next = worker.poll_workflow_activation().await.unwrap();
-        let read = reads(&next).pop().unwrap();
-        got += read.records.len();
-        if let Some(end) = read.end.clone() {
-            worker.complete_execution(&next.run_id).await;
-            break end;
-        }
-        complete(&worker, &next, vec![]).await;
-    };
+    let ended = worker.poll_workflow_activation().await.unwrap();
+    let read = &reads(&ended)[0];
+    assert!(read.records.is_empty());
+    assert_eq!(stop(read), StreamReadStop::Idle);
+    worker.complete_execution(&ended.run_id).await;
     worker.drain_pollers_and_shutdown().await;
-    assert_eq!(end.stop(), StreamReadStop::Idle);
-    assert_eq!(got, all_records(&runtime, "s").await.len());
 }
 
 /// The idle time doesn't count while a page waits for the next Workflow Task. Records that come
@@ -2910,39 +2955,21 @@ fn task_epoch(started_event_id: i64) -> WorkflowTaskEpoch {
     }
 }
 
-/// A history whose first task completed with a marker event, and whose second one started.
-fn two_task_history() -> TestHistoryBuilder {
-    let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-    marker_event(&mut t, 4);
-    t.add_workflow_task_scheduled_and_started();
-    t
-}
-
 /// An awaited close spans two Workflow Tasks. The first records the intent and calls no Store.
 /// The Stream closes after the server took that task, and the second task gets the result.
 #[tokio::test]
 async fn an_awaited_close_spans_two_tasks() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = two_task_history();
+    let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
     let open_at_completion = Arc::new(Mutex::new(vec![]));
-    let sent = Arc::new(Mutex::new(vec![]));
-    let mut cfg = MockPollCfg::from_resps(t, [1, 2].map(ResponseType::ToTaskNum));
-    let (kept, seen, store) = (sent.clone(), open_at_completion.clone(), runtime.clone());
-    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+    let (seen, store) = (open_at_completion.clone(), runtime.clone());
+    let observe = move |_: &WorkflowTaskCompletion| {
         seen.lock().push(!stream_is_closed(&store, "s"));
-        kept.lock().push(completion.clone());
-        Ok(Default::default())
-    }));
-    let mut mock = build_mock_pollers(cfg);
-    mock.worker_cfg(|wc| {
-        wc.max_cached_workflows = 1;
-        wc.stream_runtimes = runtimes(&runtime);
-    });
-    let worker = mock_worker(mock);
+    };
+    let run = served(t, runtimes(&runtime), None, observe, |_| {});
+    let (worker, sent) = (run.worker, run.sent);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
@@ -3036,9 +3063,10 @@ async fn a_failed_task_after_a_close_leaves_the_stream_open() {
 async fn appends_of_the_intent_task_come_before_the_close() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = two_task_history();
+    let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
-    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
+    let (worker, sent) = (run.worker, run.sent);
 
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(
@@ -3084,9 +3112,9 @@ async fn a_close_of_a_closed_stream_succeeds() {
     let runtime = runtime();
     create(&runtime, "s").await;
     close(&runtime, "s").await;
-    let t = two_task_history();
+    let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
-    let (worker, _sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let worker = served(t, runtimes(&runtime), None, |_| {}, |_| {}).worker;
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
     let (next, close) = until_closed(&worker).await;
@@ -3100,7 +3128,7 @@ async fn a_close_of_a_closed_stream_succeeds() {
 async fn a_refused_close_gives_a_failure() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = two_task_history();
+    let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
     let mut later = workflow_producer(&run_id);
     if let Some(Kind::Workflow(workflow)) = later.kind.as_mut() {
@@ -3117,7 +3145,8 @@ async fn a_refused_close_gives_a_failure() {
         })
         .await
         .unwrap();
-    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
+    let (worker, sent) = (run.worker, run.sent);
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
     let (next, close) = until_closed(&worker).await;
@@ -3598,9 +3627,10 @@ async fn an_append_counts_its_start_and_its_latency() {
 async fn a_close_counts_its_start_and_its_latency() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = two_task_history();
+    let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
-    let (run, meter) = metered(t, [1, 2].map(ResponseType::ToTaskNum), runtimes(&runtime));
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let run = served(t, runtimes(&runtime), Some(&meter), |_| {}, |_| {});
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(&run.worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
     let (next, close) = until_closed(&run.worker).await;
@@ -3694,7 +3724,7 @@ async fn each_failed_call_counts_as_failed() {
 
     // A write of a later Workflow Task of the run raises the fence over the task of the close.
     create(&runtime, "fenced").await;
-    let t = two_task_history();
+    let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
     let mut later = workflow_producer(&run_id);
     if let Some(Kind::Workflow(workflow)) = later.kind.as_mut() {
@@ -3711,7 +3741,8 @@ async fn each_failed_call_counts_as_failed() {
         })
         .await
         .unwrap();
-    let (run, meter) = metered(t, [1, 2].map(ResponseType::ToTaskNum), runtimes(&runtime));
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let run = served(t, runtimes(&runtime), Some(&meter), |_| {}, |_| {});
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(
         &run.worker,
@@ -3906,13 +3937,26 @@ async fn stream_metrics_have_the_store_of_the_call() {
     }
 }
 
-/// A memory Store that holds each close until the test lets it go.
+/// A memory Store that holds each close, and each append if `appends` is set, until the test
+/// lets it go.
 struct HeldCloseStore {
     inner: MemoryStore,
-    /// Told when a close reaches the Store.
+    /// Told when a held call reaches the Store.
     held: Arc<Notify>,
-    /// One permit lets one close go.
+    /// One permit lets one held call go.
     release: Arc<Semaphore>,
+    appends: bool,
+}
+
+impl HeldCloseStore {
+    async fn hold(&self) {
+        self.held.notify_one();
+        self.release
+            .acquire()
+            .await
+            .expect("the test never closes the semaphore")
+            .forget();
+    }
 }
 
 #[async_trait::async_trait]
@@ -3926,6 +3970,9 @@ impl Store for HeldCloseStore {
     }
 
     async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        if self.appends {
+            self.hold().await;
+        }
         self.inner.append(stream_ref, batch).await
     }
 
@@ -3948,12 +3995,7 @@ impl Store for HeldCloseStore {
     }
 
     async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
-        self.held.notify_one();
-        self.release
-            .acquire()
-            .await
-            .expect("the test never closes the semaphore")
-            .forget();
+        self.hold().await;
         self.inner.close(stream_ref, producer).await
     }
 }
@@ -3969,12 +4011,18 @@ struct Held {
 
 impl Held {
     async fn new() -> Self {
+        Self::holding(false).await
+    }
+
+    /// A Store that holds each close, and each append if `appends` is set.
+    async fn holding(appends: bool) -> Self {
         let held = Arc::new(Notify::new());
         let release = Arc::new(Semaphore::new(0));
         let store = HeldCloseStore {
             inner: MemoryStore::new(DEFAULT_RETENTION, None),
             held: held.clone(),
             release: release.clone(),
+            appends,
         };
         let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
         create(&runtime, "s").await;
@@ -4552,10 +4600,9 @@ async fn a_read_holds_its_task_apart_from_the_duration_warning() {
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(500));
-    t.add_full_wf_task();
-    marker_event(&mut t, 4);
     t.add_workflow_task_scheduled_and_started();
-    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
+    let (worker, sent) = (run.worker, run.sent);
     let first = worker.poll_workflow_activation().await.unwrap();
     let run_id = first.run_id.clone();
     complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
@@ -4855,18 +4902,8 @@ async fn a_marker_with_records_in_history_stays_under_its_bound() {
     let largest = records.iter().map(Message::encoded_len).max().unwrap();
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
-    for task in 0..2 {
-        t.add_full_wf_task();
-        marker_event(&mut t, 4 + task * 4);
-    }
     t.add_workflow_task_scheduled_and_started();
-    let run = start(
-        t,
-        [1, 2, 3].map(ResponseType::ToTaskNum),
-        runtimes(&runtime),
-        1,
-        0,
-    );
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
     let first = run.worker.poll_workflow_activation().await.unwrap();
     let read = StartStreamRead {
         records_in_history: true,
@@ -5094,4 +5131,66 @@ async fn a_replay_worker_fails_the_workflow_for_records_that_are_gone() {
         "{}",
         failure.message
     );
+}
+
+/// A cache-full eviction of a run whose append is in flight stops the append, and the Worker
+/// takes the task of the run that needed the cache slot.
+#[tokio::test]
+async fn a_cache_full_eviction_stops_a_call_in_flight() {
+    let held = Held::holding(true).await;
+    let first = one_task_history();
+    let first_run = first.get_orig_run_id().to_string();
+    let second = one_task_history();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let gate = async move {
+        released.await.ok();
+    }
+    .boxed();
+    let mut mock = crate::test_help::build_multihist_mock_sg(
+        [
+            crate::test_help::FakeWfResponses {
+                wf_id: "first".to_string(),
+                hist: first,
+                response_batches: vec![ResponseType::AllHistory],
+            },
+            crate::test_help::FakeWfResponses {
+                wf_id: "second".to_string(),
+                hist: second,
+                response_batches: vec![ResponseType::UntilResolved(gate, 1)],
+            },
+        ],
+        false,
+        0,
+    );
+    mock.make_wft_stream_interminable();
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.stream_runtimes = held.runtimes();
+    });
+    let worker = mock_worker(mock);
+    let start = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(start.run_id, first_run);
+    complete(
+        &worker,
+        &start,
+        vec![append_cmd(1, "s", &first_run, &["a"]).into()],
+    )
+    .await;
+    // The append waits in the Store, and holds the first run's task open.
+    held.held.notified().await;
+    release.send(()).unwrap();
+    let evicted = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(evicted.run_id, first_run);
+    assert!(evicted.is_only_eviction(), "{:?}", evicted.jobs);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(evicted.run_id))
+        .await
+        .unwrap();
+    let other = worker.poll_workflow_activation().await.unwrap();
+    assert_ne!(other.run_id, first_run);
+    worker.complete_execution(&other.run_id).await;
+    // The append's task is gone, so letting the Store go on writes nothing.
+    held.release.add_permits(1);
+    worker.drain_pollers_and_shutdown().await;
+    assert!(all_records(&held.runtime, "s").await.is_empty());
 }
