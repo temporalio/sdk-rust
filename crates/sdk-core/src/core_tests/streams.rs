@@ -9,6 +9,7 @@ use crate::{
         WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
         schedule_local_activity_cmd, test_worker_cfg,
     },
+    worker::MAX_MARKER_RECORD_BYTES,
     worker::client::WorkflowTaskCompletion,
 };
 use futures_util::FutureExt;
@@ -4818,4 +4819,66 @@ async fn an_update_rejection_next_to_a_read_completes_the_task() {
     assert_eq!(sent.messages.len(), 1);
     assert!(sent.commands.is_empty());
     run.worker.drain_pollers_and_shutdown().await;
+}
+
+/// A read with its Records in History keeps the Records of one marker under the bound. The task
+/// that reaches it completes with a new one forced, and the read goes on there. The first Record
+/// of a task always comes.
+#[tokio::test]
+async fn a_marker_with_records_in_history_stays_under_its_bound() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let body = "x".repeat(100 << 10);
+    for _ in 0..30 {
+        put(&runtime, "s", &[body.as_str()]).await;
+    }
+    close(&runtime, "s").await;
+    let records = all_records(&runtime, "s").await;
+    let largest = records.iter().map(Message::encoded_len).max().unwrap();
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    for task in 0..2 {
+        t.add_full_wf_task();
+        marker_event(&mut t, 4 + task * 4);
+    }
+    t.add_workflow_task_scheduled_and_started();
+    let run = start(
+        t,
+        [1, 2, 3].map(ResponseType::ToTaskNum),
+        runtimes(&runtime),
+        1,
+        0,
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let mut got = 0;
+    let last = loop {
+        let next = run.worker.poll_workflow_activation().await.unwrap();
+        let read = reads(&next).pop().unwrap();
+        got += read.records.len();
+        if read.end.is_some() {
+            break next;
+        }
+        complete(&run.worker, &next, vec![]).await;
+    };
+    run.worker.complete_execution(&last.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(got, records.len());
+    let sent = run.sent.lock();
+    let sizes: Vec<usize> = sent
+        .iter()
+        .filter_map(marker)
+        .map(|data| data.reads[0].records.iter().map(Message::encoded_len).sum())
+        .collect();
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert!(
+        sizes
+            .iter()
+            .all(|size| *size <= MAX_MARKER_RECORD_BYTES + largest),
+        "{sizes:?}"
+    );
 }

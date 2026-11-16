@@ -16,6 +16,8 @@ pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
 #[cfg(test)]
 pub(crate) use managed_run::TASK_DURATIONS;
+#[cfg(test)]
+pub(crate) use streams::MAX_MARKER_RECORD_BYTES;
 pub use streams::StreamRuntimes;
 
 use crate::{
