@@ -374,6 +374,9 @@ Nexus request headers can be set by workflow interceptors, not by the typed call
 Calls use the workflow's payload and failure converters, with payload codecs applied at the worker
 boundary. Service and operation wire names are recorded in history, so changing them in existing
 workflow code requires the same replay-safe versioning as other command changes.
+`NexusOperationError::Failed` retains a `NexusOperationFailureError`; use `operation_failure()` to
+inspect its metadata and normalized reason, and `as_cancelled()` / `as_timeout()` to classify it.
+`NexusOperationError::Serialization` reports input or result conversion errors.
 The endpoint must already exist in the server's endpoint registry. Hosting Nexus handlers is not
 included yet.
 

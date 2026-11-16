@@ -1,7 +1,12 @@
 //! Type-safe Nexus service calls from workflows.
 //!
-//! **Experimental:** Enable the `experimental` feature. This API and the draft Nexus SDK it
-//! depends on may change.
+//! **Experimental:** Enable the `experimental` feature. This API and the Nexus SDK it depends on
+//! may change.
+//!
+//! Calls return [`NexusOperationError`]. Its [`Failed`](NexusOperationError::Failed) variant retains
+//! a [`NexusOperationFailureError`] with optional Nexus metadata and a normalized failure reason.
+//! Use [`NexusOperationError::as_cancelled`] and [`NexusOperationError::as_timeout`] to inspect
+//! cancellation and timeout causes, including when the resolution's failure proto omits them.
 //!
 //! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Each generated operation
 //! value identifies its service, input, and output types. Calls use the workflow's payload converter;
@@ -48,7 +53,7 @@
 
 pub use crate::NexusOperationCancellationType;
 pub use nexus_rpc::{NexusOperation, NexusService};
-pub use temporalio_common_wasm::error::NexusOperationError;
+pub use temporalio_common_wasm::error::{NexusOperationError, NexusOperationFailureError};
 
 use crate::{
     BaseWorkflowContext, EventGroup, StartedNexusOperation, WorkflowCancellationToken,
@@ -57,7 +62,7 @@ use crate::{
 use std::{future, marker::PhantomData, time::Duration};
 use temporalio_common_wasm::{
     data_converters::{
-        GenericPayloadConverter, NexusOperationDecodeHint, NoopDecodeHint, PayloadConversionError,
+        GenericPayloadConverter, NexusOperationDecodeHint, PayloadConversionError,
         SerializationContext, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
@@ -203,7 +208,6 @@ impl<S: NexusService> NexusServiceClient<S> {
                 );
             }
         };
-        let context = self.context.clone();
         self.context
             .start_nexus_operation(
                 crate::NexusOperationOptions::builder()
@@ -220,18 +224,10 @@ impl<S: NexusService> NexusServiceClient<S> {
                     .build(),
             )
             .map(move |result| {
-                result
-                    .map(|started| NexusOperationHandle {
-                        started,
-                        output: PhantomData,
-                    })
-                    .map_err(|failure| {
-                        context
-                            .data_converter()
-                            .to_error(&context_data, failure, NoopDecodeHint)
-                            .map(NexusOperationError::from)
-                            .unwrap_or_else(NexusOperationError::Serialization)
-                    })
+                result.map(|started| NexusOperationHandle {
+                    started,
+                    output: PhantomData,
+                })
             })
     }
 

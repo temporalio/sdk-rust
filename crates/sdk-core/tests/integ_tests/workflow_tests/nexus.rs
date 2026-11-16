@@ -94,7 +94,11 @@ impl NexusBasicWf {
                 let res = started.result().await;
                 Ok(Ok(res))
             }
-            Err(failure) => Ok(Err(failure)),
+            Err(error) => Ok(Err(error
+                .operation_failure()
+                .expect("expected operation failure")
+                .failure()
+                .clone())),
         }
     }
 }
@@ -562,8 +566,13 @@ impl NexusCancelBeforeStartWf {
         );
         started.cancel();
         let res = started.await.unwrap_err();
-        assert_eq!(res.message, "Nexus Operation cancelled before scheduled");
-        if let FailureInfo::NexusOperationExecutionFailureInfo(fi) = res.failure_info.unwrap() {
+        assert!(res.as_cancelled().is_some());
+        let failure = res.operation_failure().unwrap().failure();
+        assert_eq!(
+            failure.message,
+            "Nexus Operation cancelled before scheduled"
+        );
+        if let Some(FailureInfo::NexusOperationExecutionFailureInfo(fi)) = &failure.failure_info {
             assert_eq!(fi.endpoint, ctx.state(|wf| wf.endpoint.clone()));
             assert_eq!(fi.service, "svc");
             assert_eq!(fi.operation, "op");
@@ -1294,14 +1303,8 @@ impl NexusAbandonWf {
             ctx.wait_condition(|wf| wf.abandon).await?;
             start.cancel();
             ctx.state_mut(|wf| wf.abandoned = true);
-            let failure = start.await.unwrap_err();
-            assert_matches!(
-                failure.cause.as_deref(),
-                Some(Failure {
-                    failure_info: Some(FailureInfo::CanceledFailureInfo(_)),
-                    ..
-                })
-            );
+            let error = start.await.unwrap_err();
+            assert!(error.as_cancelled().is_some());
         } else {
             let started = start.await.unwrap();
             ctx.wait_condition(|wf| wf.abandon).await?;
