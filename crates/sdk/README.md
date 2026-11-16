@@ -17,7 +17,7 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
-struct MyActivities {
+pub struct MyActivities {
     counter: AtomicUsize,
 }
 
@@ -42,7 +42,7 @@ Workflows are defined using the `#[workflow]` and `#[workflow_methods]` macros:
 
 ```rust
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{WorkflowContext, WorkflowContextView, WorkflowResult};
+use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowContextView, WorkflowResult};
 use std::time::Duration;
 
 #[workflow]
@@ -58,7 +58,7 @@ impl GreetingWorkflow {
     }
 
     #[run]
-    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+    pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         let name = ctx.state(|s| s.name.clone());
 
         // Execute an activity
@@ -66,7 +66,7 @@ impl GreetingWorkflow {
             MyActivities::greet,
             name,
             ActivityOptions::start_to_close_timeout(Duration::from_secs(10))
-        )?.await?;
+        ).await?;
 
         Ok(greeting)
     }
@@ -200,6 +200,7 @@ the context with `state()` or `state_mut()`.
 
 ```rust
 #[workflow]
+#[derive(Default)]
 pub struct MyWorkflow {
     values: Vec<u32>,
 }
@@ -207,7 +208,7 @@ pub struct MyWorkflow {
 #[workflow_methods]
 impl MyWorkflow {
     #[run]
-    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Vec<u32>> {
+    pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Vec<u32>> {
         // Wait until we have at least 3 values
         ctx.wait_condition(|s| s.values.len() >= 3)
             .await?;
@@ -215,7 +216,7 @@ impl MyWorkflow {
     }
 
     #[signal(name = "add_value")]
-    fn push_value(&mut self, _ctx: &mut WorkflowContext<Self>, value: u32) {
+    fn push_value(&mut self, _ctx: &mut SyncWorkflowContext<Self>, value: u32) {
         self.values.push(value);
     }
 
@@ -309,7 +310,7 @@ let result = started.result().await?;
 
 ```rust
 // To continue as new, use the workflow context helper and propagate the termination
-ctx.continue_as_new(&new_input, ContinueAsNewOptions::default())?;
+ctx.continue_as_new(new_input, ContinueAsNewOptions::default())?;
 ```
 
 ### Patching (Versioning)
@@ -326,16 +327,23 @@ if ctx.patched("my-patch-id") {
 
 ### Nexus Operations
 
-The SDK supports starting Nexus operations from a workflow:
+With the `experimental` feature, the SDK supports starting Nexus operations from a workflow:
 
 ```rust
-let started = ctx.start_nexus_operation(NexusOperationOptions {
-    endpoint: "my-endpoint".to_string(),
-    service: "my-service".to_string(),
-    operation: "my-operation".to_string(),
-    input: Some(payload),
-    ..Default::default()
-}).await?;
+let start = ctx.start_nexus_operation(
+    NexusOperationOptions::builder()
+        .endpoint("my-endpoint")
+        .service("my-service")
+        .operation("my-operation")
+        .input(payload)
+        .build(),
+).await;
+match start {
+    Ok(started) => {
+        let result = started.result().await;
+    }
+    Err(start_failure) => {}
+}
 ```
 
 Defining Nexus handlers will be added later.
@@ -361,11 +369,10 @@ For short-lived activities that you want to run on the same worker as the workfl
 ctx.execute_local_activity(
     MyActivities::quick_operation,
     input,
-    LocalActivityOptions {
-        schedule_to_close_timeout: Some(Duration::from_secs(5)),
-        ..Default::default()
-    }
-)?.await?;
+    LocalActivityOptions::builder()
+        .schedule_to_close_timeout(Duration::from_secs(5))
+        .build(),
+).await?;
 ```
 
 ## Cancellation
@@ -381,11 +388,11 @@ ctx.wait_condition(|state| state.ready).await?;
 
 // A child token cancels a related group of operations together.
 let group = ctx.cancellation_token().child_token();
-let timer = ctx.timer(TimerOptions {
-    duration: Duration::from_secs(60),
-    cancellation_token: Some(group.clone()),
-    ..Default::default()
-});
+let timer = ctx.timer(
+    TimerOptions::builder(Duration::from_secs(60))
+        .cancellation_token(group.clone())
+        .build(),
+);
 group.cancel_with_reason("no longer needed");
 
 // A newly-created token is detached, which is useful for cleanup after workflow cancellation.
@@ -443,7 +450,7 @@ among other operations.
 use temporalio_client::{
     Client, ClientOptions, Connection,
     envconfig::LoadClientConfigProfileOptions,
-    WorkflowOptions, GetWorkflowResultOptions,
+    WorkflowStartOptions, WorkflowGetResultOptions,
 };
 
 #[tokio::main]
@@ -452,17 +459,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LoadClientConfigProfileOptions::default()
     )?;
     let connection = Connection::connect(conn_options).await?;
-    let client = Client::new(connection, client_options);
+    let client = Client::new(connection, client_options)?;
 
     // Start a workflow
     let handle = client.start_workflow(
         GreetingWorkflow::run,
         "World".to_string(),
-        WorkflowOptions::new("my-task-queue", "greeting-workflow-1").build()
+        WorkflowStartOptions::new("my-task-queue", "greeting-workflow-1").build()
     ).await?;
 
     // Wait for the result
-    let result = handle.get_result(GetWorkflowResultOptions::default()).await?;
+    let result = handle.get_result(WorkflowGetResultOptions::default()).await?;
 
     Ok(())
 }
@@ -474,8 +481,8 @@ Once you have a workflow handle, you can interact with the running workflow:
 
 ```rust
 use temporalio_client::{
-    SignalOptions, QueryOptions, UpdateOptions,
-    StartUpdateOptions,
+    WorkflowSignalOptions, WorkflowQueryOptions, WorkflowExecuteUpdateOptions,
+    WorkflowStartUpdateOptions, RpcOptions,
     UntypedSignal,
 };
 use temporalio_common::data_converters::{PayloadConverter, RawValue};
@@ -484,16 +491,16 @@ use temporalio_common::data_converters::{PayloadConverter, RawValue};
 let handle = client.get_workflow_handle::<MyWorkflow>("workflow-id");
 
 // --- Signals (fire-and-forget messages) ---
-handle.signal(MyWorkflow::push_value, 42, SignalOptions::default()).await?;
+handle.signal(MyWorkflow::push_value, 42, WorkflowSignalOptions::default()).await?;
 
 // --- Queries (read workflow state) ---
 let values = handle
-    .query(MyWorkflow::get_values, (), QueryOptions::default())
+    .query(MyWorkflow::get_values, (), WorkflowQueryOptions::default())
     .await?;
 
 // --- Updates (modify state and get a result) ---
 let values = handle
-    .execute_update(MyWorkflow::add_wait_return, 100, UpdateOptions::default())
+    .execute_update(MyWorkflow::add_wait_return, 100, WorkflowExecuteUpdateOptions::default())
     .await?;
 
 // Start an update and wait for acceptance only
@@ -501,10 +508,10 @@ let update_handle = handle
     .start_update(
         MyWorkflow::add_wait_return,
         50,
-        StartUpdateOptions::default()
+        WorkflowStartUpdateOptions::default()
     )
     .await?;
-update_handle.get_result().await?;
+update_handle.get_result(RpcOptions::default()).await?;
 
 // --- Untyped interactions (when types aren't known at compile time) ---
 let pc = PayloadConverter::serde_json();
@@ -512,7 +519,7 @@ handle
     .signal(
         UntypedSignal::new("increment"),
         RawValue::from_value(&25i32, &pc),
-        SignalOptions::default(),
+        WorkflowSignalOptions::default(),
     )
     .await?;
 // UntypedQuery and UntypedUpdate work similarly
@@ -521,24 +528,24 @@ handle
 ### Cancelling and Terminating Workflows
 
 ```rust
-use temporalio_client::{CancelWorkflowOptions, TerminateWorkflowOptions};
+use temporalio_client::{WorkflowCancelOptions, WorkflowTerminateOptions};
 
 // Request cancellation (workflow can handle this gracefully)
-handle.cancel(CancelWorkflowOptions::builder().reason("No longer needed").build()).await?;
+handle.cancel(WorkflowCancelOptions::builder().reason("No longer needed").build()).await?;
 
 // Terminate immediately (workflow cannot intercept this)
-handle.terminate(TerminateWorkflowOptions::builder().reason("Emergency shutdown").build()).await?;
+handle.terminate(WorkflowTerminateOptions::builder().reason("Emergency shutdown").build()).await?;
 ```
 
 ### Listing Workflows
 
 ```rust
-use temporalio_client::ListWorkflowsOptions;
+use temporalio_client::WorkflowListOptions;
 use futures_util::StreamExt;
 
 let mut stream = client.list_workflows(
     "WorkflowType = 'GreetingWorkflow'",
-    ListWorkflowsOptions::builder().limit(10).build()
+    WorkflowListOptions::builder().limit(10).build()
 );
 
 while let Some(result) = stream.next().await {
