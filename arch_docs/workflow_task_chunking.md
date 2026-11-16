@@ -38,26 +38,21 @@ and grouping of their activation jobs on replay.
 
 ## Disabling chunking
 
-The non-default Core Cargo feature `disable_workflow_task_chunking` requests Core SDK flag 5,
-`DisableWorkflowTaskChunking`, in `WorkflowTaskCompleted` SDK metadata. The task whose completion
-first records the flag ends its logical chunk even if it produces no commands, preserving its
-activation time. All subsequent successful workflow tasks are processed separately, preserving
-the timestamps and grouping of their activation jobs. Tasks with no jobs are handled internally
-without activating lang or polling workflow routines, just as during live execution. Earlier
-history retains legacy chunking. This works for both new and already-running workflows; no
-separate marker command is needed.
+The non-default Core Cargo feature `disable_workflow_task_chunking` records Core SDK flag 5,
+`DisableWorkflowTaskChunking`, in the first successful `WorkflowTaskCompleted` event's SDK
+metadata. That selects unchunked replay for the entire workflow. Workflows whose first completion
+does not record the flag retain legacy chunking for their lifetime, even on a worker built with
+the feature enabled. Server SDK metadata support is required to adopt the new mode.
 
-Core requests the transition at the first live completion with no outstanding local activities
-and a language activation in that task. Waiting for local activities avoids changing the meaning
-of their recorded activation indices. The transition takes effect only after its completion is
-consumed from history. Core requests it again if a speculative task is discarded, and cannot
-establish it when the server does not support SDK metadata.
+In unchunked mode, successful workflow tasks are processed separately, preserving the timestamps
+and grouping of their activation jobs. Tasks with no jobs are handled internally without
+activating lang or polling workflow routines, just as during live execution.
 
 Failed and timed-out attempts are still skipped during replay. Queries retain their separate,
 unrecorded activation boundaries. Rejected-update-only activations do not poll workflow routines;
 their persisted tasks can therefore replay without reconstructing the rejected requests. Once
-recorded, the transition is honored even by builds with the Cargo feature disabled; disabling
-adoption cannot re-enable chunking in an already-transitioned workflow.
+recorded, the mode is honored even by builds with the Cargo feature disabled; disabling adoption
+only changes the default for new workflows.
 
 The C bridge forwards the same Cargo feature to Core. It is enabled when building the bridge,
 rather than through a worker option at runtime.

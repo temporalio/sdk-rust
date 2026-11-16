@@ -27,7 +27,7 @@ use crate::{
             CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
             LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
             WFMachinesError, WorkflowStartedInfo, fatal,
-            history_update::{NextWFT, WorkflowTaskChunking},
+            history_update::NextWFT,
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
@@ -369,9 +369,7 @@ impl WorkflowMachines {
 
     pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
-        if self.last_history_from_server.chunking.is_disabled() {
-            update.chunking = WorkflowTaskChunking::Disabled;
-        }
+        update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
@@ -611,7 +609,7 @@ impl WorkflowMachines {
             // Avoid sending activations containing only patch notifications: they exist only on
             // replay and would poll workflow routines when live execution did not. Keep them
             // queued until another job, such as an LA resolution, needs to activate lang.
-            !self.last_history_from_server.chunking.is_disabled()
+            !self.last_history_from_server.chunking_disabled
                 || !matches!(
                     job.variant,
                     workflow_activation_job::Variant::NotifyHasPatch(_)
@@ -639,25 +637,13 @@ impl WorkflowMachines {
         // report that our ID was the one used for the completion.
         self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
         let mut flags = (*self.observed_internal_flags).borrow_mut();
-        let record_transition = cfg!(feature = "disable_workflow_task_chunking")
+        if cfg!(feature = "disable_workflow_task_chunking")
             && !self.replaying
-            && !self.last_history_from_server.chunking.is_disabled()
-            && self.outstanding_local_activity_count() == 0
-            && self.local_activity_data.current_activation_index() > 0
-            && flags.try_use(CoreInternalFlags::DisableWorkflowTaskChunking, true);
-        let mut metadata = flags.gather_for_wft_complete();
-        // A speculative completion may never reach history. Request the transition until its
-        // completion is consumed, rather than changing replay boundaries optimistically.
-        if record_transition
-            && !metadata
-                .core_used_flags
-                .contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32))
+            && self.last_history_from_server.previous_wft_started_id == 0
         {
-            metadata
-                .core_used_flags
-                .push(CoreInternalFlags::DisableWorkflowTaskChunking as u32);
+            flags.try_use(CoreInternalFlags::DisableWorkflowTaskChunking, true);
         }
-        metadata
+        flags.gather_for_wft_complete()
     }
 
     pub(crate) fn add_lang_used_flags(&self, flags: Vec<u32>) {
@@ -1887,7 +1873,7 @@ impl WorkflowMachines {
     /// recorded resolutions so the task can make progress.
     fn release_held_local_activity_resolutions_if_idle(&mut self) -> Result<()> {
         if !self.activation_needed() {
-            if self.last_history_from_server.chunking.is_disabled() {
+            if self.last_history_from_server.chunking_disabled {
                 // Advance to the next marker's activation index without sending an empty activation.
                 // Stop there so resolutions recorded in later activations remain separate.
                 if let Some(seq) = self.local_activity_data.peek_preresolution_seq(true)

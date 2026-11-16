@@ -2473,15 +2473,20 @@ mod tests {
         #[case(true)]
         #[case(false)]
         #[test]
-        fn chunking_transition_waits_for_local_activities_and_persisted_history(
+        fn chunking_mode_is_chosen_only_on_first_completion(
             #[case] sdk_metadata: bool,
+            #[values(false, true)] already_completed_task: bool,
         ) {
             let mut history = TestHistoryBuilder::default();
             history.add_by_type(EventType::WorkflowExecutionStarted);
+            if already_completed_task {
+                history.add_full_wf_task();
+                history.add_we_signaled("start", vec![]);
+            }
             history.add_workflow_task_scheduled_and_started();
             let mut live = WorkflowManager::new(RunBasics {
                 worker_config: test_worker_cfg().build().unwrap().into(),
-                workflow_id: "transition".to_owned(),
+                workflow_id: "chunking-mode".to_owned(),
                 workflow_type: DEFAULT_WORKFLOW_TYPE.to_owned(),
                 run_id: history.get_orig_run_id().to_owned(),
                 history: history.get_full_history_info().unwrap().into(),
@@ -2493,13 +2498,10 @@ mod tests {
                 sdk_name: "test",
                 sdk_version: "test",
             });
-            assert!(
-                !live
-                    .machines
-                    .get_metadata_for_wft_complete()
-                    .core_used_flags
-                    .contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32))
-            );
+            if already_completed_task {
+                live.get_next_activation().unwrap();
+                live.push_commands_and_iterate(vec![]).unwrap();
+            }
             live.get_next_activation().unwrap();
             let mut workflow = FanoutWorkflow::default();
             live.push_commands_and_iterate(vec![workflow.schedule(Activity::Work(1))])
@@ -2509,31 +2511,16 @@ mod tests {
                 .machines
                 .get_metadata_for_wft_complete()
                 .core_used_flags;
-            assert!(!flags.contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32)));
-            live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
-                seq: 1,
-                result: LocalActivityExecutionResult::Completed(Success { result: None }),
-                runtime: Duration::ZERO,
-                attempt: 1,
-                backoff: None,
-                original_schedule_time: None,
-            }))
-            .unwrap();
-            live.get_next_activation().unwrap();
-            live.push_commands_and_iterate(vec![]).unwrap();
-            for _ in 0..2 {
-                assert_eq!(
-                    live.machines
-                        .get_metadata_for_wft_complete()
-                        .core_used_flags
-                        .contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32)),
-                    sdk_metadata && cfg!(feature = "disable_workflow_task_chunking")
-                );
-            }
+            assert_eq!(
+                flags.contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32)),
+                !already_completed_task
+                    && sdk_metadata
+                    && cfg!(feature = "disable_workflow_task_chunking")
+            );
         }
 
         #[rstest]
-        fn local_activity_after_chunking_transition_replays_empty_heartbeat(
+        fn unchunked_local_activity_heartbeats_do_not_activate_lang(
             #[values(false, true)] legacy_query_before_heartbeat: bool,
         ) {
             let mut history = TestHistoryBuilder::default();
