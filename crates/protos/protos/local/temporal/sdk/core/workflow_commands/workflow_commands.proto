@@ -434,7 +434,8 @@ message StartStreamRead {
     temporal.api.stream.v1.StreamRef stream = 2;
     // The read starts after this offset. Empty means the start of the Stream.
     bytes from_offset = 3;
-    // The longest time the read may take. Unset means no bound.
+    // The longest time the read may take. Unset means no bound. A read that gave no Record yet
+    // looks at the Store once before its timeout ends it.
     google.protobuf.Duration timeout = 4;
     // The read ends when no Record comes for this long. Unset means no bound. Zero gives the
     // Records that are in the Stream, and ends with no wait.
