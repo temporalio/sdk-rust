@@ -6,8 +6,8 @@ use crate::{
     worker::workflow::{
         OutgoingJob, WFMachinesError, fatal, nondeterminism,
         streams::{
-            AppendSpec, CloseSpec, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
-            StreamResolution, next_call_id, store_metrics,
+            AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult,
+            StreamRequest, StreamResolution, next_call_id, store_metrics,
         },
     },
 };
@@ -83,8 +83,8 @@ struct Read {
     from_offset: Vec<u8>,
     records_in_history: bool,
     deadline: Option<SystemTime>,
-    /// `None` for a read that set no idle timeout, which has no idle bound.
-    idle_timeout: Option<Duration>,
+    /// [DEFAULT_IDLE_TIMEOUT] for a read that set none.
+    idle_timeout: Duration,
     max_records: u32,
     max_bytes: u64,
     flow: Arc<ReadFlow>,
@@ -215,10 +215,10 @@ impl StreamCalls {
             from_offset: attrs.from_offset,
             records_in_history: attrs.records_in_history,
             deadline,
-            // An unset idle timeout is no bound, and a zero one, or a negative one, doesn't wait.
-            idle_timeout: attrs
-                .idle_timeout
-                .map(|idle| Duration::try_from(idle).unwrap_or_default()),
+            // A zero idle timeout, or a negative one, doesn't wait.
+            idle_timeout: attrs.idle_timeout.map_or(DEFAULT_IDLE_TIMEOUT, |idle| {
+                Duration::try_from(idle).unwrap_or_default()
+            }),
             max_records: attrs.max_records,
             max_bytes: attrs.max_bytes,
             flow: Arc::new(ReadFlow::default()),
