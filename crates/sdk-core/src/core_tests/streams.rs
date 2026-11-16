@@ -9,8 +9,8 @@ use crate::{
         WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
         schedule_local_activity_cmd, test_worker_cfg,
     },
-    worker::MAX_MARKER_RECORD_BYTES,
     worker::client::WorkflowTaskCompletion,
+    worker::{MAX_MARKER_RECORD_BYTES, StreamTestHooks},
 };
 use futures_util::FutureExt;
 use parking_lot::Mutex;
@@ -246,6 +246,26 @@ fn start_metered(
     interminable: bool,
     meter: Option<&Arc<CounterRecordingMeter>>,
 ) -> Run {
+    start_configured(
+        t,
+        responses,
+        runtimes,
+        (cache, expected_fails, interminable),
+        meter,
+        |_| {},
+    )
+}
+
+/// As [start_metered], with `configure` setting the Worker's config last. `(cache,
+/// expected_fails, interminable)` are as for [start_with].
+fn start_configured(
+    t: TestHistoryBuilder,
+    responses: impl IntoIterator<Item = ResponseType>,
+    runtimes: StreamRuntimes,
+    (cache, expected_fails, interminable): (usize, usize, bool),
+    meter: Option<&Arc<CounterRecordingMeter>>,
+    configure: impl FnOnce(&mut WorkerConfig),
+) -> Run {
     let sent = Arc::new(Mutex::new(vec![]));
     let failed = Arc::new(Mutex::new(vec![]));
     let mut cfg = MockPollCfg::from_resps(t, responses);
@@ -270,6 +290,7 @@ fn start_metered(
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = cache;
         wc.stream_runtimes = runtimes;
+        configure(wc);
     });
     if let Some(meter) = meter {
         mock.set_temporal_meter(meter.clone().into_temporal_meter());
@@ -4035,7 +4056,29 @@ impl Held {
     }
 
     fn runtimes(&self) -> StreamRuntimes {
-        runtimes(&self.runtime).with_shutdown_waits(self.shutdown_waits.clone())
+        runtimes(&self.runtime)
+    }
+
+    /// A Worker on `t` that runs on this Store. The test hooks tell the test each time a graceful
+    /// shutdown waits for a close in flight, with `close_bound` in place of the real bound.
+    fn start(
+        &self,
+        t: TestHistoryBuilder,
+        close_bound: Option<Duration>,
+        meter: Option<&Arc<CounterRecordingMeter>>,
+    ) -> Run {
+        let hooks = StreamTestHooks {
+            close_bound,
+            shutdown_waits: Some(self.shutdown_waits.clone()),
+        };
+        start_configured(
+            t,
+            [ResponseType::AllHistory],
+            self.runtimes(),
+            (1, 0, true),
+            meter,
+            |wc| wc.stream_test_hooks = hooks,
+        )
     }
 }
 
@@ -4060,7 +4103,7 @@ async fn a_shutdown_waits_for_a_close_of_a_completed_workflow() {
     let held = Held::new().await;
     let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
-    let run = start_with(t, [ResponseType::AllHistory], held.runtimes(), 1, 0, true);
+    let run = held.start(t, None, None);
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(
         &run.worker,
@@ -4090,7 +4133,7 @@ async fn a_shutdown_waits_for_an_awaited_close() {
     let held = Held::new().await;
     let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
-    let run = start_with(t, [ResponseType::AllHistory], held.runtimes(), 1, 0, true);
+    let run = held.start(t, None, None);
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(&run.worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
     held.held.notified().await;
@@ -4108,17 +4151,8 @@ async fn a_shutdown_gives_up_a_close_past_its_bound() {
     let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
     // A short bound keeps the test quick. The two tests before this one check the wait.
-    let runtimes = held.runtimes().with_close_bound(Duration::from_secs(1));
     let meter = Arc::new(CounterRecordingMeter::default());
-    let run = start_metered(
-        t,
-        [ResponseType::AllHistory],
-        runtimes,
-        1,
-        0,
-        true,
-        Some(&meter),
-    );
+    let run = held.start(t, Some(Duration::from_secs(1)), Some(&meter));
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(
         &run.worker,

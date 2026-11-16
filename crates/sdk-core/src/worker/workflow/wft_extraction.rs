@@ -5,8 +5,8 @@ use crate::{
         WorkflowSlotKind,
         client::WorkerClient,
         workflow::{
-            CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, StreamRuntimes,
-            UnstoredWftFailInfo, history_update::HistoryPaginator,
+            CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, UnstoredWftFailInfo,
+            history_update::HistoryPaginator, streams::WorkerStreams,
         },
     },
 };
@@ -65,7 +65,7 @@ impl WFTExtractor {
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
-        streams: StreamRuntimes,
+        streams: Arc<WorkerStreams>,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
@@ -146,15 +146,19 @@ impl WFTExtractor {
                                 attempt: pwft.work.attempt,
                                 workflow_type: pwft.work.workflow_type.clone(),
                             };
-                            let runtimes = pwft.paginator.stream_runtimes().clone();
-                            match pwft.work.update.read_stream_records(&runtimes).await {
+                            let streams = pwft.paginator.streams().cloned();
+                            match pwft.work.update.read_stream_records(streams.as_ref()).await {
                                 Ok(()) => WFTExtractorOutput::FetchResult(*pwft, rc),
                                 // A replay Worker fails the run instead, so that lang sees the
                                 // eviction and the replay of this history ends. So does a Worker
                                 // that fails the Workflow for this error, which needs the run.
                                 Err(err)
-                                    if !runtimes.calls_stores()
-                                        || runtimes.fails_workflow(&pwft.work.workflow_type) =>
+                                    if streams.as_ref().is_some_and(|streams| {
+                                        !streams.worker().calls_stores()
+                                            || streams
+                                                .worker()
+                                                .fails_workflow(&pwft.work.workflow_type)
+                                    }) =>
                                 {
                                     pwft.work.stream_replay_error = Some(err.message().to_string());
                                     WFTExtractorOutput::FetchResult(*pwft, rc)

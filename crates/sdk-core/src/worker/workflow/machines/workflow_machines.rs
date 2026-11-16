@@ -1,5 +1,5 @@
 mod local_acts;
-mod streams;
+mod stream_calls;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
@@ -16,7 +16,7 @@ use super::{
     upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::{
         local_acts::LocalActivityData,
-        streams::{StreamCalls, StreamJob},
+        stream_calls::{StreamCalls, StreamJob},
     },
     workflow_task_state_machine::WorkflowTaskMachine,
 };
@@ -345,7 +345,7 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
-            stream_calls: StreamCalls::new(basics.worker_config.stream_runtimes.calls_stores()),
+            stream_calls: StreamCalls::new(!basics.worker_config.replays_only),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -488,19 +488,18 @@ impl WorkflowMachines {
     }
 
     /// The number of local calls that hold the Workflow Task open: Local Activities, and Stream
-    /// reads and appends.
+    /// reads and writes.
     pub(crate) fn outstanding_local_work(&self) -> usize {
         self.outstanding_local_activity_count()
             + self.stream_calls.open_reads()
-            + self.stream_calls.open_appends()
+            + self.stream_calls.open_writes()
     }
 
-    /// The number of Stream appends that have no result yet.
     /// True if only Stream reads hold the run's Workflow Task open.
     pub(crate) fn only_stream_reads_open(&self) -> bool {
         self.stream_calls.open_reads() > 0
             && self.outstanding_local_activity_count() == 0
-            && self.stream_calls.open_appends() == 0
+            && self.stream_calls.open_writes() == 0
     }
 
     /// Stops the run's reads, with no job. Their pages that Workflow code got stay in the marker,
@@ -519,8 +518,9 @@ impl WorkflowMachines {
         self.stream_calls.has_calls()
     }
 
-    pub(crate) fn outstanding_stream_appends(&self) -> usize {
-        self.stream_calls.open_appends()
+    /// The number of Stream appends and closes that have no result yet.
+    pub(crate) fn outstanding_stream_writes(&self) -> usize {
+        self.stream_calls.open_writes()
     }
 
     /// Stops every Stream call of the run, and drops the results still on their way. A failed
