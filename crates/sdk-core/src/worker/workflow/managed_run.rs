@@ -16,7 +16,7 @@ use crate::{
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
-            streams::StreamManager,
+            streams::{StreamManager, stream_marker_payload_of},
         },
     },
 };
@@ -1017,6 +1017,35 @@ impl ManagedRun {
         } else {
             Some(work)
         }
+    }
+
+    /// True if `update` has events of a Workflow Task that another Worker completed, and Stream
+    /// state that they would mix with. The run's own live calls and the results that no task took
+    /// would then reach Workflow code in a replayed task, and its markers would lack the Records
+    /// that a run new to the cache reads.
+    pub(super) fn has_foreign_stream_events(&self, update: &HistoryUpdate) -> bool {
+        update.is_real()
+            && update.previous_wft_started_id > self.wfm.machines.get_last_wft_started_id()
+            && (self.wfm.machines.has_stream_calls()
+                || update
+                    .get_events()
+                    .iter()
+                    .any(|event| stream_marker_payload_of(event).is_some()))
+    }
+
+    /// Evicts the run and keeps `work`, which the run new to the cache then takes. That run reads
+    /// the Stream markers and replays them as the other Worker wrote them.
+    pub(super) fn evict_for_foreign_task(&mut self, work: PermittedWFT) -> RunUpdateAct {
+        self.task_buffer.buffer(work);
+        self.request_eviction(RequestEvictMsg {
+            run_id: self.run_id().to_string(),
+            message: "The run got Workflow Task events that another Worker wrote, and its Stream \
+                      calls start again from History"
+                .to_string(),
+            reason: EvictionReason::CacheMiss,
+            auto_reply_fail: None,
+        })
+        .into_run_update_resp()
     }
 
     /// Returns true if there is a buffered workflow task for this run.

@@ -272,6 +272,9 @@ impl WFStream {
         // it yet.
         let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
             if let Some(w) = rh.buffer_wft_if_outstanding_work(pwft) {
+                if rh.has_foreign_stream_events(&w.work.update) {
+                    return Ok(rh.evict_for_foreign_task(w));
+                }
                 w
             } else {
                 return Ok(None);
