@@ -495,6 +495,19 @@ impl WorkflowMachines {
     }
 
     /// The number of Stream appends that have no result yet.
+    /// True if only Stream reads hold the run's Workflow Task open.
+    pub(crate) fn only_stream_reads_open(&self) -> bool {
+        self.stream_calls.open_reads() > 0
+            && self.outstanding_local_activity_count() == 0
+            && self.stream_calls.open_appends() == 0
+    }
+
+    /// Stops the run's reads, with no job. Their pages that Workflow code got stay in the marker,
+    /// and History has no end for them, so a later Worker resumes each read from History.
+    pub(crate) fn stop_stream_reads(&mut self) {
+        self.stream_calls.stop_all();
+    }
+
     /// True if Workflow code ever started a Stream call in this run.
     pub(crate) fn has_stream_calls(&self) -> bool {
         self.stream_calls.has_calls()

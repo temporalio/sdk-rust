@@ -81,6 +81,9 @@ pub(super) struct ManagedRun {
     waiting_on_la: Option<WaitingOnLAs>,
     /// The time in this Workflow Task in which only Stream calls held it open.
     stream_hold: StreamHold,
+    /// True while a graceful shutdown completes a task that only reads held open. That completion
+    /// asks for no new task.
+    ending_for_shutdown: bool,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
     /// do is be evicted.
     am_broken: bool,
@@ -125,6 +128,7 @@ impl ManagedRun {
             stream_manager,
             waiting_on_la: None,
             stream_hold: StreamHold::default(),
+            ending_for_shutdown: false,
             am_broken: false,
             wft: None,
             activation: None,
@@ -1041,6 +1045,28 @@ impl ManagedRun {
                     .any(|event| stream_marker_payload_of(event).is_some()))
     }
 
+    /// At a graceful shutdown, completes a Workflow Task that only reads hold open, with what they
+    /// gave, and asks for no new task. Each heartbeat would otherwise get the run a new task, and
+    /// the shutdown would never end. The reads stop, and a later Worker resumes each from History.
+    pub(super) fn end_reads_for_shutdown(&mut self) -> RunUpdateAct {
+        if self.activation.is_some()
+            || self.wft.is_none()
+            || self.trying_to_evict.is_some()
+            || self.wfm.machines.has_pending_jobs()
+            || !self.wfm.machines.only_stream_reads_open()
+        {
+            return None;
+        }
+        self.waiting_on_la.take()?.hb_timeout_handle.abort();
+        self.wfm.machines.stop_stream_reads();
+        self.dispatch_stream_requests();
+        self.ending_for_shutdown = true;
+        self.update_to_acts(Ok(Some(ActivationOrAuto::Autocomplete {
+            run_id: self.run_id().to_string(),
+        })
+        .into()))
+    }
+
     /// Evicts the run and keeps `work`, which the run new to the cache then takes. That run reads
     /// the Stream markers and replays them as the other Worker wrote them.
     pub(super) fn evict_for_foreign_task(&mut self, work: PermittedWFT) -> RunUpdateAct {
@@ -1355,6 +1381,7 @@ impl ManagedRun {
                 task_token: data.task_token,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
+                    return_new_wft: !std::mem::take(&mut self.ending_for_shutdown),
                     commands,
                     messages,
                     query_responses,
