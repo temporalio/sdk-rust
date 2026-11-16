@@ -437,8 +437,9 @@ message StartStreamRead {
     // The longest time the read may take. Unset means no bound. A read that gave no Record yet
     // looks at the Store once before its timeout ends it.
     google.protobuf.Duration timeout = 4;
-    // The read ends when no Record comes for this long. Unset means no bound. Zero gives the
-    // Records that are in the Stream, and ends with no wait.
+    // The read ends when no Record comes for this long. Unset means 1 minute. Zero gives the
+    // Records that are in the Stream, and ends with no wait. A read that must wait longer sets a
+    // longer value.
     google.protobuf.Duration idle_timeout = 5;
     // The most Records the read gives. Zero means no cap.
     uint32 max_records = 6;
