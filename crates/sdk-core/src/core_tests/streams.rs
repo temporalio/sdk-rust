@@ -2105,6 +2105,73 @@ fn timer_cmd(seq: u32) -> workflow_command::Variant {
     .into()
 }
 
+/// A read with no idle timeout has no idle bound. On a quiet Stream it holds the task open with
+/// the heartbeat, and gets a Record that comes after it. The heartbeat comes at 1.6 s, past the
+/// 1 s of idle time that an unset idle timeout once meant.
+#[tokio::test]
+async fn a_read_with_no_idle_timeout_waits_past_a_heartbeat() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(2));
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        idle_timeout: None,
+        ..read_cmd(1, "s")
+    };
+    complete(&worker, &first, vec![read.into()]).await;
+    let page = poll_after_heartbeat(&worker, &sent, || put(&runtime, "s", &["a"])).await;
+    let read = &reads(&page)[0];
+    assert_eq!(texts(&read.records), ["a"]);
+    assert!(read.end.is_none(), "the read ended: {:?}", read.end);
+    worker.complete_execution(&page.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    let sent = sent.lock();
+    assert!(sent[0].force_create_new_workflow_task);
+    assert!(marker(&sent[0]).is_none());
+}
+
+/// A read with a zero idle timeout doesn't wait for the Store. On an empty Stream it ends with
+/// `Idle` immediately, and on a Stream that has Records it gives them.
+#[tokio::test]
+async fn a_read_with_a_zero_idle_timeout_gives_what_is_there() {
+    let runtime = runtime();
+    create(&runtime, "empty").await;
+    create(&runtime, "full").await;
+    put(&runtime, "full", &["a", "b"]).await;
+    for (id, expected) in [("empty", vec![]), ("full", vec!["a", "b"])] {
+        let mut t = TestHistoryBuilder::default();
+        t.add_wfe_started_with_wft_timeout(Duration::from_secs(30));
+        t.add_workflow_task_scheduled_and_started();
+        let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+        let first = worker.poll_workflow_activation().await.unwrap();
+        complete(
+            &worker,
+            &first,
+            vec![read_with_idle(1, id, Duration::ZERO).into()],
+        )
+        .await;
+        let mut got = vec![];
+        let end = loop {
+            let next = worker.poll_workflow_activation().await.unwrap();
+            let read = reads(&next).pop().unwrap();
+            got.extend(texts(&read.records));
+            if let Some(end) = read.end.clone() {
+                worker.complete_execution(&next.run_id).await;
+                break end;
+            }
+            complete(&worker, &next, vec![]).await;
+        };
+        worker.drain_pollers_and_shutdown().await;
+        assert_eq!(got, expected, "{id}");
+        assert_eq!(end.stop(), StreamReadStop::Idle, "{id}");
+        assert!(!end.done, "{id}");
+    }
+}
+
 /// The idle time doesn't count while a read pauses for Workflow code to take its Records. A read
 /// that pauses at 4 MiB reads the Records that came during the pause.
 #[tokio::test]

@@ -436,7 +436,8 @@ message StartStreamRead {
     bytes from_offset = 3;
     // The longest time the read may take. Unset means no bound.
     google.protobuf.Duration timeout = 4;
-    // The read ends when no Record comes for this long. Unset means one second.
+    // The read ends when no Record comes for this long. Unset means no bound. Zero gives the
+    // Records that are in the Stream, and ends with no wait.
     google.protobuf.Duration idle_timeout = 5;
     // The most Records the read gives. Zero means no cap.
     uint32 max_records = 6;
