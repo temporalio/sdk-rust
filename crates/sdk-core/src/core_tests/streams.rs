@@ -6,7 +6,8 @@ use crate::{
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
         CounterRecordingMeter, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, mock_worker, schedule_local_activity_cmd, test_worker_cfg,
+        build_mock_pollers, hist_to_poll_resp, mock_worker, schedule_local_activity_cmd,
+        test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
 };
@@ -46,6 +47,7 @@ use temporalio_common::protos::{
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         failure::v1::{Failure, failure::FailureInfo},
         history::v1::MarkerRecordedEventAttributes,
+        workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
 };
 use temporalio_common::worker::WorkerTaskTypes;
@@ -208,6 +210,8 @@ struct Run {
     failed: Arc<Mutex<Vec<(WorkflowTaskFailedCause, String)>>>,
 }
 
+/// A Worker whose mock poller stays alive. The end of a poller begins a shutdown, which ends a
+/// task that only reads hold open, so a test shuts the Worker down when it asks.
 fn start(
     t: TestHistoryBuilder,
     responses: impl IntoIterator<Item = ResponseType>,
@@ -215,7 +219,7 @@ fn start(
     cache: usize,
     expected_fails: usize,
 ) -> Run {
-    start_with(t, responses, runtimes, cache, expected_fails, false)
+    start_with(t, responses, runtimes, cache, expected_fails, true)
 }
 
 /// As [start]. With `interminable`, the mock poller doesn't end when it gave every task, so the
@@ -480,6 +484,8 @@ async fn heartbeat_runs_without_local_activities() {
     let responses = [1, 2].map(ResponseType::ToTaskNum);
     let sent = Arc::new(Mutex::new(vec![]));
     let mut cfg = MockPollCfg::from_resps(t, responses);
+    // The poller stays alive, as the end of a poller begins a shutdown, which stops the read.
+    cfg.make_poll_stream_interminable = true;
     let kept = sent.clone();
     cfg.completion_mock_fn = Some(Box::new(move |completion| {
         kept.lock().push(completion.clone());
@@ -4595,4 +4601,60 @@ async fn a_cached_run_drops_its_own_page_for_one_in_history() {
 async fn a_cached_run_gives_no_page_that_history_lacks() {
     let seen = back_again(foreign_task_history(None), watched_with_a().await, false).await;
     assert_eq!(seen.pages, [(false, vec!["a".to_string()])], "{seen:?}");
+}
+
+/// A graceful shutdown ends a Workflow Task that only a read holds open, also when the server
+/// returns the next task inline after each heartbeat, as a real server does. The task completes
+/// with no new task, and the read resumes from History on the Worker that takes the run later.
+#[tokio::test]
+async fn a_shutdown_ends_a_task_that_only_a_read_holds() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(300));
+    for _ in 0..400 {
+        t.add_full_wf_task();
+    }
+    t.add_workflow_task_scheduled_and_started();
+    let inline = t.clone();
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut cfg = MockPollCfg::from_resps(t, [ResponseType::ToTaskNum(1)]);
+    cfg.make_poll_stream_interminable = true;
+    let kept = sent.clone();
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        let mut kept = kept.lock();
+        kept.push(completion.clone());
+        // The heartbeat forces a task, which the server returns inline.
+        let workflow_task = (completion.force_create_new_workflow_task
+            && completion.return_new_workflow_task)
+            .then(|| {
+                let next = ResponseType::ToTaskNum(kept.len() + 1);
+                hist_to_poll_resp(&inline, "fake_wf_id", next).resp
+            });
+        Ok(RespondWorkflowTaskCompletedResponse {
+            workflow_task,
+            ..Default::default()
+        })
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.stream_runtimes = runtimes(&runtime);
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
+    // The guard is long next to the heartbeat at 240 ms, so a shutdown that waits on the inline
+    // tasks shows here.
+    let shutdown =
+        tokio::time::timeout(Duration::from_secs(10), worker.drain_pollers_and_shutdown());
+    if shutdown.await.is_err() {
+        panic!(
+            "the shutdown didn't end after 10 s, with {} heartbeat completions",
+            sent.lock().len()
+        );
+    }
+    let sent = sent.lock();
+    let last = sent.last().unwrap();
+    assert!(!last.force_create_new_workflow_task && !last.return_new_workflow_task);
 }
