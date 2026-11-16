@@ -844,11 +844,12 @@ impl ManagedRun {
             } else if self.wfm.machines.outstanding_local_activity_count() == 0
                 && self.wfm.machines.outstanding_stream_appends() == 0
                 && (self.wfm.machines.has_server_commands()
+                    || self.wfm.machines.has_messages_for_server()
                     || self.wfm.machines.has_pending_close_intents())
             {
-                // Only reads are left. A command for the server, or a close, must not wait for a
-                // read, so the task completes at once, and the read gives its next pages to the
-                // next task.
+                // Only reads are left. A command or a message for the server, or a close, must not
+                // wait for a read, so the task completes immediately, and the read gives its next
+                // pages to the next task.
                 Ok(Some(None))
             } else {
                 let wft_timeout: Duration = self

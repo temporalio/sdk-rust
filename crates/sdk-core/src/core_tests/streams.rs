@@ -5,9 +5,9 @@ use crate::{
     StreamRuntimes, Worker, WorkflowErrorType,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
-        CounterRecordingMeter, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, hist_to_poll_resp, mock_worker, schedule_local_activity_cmd,
-        test_worker_cfg,
+        CounterRecordingMeter, MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt,
+        WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
+        schedule_local_activity_cmd, test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
 };
@@ -37,7 +37,8 @@ use temporalio_common::protos::{
         },
         workflow_commands::{
             ActivityCancellationType, AppendToStream, CloseStream, CloseStreamRead,
-            CompleteWorkflowExecution, StartStreamRead, StartTimer, workflow_command,
+            CompleteWorkflowExecution, StartStreamRead, StartTimer, UpdateResponse,
+            update_response, workflow_command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
@@ -4657,4 +4658,47 @@ async fn a_shutdown_ends_a_task_that_only_a_read_holds() {
     let sent = sent.lock();
     let last = sent.last().unwrap();
     assert!(!last.force_create_new_workflow_task && !last.return_new_workflow_task);
+}
+
+/// An Update rejection is a message for the server and no command. With only a read open, the
+/// task completes immediately with it, as for a command, and doesn't wait for the heartbeat.
+#[tokio::test]
+async fn an_update_rejection_next_to_a_read_completes_the_task() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(2));
+    t.add_workflow_task_scheduled_and_started();
+    let mut task = hist_to_poll_resp(&t, "fake_wf_id", ResponseType::AllHistory).resp;
+    task.add_update_request("upd-1", 1);
+    let run = start(t, [ResponseType::Raw(task)], runtimes(&runtime), 1, 0);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let rejection = UpdateResponse {
+        protocol_instance_id: "upd-1".to_string(),
+        response: Some(update_response::Response::Rejected(Default::default())),
+    };
+    let started = std::time::Instant::now();
+    complete(
+        &run.worker,
+        &first,
+        vec![read_cmd(1, "s").into(), rejection.into()],
+    )
+    .await;
+    if run.sent.lock().is_empty() {
+        // Core sends the heartbeat only while a poll waits.
+        let next = run.worker.poll_workflow_activation();
+        tokio::pin!(next);
+        tokio::select! {
+            _ = until("the rejection", || !run.sent.lock().is_empty()) => {}
+            early = &mut next => panic!("an activation came first: {early:?}"),
+        }
+        panic!(
+            "the rejection reached the server after {:?}, at the heartbeat",
+            started.elapsed()
+        );
+    }
+    let sent = run.sent.lock()[0].clone();
+    assert_eq!(sent.messages.len(), 1);
+    assert!(sent.commands.is_empty());
+    run.worker.drain_pollers_and_shutdown().await;
 }

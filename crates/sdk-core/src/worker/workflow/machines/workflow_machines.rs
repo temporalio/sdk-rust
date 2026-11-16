@@ -528,6 +528,11 @@ impl WorkflowMachines {
 
     /// True if this Workflow Task has a command for the server, other than a marker. A marker asks
     /// the server for nothing, so it never needs the task to complete early.
+    /// True if the run has a protocol message for the server, such as an Update rejection.
+    pub(crate) fn has_messages_for_server(&self) -> bool {
+        !self.message_outbox.is_empty()
+    }
+
     pub(crate) fn has_server_commands(&self) -> bool {
         self.commands
             .iter()
