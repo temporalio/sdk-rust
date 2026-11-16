@@ -2132,33 +2132,77 @@ fn timer_cmd(seq: u32) -> workflow_command::Variant {
     .into()
 }
 
-/// A read with no idle timeout has no idle bound. On a quiet Stream it holds the task open with
-/// the heartbeat, and gets a Record that comes after it. The heartbeat comes at 1.6 s, past the
-/// 1 s of idle time that an unset idle timeout once meant.
+/// A read with no idle timeout ends after 1 minute with no Record. On a quiet Stream it holds its
+/// task open past a heartbeat, and then ends with `Idle`. Tokio's paused clock moves the minute.
 #[tokio::test]
-async fn a_read_with_no_idle_timeout_waits_past_a_heartbeat() {
-    let runtime = runtime();
+async fn a_read_with_no_idle_timeout_ends_after_a_minute() {
+    let waits = Arc::new(AtomicUsize::new(0));
+    let store = WatchedStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        gave: Default::default(),
+        waits: waits.clone(),
+    };
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
     create(&runtime, "s").await;
+    // The heartbeats come at 40 s and 80 s, so the minute ends between them.
     let mut t = TestHistoryBuilder::default();
-    t.add_wfe_started_with_wft_timeout(Duration::from_secs(2));
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(50));
     t.add_full_wf_task();
     t.add_workflow_task_scheduled_and_started();
-    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut cfg = MockPollCfg::from_resps(t, [1, 2].map(ResponseType::ToTaskNum));
+    cfg.make_poll_stream_interminable = true;
+    let kept = sent.clone();
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        kept.lock().push(completion.clone());
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    // With no Local Activity manager, the Stream manager keeps the heartbeat on Tokio's clock.
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.task_types = WorkerTaskTypes::workflow_only();
+        wc.stream_runtimes = runtimes(&runtime);
+    });
+    let worker = mock_worker(mock);
     let first = worker.poll_workflow_activation().await.unwrap();
     let read = StartStreamRead {
         idle_timeout: None,
         ..read_cmd(1, "s")
     };
     complete(&worker, &first, vec![read.into()]).await;
-    let page = poll_after_heartbeat(&worker, &sent, || put(&runtime, "s", &["a"])).await;
-    let read = &reads(&page)[0];
-    assert_eq!(texts(&read.records), ["a"]);
-    assert!(read.end.is_none(), "the read ended: {:?}", read.end);
-    worker.complete_execution(&page.run_id).await;
+    // The read's minute counts on this test's clock from its first wait on the Store.
+    until("the read's wait on the Store", || {
+        waits.load(Ordering::Acquire) == 1
+    })
+    .await;
+    let ended = {
+        let next = worker.poll_workflow_activation();
+        tokio::pin!(next);
+        tokio::select! {
+            _ = async {
+                move_clock(Duration::from_secs(40)).await;
+                until("the heartbeat", || sent.lock().len() == 1).await;
+            } => {}
+            early = &mut next => panic!("an activation came before the heartbeat: {early:?}"),
+        }
+        assert!(sent.lock()[0].force_create_new_workflow_task);
+        let ended = tokio::select! {
+            ended = tokio::time::timeout(Duration::from_secs(30), &mut next) => ended,
+            _ = move_clock(Duration::from_secs(20)) => {
+                tokio::time::timeout(Duration::from_secs(30), &mut next).await
+            }
+        };
+        ended
+    };
+    let ended = ended
+        .expect("the read didn't end after its minute")
+        .unwrap();
+    let read = &reads(&ended)[0];
+    assert!(read.records.is_empty());
+    assert_eq!(stop(read), StreamReadStop::Idle);
+    worker.complete_execution(&ended.run_id).await;
     worker.drain_pollers_and_shutdown().await;
-    let sent = sent.lock();
-    assert!(sent[0].force_create_new_workflow_task);
-    assert!(marker(&sent[0]).is_none());
 }
 
 /// A read whose timeout passed before Core could start it still looks at the Store once, and
@@ -4269,10 +4313,10 @@ impl Windowed {
     }
 }
 
-/// A read with no idle bound, since a test moves the clock by a long window.
-fn unbounded_read(seq: u32) -> StartStreamRead {
+/// A read whose idle timeout is far past the clock moves of a test with a long window.
+fn long_read(seq: u32) -> StartStreamRead {
     StartStreamRead {
-        idle_timeout: None,
+        idle_timeout: Some(Duration::from_secs(3600).try_into().unwrap()),
         ..read_cmd(seq, "s")
     }
 }
@@ -4291,7 +4335,7 @@ const LONG_WINDOW: Duration = Duration::from_secs(60);
 #[tokio::test]
 async fn a_read_gives_the_records_of_its_window_in_one_batch() {
     let w = Windowed::new(LONG_WINDOW).await;
-    complete(&w.run.worker, &w.first, vec![unbounded_read(1).into()]).await;
+    complete(&w.run.worker, &w.first, vec![long_read(1).into()]).await;
     until("the read's wait on the Store", || {
         w.waits.load(Ordering::Acquire) == 1
     })
@@ -4326,7 +4370,7 @@ async fn a_read_gives_the_records_of_its_window_in_one_batch() {
 #[tokio::test]
 async fn a_zero_window_gives_each_batch_as_it_comes() {
     let w = Windowed::new(Duration::ZERO).await;
-    complete(&w.run.worker, &w.first, vec![unbounded_read(1).into()]).await;
+    complete(&w.run.worker, &w.first, vec![long_read(1).into()]).await;
     let mut last = None;
     for (at, text) in ["a", "b", "c"].into_iter().enumerate() {
         // The read waits on the Store before the Record comes, so no window holds it.
@@ -4354,7 +4398,7 @@ async fn a_timeout_in_the_window_ends_the_read() {
     let w = Windowed::new(LONG_WINDOW).await;
     let read = StartStreamRead {
         timeout: Some(Duration::from_secs(30).try_into().unwrap()),
-        ..unbounded_read(1)
+        ..long_read(1)
     };
     complete(&w.run.worker, &w.first, vec![read.into()]).await;
     put(&w.runtime, "s", &["a"]).await;
@@ -4376,13 +4420,13 @@ async fn a_timeout_in_the_window_ends_the_read() {
 #[tokio::test]
 async fn a_close_in_the_window_stops_the_read() {
     let w = Windowed::new(LONG_WINDOW).await;
-    complete(&w.run.worker, &w.first, vec![unbounded_read(1).into()]).await;
+    complete(&w.run.worker, &w.first, vec![long_read(1).into()]).await;
     put(&w.runtime, "s", &["a"]).await;
     let page = w.next().await;
     let after_a = reads(&page)[0].records[0].offset.clone();
     let second = StartStreamRead {
         from_offset: after_a,
-        ..unbounded_read(2)
+        ..long_read(2)
     };
     complete(
         &w.run.worker,
