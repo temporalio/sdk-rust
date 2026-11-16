@@ -139,8 +139,8 @@ enum HeldResult {
         page: ResolveStreamRead,
     },
     Append(resolve_stream_append::Status),
-    /// The intent of a close, which gives no job.
-    CloseIntent,
+    /// The intent of a close, with the epoch of its task, which gives no job.
+    CloseIntent(Option<WorkflowTaskEpoch>),
     CloseResult(Option<Failure>),
 }
 
@@ -258,22 +258,8 @@ impl StreamCalls {
             stores.push(read.stream.store.clone());
             self.requests.push(StreamRequest::Read(read.spec()));
         }
-        // A close that history recorded with no result is sent again, with the task in hand.
-        let mut resent: Vec<_> = self
-            .closes
-            .iter()
-            .filter(|(_, close)| {
-                matches!(close.intent, Intent::Recorded(_)) && !close.queued && !close.resolved
-            })
-            .map(|(seq, _)| *seq)
-            .collect();
-        resent.sort();
-        for seq in resent {
-            if let Some(close) = self.closes.get_mut(&seq) {
-                close.intent = Intent::Recorded(None);
-            }
-            self.queue_close(seq);
-        }
+        // A close that history recorded with no result waits in its Stream's queue since its intent
+        // replayed. It runs again with the epoch of that intent.
         let mut keys: Vec<_> = self.append_queues.keys().cloned().collect();
         keys.sort();
         for key in keys {
@@ -364,7 +350,10 @@ impl StreamCalls {
             .entry(key.clone())
             .or_default()
             .push_back(Queued::Close(seq));
-        self.dispatch_head(&key);
+        // A replaying run sends nothing. It runs the head of each queue once it goes live.
+        if self.live {
+            self.dispatch_head(&key);
+        }
     }
 
     /// Runs the call at the front of a Stream's queue, unless it runs already. Returns its Store.
@@ -638,7 +627,7 @@ impl StreamCalls {
             let (activation, result) = if entry.resolved {
                 (entry.activation, HeldResult::CloseResult(entry.failure))
             } else {
-                (0, HeldResult::CloseIntent)
+                (0, HeldResult::CloseIntent(entry.intent_epoch))
             };
             self.held.push(Held {
                 seq: entry.seq,
@@ -661,7 +650,7 @@ impl StreamCalls {
             let started = match held.result {
                 HeldResult::Read { .. } => self.reads.contains_key(&held.seq),
                 HeldResult::Append(_) => self.appends.contains_key(&held.seq),
-                HeldResult::CloseIntent | HeldResult::CloseResult(_) => {
+                HeldResult::CloseIntent(_) | HeldResult::CloseResult(_) => {
                     self.closes.contains_key(&held.seq)
                 }
             };
@@ -750,14 +739,20 @@ impl StreamCalls {
                     status: Some(status),
                 })))
             }
-            HeldResult::CloseIntent => {
+            HeldResult::CloseIntent(epoch) => {
                 let close = self.held_close(seq, &stream)?;
                 if !matches!(close.intent, Intent::Pending) {
                     return Err(nondeterminism!(
                         "History has a second intent of Stream close {seq}"
                     ));
                 }
-                close.intent = Intent::Recorded(None);
+                close.intent = Intent::Recorded(epoch);
+                // The close takes its place in its Stream's queue here, as on the Worker that
+                // recorded it, so that it runs in front of every call of a later task. A result
+                // later in History takes it out again.
+                if self.calls_stores {
+                    self.queue_close(seq);
+                }
                 Ok(None)
             }
             HeldResult::CloseResult(failed) => {
@@ -810,7 +805,7 @@ impl StreamCalls {
                 match held.result {
                     HeldResult::Read { .. } => "read",
                     HeldResult::Append(_) => "append",
-                    HeldResult::CloseIntent | HeldResult::CloseResult(_) => "close",
+                    HeldResult::CloseIntent(_) | HeldResult::CloseResult(_) => "close",
                 },
                 held.seq
             )),

@@ -374,8 +374,8 @@ pub(crate) struct CloseSpec {
     pub(crate) stream: StreamRef,
     /// The Producer that lang sent, with no epoch.
     pub(crate) producer: Producer,
-    /// The task that recorded the close, or `None` for the task in hand, when a replay sends again
-    /// a close that history recorded with no result.
+    /// The task that recorded the close, also when a replay sends it again. `None` only for a
+    /// marker with no `intent_epoch`, which then takes the task in hand.
     pub(crate) epoch: Option<WorkflowTaskEpoch>,
 }
 
