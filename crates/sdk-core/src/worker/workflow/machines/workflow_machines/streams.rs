@@ -4,8 +4,8 @@
 use crate::worker::workflow::{
     OutgoingJob, WFMachinesError, fatal, nondeterminism,
     streams::{
-        AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult,
-        StreamRequest, StreamResolution, next_call_id,
+        AppendSpec, CloseSpec, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
+        StreamResolution, next_call_id,
     },
 };
 use prost::Message;
@@ -80,7 +80,8 @@ struct Read {
     from_offset: Vec<u8>,
     records_in_history: bool,
     deadline: Option<SystemTime>,
-    idle_timeout: Duration,
+    /// `None` for a read that set no idle timeout, which has no idle bound.
+    idle_timeout: Option<Duration>,
     max_records: u32,
     max_bytes: u64,
     flow: Arc<ReadFlow>,
@@ -209,7 +210,10 @@ impl StreamCalls {
             from_offset: attrs.from_offset,
             records_in_history: attrs.records_in_history,
             deadline,
-            idle_timeout: duration(attrs.idle_timeout).unwrap_or(DEFAULT_IDLE_TIMEOUT),
+            // An unset idle timeout is no bound, and a zero one, or a negative one, doesn't wait.
+            idle_timeout: attrs
+                .idle_timeout
+                .map(|idle| Duration::try_from(idle).unwrap_or_default()),
             max_records: attrs.max_records,
             max_bytes: attrs.max_bytes,
             flow: Arc::new(ReadFlow::default()),
