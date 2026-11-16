@@ -2141,6 +2141,7 @@ async fn a_read_with_no_idle_timeout_ends_after_a_minute() {
         inner: MemoryStore::new(DEFAULT_RETENTION, None),
         gave: Default::default(),
         waits: waits.clone(),
+        closes: Default::default(),
     };
     let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
     create(&runtime, "s").await;
@@ -3256,10 +3257,17 @@ fn close_history(intent: StreamCloseEntry, result: Option<StreamCloseEntry>) -> 
 }
 
 /// A Worker that is gone after History recorded the intent of a close. A new Worker replays the
-/// intent, sends the close with the task in hand, and gives the result.
+/// intent, sends the close with the epoch of the intent's task, and gives the result.
 #[tokio::test]
 async fn a_new_worker_sends_a_recorded_close() {
-    let runtime = runtime();
+    let closes = Arc::new(Mutex::new(vec![]));
+    let store = WatchedStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        gave: Default::default(),
+        waits: Default::default(),
+        closes: closes.clone(),
+    };
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
     create(&runtime, "s").await;
     let t = close_history(intent_entry(1), None);
     let run_id = t.get_orig_run_id().to_string();
@@ -3276,6 +3284,66 @@ async fn a_new_worker_sends_a_recorded_close() {
     let data = marker(&sent[0]).unwrap();
     assert_eq!(data.closes.len(), 1);
     assert!(data.closes[0].resolved);
+    let Some(Kind::Workflow(sent_by)) = closes.lock()[0].kind.clone() else {
+        panic!("the close had no Workflow Producer");
+    };
+    assert_eq!(
+        sent_by.epoch,
+        Some(task_epoch(3)),
+        "the close has another epoch"
+    );
+}
+
+/// A close that a new Worker sends again goes in front of an append that Workflow code issued in
+/// a later task, so the append gets `stream_closed`, as on the first Worker.
+#[tokio::test]
+async fn a_resent_close_goes_before_a_later_append() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    stream_marker_event(&mut t, 4, &closes_only(vec![intent_entry(1)]));
+    t.add_we_signaled("go", vec![]);
+    // The task of the append completed with the append in flight, so it has no marker.
+    t.add_full_wf_task();
+    t.add_we_signaled("again", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    let go = worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&go) && go.is_replaying);
+    complete(
+        &worker,
+        &go,
+        vec![append_cmd(1, "s", &run_id, &["late"]).into()],
+    )
+    .await;
+    let (mut appended, mut closed) = (None, None);
+    let last = loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        appended = appended.or(appends(&next).pop());
+        closed = closed.or(closes(&next).pop());
+        if appended.is_some() && closed.is_some() {
+            break next;
+        }
+        complete(&worker, &next, vec![]).await;
+    };
+    worker.complete_execution(&last.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    let records = texts(&all_records(&runtime, "s").await);
+    assert!(
+        matches!(
+            appended.unwrap().status,
+            Some(resolve_stream_append::Status::Failed(ref failure))
+                if failure.message.starts_with("stream_closed")
+        ),
+        "the append wasn't refused, and the Store has {records:?}"
+    );
+    assert!(closed.unwrap().failed.is_none());
+    assert!(records.is_empty() && stream_is_closed(&runtime, "s"));
 }
 
 /// A replay of a History with an intent and its result calls no Store, and gives the result in
@@ -4212,6 +4280,8 @@ struct WatchedStore {
     /// The clock time and the count of each read that gave Records.
     gave: Arc<Mutex<Vec<(tokio::time::Instant, usize)>>>,
     waits: Arc<AtomicUsize>,
+    /// The Producer of each close.
+    closes: Arc<Mutex<Vec<Producer>>>,
 }
 
 #[async_trait::async_trait]
@@ -4254,6 +4324,7 @@ impl Store for WatchedStore {
     }
 
     async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.closes.lock().push(producer.clone());
         self.inner.close(stream_ref, producer).await
     }
 }
@@ -4277,6 +4348,7 @@ impl Windowed {
             inner: MemoryStore::new(DEFAULT_RETENTION, None),
             gave: gave.clone(),
             waits: waits.clone(),
+            closes: Default::default(),
         };
         let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
         create(&runtime, "s").await;
@@ -4515,6 +4587,7 @@ async fn watched_with_a() -> Watched {
         inner: MemoryStore::new(DEFAULT_RETENTION, None),
         gave: gave.clone(),
         waits: Arc::new(AtomicUsize::new(0)),
+        closes: Default::default(),
     };
     let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
     create(&runtime, "s").await;
