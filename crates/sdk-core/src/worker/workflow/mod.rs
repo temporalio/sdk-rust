@@ -404,6 +404,7 @@ impl Workflows {
                         messages,
                         query_responses,
                         force_new_wft,
+                        return_new_wft,
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
@@ -433,7 +434,7 @@ impl Workflows {
                     messages,
                     query_responses,
                     sticky_attributes: None,
-                    return_new_workflow_task: true,
+                    return_new_workflow_task: return_new_wft,
                     force_create_new_workflow_task: force_new_wft,
                     sdk_metadata,
                     metering_metadata: MeteringMetadata {
@@ -1243,6 +1244,8 @@ pub(crate) enum ActivationAction {
         messages: Vec<ProtocolMessage>,
         query_responses: Vec<QueryResult>,
         force_new_wft: bool,
+        /// False when the run asks for no new task, as at a graceful shutdown.
+        return_new_wft: bool,
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
