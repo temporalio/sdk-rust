@@ -846,7 +846,8 @@ impl ManagedRun {
                 && self.wfm.machines.outstanding_stream_appends() == 0
                 && (self.wfm.machines.has_server_commands()
                     || self.wfm.machines.has_messages_for_server()
-                    || self.wfm.machines.has_pending_close_intents())
+                    || self.wfm.machines.has_pending_close_intents()
+                    || self.wfm.machines.stream_marker_full())
             {
                 // Only reads are left. A command or a message for the server, or a close, must not
                 // wait for a read, so the task completes immediately, and the read gives its next
