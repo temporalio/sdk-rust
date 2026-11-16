@@ -4059,7 +4059,16 @@ async fn a_shutdown_gives_up_a_close_past_its_bound() {
     let run_id = t.get_orig_run_id().to_string();
     // A short bound keeps the test quick. The two tests before this one check the wait.
     let runtimes = held.runtimes().with_close_bound(Duration::from_secs(1));
-    let run = start_with(t, [ResponseType::AllHistory], runtimes, 1, 0, true);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let run = start_metered(
+        t,
+        [ResponseType::AllHistory],
+        runtimes,
+        1,
+        0,
+        true,
+        Some(&meter),
+    );
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(
         &run.worker,
@@ -4073,6 +4082,10 @@ async fn a_shutdown_gives_up_a_close_past_its_bound() {
     held.held.notified().await;
     run.worker.drain_pollers_and_shutdown().await;
     assert!(!stream_is_closed(&held.runtime, "s"));
+    assert_eq!(
+        totals(&meter, &["stream_close_total", "stream_close_abandoned"]),
+        [1, 1]
+    );
 }
 
 /// A `read_ahead_bytes` that four Records of 1 KiB pass, so that a test pauses a read with little
