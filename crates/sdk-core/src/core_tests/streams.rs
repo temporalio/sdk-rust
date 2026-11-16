@@ -15,7 +15,10 @@ use parking_lot::Mutex;
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use temporalio_common::protos::{
@@ -429,11 +432,10 @@ async fn read_spans_three_tasks() {
         ]
     );
 
-    let entry = &marker(&sent[0]).unwrap().reads[0];
-    assert_eq!(
-        (entry.seq, entry.stream.clone(), entry.count),
-        (1, Some(stream("s")), 1)
-    );
+    let data = marker(&sent[0]).unwrap();
+    let entry = &data.reads[0];
+    assert_eq!(data.streams, [stream("s")]);
+    assert_eq!((entry.seq, entry.stream_index, entry.count), (1, 0, 1));
     assert!(entry.from_offset.is_empty() && entry.after_offset.is_empty());
     assert_eq!(entry.last_offset, offset(0));
     assert_eq!(entry.digest, records_digest(&records[..1]).to_vec());
@@ -597,7 +599,10 @@ async fn two_reads_keep_their_pages_and_activations() {
     let mut entries: Vec<_> = data
         .reads
         .iter()
-        .map(|entry| (entry.seq, entry.stream.clone().unwrap().id, entry.count))
+        .map(|entry| {
+            let stream = &data.streams[entry.stream_index as usize];
+            (entry.seq, stream.id.clone(), entry.count)
+        })
         .collect();
     entries.sort();
     assert_eq!(entries, [(1, "x".to_string(), 1), (2, "y".to_string(), 1)]);
@@ -1140,7 +1145,6 @@ struct Page<'a> {
 /// The marker entry of read `seq` of Stream `id`, with its pages and its end.
 fn read_entry(
     seq: u32,
-    id: &str,
     after_offset: Vec<u8>,
     pages: &[Page<'_>],
     end: Option<(StreamReadStop, u32)>,
@@ -1170,7 +1174,7 @@ fn read_entry(
         .collect();
     StreamReadEntry {
         seq,
-        stream: Some(stream(id)),
+        stream_index: 0,
         from_offset: vec![],
         end: end.map(|(stop, activation)| StreamReadEnded {
             last_offset: if last_offset.is_empty() {
@@ -1259,18 +1263,12 @@ async fn replay_reads_records_from_the_store() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(
-        1,
-        "s",
-        vec![],
-        &[page],
-        Some((StreamReadStop::Done, 1)),
-        false,
-    );
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), false);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
 
@@ -1307,18 +1305,12 @@ async fn replay_from_history_calls_no_store() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(
-        1,
-        "s",
-        vec![],
-        &[page],
-        Some((StreamReadStop::Done, 1)),
-        true,
-    );
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), true);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let run = start(
         t,
@@ -1373,7 +1365,7 @@ fn one_page(records: &[StreamRecord]) -> (StreamMarkerData, String) {
         records,
         activation: 1,
     };
-    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let entry = read_entry(1, vec![], &[page], None, false);
     let range = format!(
         "Stream `s` in Store `mem`, the Records after the start through offset {}",
         records
@@ -1389,6 +1381,7 @@ fn one_page(records: &[StreamRecord]) -> (StreamMarkerData, String) {
             reads: vec![entry],
             appends: vec![],
             closes: vec![],
+            streams: vec![stream("s")],
         },
         range,
     )
@@ -1450,7 +1443,7 @@ async fn append_replay_calls_no_store() {
     create(&runtime, "s").await;
     let appended = StreamAppendEntry {
         seq: 1,
-        stream: Some(stream("s")),
+        stream_index: 0,
         first_offset: 7u64.to_be_bytes().to_vec(),
         last_offset: 8u64.to_be_bytes().to_vec(),
         failure: None,
@@ -1460,6 +1453,7 @@ async fn append_replay_calls_no_store() {
         reads: vec![],
         appends: vec![appended.clone()],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let run_id = t.get_orig_run_id().to_string();
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
@@ -1500,11 +1494,12 @@ async fn open_read_resumes_after_replay() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let entry = read_entry(1, vec![], &[page], None, false);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
 
@@ -1546,11 +1541,12 @@ async fn resumed_read_keeps_its_deadline() {
         records: &records[..1],
         activation: 1,
     };
-    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let entry = read_entry(1, vec![], &[page], None, false);
     let mut t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
     for event_id in 1..=5 {
@@ -1595,11 +1591,12 @@ async fn close_ends_a_read_in_replay() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(1, "s", vec![], &[page], None, false);
+    let entry = read_entry(1, vec![], &[page], None, false);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 0);
 
@@ -1689,14 +1686,7 @@ async fn worker_with_no_cache_runs_reads_and_appends() {
         records: &records,
         activation: 0,
     };
-    let entry = read_entry(
-        1,
-        "s",
-        vec![],
-        &[page],
-        Some((StreamReadStop::Done, 0)),
-        false,
-    );
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 0)), false);
     stream_marker_event(
         &mut t,
         8,
@@ -1704,6 +1694,7 @@ async fn worker_with_no_cache_runs_reads_and_appends() {
             reads: vec![entry],
             appends: vec![],
             closes: vec![],
+            streams: vec![stream("s")],
         },
     );
     t.add_timer_fired(timer, "1".to_string());
@@ -1759,14 +1750,7 @@ async fn worker_with_no_cache_runs_reads_and_appends() {
             records: &records,
             activation: 0,
         };
-        read_entry(
-            1,
-            "s",
-            vec![],
-            &[page],
-            Some((StreamReadStop::Done, 0)),
-            false,
-        )
+        read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 0)), false)
     });
     assert_eq!(
         command_types(&sent[2]),
@@ -2243,15 +2227,17 @@ async fn a_read_with_a_zero_idle_timeout_gives_what_is_there() {
 }
 
 /// The idle time doesn't count while a read pauses for Workflow code to take its Records. A read
-/// that pauses at 4 MiB reads the Records that came during the pause.
+/// that pauses at its `read_ahead_bytes` reads the Records that came during the pause.
 #[tokio::test]
 async fn idle_time_skips_a_paused_read() {
-    let runtime = runtime();
+    let (runtime, served) = counted_runtime();
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(30));
     t.add_workflow_task_scheduled_and_started();
-    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let runtimes = runtimes(&runtime).with_read_ahead_bytes(SMALL_READ_AHEAD);
+    let run = start(t, [ResponseType::AllHistory], runtimes, 1, 0);
+    let worker = run.worker;
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(
         &worker,
@@ -2262,11 +2248,15 @@ async fn idle_time_skips_a_paused_read() {
     put(&runtime, "s", &["a"]).await;
     let page = worker.poll_workflow_activation().await.unwrap();
     let mut got = reads(&page)[0].records.len();
-    let big = "x".repeat(1 << 20);
+    let big = "x".repeat(1 << 10);
     for _ in 0..4 {
         put(&runtime, "s", &[big.as_str()]).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Four Records of 1 KiB pass the bound, so the read pauses once the Store gave them.
+    until("the read of four Records", || {
+        served.load(Ordering::Acquire) >= 5
+    })
+    .await;
     for _ in 0..2 {
         put(&runtime, "s", &[big.as_str()]).await;
     }
@@ -2334,33 +2324,41 @@ async fn idle_time_skips_a_page_that_waits_for_a_task() {
     assert!(sent.lock()[0].force_create_new_workflow_task);
 }
 
-/// No read task outlives its Worker, also one that paused because its run holds 4 MiB that no
-/// Workflow Task took.
+/// No read task outlives its Worker, also one that paused because its run holds its
+/// `read_ahead_bytes` that no Workflow Task took.
 #[tokio::test]
 async fn no_read_outlives_its_worker() {
-    let runtime = runtime();
+    let (runtime, served) = counted_runtime();
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
-    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let runtimes = runtimes(&runtime).with_read_ahead_bytes(SMALL_READ_AHEAD);
+    // The mock poller stays alive, or its end would shut the Worker down before the read pauses.
+    let run = start_with(t, [ResponseType::AllHistory], runtimes, 1, 0, true);
+    let (worker, sent) = (run.worker, run.sent);
     let first = worker.poll_workflow_activation().await.unwrap();
-    // The timer completes the task at once, so the read's pages wait for a task that never comes.
     complete(
         &worker,
         &first,
-        vec![
-            read_with_idle(1, "s", Duration::from_secs(1)).into(),
-            timer_cmd(1),
-        ],
+        vec![read_with_idle(1, "s", Duration::from_secs(1)).into()],
     )
     .await;
+    put(&runtime, "s", &["a"]).await;
+    let page = worker.poll_workflow_activation().await.unwrap();
+    // The timer completes the task immediately, so the read's later pages wait for a task that
+    // never comes.
+    complete(&worker, &page, vec![timer_cmd(1)]).await;
     assert_eq!(sent.lock().len(), 1);
-    let big = "x".repeat(1 << 20);
+    let big = "x".repeat(1 << 10);
     for _ in 0..5 {
         put(&runtime, "s", &[big.as_str()]).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Four Records of 1 KiB pass the bound, so the read pauses once the Store gave them.
+    until("the read of four Records", || {
+        served.load(Ordering::Acquire) >= 5
+    })
+    .await;
     worker.drain_pollers_and_shutdown().await;
     // A paused read would hold the runtime for good, so this wait would not end.
     until("the end of every Stream task", || {
@@ -2446,11 +2444,12 @@ async fn a_replay_worker_needs_no_runtime_for_an_open_read() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(1, "s", vec![], &[page], None, true);
+    let entry = read_entry(1, vec![], &[page], None, true);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let worker = replay_worker(t, StreamRuntimes::default());
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -2486,18 +2485,12 @@ async fn a_replay_worker_reads_a_marker_from_the_store() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(
-        1,
-        "s",
-        vec![],
-        &[page],
-        Some((StreamReadStop::Done, 1)),
-        false,
-    );
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), false);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let worker = replay_worker(t, runtimes(&runtime));
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -2516,26 +2509,19 @@ async fn a_replay_worker_reads_a_marker_from_the_store() {
 async fn a_cached_run_reads_no_marker_of_a_full_history() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let elsewhere = StreamReadEntry {
-        stream: Some(StreamRef {
-            id: "s".to_string(),
-            store: "elsewhere".to_string(),
-        }),
-        ..read_entry(
-            1,
-            "s",
-            vec![],
-            &[Page {
-                records: &[StreamRecord {
-                    offset: 1u64.to_be_bytes().to_vec(),
-                    ..Default::default()
-                }],
-                activation: 1,
+    let elsewhere = read_entry(
+        1,
+        vec![],
+        &[Page {
+            records: &[StreamRecord {
+                offset: 1u64.to_be_bytes().to_vec(),
+                ..Default::default()
             }],
-            None,
-            false,
-        )
-    };
+            activation: 1,
+        }],
+        None,
+        false,
+    );
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(500));
     t.add_full_wf_task();
@@ -2546,6 +2532,10 @@ async fn a_cached_run_reads_no_marker_of_a_full_history() {
             reads: vec![elsewhere],
             appends: vec![],
             closes: vec![],
+            streams: vec![StreamRef {
+                id: "s".to_string(),
+                store: "elsewhere".to_string(),
+            }],
         },
     );
     t.add_we_signaled("go", vec![]);
@@ -2656,18 +2646,12 @@ async fn a_replayed_read_with_no_store_name_takes_the_store_of_history() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(
-        1,
-        "s",
-        vec![],
-        &[page],
-        Some((StreamReadStop::Done, 1)),
-        true,
-    );
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), true);
     let t = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let worker = replay_worker(t, StreamRuntimes::default());
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -2698,7 +2682,7 @@ async fn a_replayed_read_with_no_store_name_takes_the_store_of_history() {
 async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
     let appended = StreamAppendEntry {
         seq: 1,
-        stream: Some(stream("s")),
+        stream_index: 0,
         first_offset: 7u64.to_be_bytes().to_vec(),
         last_offset: 7u64.to_be_bytes().to_vec(),
         failure: None,
@@ -2708,6 +2692,7 @@ async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
         reads: vec![],
         appends: vec![appended],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let run_id = t.get_orig_run_id().to_string();
     let worker = replay_worker(t, StreamRuntimes::default());
@@ -3170,19 +3155,17 @@ async fn a_workflow_that_completes_with_its_close_still_closes_the_stream() {
     assert!(!sent[0].force_create_new_workflow_task);
 }
 
-fn intent_entry(seq: u32, id: &str) -> StreamCloseEntry {
+fn intent_entry(seq: u32) -> StreamCloseEntry {
     StreamCloseEntry {
         seq,
-        stream: Some(stream(id)),
         intent_epoch: Some(task_epoch(3)),
         ..Default::default()
     }
 }
 
-fn close_result_entry(seq: u32, id: &str, failure: Option<Failure>) -> StreamCloseEntry {
+fn close_result_entry(seq: u32, failure: Option<Failure>) -> StreamCloseEntry {
     StreamCloseEntry {
         seq,
-        stream: Some(stream(id)),
         resolved: true,
         failure,
         activation: 0,
@@ -3195,6 +3178,7 @@ fn closes_only(closes: Vec<StreamCloseEntry>) -> StreamMarkerData {
         reads: vec![],
         appends: vec![],
         closes,
+        streams: vec![stream("s")],
     }
 }
 
@@ -3220,7 +3204,7 @@ fn close_history(intent: StreamCloseEntry, result: Option<StreamCloseEntry>) -> 
 async fn a_new_worker_sends_a_recorded_close() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = close_history(intent_entry(1, "s"), None);
+    let t = close_history(intent_entry(1), None);
     let run_id = t.get_orig_run_id().to_string();
     let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -3243,7 +3227,7 @@ async fn a_new_worker_sends_a_recorded_close() {
 async fn a_replay_of_a_close_and_its_result_calls_no_store() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = close_history(intent_entry(1, "s"), Some(close_result_entry(1, "s", None)));
+    let t = close_history(intent_entry(1), Some(close_result_entry(1, None)));
     let run_id = t.get_orig_run_id().to_string();
     let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -3268,7 +3252,7 @@ async fn a_replay_of_a_close_and_its_result_calls_no_store() {
 async fn a_replay_worker_sends_no_recorded_close() {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = close_history(intent_entry(1, "s"), None);
+    let t = close_history(intent_entry(1), None);
     let run_id = t.get_orig_run_id().to_string();
     let worker = replay_worker(t, runtimes(&runtime));
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -3297,8 +3281,8 @@ async fn a_refused_close_replays_its_failure() {
         ..Default::default()
     };
     let t = close_history(
-        intent_entry(1, "s"),
-        Some(close_result_entry(1, "s", Some(failure.clone()))),
+        intent_entry(1),
+        Some(close_result_entry(1, Some(failure.clone()))),
     );
     let run_id = t.get_orig_run_id().to_string();
     let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
@@ -3320,7 +3304,7 @@ async fn replay_close_history(
 ) -> (WorkflowTaskFailedCause, String) {
     let runtime = runtime();
     create(&runtime, "s").await;
-    let t = close_history(intent_entry(1, "s"), None);
+    let t = close_history(intent_entry(1), None);
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(&run.worker, &first, commands).await;
@@ -3356,7 +3340,7 @@ async fn a_close_of_another_stream_is_nondeterministic() {
 /// runtime replays it.
 #[tokio::test]
 async fn a_replayed_close_with_no_store_name_takes_the_store_of_history() {
-    let t = close_history(intent_entry(1, "s"), Some(close_result_entry(1, "s", None)));
+    let t = close_history(intent_entry(1), Some(close_result_entry(1, None)));
     let run_id = t.get_orig_run_id().to_string();
     let worker = replay_worker(t, StreamRuntimes::default());
     let first = worker.poll_workflow_activation().await.unwrap();
@@ -3663,18 +3647,12 @@ async fn replayed_calls_count_nothing() {
         records: &records,
         activation: 1,
     };
-    let entry = read_entry(
-        1,
-        "s",
-        vec![],
-        &[page],
-        Some((StreamReadStop::Done, 1)),
-        true,
-    );
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), true);
     let read_history = replayed_read_history(&StreamMarkerData {
         reads: vec![entry],
         appends: vec![],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let read = StartStreamRead {
         records_in_history: true,
@@ -3682,7 +3660,7 @@ async fn replayed_calls_count_nothing() {
     };
     let appended = StreamAppendEntry {
         seq: 1,
-        stream: Some(stream("s")),
+        stream_index: 0,
         first_offset: 7u64.to_be_bytes().to_vec(),
         last_offset: 8u64.to_be_bytes().to_vec(),
         failure: None,
@@ -3692,9 +3670,10 @@ async fn replayed_calls_count_nothing() {
         reads: vec![],
         appends: vec![appended],
         closes: vec![],
+        streams: vec![stream("s")],
     });
     let append_run = append_history.get_orig_run_id().to_string();
-    let close_events = close_history(intent_entry(1, "s"), Some(close_result_entry(1, "s", None)));
+    let close_events = close_history(intent_entry(1), Some(close_result_entry(1, None)));
     let close_run = close_events.get_orig_run_id().to_string();
     for (t, command) in [
         (read_history, workflow_command::Variant::from(read)),
@@ -3971,4 +3950,203 @@ async fn a_shutdown_gives_up_a_close_past_its_bound() {
     held.held.notified().await;
     run.worker.drain_pollers_and_shutdown().await;
     assert!(!stream_is_closed(&held.runtime, "s"));
+}
+
+/// A `read_ahead_bytes` that four Records of 1 KiB pass, so that a test pauses a read with little
+/// memory.
+const SMALL_READ_AHEAD: usize = 4 << 10;
+
+/// A memory Store that counts the entries that its reads gave.
+struct CountedStore {
+    inner: MemoryStore,
+    served: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Store for CountedStore {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.inner.create(stream_ref, create).await
+    }
+
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        self.inner.append(stream_ref, batch).await
+    }
+
+    async fn read(
+        &self,
+        stream_ref: &StreamRef,
+        from: i64,
+        count: usize,
+    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        let read = self.inner.read(stream_ref, from, count).await?;
+        self.served.fetch_add(read.1.len(), Ordering::AcqRel);
+        Ok(read)
+    }
+
+    async fn wait_after(
+        &self,
+        stream_ref: &StreamRef,
+        after: i64,
+        deadline: tokio::time::Instant,
+    ) -> StreamResult<bool> {
+        self.inner.wait_after(stream_ref, after, deadline).await
+    }
+
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.inner.close(stream_ref, producer).await
+    }
+}
+
+/// A runtime on a [CountedStore], and the count of the entries that its reads gave.
+fn counted_runtime() -> (Arc<StreamRuntime>, Arc<AtomicUsize>) {
+    let served = Arc::new(AtomicUsize::new(0));
+    let store = CountedStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        served: served.clone(),
+    };
+    (StreamRuntime::new(STORE, Arc::new(store), None), served)
+}
+
+/// A read with a small `read_ahead_bytes` stops asking the Store while that many bytes of its
+/// Records wait for Workflow code, and goes on once an activation takes them. Its first page
+/// always comes.
+#[tokio::test]
+async fn a_read_pauses_at_its_read_ahead_bytes() {
+    let (runtime, served) = counted_runtime();
+    create(&runtime, "s").await;
+    // One byte, so that each page is past the bound until an activation takes it.
+    let runtimes = runtimes(&runtime).with_read_ahead_bytes(1);
+    let run = start_with(
+        one_task_history(),
+        [ResponseType::AllHistory],
+        runtimes,
+        1,
+        0,
+        true,
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    put(&runtime, "s", &["a"]).await;
+    let page = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&page)[0].records), ["a"]);
+    // Workflow code holds the page. The read gives "b" to the run, and then waits, so "c" stays
+    // in the Store until an activation takes "b".
+    put(&runtime, "s", &["b"]).await;
+    until("the read of b", || served.load(Ordering::Acquire) >= 2).await;
+    put(&runtime, "s", &["c"]).await;
+    assert_eq!(served.load(Ordering::Acquire), 2);
+    complete(&run.worker, &page, vec![]).await;
+    let page = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&page)[0].records), ["b"]);
+    complete(&run.worker, &page, vec![]).await;
+    let page = run.worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&page)[0].records), ["c"]);
+    run.worker.complete_execution(&page.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+}
+
+/// A Worker whose `read_ahead_bytes` is zero is refused when its config is built.
+#[test]
+fn a_zero_read_ahead_bytes_is_refused() {
+    let runtimes = runtimes(&runtime()).with_read_ahead_bytes(0);
+    let Err(refused) = test_worker_cfg().stream_runtimes(runtimes).build() else {
+        panic!("a zero `read_ahead_bytes` was taken");
+    };
+    assert_eq!(
+        refused,
+        "`read_ahead_bytes` of `stream_runtimes` must be > 0"
+    );
+}
+
+/// A task with several appends to two Streams writes each Stream ref once in its marker, and the
+/// replay of that marker gives each append its own result.
+#[tokio::test]
+async fn a_marker_has_each_stream_once() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    create(&runtime, "t").await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start_with(
+        t,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        1,
+        0,
+        true,
+    );
+    let commands = |run_id: &str| -> Vec<workflow_command::Variant> {
+        vec![
+            append_cmd(1, "s", run_id, &["a"]).into(),
+            append_cmd(2, "t", run_id, &["b"]).into(),
+            append_cmd(3, "s", run_id, &["c"]).into(),
+            append_cmd(4, "t", run_id, &["d"]).into(),
+        ]
+    };
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, commands(&run_id)).await;
+    let (live, last) = all_appends(&run.worker, 4).await;
+    run.worker.complete_execution(&last.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let data = marker(run.sent.lock().last().unwrap()).unwrap();
+    let mut ids: Vec<_> = data.streams.iter().map(|s| s.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["s", "t"]);
+    assert!(data.streams.iter().all(|s| s.store == STORE));
+    let mut entries: Vec<_> = data
+        .appends
+        .iter()
+        .map(|entry| {
+            (
+                entry.seq,
+                data.streams[entry.stream_index as usize].id.as_str(),
+            )
+        })
+        .collect();
+    entries.sort();
+    assert_eq!(entries, [(1, "s"), (2, "t"), (3, "s"), (4, "t")]);
+
+    let replayed = replayed_read_history(&data);
+    let run_id = replayed.get_orig_run_id().to_string();
+    let run = start_with(
+        replayed,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        1,
+        0,
+        true,
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    complete(&run.worker, &first, commands(&run_id)).await;
+    let (replayed, last) = all_appends(&run.worker, 4).await;
+    assert_eq!(replayed, live);
+    complete(&run.worker, &last, vec![]).await;
+    let signal = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&signal) && !signal.is_replaying);
+    run.worker.complete_execution(&signal.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(texts(&all_records(&runtime, "s").await), ["a", "c"]);
+}
+
+/// The result of each append, by seq.
+type AppendResults = Vec<(u32, Option<resolve_stream_append::Status>)>;
+
+/// Polls until `count` appends have their results. Returns each result by seq, and the
+/// activation of the last one, which the caller completes.
+async fn all_appends(worker: &Worker, count: usize) -> (AppendResults, WorkflowActivation) {
+    let mut results = vec![];
+    loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        results.extend(appends(&next).into_iter().map(|a| (a.seq, a.status)));
+        if results.len() == count {
+            results.sort_by_key(|(seq, _)| *seq);
+            return (results, next);
+        }
+        complete(worker, &next, vec![]).await;
+    }
 }

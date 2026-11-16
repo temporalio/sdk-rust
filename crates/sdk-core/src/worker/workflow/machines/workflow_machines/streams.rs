@@ -165,8 +165,10 @@ pub(super) struct StreamCalls {
     append_queues: HashMap<(String, String), VecDeque<Queued>>,
     requests: Vec<StreamRequest>,
     marker_reads: Vec<ReadEntryBuilder>,
-    marker_appends: Vec<StreamAppendEntry>,
-    marker_closes: Vec<StreamCloseEntry>,
+    /// The append and close entries of this task's marker, each with its Stream, which the marker
+    /// gives as an index into its table of Streams.
+    marker_appends: Vec<(StreamRef, StreamAppendEntry)>,
+    marker_closes: Vec<(StreamRef, StreamCloseEntry)>,
     /// The results of the markers of history that wait for Workflow code, in marker order.
     held: Vec<Held>,
     /// False while the run replays. A call then waits for its results from history, and the
@@ -519,8 +521,17 @@ impl StreamCalls {
 
     /// Holds the results of a marker of history, each for its activation in the Workflow Task.
     pub(super) fn insert_peeked(&mut self, data: StreamMarkerData) -> Result<()> {
+        let streams = data.streams;
+        let stream_of = |kind: &str, seq: u32, index: u32| {
+            streams.get(index as usize).cloned().ok_or_else(|| {
+                fatal!(
+                    "The Stream marker entry of {kind} {seq} has Stream {index}, which the marker \
+                     doesn't have"
+                )
+            })
+        };
         for entry in data.reads {
-            let stream = entry.stream.unwrap_or_default();
+            let stream = stream_of("read", entry.seq, entry.stream_index)?;
             let seq = entry.seq;
             let bad = |what: &str| fatal!("The Stream marker entry of read {seq} is bad: {what}");
             // A run that was cached when its history came, and left the cache before it replayed
@@ -618,7 +629,7 @@ impl StreamCalls {
             self.held.push(Held {
                 seq: entry.seq,
                 activation: entry.activation,
-                stream: entry.stream.unwrap_or_default(),
+                stream: stream_of("append", entry.seq, entry.stream_index)?,
                 result: HeldResult::Append(status),
             });
         }
@@ -632,7 +643,7 @@ impl StreamCalls {
             self.held.push(Held {
                 seq: entry.seq,
                 activation,
-                stream: entry.stream.unwrap_or_default(),
+                stream: stream_of("close", entry.seq, entry.stream_index)?,
                 result,
             });
         }
@@ -903,7 +914,6 @@ impl StreamCalls {
                     };
                     let mut entry = StreamAppendEntry {
                         seq: result.seq,
-                        stream: Some(append.stream.clone()),
                         activation,
                         ..Default::default()
                     };
@@ -917,20 +927,22 @@ impl StreamCalls {
                         }
                         None => {}
                     }
-                    self.marker_appends.push(entry);
+                    self.marker_appends.push((append.stream.clone(), entry));
                 }
                 workflow_activation_job::Variant::ResolveStreamClose(result) => {
                     let Some(close) = self.closes.get(&result.seq) else {
                         continue;
                     };
-                    self.marker_closes.push(StreamCloseEntry {
-                        seq: result.seq,
-                        stream: Some(close.stream.clone()),
-                        resolved: true,
-                        failure: result.failed.clone(),
-                        activation,
-                        ..Default::default()
-                    });
+                    self.marker_closes.push((
+                        close.stream.clone(),
+                        StreamCloseEntry {
+                            seq: result.seq,
+                            resolved: true,
+                            failure: result.failed.clone(),
+                            activation,
+                            ..Default::default()
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -1019,30 +1031,65 @@ impl StreamCalls {
             pending.sort_by_key(|(seq, _)| **seq);
             for (seq, close) in pending {
                 close.intent = Intent::Sealed(epoch);
-                closes.push(StreamCloseEntry {
-                    seq: *seq,
-                    stream: Some(close.stream.clone()),
-                    intent_epoch: Some(epoch),
-                    ..Default::default()
-                });
+                closes.push((
+                    close.stream.clone(),
+                    StreamCloseEntry {
+                        seq: *seq,
+                        intent_epoch: Some(epoch),
+                        ..Default::default()
+                    },
+                ));
             }
         }
+        let mut streams = vec![];
         let reads = std::mem::take(&mut self.marker_reads)
             .into_iter()
             .filter_map(|entry| {
                 let read = self.reads.get(&entry.seq)?;
-                Some(read_entry(read, entry))
+                Some(read_entry(
+                    read,
+                    entry,
+                    index_of(&mut streams, &read.stream),
+                ))
+            })
+            .collect();
+        let appends = std::mem::take(&mut self.marker_appends)
+            .into_iter()
+            .map(|(stream, entry)| StreamAppendEntry {
+                stream_index: index_of(&mut streams, &stream),
+                ..entry
+            })
+            .collect();
+        let closes = closes
+            .into_iter()
+            .map(|(stream, entry)| StreamCloseEntry {
+                stream_index: index_of(&mut streams, &stream),
+                ..entry
             })
             .collect();
         Some(StreamMarkerData {
             reads,
-            appends: std::mem::take(&mut self.marker_appends),
+            appends,
             closes,
+            streams,
         })
     }
 }
 
-fn read_entry(read: &Read, entry: ReadEntryBuilder) -> StreamReadEntry {
+/// The index of `stream` in the marker's table of Streams, which it joins if it isn't there. A
+/// task calls few Streams, so a scan costs less than a map.
+fn index_of(streams: &mut Vec<StreamRef>, stream: &StreamRef) -> u32 {
+    let at = streams
+        .iter()
+        .position(|known| known == stream)
+        .unwrap_or_else(|| {
+            streams.push(stream.clone());
+            streams.len() - 1
+        });
+    u32::try_from(at).unwrap_or(u32::MAX)
+}
+
+fn read_entry(read: &Read, entry: ReadEntryBuilder, stream_index: u32) -> StreamReadEntry {
     let count = entry.records.len() as u32;
     let last_offset = entry
         .records
@@ -1073,7 +1120,7 @@ fn read_entry(read: &Read, entry: ReadEntryBuilder) -> StreamReadEntry {
         .collect();
     StreamReadEntry {
         seq: entry.seq,
-        stream: Some(read.stream.clone()),
+        stream_index,
         from_offset: read.from_offset.clone(),
         after_offset: entry.after_offset,
         last_offset,
