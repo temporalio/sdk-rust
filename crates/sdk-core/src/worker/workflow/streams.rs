@@ -49,7 +49,8 @@ use tokio::{
     sync::{Notify, mpsc::UnboundedSender},
     time::Instant,
 };
-use tracing::Span;
+use tokio_util::sync::CancellationToken;
+use tracing::{Span, warn};
 
 /// The Stream runtimes of a Worker, by the name of the Store that each serves. A Workflow call on
 /// a Stream uses the runtime of its `StreamRef.store`.
@@ -65,6 +66,15 @@ pub struct StreamRuntimes {
     /// The Workflow type of the run whose history these runtimes read, which the Worker's metrics
     /// lack.
     workflow_type: Option<String>,
+    /// A shorter bound for a close in flight at a graceful shutdown, so that a test needn't wait
+    /// for the real one.
+    #[cfg(test)]
+    close_bound: Option<Duration>,
+    /// Told each time a graceful shutdown waits for a close in flight, so that a test sees the wait
+    /// as an event.
+    #[cfg(test)]
+    #[debug(skip)]
+    shutdown_waits: Option<Arc<Notify>>,
 }
 
 impl Default for StreamRuntimes {
@@ -81,7 +91,37 @@ impl StreamRuntimes {
             calls_stores: true,
             metrics: None,
             workflow_type: None,
+            #[cfg(test)]
+            close_bound: None,
+            #[cfg(test)]
+            shutdown_waits: None,
         }
+    }
+
+    /// The runtimes, telling `waits` each time a graceful shutdown waits for a close in flight.
+    #[cfg(test)]
+    pub(crate) fn with_shutdown_waits(self, waits: Arc<Notify>) -> Self {
+        Self {
+            shutdown_waits: Some(waits),
+            ..self
+        }
+    }
+
+    /// The runtimes, with `bound` in place of [CLOSE_SHUTDOWN_BOUND].
+    #[cfg(test)]
+    pub(crate) fn with_close_bound(self, bound: Duration) -> Self {
+        Self {
+            close_bound: Some(bound),
+            ..self
+        }
+    }
+
+    fn close_bound(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(bound) = self.close_bound {
+            return bound;
+        }
+        CLOSE_SHUTDOWN_BOUND
     }
 
     /// The runtimes with the Worker's metrics, for a replay's reads of the Store.
@@ -139,6 +179,10 @@ impl StreamRuntimes {
 /// The bytes of Records that a read may hold before Workflow code takes them. Past it, the read
 /// waits, so a run with no Workflow Task in hand doesn't gather Records without a bound.
 const MAX_UNDELIVERED_BYTES: usize = 4 * 1024 * 1024;
+/// How long a graceful shutdown waits for a close in flight, from the start of the shutdown or
+/// of the close if it is later. The Worker has no other bound for the work of its runs at a
+/// shutdown, and a Store that never answers must not hold the shutdown for ever.
+pub(crate) const CLOSE_SHUTDOWN_BOUND: Duration = Duration::from_secs(10);
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -297,6 +341,11 @@ pub(crate) struct StreamManager {
     /// The run and the abort handle of each running call, by its call id, and whether the call
     /// outlives its run.
     tasks: Arc<Mutex<HashMap<u64, Task>>>,
+    /// The closes that the Store didn't answer yet. A graceful shutdown waits for them, since
+    /// History has their intent and Workflow code may never await them.
+    closes_in_flight: Arc<AtomicUsize>,
+    /// The Worker's shutdown, from whose start a close in flight has [CLOSE_SHUTDOWN_BOUND].
+    shutdown: CancellationToken,
 }
 
 struct Task {
@@ -320,13 +369,26 @@ impl StreamManager {
         runtimes: StreamRuntimes,
         handle: Handle,
         local_tx: UnboundedSender<LocalInput>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             runtimes,
             handle,
             local_tx,
             tasks: Default::default(),
+            closes_in_flight: Default::default(),
+            shutdown,
         }
+    }
+
+    /// True while a close waits for the Store, so that a graceful shutdown isn't done.
+    pub(crate) fn has_closes_in_flight(&self) -> bool {
+        let in_flight = self.closes_in_flight.load(Ordering::Acquire) > 0;
+        #[cfg(test)]
+        if in_flight && let Some(waits) = &self.runtimes.shutdown_waits {
+            waits.notify_one();
+        }
+        in_flight
     }
 
     /// Starts or stops the calls of a run. `epoch` is the run's current Workflow Task, which an
@@ -384,7 +446,10 @@ impl StreamManager {
                             if let Some(timer) = &timer {
                                 timer.metrics.stream_close_started();
                             }
-                            let call = close(runtime, spec, epoch, sink, timer);
+                            let in_flight = CloseInFlight::new(&self.closes_in_flight);
+                            let stream = spec.stream.clone();
+                            let call = close(runtime, spec, epoch, sink, timer, in_flight);
+                            let call = self.bounded_by_shutdown(stream, call);
                             // History recorded the close, so the end of the run must not stop it.
                             self.spawn(run_id, call_id, true, call);
                         }
@@ -428,6 +493,42 @@ impl StreamManager {
             },
             abort_reg,
         ));
+    }
+
+    /// The close, which a graceful shutdown gives up after its bound. The bound counts from the
+    /// start of the shutdown, or from the start of the close if that is later.
+    fn bounded_by_shutdown(
+        &self,
+        stream: StreamRef,
+        call: impl Future<Output = ()> + Send + 'static,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let shutdown = self.shutdown.clone();
+        let bound = self.runtimes.close_bound();
+        let local_tx = self.local_tx.clone();
+        async move {
+            let mut call = Box::pin(call);
+            let passed = async {
+                shutdown.cancelled().await;
+                tokio::time::sleep(bound).await;
+            };
+            tokio::select! {
+                _ = &mut call => {}
+                _ = passed => {
+                    // Dropping the call ends its count as in flight before the shutdown looks.
+                    drop(call);
+                    warn!(
+                        stream_id = %stream.id,
+                        store = %stream.store,
+                        "A graceful shutdown gave up a Stream close that the Store didn't answer \
+                         in {bound:?}"
+                    );
+                    let _ = local_tx.send(LocalInput {
+                        input: LocalInputs::BumpStream,
+                        span: Span::current(),
+                    });
+                }
+            }
+        }
     }
 
     fn runtime(&self, stream: &StreamRef) -> Option<Arc<StreamRuntime>> {
@@ -692,6 +793,22 @@ enum Call {
     Close,
 }
 
+/// Counts a close as in flight for as long as it lives.
+struct CloseInFlight(Arc<AtomicUsize>);
+
+impl CloseInFlight {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count.clone())
+    }
+}
+
+impl Drop for CloseInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Closes the Stream as the run's Producer, with the Workflow Task that recorded the close as the
 /// epoch. A Stream that is closed already is a success.
 async fn close(
@@ -700,6 +817,7 @@ async fn close(
     epoch: WorkflowTaskEpoch,
     sink: impl Fn(StreamCallResult),
     timer: Option<CallTimer>,
+    in_flight: CloseInFlight,
 ) {
     let mut producer = spec.producer;
     if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
@@ -711,6 +829,8 @@ async fn close(
         producer: Some(producer),
     };
     let result = runtime.close_stream(request).await.err();
+    // The Store answered, so the result that wakes the run also finds no close in flight.
+    drop(in_flight);
     if let Some(timer) = timer {
         timer.metrics.stream_close_latency(timer.started.elapsed());
         if result.is_some() {

@@ -47,14 +47,20 @@ use temporalio_common::protos::{
 };
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_streams::{
-    MemoryStreamOptions, MemoryStreamRuntime, StreamRuntime,
+    MemoryStreamOptions, MemoryStreamRuntime, StreamResult, StreamRuntime,
     digest::records_digest,
+    memory::MemoryStore,
     proto::{
         AppendRecord, AppendRecordsRequest, ClientProducer, CloseStreamRequest,
         CreateStreamRequest, DescribeStreamRequest, Producer, ReadRecordsRequest, StreamRecord,
         StreamRef, StreamStatus, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
     },
+    store::{
+        Appended, Batch, Capabilities, Closed, Create, Created, DEFAULT_RETENTION, Entry, Store,
+        StreamState,
+    },
 };
+use tokio::sync::{Notify, Semaphore};
 
 const STORE: &str = "mem";
 
@@ -3131,8 +3137,7 @@ async fn a_workflow_that_completes_with_its_close_still_closes_the_stream() {
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_workflow_task_scheduled_and_started();
     let run_id = t.get_orig_run_id().to_string();
-    // The mock poller stays alive, or its end would shut the Worker down, and a shutdown may stop
-    // the close.
+    // The mock poller stays alive, so that the Worker shuts down only when the test asks.
     let run = start_with(
         t,
         [ResponseType::AllHistory],
@@ -3795,4 +3800,175 @@ async fn stream_metrics_have_the_store_of_the_call() {
         assert_eq!(keys, expected, "{labels:?}");
         assert_eq!(labels["workflow_type"], "default_wf_type", "{labels:?}");
     }
+}
+
+/// A memory Store that holds each close until the test lets it go.
+struct HeldCloseStore {
+    inner: MemoryStore,
+    /// Told when a close reaches the Store.
+    held: Arc<Notify>,
+    /// One permit lets one close go.
+    release: Arc<Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl Store for HeldCloseStore {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.inner.create(stream_ref, create).await
+    }
+
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        self.inner.append(stream_ref, batch).await
+    }
+
+    async fn read(
+        &self,
+        stream_ref: &StreamRef,
+        from: i64,
+        count: usize,
+    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        self.inner.read(stream_ref, from, count).await
+    }
+
+    async fn wait_after(
+        &self,
+        stream_ref: &StreamRef,
+        after: i64,
+        deadline: tokio::time::Instant,
+    ) -> StreamResult<bool> {
+        self.inner.wait_after(stream_ref, after, deadline).await
+    }
+
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.held.notify_one();
+        self.release
+            .acquire()
+            .await
+            .expect("the test never closes the semaphore")
+            .forget();
+        self.inner.close(stream_ref, producer).await
+    }
+}
+
+/// A Store runtime that holds each close, with what tells the test about it.
+struct Held {
+    runtime: Arc<StreamRuntime>,
+    held: Arc<Notify>,
+    release: Arc<Semaphore>,
+    /// Told each time a graceful shutdown waits for a close in flight.
+    shutdown_waits: Arc<Notify>,
+}
+
+impl Held {
+    async fn new() -> Self {
+        let held = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let store = HeldCloseStore {
+            inner: MemoryStore::new(DEFAULT_RETENTION, None),
+            held: held.clone(),
+            release: release.clone(),
+        };
+        let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+        create(&runtime, "s").await;
+        Self {
+            runtime,
+            held,
+            release,
+            shutdown_waits: Arc::new(Notify::new()),
+        }
+    }
+
+    fn runtimes(&self) -> StreamRuntimes {
+        runtimes(&self.runtime).with_shutdown_waits(self.shutdown_waits.clone())
+    }
+}
+
+/// Runs a graceful shutdown of `worker` while the Store holds its close. The shutdown must wait
+/// for the close, and complete once the test lets the close go.
+async fn shutdown_waits_for_the_held_close(worker: Worker, held: &Held) {
+    let mut shutdown = Box::pin(worker.drain_pollers_and_shutdown());
+    tokio::select! {
+        _ = &mut shutdown => panic!("the shutdown completed while the Store held the close"),
+        _ = held.shutdown_waits.notified() => {}
+    }
+    assert!(!stream_is_closed(&held.runtime, "s"));
+    held.release.add_permits(1);
+    shutdown.await;
+    assert!(stream_is_closed(&held.runtime, "s"));
+}
+
+/// A Workflow that completes in the task of a close that it doesn't await: a graceful shutdown
+/// waits until the Store answered the close.
+#[tokio::test]
+async fn a_shutdown_waits_for_a_close_of_a_completed_workflow() {
+    let held = Held::new().await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start_with(t, [ResponseType::AllHistory], held.runtimes(), 1, 0, true);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![
+            close_cmd(1, "s", &run_id).into(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ],
+    )
+    .await;
+    held.held.notified().await;
+    shutdown_waits_for_the_held_close(run.worker, &held).await;
+    let sent = run.sent.lock();
+    assert_eq!(
+        command_types(&sent[0]),
+        [
+            CommandType::RecordMarker,
+            CommandType::CompleteWorkflowExecution
+        ]
+    );
+}
+
+/// An awaited close whose result has no Workflow Task yet: a graceful shutdown waits until the
+/// Store answered the close.
+#[tokio::test]
+async fn a_shutdown_waits_for_an_awaited_close() {
+    let held = Held::new().await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start_with(t, [ResponseType::AllHistory], held.runtimes(), 1, 0, true);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    held.held.notified().await;
+    shutdown_waits_for_the_held_close(run.worker, &held).await;
+    let sent = run.sent.lock();
+    assert!(sent[0].force_create_new_workflow_task);
+    assert!(!marker(&sent[0]).unwrap().closes[0].resolved);
+}
+
+/// A Store that never answers a close doesn't hold a graceful shutdown past the bound. The close
+/// is given up, and the Stream stays open.
+#[tokio::test]
+async fn a_shutdown_gives_up_a_close_past_its_bound() {
+    let held = Held::new().await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    // A short bound keeps the test quick. The two tests before this one check the wait.
+    let runtimes = held.runtimes().with_close_bound(Duration::from_secs(1));
+    let run = start_with(t, [ResponseType::AllHistory], runtimes, 1, 0, true);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![
+            close_cmd(1, "s", &run_id).into(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ],
+    )
+    .await;
+    held.held.notified().await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(!stream_is_closed(&held.runtime, "s"));
 }
