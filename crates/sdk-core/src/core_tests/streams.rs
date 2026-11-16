@@ -2389,15 +2389,24 @@ async fn activations_until_the_end(worker: &Worker) -> Vec<String> {
         let Ok(next) = next else {
             return jobs;
         };
-        jobs.extend(
-            next.jobs
-                .iter()
-                .filter_map(|job| job.variant.as_ref().map(|v| format!("{v}"))),
-        );
+        jobs.extend(next.jobs.iter().filter_map(|job| {
+            job.variant.as_ref().map(|v| match v {
+                workflow_activation_job::Variant::RemoveFromCache(evict) => {
+                    format!("RemoveFromCache({:?})", evict.reason())
+                }
+                v => format!("{v}"),
+            })
+        }));
         let _ = worker
             .complete_workflow_activation(WorkflowActivationCompletion::empty(next.run_id))
             .await;
     }
+}
+
+/// True when a job evicts the run for a failure. The eviction that ends a replay doesn't count.
+fn has_failure_eviction(jobs: &[String]) -> bool {
+    jobs.iter()
+        .any(|job| job.starts_with("RemoveFromCache") && job != "RemoveFromCache(LangRequested)")
 }
 
 /// A replay Worker never calls a Store for a call that history leaves open. The call stays open,
@@ -2468,10 +2477,7 @@ async fn a_replay_worker_needs_no_runtime_for_an_open_read() {
         jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
         "{jobs:?}"
     );
-    assert!(
-        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
-        "{jobs:?}"
-    );
+    assert!(!has_failure_eviction(&jobs), "{jobs:?}");
 }
 
 /// A replay Worker still reads the Records of a marker that has none from the Store.
@@ -2671,10 +2677,7 @@ async fn a_replayed_read_with_no_store_name_takes_the_store_of_history() {
         jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
         "{jobs:?}"
     );
-    assert!(
-        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
-        "{jobs:?}"
-    );
+    assert!(!has_failure_eviction(&jobs), "{jobs:?}");
 }
 
 /// In a replay, an append with no Store name takes the Store of its entry in history.
@@ -2712,10 +2715,7 @@ async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
         jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
         "{jobs:?}"
     );
-    assert!(
-        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
-        "{jobs:?}"
-    );
+    assert!(!has_failure_eviction(&jobs), "{jobs:?}");
 }
 
 /// A replayed call that names another Store than history is still a non-determinism error.
@@ -3359,10 +3359,7 @@ async fn a_replayed_close_with_no_store_name_takes_the_store_of_history() {
         jobs.iter().any(|job| job.starts_with("SignalWorkflow")),
         "{jobs:?}"
     );
-    assert!(
-        !jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
-        "{jobs:?}"
-    );
+    assert!(!has_failure_eviction(&jobs), "{jobs:?}");
 }
 
 /// A Worker with a meter, on a history of one Workflow Task, whose poller stays alive.
