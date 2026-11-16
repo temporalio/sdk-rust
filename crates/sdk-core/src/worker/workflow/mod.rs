@@ -205,6 +205,7 @@ impl Workflows {
             stream_runtimes.clone(),
             tokio::runtime::Handle::current(),
             local_tx.clone(),
+            basics.shutdown_token.clone(),
         ));
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();

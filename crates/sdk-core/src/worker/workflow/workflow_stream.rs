@@ -637,6 +637,11 @@ impl WFStream {
                 // Don't exit if there are outstanding fetch requests
                 return false;
             }
+            // History has the intent of a close in flight, and Workflow code may never await it,
+            // so the end of the Worker would lose it.
+            if self.runs.has_stream_closes_in_flight() {
+                return false;
+            }
             let all_runs_ready = self
                 .runs
                 .handles()

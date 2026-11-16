@@ -146,6 +146,12 @@ impl RunCache {
         self.runs.cap().get() == self.runs.len()
     }
 
+    /// True while a Stream close of a run of this cache, or of one that left it, waits for the
+    /// Store.
+    pub(super) fn has_stream_closes_in_flight(&self) -> bool {
+        self.stream_manager.has_closes_in_flight()
+    }
+
     pub(super) fn len(&self) -> usize {
         self.runs.len()
     }
