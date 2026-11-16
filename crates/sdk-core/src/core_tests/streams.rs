@@ -4986,3 +4986,112 @@ async fn a_call_that_lang_got_wrong_fails_the_task() {
     assert!(all_records(&runtime, "s").await.is_empty());
     assert!(!stream_is_closed(&runtime, "s"));
 }
+
+/// A marker of read 1 whose Records the Worker's Store doesn't have, and that Store.
+async fn records_gone() -> (StreamMarkerData, Arc<StreamRuntime>) {
+    let first = runtime();
+    create(&first, "s").await;
+    put(&first, "s", &["a", "b"]).await;
+    let (data, _) = one_page(&all_records(&first, "s").await);
+    let emptied = runtime();
+    create(&emptied, "s").await;
+    (data, emptied)
+}
+
+/// The Workflow failure of a completion, if it has one.
+fn workflow_failure(completion: &WorkflowTaskCompletion) -> Option<Failure> {
+    completion
+        .commands
+        .iter()
+        .find_map(|command| match &command.attributes {
+            Some(Attributes::FailWorkflowExecutionCommandAttributes(attrs)) => {
+                attrs.failure.clone()
+            }
+            _ => None,
+        })
+}
+
+/// With `StreamReplay` in `workflow_failure_errors`, a replay whose Records are gone fails the
+/// Workflow with the text of the task failure, and the type `StreamReplayError`.
+#[tokio::test]
+async fn a_replay_with_its_records_gone_can_fail_the_workflow() {
+    let (data, emptied) = records_gone().await;
+    let sent = Arc::new(Mutex::new(vec![]));
+    let mut cfg = MockPollCfg::from_resps(replayed_read_history(&data), [ResponseType::AllHistory]);
+    cfg.make_poll_stream_interminable = true;
+    let kept = sent.clone();
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        kept.lock().push(completion.clone());
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.stream_runtimes = runtimes(&emptied);
+        wc.workflow_failure_errors = [WorkflowErrorType::StreamReplay].into();
+    });
+    let worker = mock_worker(mock);
+    let evicted = worker.poll_workflow_activation().await.unwrap();
+    assert!(evicted.is_only_eviction(), "{:?}", evicted.jobs);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(evicted.run_id))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+    let sent = sent.lock();
+    let failure = workflow_failure(&sent[0]).expect("the Workflow didn't fail");
+    assert!(
+        failure.message.starts_with("StreamReplayError: "),
+        "{}",
+        failure.message
+    );
+    assert!(failure.message.contains("the Store has 0 of the 2 Records"));
+    let Some(FailureInfo::ApplicationFailureInfo(info)) = failure.failure_info else {
+        panic!("the failure has no type");
+    };
+    assert_eq!(info.r#type, "StreamReplayError");
+}
+
+/// A replay Worker with `StreamReplay` in `workflow_failure_errors` reports a replay whose Records
+/// are gone as it reports a non-determinism failure: it fails the Workflow, and evicts the run
+/// with the same text.
+#[tokio::test]
+async fn a_replay_worker_fails_the_workflow_for_records_that_are_gone() {
+    let (data, emptied) = records_gone().await;
+    let sent = Arc::new(Mutex::new(vec![]));
+    let kept = sent.clone();
+    let mut client = crate::worker::client::mocks::mock_manual_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .returning(move |completion, _| {
+            kept.lock().push(completion);
+            async { Ok(Default::default()) }.boxed()
+        });
+    let cfg = test_worker_cfg()
+        .stream_runtimes(runtimes(&emptied))
+        .workflow_failure_errors([WorkflowErrorType::StreamReplay].into())
+        .build()
+        .unwrap();
+    let mut input = ReplayWorkerInput::new(
+        cfg,
+        futures_util::stream::iter([HistoryForReplay::from(replayed_read_history(&data))]),
+    );
+    input.client_override = Some(client);
+    let worker = crate::init_replay_worker(input).unwrap();
+    let jobs = activations_until_the_end(&worker).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        jobs.iter().any(|job| job.starts_with("RemoveFromCache")),
+        "{jobs:?}"
+    );
+    let sent = sent.lock();
+    let failure = sent
+        .iter()
+        .find_map(workflow_failure)
+        .expect("the Workflow didn't fail");
+    assert!(
+        failure.message.starts_with("StreamReplayError: "),
+        "{}",
+        failure.message
+    );
+}

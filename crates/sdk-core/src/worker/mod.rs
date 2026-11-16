@@ -1855,6 +1855,9 @@ pub enum CompleteNexusError {
 pub enum WorkflowErrorType {
     /// A nondeterminism error
     Nondeterminism,
+    /// A replay that can't read or check the Records of a Stream marker from the Store, such as
+    /// after the Stream's Retention. The Workflow Task fails with `StreamReplayError` otherwise.
+    StreamReplay,
 }
 
 /// This trait allows users to customize the performance characteristics of workers dynamically.
