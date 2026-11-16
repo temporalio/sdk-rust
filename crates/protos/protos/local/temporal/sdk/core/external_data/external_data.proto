@@ -51,12 +51,16 @@ message StreamMarkerData {
   repeated StreamReadEntry reads = 1;
   repeated StreamAppendEntry appends = 2;
   repeated StreamCloseEntry closes = 3;
+  // Each Stream of the entries, once. An entry gives the index of its Stream here, so that a task
+  // with many results on one Stream holds its ref once.
+  repeated temporal.api.stream.v1.StreamRef streams = 4;
 }
 
 // What one read gave the workflow in one workflow task.
 message StreamReadEntry {
   uint32 seq = 1;
-  temporal.api.stream.v1.StreamRef stream = 2;
+  // The index of the read's Stream in `StreamMarkerData.streams`.
+  uint32 stream_index = 2;
   // The `from_offset` of the read, so a replay can check that the read is the same.
   bytes from_offset = 3;
   // The offset before the first Record of this task. A replay reads after it.
@@ -90,7 +94,8 @@ message StreamReadEnded {
 // The result of one append, in the workflow task whose activation got it.
 message StreamAppendEntry {
   uint32 seq = 1;
-  temporal.api.stream.v1.StreamRef stream = 2;
+  // The index of the append's Stream in `StreamMarkerData.streams`.
+  uint32 stream_index = 2;
   bytes first_offset = 3;
   bytes last_offset = 4;
   temporal.api.failure.v1.Failure failure = 5;
@@ -102,7 +107,8 @@ message StreamAppendEntry {
 // task whose activation got it.
 message StreamCloseEntry {
   uint32 seq = 1;
-  temporal.api.stream.v1.StreamRef stream = 2;
+  // The index of the closed Stream in `StreamMarkerData.streams`.
+  uint32 stream_index = 2;
   // Set on the intent, the epoch that Core closes with after the server took the task.
   temporal.api.stream.v1.WorkflowTaskEpoch intent_epoch = 3;
   // True on the result. `failure` is unset when the Stream is closed.
