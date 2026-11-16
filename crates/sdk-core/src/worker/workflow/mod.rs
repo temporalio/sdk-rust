@@ -16,9 +16,9 @@ pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
 #[cfg(test)]
 pub(crate) use managed_run::TASK_DURATIONS;
-#[cfg(test)]
-pub(crate) use streams::MAX_MARKER_RECORD_BYTES;
 pub use streams::StreamRuntimes;
+#[cfg(test)]
+pub(crate) use streams::{MAX_MARKER_RECORD_BYTES, StreamTestHooks};
 
 use crate::{
     MetricsContext, WorkerConfig,
@@ -43,7 +43,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
-            streams::{STREAM_REPLAY_ERROR_TYPE, StreamManager},
+            streams::{STREAM_REPLAY_ERROR_TYPE, StreamManager, WorkerStreams},
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -155,7 +155,7 @@ pub(crate) struct Workflows {
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
     /// The Worker's Stream runtimes, for the markers of a task that a completion returns.
-    stream_runtimes: StreamRuntimes,
+    streams: Arc<WorkerStreams>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -199,23 +199,11 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         // The subsystems of a Worker are built inside its runtime, as the pollers spawn there too.
         // Stream calls run on it, so that Store work never holds up the workflow processing thread.
-        // The runtimes carry the Worker's metrics, which a replay's reads of the Store count in.
-        let stream_runtimes = basics
-            .worker_config
-            .stream_runtimes
-            .clone()
-            .with_metrics(&basics.metrics)
-            .with_workflow_failure({
-                let config = basics.worker_config.clone();
-                move |workflow_type| {
-                    config.should_fail_workflow(
-                        workflow_type,
-                        &crate::WorkflowErrorType::StreamReplay,
-                    )
-                }
-            });
+        // The Worker's Stream state carries its metrics, which a replay's reads of the Store count
+        // in, and its choice for a replay that can't read its Records.
+        let streams = Arc::new(WorkerStreams::new(&basics.worker_config, &basics.metrics));
         let stream_manager = Arc::new(StreamManager::new(
-            stream_runtimes.clone(),
+            streams.clone(),
             tokio::runtime::Handle::current(),
             local_tx.clone(),
             basics.shutdown_token.clone(),
@@ -233,7 +221,7 @@ impl Workflows {
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
-            stream_runtimes.clone(),
+            streams.clone(),
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang
@@ -327,7 +315,7 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
-            stream_runtimes,
+            streams,
         }
     }
 
@@ -698,12 +686,7 @@ impl Workflows {
             .await;
 
         let maybe_pwft = if let Some(wft) = wft_from_complete {
-            match HistoryPaginator::from_poll(
-                wft,
-                self.client.clone(),
-                self.stream_runtimes.clone(),
-            )
-            .await
+            match HistoryPaginator::from_poll(wft, self.client.clone(), self.streams.clone()).await
             {
                 Ok((paginator, wft)) => Some(WFTWithPaginator { wft, paginator }),
                 Err(e) => {
@@ -2240,7 +2223,10 @@ mod tests {
         let (paginator, work) = HistoryPaginator::from_poll(
             validate_wft(response).unwrap(),
             Arc::new(mock_worker_client()),
-            StreamRuntimes::default(),
+            Arc::new(WorkerStreams::new(
+                &Arc::new(crate::test_help::test_worker_cfg().build().unwrap()),
+                &crate::telemetry::metrics::MetricsContext::no_op(),
+            )),
         )
         .await
         .unwrap();

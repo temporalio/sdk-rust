@@ -4,8 +4,8 @@ use crate::{
     worker::{
         client::WorkerClient,
         workflow::{
-            CacheMissFetchReq, PermittedWFT, PreparedWFT, StreamRuntimes,
-            streams::{hydrate_stream_markers, needs_stream_records},
+            CacheMissFetchReq, PermittedWFT, PreparedWFT,
+            streams::{RunStreams, WorkerStreams, hydrate_stream_markers, needs_stream_records},
         },
     },
 };
@@ -84,9 +84,9 @@ impl HistoryUpdate {
     /// Reads the Records that the markers of the update count from the Store.
     pub(crate) async fn read_stream_records(
         &mut self,
-        runtimes: &StreamRuntimes,
+        streams: Option<&RunStreams>,
     ) -> Result<(), tonic::Status> {
-        hydrate_stream_markers(&mut self.events, runtimes).await
+        hydrate_stream_markers(&mut self.events, streams).await
     }
 }
 
@@ -114,7 +114,7 @@ pub(crate) struct HistoryPaginator {
     final_events: Vec<HistoryEvent>,
     chunking_disabled: bool,
     /// The Worker's Stream runtimes, which a replay reads the Records of its markers with.
-    streams: StreamRuntimes,
+    streams: Option<RunStreams>,
     /// True if the run of this history is new to the cache, so that it replays the markers that
     /// it gives, which need their Records. A cached run has every marker it meets already.
     hydrate: bool,
@@ -148,8 +148,8 @@ impl HistoryPaginator {
         self.hydrate = true;
     }
 
-    pub(super) fn stream_runtimes(&self) -> &StreamRuntimes {
-        &self.streams
+    pub(super) fn streams(&self) -> Option<&RunStreams> {
+        self.streams.as_ref()
     }
 
     /// Use a new poll response to create a new [WFTPaginator], returning it and the
@@ -157,7 +157,7 @@ impl HistoryPaginator {
     pub(super) async fn from_poll(
         wft: ValidPollWFTQResponse,
         client: Arc<dyn WorkerClient>,
-        streams: StreamRuntimes,
+        streams: Arc<WorkerStreams>,
     ) -> Result<(Self, PreparedWFT), tonic::Status> {
         let empty_hist = wft.history.events.is_empty();
         let npt = if empty_hist {
@@ -174,7 +174,7 @@ impl HistoryPaginator {
             npt,
             client,
         );
-        paginator.streams = streams.for_run(&wft.workflow_type);
+        paginator.streams = Some(RunStreams::new(&streams, &wft.workflow_type));
         if empty_hist && wft.legacy_query.is_none() && wft.query_requests.is_empty() {
             return Err(EMPTY_TASK_ERR.clone());
         }
@@ -259,7 +259,7 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             chunking_disabled: false,
-            streams: StreamRuntimes::default(),
+            streams: None,
             hydrate: false,
         }
     }
@@ -363,7 +363,7 @@ impl HistoryPaginator {
             update.assert_contiguous();
             let mut update = update;
             if self.hydrate {
-                hydrate_stream_markers(&mut update.events, &self.streams).await?;
+                hydrate_stream_markers(&mut update.events, self.streams.as_ref()).await?;
             }
             return Ok(update);
         }
