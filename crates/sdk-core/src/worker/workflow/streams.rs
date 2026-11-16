@@ -62,6 +62,9 @@ pub struct StreamRuntimes {
     /// The bytes of one read's Records that may wait for Workflow code, or `None` for
     /// [DEFAULT_READ_AHEAD_BYTES].
     read_ahead_bytes: Option<usize>,
+    /// The least time between two batches of one read, or `None` for
+    /// [DEFAULT_READ_BATCH_WINDOW].
+    read_batch_window: Option<Duration>,
     /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
     /// with no meter, so that it builds no attributes for a read.
     #[debug(skip)]
@@ -93,6 +96,7 @@ impl StreamRuntimes {
             runtimes: runtimes.into_iter().collect(),
             calls_stores: true,
             read_ahead_bytes: None,
+            read_batch_window: None,
             metrics: None,
             workflow_type: None,
             #[cfg(test)]
@@ -143,6 +147,31 @@ impl StreamRuntimes {
     /// The bound that [StreamRuntimes::with_read_ahead_bytes] set, if it set one.
     pub fn read_ahead_bytes(&self) -> Option<usize> {
         self.read_ahead_bytes
+    }
+
+    /// The runtimes with `window` as the least time between two batches of one read. A read gives
+    /// its first batch immediately. After it gave a batch to its run, it asks the Store again only
+    /// once `window` has passed, so the Records that came in between go in one batch. On a busy
+    /// Stream this caps how often Workflow code is activated, and a Record waits at most one
+    /// window. Unset is 50 ms, and zero is no window.
+    pub fn with_read_batch_window(self, window: Duration) -> Self {
+        Self {
+            read_batch_window: Some(window),
+            ..self
+        }
+    }
+
+    /// The window that [StreamRuntimes::with_read_batch_window] set, if it set one.
+    pub fn read_batch_window(&self) -> Option<Duration> {
+        self.read_batch_window
+    }
+
+    /// The Worker's options of a read.
+    fn read_options(&self) -> ReadOptions {
+        ReadOptions {
+            read_ahead_bytes: self.read_ahead_bytes.unwrap_or(DEFAULT_READ_AHEAD_BYTES),
+            batch_window: self.read_batch_window.unwrap_or(DEFAULT_READ_BATCH_WINDOW),
+        }
     }
 
     /// The runtimes with the Worker's metrics, for a replay's reads of the Store.
@@ -201,6 +230,17 @@ impl StreamRuntimes {
 /// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
 /// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// The least time between two batches of one read when the Worker sets no `read_batch_window`.
+/// A read that gave each Record in its own batch would activate Workflow code once for each
+/// Record of a busy Stream, which costs lang far more than one activation for several Records.
+pub(crate) const DEFAULT_READ_BATCH_WINDOW: Duration = Duration::from_millis(50);
+
+/// The Worker's options of a read.
+#[derive(Clone, Copy, Debug)]
+struct ReadOptions {
+    read_ahead_bytes: usize,
+    batch_window: Duration,
+}
 /// How long a graceful shutdown waits for a close in flight, from the start of the shutdown or
 /// of the close if it is later. The Worker has no other bound for the work of its runs at a
 /// shutdown, and a Store that never answers must not hold the shutdown for ever.
@@ -438,11 +478,8 @@ impl StreamManager {
                             if let Some(metrics) = &metrics {
                                 metrics.stream_read_started();
                             }
-                            let read_ahead = self
-                                .runtimes
-                                .read_ahead_bytes
-                                .unwrap_or(DEFAULT_READ_AHEAD_BYTES);
-                            let call = read(runtime, spec, sink, metrics, read_ahead);
+                            let options = self.runtimes.read_options();
+                            let call = read(runtime, spec, sink, metrics, options);
                             self.spawn(run_id, call_id, false, call);
                         }
                         None => self.no_runtime(run_id, call_id, seq, Call::Read),
@@ -637,13 +674,14 @@ impl StreamManager {
     }
 }
 
-/// Reads until the first stop, and sends each response with Records as one page at once.
+/// Reads until the first stop. It sends each response with Records as one batch immediately, and
+/// looks at the Store again only once the batch window after that batch has passed.
 async fn read(
     runtime: Arc<StreamRuntime>,
     spec: ReadSpec,
     sink: impl Fn(StreamCallResult),
     metrics: Option<MetricsContext>,
-    read_ahead_bytes: usize,
+    options: ReadOptions,
 ) {
     let deadline = spec.deadline.map(|deadline| {
         Instant::now()
@@ -674,8 +712,15 @@ async fn read(
     // deadline counts from the Workflow time of its task, so a slow start would otherwise end a
     // short read with no Record, and a loop of such reads could stand still.
     let mut looked = spec.took_a_record;
+    // When the window after the last batch ends. The read asks the Store again only then, so the
+    // Records that come in the window go in one batch.
+    let mut next_batch_at: Option<Instant> = None;
     loop {
-        spec.flow.wait_for_room(read_ahead_bytes).await;
+        if let Some(at) = next_batch_at.take() {
+            // A deadline in the window ends the read at the deadline, and not at the window's end.
+            tokio::time::sleep_until(deadline.map_or(at, |deadline| deadline.min(at))).await;
+        }
+        spec.flow.wait_for_room(options.read_ahead_bytes).await;
         let now = Instant::now();
         if looked && deadline.is_some_and(|deadline| deadline <= now) {
             sink(StreamCallResult::Page {
@@ -771,10 +816,15 @@ async fn read(
                 });
                 return;
             }
-            None if !page.is_empty() => sink(StreamCallResult::Page {
-                records: page,
-                end: None,
-            }),
+            None if !page.is_empty() => {
+                sink(StreamCallResult::Page {
+                    records: page,
+                    end: None,
+                });
+                if !options.batch_window.is_zero() {
+                    next_batch_at = Some(Instant::now() + options.batch_window);
+                }
+            }
             // The idle end comes after a look at the Store, so that a read with a zero idle
             // timeout gives the Records that are there.
             None if idle_deadline(last_record_at).is_some_and(|idle| idle <= Instant::now()) => {
