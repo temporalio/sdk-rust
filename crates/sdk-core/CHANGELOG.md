@@ -55,6 +55,8 @@ relevant information.
   result comes in a later task. The Worker's meter counts these calls, their failures and the
   Records that reads gave, and records append, close and replay read latencies, as `stream_*`.
   A graceful shutdown of the Worker waits for each close in flight, for at most 10 s.
+  `StreamRuntimes::with_read_ahead_bytes` sets how many bytes of one read's Records may wait for
+  Workflow code before the read stops asking the Store, 4 MiB by default.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
