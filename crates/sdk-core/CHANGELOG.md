@@ -47,7 +47,8 @@ relevant information.
   and `ResolveStreamClose` jobs. Core calls the Store itself and records one `core_stream` marker
   for each Workflow Task in which Workflow code got a result, which a replay gives back in the same
   activations. A close takes effect only after the server took the task that asked for it, so its
-  result comes in a later task.
+  result comes in a later task. The Worker's meter counts these calls, their failures and the
+  Records that reads gave, and records append, close and replay read latencies, as `stream_*`.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
