@@ -14,6 +14,8 @@ mod workflow_stream;
 
 pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
+#[cfg(test)]
+pub(crate) use managed_run::TASK_DURATIONS;
 pub use streams::StreamRuntimes;
 
 use crate::{
