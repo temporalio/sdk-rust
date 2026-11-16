@@ -79,6 +79,8 @@ pub(super) struct ManagedRun {
     stream_manager: Arc<StreamManager>,
     /// Set if the run is currently waiting on the execution of some local activities.
     waiting_on_la: Option<WaitingOnLAs>,
+    /// The time in this Workflow Task in which only Stream calls held it open.
+    stream_hold: StreamHold,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
     /// do is be evicted.
     am_broken: bool,
@@ -122,6 +124,7 @@ impl ManagedRun {
             local_activity_request_sink,
             stream_manager,
             waiting_on_la: None,
+            stream_hold: StreamHold::default(),
             am_broken: false,
             wft: None,
             activation: None,
@@ -293,6 +296,7 @@ impl ManagedRun {
                         .expect("waiting_on_la was just checked");
                     lawait.hb_timeout_handle.abort();
                     lawait.hb_timeout_handle = hb_timeout_handle;
+                    self.start_stream_hold();
                     // No activation needs to be sent to lang. We just need to wait for another
                     // heartbeat timeout or LAs to resolve
                     return Ok(None);
@@ -318,11 +322,18 @@ impl ManagedRun {
         debug!("Marking WFT completed");
         let retme = self.wft.take();
 
+        let stream_held = self.stream_hold.take(report_status.completion_time());
         if let Some(ot) = &retme
             && let Some(ct) = report_status.completion_time()
         {
             let task_duration = ct.sub(ot.start_time);
             self.metrics.wf_task_latency(task_duration);
+            #[cfg(test)]
+            TASK_DURATIONS
+                .lock()
+                .entry(self.wfm.machines.run_id.clone())
+                .or_default()
+                .push((task_duration, stream_held));
             log_workflow_task_duration(
                 &self.wfm.machines.run_id,
                 &self.wfm.machines.workflow_type,
@@ -330,6 +341,7 @@ impl ManagedRun {
                 ot.info.attempt,
                 self.wfm.machines.history_size_bytes(),
                 task_duration,
+                stream_held,
                 task_storage_metrics,
             );
         }
@@ -906,6 +918,7 @@ impl ManagedRun {
                         hb_timeout_handle: self.start_heartbeat_timeout(start_t, wft_timeout),
                         heartbeat_timeout_pending: false,
                     });
+                    self.start_stream_hold();
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -1226,6 +1239,7 @@ impl ManagedRun {
                 OutstandingActivation::Autocomplete
             }
         };
+        self.stream_hold.end(Instant::now());
         if let Some(old_act) = self.activation {
             // This is a panic because we have screwed up core logic if this is violated. It must be
             // upheld.
@@ -1235,6 +1249,14 @@ impl ManagedRun {
             );
         }
         self.activation = Some(act_type);
+    }
+
+    /// Starts to count the time in which the task waits only for Stream calls. A Local Activity
+    /// that holds the task too keeps the time in the task's duration, as it always did.
+    fn start_stream_hold(&mut self) {
+        if self.wfm.machines.outstanding_local_activity_count() == 0 {
+            self.stream_hold.start(Instant::now());
+        }
     }
 
     fn prepare_complete_resp(
@@ -1576,6 +1598,47 @@ fn sink_heartbeat_timeout_start(
     abort_handle
 }
 
+/// The duration of each Workflow Task of a run, and the time in it that only Stream calls held it
+/// open.
+#[cfg(test)]
+type TaskDurations = std::collections::HashMap<String, Vec<(Duration, Duration)>>;
+
+/// The [TaskDurations] of each run, by run id, so that a test sees what the duration warning looks
+/// at.
+#[cfg(test)]
+pub(crate) static TASK_DURATIONS: std::sync::LazyLock<parking_lot::Mutex<TaskDurations>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The time in which only Stream calls held a Workflow Task open, with no activation out. The
+/// duration warning leaves it out, since a read holds its task open until the heartbeat with
+/// nothing wrong, and the warning is for a task that Workflow code or Core made slow.
+#[derive(Debug, Default)]
+struct StreamHold {
+    since: Option<Instant>,
+    total: Duration,
+}
+
+impl StreamHold {
+    fn start(&mut self, at: Instant) {
+        self.since.get_or_insert(at);
+    }
+
+    fn end(&mut self, at: Instant) {
+        if let Some(since) = self.since.take() {
+            self.total += at.saturating_duration_since(since);
+        }
+    }
+
+    /// The time of the task, which it ended at `at`. It clears the count for the next task.
+    fn take(&mut self, at: Option<Instant>) -> Duration {
+        if let Some(at) = at {
+            self.end(at);
+        }
+        self.since = None;
+        std::mem::take(&mut self.total)
+    }
+}
+
 /// Tracks the heartbeat while a workflow task has outstanding local activities.
 struct WaitingOnLAs {
     wft_timeout: Duration,
@@ -1802,10 +1865,11 @@ fn log_workflow_task_duration(
     attempt: u32,
     history_size_bytes: u64,
     duration: Duration,
+    stream_held: Duration,
     storage: &TaskStorageMetrics,
 ) {
     let threshold = wft_duration_warn_threshold();
-    if duration <= threshold {
+    if duration.saturating_sub(stream_held) <= threshold {
         return;
     }
     let dl = storage.download.as_ref();
@@ -1872,7 +1936,8 @@ fn task_epoch(wft: &OutstandingTask) -> WorkflowTaskEpoch {
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
+        StreamHold, TaskStorageMetrics, log_workflow_task_duration,
+        parse_wft_duration_warn_threshold,
     };
     use crate::worker::workflow::{WFCommand, WFCommandVariant};
     use std::{
@@ -1936,11 +2001,66 @@ mod tests {
     }
 
     fn capture(duration: Duration, storage: &TaskStorageMetrics) -> Option<CapturedEvent> {
+        capture_held(duration, Duration::ZERO, storage)
+    }
+
+    /// As [capture], for a task in which only Stream calls held it open for `stream_held`.
+    fn capture_held(
+        duration: Duration,
+        stream_held: Duration,
+        storage: &TaskStorageMetrics,
+    ) -> Option<CapturedEvent> {
         let sub = CapturingSub::default();
         tracing::subscriber::with_default(sub.clone(), || {
-            log_workflow_task_duration("run-1", "MyWorkflow", 12, 3, 4096, duration, storage);
+            log_workflow_task_duration(
+                "run-1",
+                "MyWorkflow",
+                12,
+                3,
+                4096,
+                duration,
+                stream_held,
+                storage,
+            );
         });
         sub.events.lock().unwrap().drain(..).next()
+    }
+
+    /// A task that a Stream read held open until its heartbeat at 8 s logs nothing. A task that
+    /// was slow for another reason still logs, also when a read held it open for a while.
+    #[test]
+    fn tmprl1104_leaves_out_the_time_that_stream_calls_held_the_task() {
+        let none = TaskStorageMetrics::default();
+        let held_by_a_read =
+            capture_held(Duration::from_secs(8), Duration::from_millis(7_900), &none);
+        assert!(held_by_a_read.is_none());
+        let slow_code = capture_held(Duration::from_secs(9), Duration::from_secs(3), &none)
+            .expect("warn emitted");
+        assert!(
+            slow_code.fields.contains("workflow_task_duration=9000"),
+            "fields: {}",
+            slow_code.fields
+        );
+    }
+
+    /// The hold counts only the spans in which Stream calls alone held the task, and the next
+    /// task starts from zero.
+    #[test]
+    fn stream_hold_counts_each_span_of_the_task() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut hold = StreamHold::default();
+        hold.start(at(1));
+        // A second start while the hold runs keeps the first.
+        hold.start(at(2));
+        hold.end(at(4));
+        hold.end(at(5));
+        hold.start(at(6));
+        assert_eq!(hold.take(Some(at(10))), Duration::from_secs(7));
+        assert_eq!(hold.take(Some(at(12))), Duration::ZERO);
+        hold.start(at(13));
+        assert_eq!(hold.take(None), Duration::ZERO);
+        assert_eq!(hold.take(Some(at(20))), Duration::ZERO);
     }
 
     #[test]
