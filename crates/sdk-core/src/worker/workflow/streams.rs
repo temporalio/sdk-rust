@@ -230,6 +230,10 @@ impl StreamRuntimes {
 /// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
 /// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// The bytes of Records that one Workflow Task may put into its marker, for reads with their
+/// Records in History. A larger marker could pass the server's payload limit, and the task would
+/// then fail for good. The first Record of a task always comes, also when it is larger.
+pub(crate) const MAX_MARKER_RECORD_BYTES: usize = 1024 * 1024;
 /// The idle timeout of a read that sets none. A quiet read holds its Workflow Task open, and each
 /// heartbeat adds three events to History, so a read with no bound would grow History for good.
 /// The server also ends a chain of heartbeat tasks after 30 minutes. One constant in Core gives

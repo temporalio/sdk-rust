@@ -43,7 +43,7 @@ pub(crate) use activities::{
 pub use workflow::LEGACY_QUERY_ID;
 pub use workflow::StreamRuntimes;
 #[cfg(test)]
-pub(crate) use workflow::TASK_DURATIONS;
+pub(crate) use workflow::{MAX_MARKER_RECORD_BYTES, TASK_DURATIONS};
 
 use crate::{
     ActivityHeartbeat,
