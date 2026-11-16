@@ -3426,14 +3426,15 @@ async fn a_refused_close_replays_its_failure() {
 /// Replays a History with the intent of close 1 of Stream `s`, with Workflow code that sends
 /// `commands` in its first activation. Returns the cause and message of the failed task.
 async fn replay_close_history(
-    commands: Vec<workflow_command::Variant>,
+    commands: impl FnOnce(&str) -> Vec<workflow_command::Variant>,
 ) -> (WorkflowTaskFailedCause, String) {
     let runtime = runtime();
     create(&runtime, "s").await;
     let t = close_history(intent_entry(1), None);
+    let run_id = t.get_orig_run_id().to_string();
     let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
     let first = run.worker.poll_workflow_activation().await.unwrap();
-    complete(&run.worker, &first, commands).await;
+    complete(&run.worker, &first, commands(&run_id)).await;
     run.worker.drain_pollers_and_shutdown().await;
     let failed = run.failed.lock();
     assert_eq!(failed.len(), 1, "the replay should fail");
@@ -3443,7 +3444,7 @@ async fn replay_close_history(
 /// An intent in History with no close in Workflow code is a non-determinism error.
 #[tokio::test]
 async fn a_close_entry_with_no_call_is_nondeterministic() {
-    let (cause, message) = replay_close_history(vec![]).await;
+    let (cause, message) = replay_close_history(|_| vec![]).await;
     assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
     assert!(
         message.contains("History has a Stream result of close 1 that Workflow code never got"),
@@ -3454,7 +3455,8 @@ async fn a_close_entry_with_no_call_is_nondeterministic() {
 /// A close of another Stream than History has is a non-determinism error.
 #[tokio::test]
 async fn a_close_of_another_stream_is_nondeterministic() {
-    let (cause, message) = replay_close_history(vec![close_cmd(1, "other", "r").into()]).await;
+    let (cause, message) =
+        replay_close_history(|run_id| vec![close_cmd(1, "other", run_id).into()]).await;
     assert_eq!(cause, WorkflowTaskFailedCause::NonDeterministicError);
     assert!(
         message.contains("Stream close 1 closes Stream `other`"),
@@ -4928,4 +4930,59 @@ async fn a_page_fits_the_room_under_read_ahead_bytes() {
     );
     run.worker.complete_execution(&page.run_id).await;
     run.worker.drain_pollers_and_shutdown().await;
+}
+
+/// A language SDK can send a call that Core can't run as it says. Each such call fails the
+/// Workflow Task with one message: a read with a `timeout` of zero or less, and an append or a
+/// close whose Producer has another run.
+#[tokio::test]
+async fn a_call_that_lang_got_wrong_fails_the_task() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let zero = StartStreamRead {
+        timeout: Some(Duration::ZERO.try_into().unwrap()),
+        ..read_cmd(1, "s")
+    };
+    let negative = StartStreamRead {
+        timeout: Some(prost_types::Duration {
+            seconds: -1,
+            nanos: 0,
+        }),
+        ..read_cmd(1, "s")
+    };
+    let cases: [(workflow_command::Variant, &str); 4] = [
+        (
+            zero.into(),
+            "Stream read 1 has a timeout of zero or less. Leave it unset for no bound",
+        ),
+        (
+            negative.into(),
+            "Stream read 1 has a timeout of zero or less. Leave it unset for no bound",
+        ),
+        (
+            append_cmd(1, "s", "another-run", &["a"]).into(),
+            "Stream append 1 has the Producer of run `another-run`, but its run is",
+        ),
+        (
+            close_cmd(1, "s", "another-run").into(),
+            "Stream close 1 has the Producer of run `another-run`, but its run is",
+        ),
+    ];
+    for (command, expected) in cases {
+        let run = start(
+            one_task_history(),
+            [ResponseType::AllHistory],
+            runtimes(&runtime),
+            1,
+            1,
+        );
+        let first = run.worker.poll_workflow_activation().await.unwrap();
+        complete(&run.worker, &first, vec![command]).await;
+        run.worker.drain_pollers_and_shutdown().await;
+        let failed = run.failed.lock();
+        assert_eq!(failed.len(), 1, "{expected}");
+        assert!(failed[0].1.contains(expected), "{}", failed[0].1);
+    }
+    assert!(all_records(&runtime, "s").await.is_empty());
+    assert!(!stream_is_closed(&runtime, "s"));
 }

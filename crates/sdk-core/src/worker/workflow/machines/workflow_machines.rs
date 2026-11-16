@@ -80,7 +80,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
-            stream::v1::{StreamRef, WorkflowTaskEpoch},
+            stream::v1::{Producer, StreamRef, WorkflowTaskEpoch, producer::Kind},
         },
     },
     worker::WorkerDeploymentVersion,
@@ -1947,10 +1947,12 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::CloseStream(attrs) => {
                     self.check_stream_call(attrs.stream.as_ref())?;
+                    self.check_producer_run("close", attrs.seq, attrs.producer.as_ref())?;
                     self.stream_calls.close(attrs)?;
                 }
                 WFCommandVariant::AppendToStream(attrs) => {
                     self.check_stream_call(attrs.stream.as_ref())?;
+                    self.check_producer_run("append", attrs.seq, attrs.producer.as_ref())?;
                     self.stream_calls.append(attrs)?;
                 }
             }
@@ -1969,6 +1971,21 @@ impl WorkflowMachines {
             .map(|stream| stream.store.as_str())
             .unwrap_or_default();
         self.check_stream_runtime(store)
+    }
+
+    /// Fails the Workflow Task for a write whose Workflow Producer has another run. The Store
+    /// fences a Producer by its id, so a write in the name of another run could fence that run.
+    fn check_producer_run(&self, call: &str, seq: u32, producer: Option<&Producer>) -> Result<()> {
+        if let Some(Kind::Workflow(workflow)) = producer.and_then(|p| p.kind.as_ref())
+            && workflow.run_id != self.run_id
+        {
+            return Err(fatal!(
+                "Stream {call} {seq} has the Producer of run `{}`, but its run is `{}`",
+                workflow.run_id,
+                self.run_id
+            ));
+        }
+        Ok(())
     }
 
     fn check_stream_runtime(&self, store: &str) -> Result<()> {
