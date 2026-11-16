@@ -2134,6 +2134,46 @@ async fn a_read_with_no_idle_timeout_waits_past_a_heartbeat() {
     assert!(marker(&sent[0]).is_none());
 }
 
+/// A read whose timeout passed before Core could start it still looks at the Store once, and
+/// gives the Records that are there. The history dates its Workflow Task an hour ago.
+#[tokio::test]
+async fn a_read_past_its_deadline_gives_what_is_there() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(30));
+    t.add_workflow_task_scheduled_and_started();
+    let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    for event_id in 1..=3 {
+        t.modify_event(event_id, |event| {
+            event.event_time = Some(an_hour_ago.into())
+        });
+    }
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        timeout: Some(Duration::from_secs(60).try_into().unwrap()),
+        ..read_cmd(1, "s")
+    };
+    complete(&worker, &first, vec![read.into()]).await;
+    let mut got = vec![];
+    let end = loop {
+        let next = worker.poll_workflow_activation().await.unwrap();
+        let read = reads(&next).pop().unwrap();
+        got.extend(texts(&read.records));
+        if let Some(end) = read.end.clone() {
+            worker.complete_execution(&next.run_id).await;
+            break end;
+        }
+        complete(&worker, &next, vec![]).await;
+    };
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(got, ["a", "b"]);
+    assert_eq!(end.stop(), StreamReadStop::Timeout);
+    assert!(!end.done);
+}
+
 /// A read with a zero idle timeout doesn't wait for the Store. On an empty Stream it ends with
 /// `Idle` immediately, and on a Stream that has Records it gives them.
 #[tokio::test]

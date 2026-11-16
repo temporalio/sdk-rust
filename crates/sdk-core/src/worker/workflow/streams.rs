@@ -479,10 +479,14 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
         });
         return;
     }
+    // A read that gave no Record yet looks at the Store once before its timeout ends it. Its
+    // deadline counts from the Workflow time of its task, so a slow start would otherwise end a
+    // short read with no Record, and a loop of such reads could stand still.
+    let mut looked = spec.took_a_record;
     loop {
         spec.flow.wait_for_room().await;
         let now = Instant::now();
-        if deadline.is_some_and(|deadline| deadline <= now) {
+        if looked && deadline.is_some_and(|deadline| deadline <= now) {
             sink(StreamCallResult::Page {
                 records: vec![],
                 end: Some(end(last_offset, StreamReadStop::Timeout)),
@@ -527,6 +531,7 @@ async fn read(runtime: Arc<StreamRuntime>, spec: ReadSpec, sink: impl Fn(StreamC
                 return;
             }
         };
+        looked = true;
         let given = response.records.len();
         let mut page = Vec::with_capacity(given);
         let mut stop = None;
