@@ -1,11 +1,14 @@
 //! The Stream calls of a run, and the marker that records what Workflow code got in one Workflow
 //! Task. A call has no command or event of its own, so it needs no state machine.
 
-use crate::worker::workflow::{
-    OutgoingJob, WFMachinesError, fatal, nondeterminism,
-    streams::{
-        AppendSpec, CloseSpec, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
-        StreamResolution, next_call_id,
+use crate::{
+    telemetry::metrics::MetricsContext,
+    worker::workflow::{
+        OutgoingJob, WFMachinesError, fatal, nondeterminism,
+        streams::{
+            AppendSpec, CloseSpec, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
+            StreamResolution, next_call_id, store_metrics,
+        },
     },
 };
 use prost::Message;
@@ -882,12 +885,17 @@ impl StreamCalls {
     }
 
     /// Notes the Stream jobs of an activation, which Workflow code gets at `activation` in the
-    /// Workflow Task. The marker of the task records them.
-    pub(super) fn note_delivered(&mut self, jobs: &[OutgoingJob], activation: u32) {
+    /// Workflow Task. The marker of the task records them. `metrics` are the run's.
+    pub(super) fn note_delivered(
+        &mut self,
+        jobs: &[OutgoingJob],
+        activation: u32,
+        metrics: &MetricsContext,
+    ) {
         for job in jobs {
             match &job.variant {
                 workflow_activation_job::Variant::ResolveStreamRead(page) => {
-                    self.note_page(page, activation);
+                    self.note_page(page, activation, metrics);
                 }
                 workflow_activation_job::Variant::ResolveStreamAppend(result) => {
                     let Some(append) = self.appends.get(&result.seq) else {
@@ -929,10 +937,18 @@ impl StreamCalls {
         }
     }
 
-    fn note_page(&mut self, page: &ResolveStreamRead, activation: u32) {
+    fn note_page(&mut self, page: &ResolveStreamRead, activation: u32, metrics: &MetricsContext) {
         let Some(read) = self.reads.get_mut(&page.seq) else {
             return;
         };
+        // Only a read that the Worker runs got its Records from the Store. A replayed one got
+        // them from History, and a replay counts nothing.
+        if read.dispatched
+            && !page.records.is_empty()
+            && let Some(metrics) = store_metrics(metrics, &read.stream.store)
+        {
+            metrics.stream_read_records(page.records.len() as u64);
+        }
         let at = match self.marker_reads.iter().position(|e| e.seq == page.seq) {
             Some(at) => at,
             None => {
