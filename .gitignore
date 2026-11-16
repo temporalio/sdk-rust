@@ -1,8 +1,9 @@
 # Build files
 /target/
 
-# sdk-core is a library we allow consumers pin specific versions.
+# Keep fixture lockfiles local while tracking the workspace lockfile.
 Cargo.lock
+!/Cargo.lock
 
 /.idea/
 *.iml
