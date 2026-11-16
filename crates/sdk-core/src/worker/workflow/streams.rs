@@ -2,6 +2,7 @@
 //! tasks on the Worker's runtime, and gives each result to the run as a [LocalResolution].
 
 use crate::{
+    WorkerConfig, WorkflowErrorType,
     telemetry::metrics::{MetricsContext, stream_store, workflow_type},
     worker::workflow::{
         LocalResolution, LocalResolutionMsg,
@@ -52,48 +53,17 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, warn};
 
-/// Says for a Workflow type whether a replay that can't read its Records fails the Workflow.
-type FailsWorkflow = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-
-/// The Stream runtimes of a Worker, by the name of the Store that each serves. A Workflow call on
-/// a Stream uses the runtime of its `StreamRef.store`.
-#[derive(Clone, derive_more::Debug)]
+/// The Stream runtimes of a Worker, by the name of the Store that each serves, and the Worker's
+/// options of a read. A Workflow call on a Stream uses the runtime of its `StreamRef.store`.
+#[derive(Clone, Debug, Default)]
 pub struct StreamRuntimes {
     runtimes: HashMap<String, Arc<StreamRuntime>>,
-    /// False for a replay Worker, which reads the Store only for the Records of a marker.
-    calls_stores: bool,
     /// The bytes of one read's Records that may wait for Workflow code, or `None` for
     /// [DEFAULT_READ_AHEAD_BYTES].
     read_ahead_bytes: Option<usize>,
     /// The least time between two batches of one read, or `None` for
     /// [DEFAULT_READ_BATCH_WINDOW].
     read_batch_window: Option<Duration>,
-    /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
-    /// with no meter, so that it builds no attributes for a read.
-    #[debug(skip)]
-    metrics: Option<MetricsContext>,
-    /// The Workflow type of the run whose history these runtimes read, which the Worker's metrics
-    /// lack.
-    workflow_type: Option<String>,
-    /// True for a Workflow type that the Worker fails, and not only its task, when a replay can't
-    /// read its Records. `None` fails the task only.
-    #[debug(skip)]
-    fails_workflow: Option<FailsWorkflow>,
-    /// A shorter bound for a close in flight at a graceful shutdown, so that a test needn't wait
-    /// for the real one.
-    #[cfg(test)]
-    close_bound: Option<Duration>,
-    /// Told each time a graceful shutdown waits for a close in flight, so that a test sees the wait
-    /// as an event.
-    #[cfg(test)]
-    #[debug(skip)]
-    shutdown_waits: Option<Arc<Notify>>,
-}
-
-impl Default for StreamRuntimes {
-    fn default() -> Self {
-        Self::new([])
-    }
 }
 
 impl StreamRuntimes {
@@ -101,43 +71,9 @@ impl StreamRuntimes {
     pub fn new(runtimes: impl IntoIterator<Item = (String, Arc<StreamRuntime>)>) -> Self {
         Self {
             runtimes: runtimes.into_iter().collect(),
-            calls_stores: true,
             read_ahead_bytes: None,
             read_batch_window: None,
-            metrics: None,
-            workflow_type: None,
-            fails_workflow: None,
-            #[cfg(test)]
-            close_bound: None,
-            #[cfg(test)]
-            shutdown_waits: None,
         }
-    }
-
-    /// The runtimes, telling `waits` each time a graceful shutdown waits for a close in flight.
-    #[cfg(test)]
-    pub(crate) fn with_shutdown_waits(self, waits: Arc<Notify>) -> Self {
-        Self {
-            shutdown_waits: Some(waits),
-            ..self
-        }
-    }
-
-    /// The runtimes, with `bound` in place of [CLOSE_SHUTDOWN_BOUND].
-    #[cfg(test)]
-    pub(crate) fn with_close_bound(self, bound: Duration) -> Self {
-        Self {
-            close_bound: Some(bound),
-            ..self
-        }
-    }
-
-    fn close_bound(&self) -> Duration {
-        #[cfg(test)]
-        if let Some(bound) = self.close_bound {
-            return bound;
-        }
-        CLOSE_SHUTDOWN_BOUND
     }
 
     /// The runtimes with `bytes` as the bound of one read's Records that may wait for Workflow
@@ -182,66 +118,6 @@ impl StreamRuntimes {
         }
     }
 
-    /// The runtimes with the Worker's metrics, for a replay's reads of the Store.
-    pub(crate) fn with_metrics(self, metrics: &MetricsContext) -> Self {
-        Self {
-            metrics: metrics.has_meter().then(|| metrics.clone()),
-            ..self
-        }
-    }
-
-    /// The runtimes for the history of a run of `workflow_type`, so that a replay's reads count
-    /// under it.
-    pub(crate) fn for_run(mut self, workflow_type: &str) -> Self {
-        if self.metrics.is_some() {
-            self.workflow_type = Some(workflow_type.to_string());
-        }
-        self
-    }
-
-    /// The metrics of a replay's read of `store`, or `None` with no meter.
-    fn replay_metrics(&self, store: &str) -> Option<MetricsContext> {
-        let metrics = self.metrics.as_ref()?;
-        let run = self
-            .workflow_type
-            .iter()
-            .map(|ty| workflow_type(ty.clone()));
-        Some(metrics.with_new_attrs(run.chain([stream_store(store)])))
-    }
-
-    /// The runtimes of a replay Worker. It reads the Records of a marker, and never makes a live
-    /// call, so a call that history leaves open stays open there.
-    pub(crate) fn for_replay(self) -> Self {
-        Self {
-            calls_stores: false,
-            ..self
-        }
-    }
-
-    /// False for a replay Worker, which makes no live call.
-    pub(crate) fn calls_stores(&self) -> bool {
-        self.calls_stores
-    }
-
-    /// The runtimes with `fails_workflow`, which says for a Workflow type whether the Worker fails
-    /// the Workflow when a replay can't read its Records.
-    pub(crate) fn with_workflow_failure(
-        self,
-        fails_workflow: impl Fn(&str) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            fails_workflow: Some(Arc::new(fails_workflow)),
-            ..self
-        }
-    }
-
-    /// True if a replay of `workflow_type` that can't read its Records fails the Workflow.
-    pub(crate) fn fails_workflow(&self, workflow_type: &str) -> bool {
-        self.fails_workflow
-            .as_ref()
-            .is_some_and(|fails| fails(workflow_type))
-    }
-
     /// The runtime of the Store `store`, if the Worker has one.
     pub fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
         self.runtimes.get(store)
@@ -251,6 +127,108 @@ impl StreamRuntimes {
     pub fn is_empty(&self) -> bool {
         self.runtimes.is_empty()
     }
+}
+
+/// Says for a Workflow type whether a replay that can't read its Records fails the Workflow.
+type FailsWorkflow = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// What the Worker builds from its config for its Stream calls. A run and each history page share
+/// it.
+#[derive(derive_more::Debug)]
+pub(crate) struct WorkerStreams {
+    runtimes: StreamRuntimes,
+    /// False for a replay Worker, which reads the Store only for the Records of a marker.
+    calls_stores: bool,
+    /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
+    /// with no meter, so that it builds no attributes for a read.
+    #[debug(skip)]
+    metrics: Option<MetricsContext>,
+    /// True for a Workflow type that the Worker fails, and not only its task, when a replay can't
+    /// read its Records.
+    #[debug(skip)]
+    fails_workflow: FailsWorkflow,
+    #[cfg(test)]
+    hooks: StreamTestHooks,
+}
+
+impl WorkerStreams {
+    pub(crate) fn new(config: &Arc<WorkerConfig>, metrics: &MetricsContext) -> Self {
+        let failure_config = config.clone();
+        Self {
+            runtimes: config.stream_runtimes.clone(),
+            calls_stores: !config.replays_only,
+            metrics: metrics.has_meter().then(|| metrics.clone()),
+            fails_workflow: Box::new(move |workflow_type| {
+                failure_config.should_fail_workflow(workflow_type, &WorkflowErrorType::StreamReplay)
+            }),
+            #[cfg(test)]
+            hooks: config.stream_test_hooks.clone(),
+        }
+    }
+
+    /// The runtime of the Store `store`, if the Worker has one.
+    pub(crate) fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
+        self.runtimes.get(store)
+    }
+
+    /// False for a replay Worker, which makes no live call.
+    pub(crate) fn calls_stores(&self) -> bool {
+        self.calls_stores
+    }
+
+    /// True if a replay of `workflow_type` that can't read its Records fails the Workflow.
+    pub(crate) fn fails_workflow(&self, workflow_type: &str) -> bool {
+        (self.fails_workflow)(workflow_type)
+    }
+
+    fn close_bound(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(bound) = self.hooks.close_bound {
+            return bound;
+        }
+        CLOSE_SHUTDOWN_BOUND
+    }
+}
+
+/// The Worker's Stream state for the history of one run, which reads its markers with it.
+#[derive(Clone, Debug)]
+pub(crate) struct RunStreams {
+    worker: Arc<WorkerStreams>,
+    /// The run's Workflow type, which a replay's reads count under. Kept only with a meter.
+    workflow_type: Option<String>,
+}
+
+impl RunStreams {
+    pub(crate) fn new(worker: &Arc<WorkerStreams>, workflow_type: &str) -> Self {
+        Self {
+            worker: worker.clone(),
+            workflow_type: worker.metrics.is_some().then(|| workflow_type.to_string()),
+        }
+    }
+
+    pub(crate) fn worker(&self) -> &WorkerStreams {
+        &self.worker
+    }
+
+    /// The metrics of a replay's read of `store`, or `None` with no meter.
+    fn replay_metrics(&self, store: &str) -> Option<MetricsContext> {
+        let metrics = self.worker.metrics.as_ref()?;
+        let run = self
+            .workflow_type
+            .iter()
+            .map(|ty| workflow_type(ty.clone()));
+        Some(metrics.with_new_attrs(run.chain([stream_store(store)])))
+    }
+}
+
+/// What lets a test see and shorten the wait of a graceful shutdown for a close.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamTestHooks {
+    /// A shorter bound in place of [CLOSE_SHUTDOWN_BOUND].
+    pub(crate) close_bound: Option<Duration>,
+    /// Told each time a graceful shutdown waits for a close in flight.
+    pub(crate) shutdown_waits: Option<Arc<Notify>>,
 }
 
 /// The bytes of one read's Records that may wait for Workflow code when the Worker sets no
@@ -438,7 +416,7 @@ pub(crate) enum StreamCallResult {
 /// Runs the Stream calls of a Worker's runs. Its tasks run on the Worker's runtime, not on the
 /// workflow processing thread, so that Store work never holds up the runs.
 pub(crate) struct StreamManager {
-    runtimes: StreamRuntimes,
+    streams: Arc<WorkerStreams>,
     handle: Handle,
     local_tx: UnboundedSender<LocalInput>,
     /// The run and the abort handle of each running call, by its call id, and whether the call
@@ -469,13 +447,13 @@ impl Drop for StreamManager {
 
 impl StreamManager {
     pub(crate) fn new(
-        runtimes: StreamRuntimes,
+        streams: Arc<WorkerStreams>,
         handle: Handle,
         local_tx: UnboundedSender<LocalInput>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
-            runtimes,
+            streams,
             handle,
             local_tx,
             tasks: Default::default(),
@@ -488,7 +466,7 @@ impl StreamManager {
     pub(crate) fn has_closes_in_flight(&self) -> bool {
         let in_flight = self.closes_in_flight.load(Ordering::Acquire) > 0;
         #[cfg(test)]
-        if in_flight && let Some(waits) = &self.runtimes.shutdown_waits {
+        if in_flight && let Some(waits) = &self.streams.hooks.shutdown_waits {
             waits.notify_one();
         }
         in_flight
@@ -519,7 +497,7 @@ impl StreamManager {
                             if let Some(metrics) = &metrics {
                                 metrics.stream_read_started();
                             }
-                            let options = self.runtimes.read_options();
+                            let options = self.streams.runtimes.read_options();
                             let call = read(runtime, spec, sink, metrics, options);
                             self.spawn(run_id, call_id, false, call);
                         }
@@ -615,7 +593,7 @@ impl StreamManager {
         metrics: Option<MetricsContext>,
     ) -> impl Future<Output = ()> + Send + 'static {
         let shutdown = self.shutdown.clone();
-        let bound = self.runtimes.close_bound();
+        let bound = self.streams.close_bound();
         let local_tx = self.local_tx.clone();
         async move {
             let mut call = Box::pin(call);
@@ -647,7 +625,7 @@ impl StreamManager {
     }
 
     fn runtime(&self, stream: &StreamRef) -> Option<Arc<StreamRuntime>> {
-        self.runtimes.get(&stream.store).cloned()
+        self.streams.get(&stream.store).cloned()
     }
 
     /// The machines check the Store of each call, so a call with no runtime only comes when the
@@ -1125,7 +1103,7 @@ pub(crate) fn is_stream_replay_error(status: &tonic::Status) -> bool {
 /// Store here, where history enters in async code, and gives them a marker that has its Records.
 pub(crate) async fn hydrate_stream_markers(
     events: &mut [HistoryEvent],
-    runtimes: &StreamRuntimes,
+    streams: Option<&RunStreams>,
 ) -> Result<(), tonic::Status> {
     let mut markers = vec![];
     for (at, event) in events.iter_mut().enumerate() {
@@ -1175,7 +1153,7 @@ pub(crate) async fn hydrate_stream_markers(
         .collect();
     let results: Vec<_> = futures_util::stream::iter(reads)
         .map(|(marker, entry, stream, read)| async move {
-            (marker, entry, read_range(runtimes, &stream, &read).await)
+            (marker, entry, read_range(streams, &stream, &read).await)
         })
         .buffer_unordered(HYDRATE_CONCURRENCY)
         .collect()
@@ -1193,16 +1171,17 @@ pub(crate) async fn hydrate_stream_markers(
 
 /// Reads the Records of one entry and checks them, and counts the read in the metrics.
 async fn read_range(
-    runtimes: &StreamRuntimes,
+    streams: Option<&RunStreams>,
     stream: &StreamRef,
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
-    let Some(metrics) = runtimes.replay_metrics(&stream.store) else {
-        return read_and_check(runtimes, stream, entry).await;
+    let runtime = streams.and_then(|streams| streams.worker.get(&stream.store));
+    let Some(metrics) = streams.and_then(|streams| streams.replay_metrics(&stream.store)) else {
+        return read_and_check(runtime, stream, entry).await;
     };
     metrics.stream_replay_read_started();
     let started = Instant::now();
-    let records = read_and_check(runtimes, stream, entry).await;
+    let records = read_and_check(runtime, stream, entry).await;
     metrics.stream_replay_read_latency(started.elapsed());
     if records.is_err() {
         metrics.stream_replay_read_failed();
@@ -1212,7 +1191,7 @@ async fn read_range(
 
 /// Reads the Records of one entry, with no wait, and checks them against the entry.
 async fn read_and_check(
-    runtimes: &StreamRuntimes,
+    runtime: Option<&Arc<StreamRuntime>>,
     stream: &StreamRef,
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
@@ -1225,7 +1204,7 @@ async fn read_and_check(
             offset_text(&entry.last_offset),
         ))
     };
-    let runtime = runtimes.get(&stream.store).ok_or_else(|| {
+    let runtime = runtime.ok_or_else(|| {
         fail(format!(
             "this Worker has no Stream runtime for the Store `{}`",
             stream.store
