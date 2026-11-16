@@ -59,6 +59,9 @@ pub struct StreamRuntimes {
     runtimes: HashMap<String, Arc<StreamRuntime>>,
     /// False for a replay Worker, which reads the Store only for the Records of a marker.
     calls_stores: bool,
+    /// The bytes of one read's Records that may wait for Workflow code, or `None` for
+    /// [DEFAULT_READ_AHEAD_BYTES].
+    read_ahead_bytes: Option<usize>,
     /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
     /// with no meter, so that it builds no attributes for a read.
     #[debug(skip)]
@@ -89,6 +92,7 @@ impl StreamRuntimes {
         Self {
             runtimes: runtimes.into_iter().collect(),
             calls_stores: true,
+            read_ahead_bytes: None,
             metrics: None,
             workflow_type: None,
             #[cfg(test)]
@@ -122,6 +126,23 @@ impl StreamRuntimes {
             return bound;
         }
         CLOSE_SHUTDOWN_BOUND
+    }
+
+    /// The runtimes with `bytes` as the bound of one read's Records that may wait for Workflow
+    /// code. A read stops asking the Store while that many bytes wait, and goes on when an
+    /// activation takes Records. Its first page always comes. The Records wait in the Worker's
+    /// memory, whichever Store they come from, so the bound is the Worker's and not a Store's.
+    /// Unset is 4 MiB. Zero is refused when the Worker's config is built.
+    pub fn with_read_ahead_bytes(self, bytes: usize) -> Self {
+        Self {
+            read_ahead_bytes: Some(bytes),
+            ..self
+        }
+    }
+
+    /// The bound that [StreamRuntimes::with_read_ahead_bytes] set, if it set one.
+    pub fn read_ahead_bytes(&self) -> Option<usize> {
+        self.read_ahead_bytes
     }
 
     /// The runtimes with the Worker's metrics, for a replay's reads of the Store.
@@ -176,9 +197,10 @@ impl StreamRuntimes {
     }
 }
 
-/// The bytes of Records that a read may hold before Workflow code takes them. Past it, the read
-/// waits, so a run with no Workflow Task in hand doesn't gather Records without a bound.
-const MAX_UNDELIVERED_BYTES: usize = 4 * 1024 * 1024;
+/// The bytes of one read's Records that may wait for Workflow code when the Worker sets no
+/// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
+/// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
+pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
 /// How long a graceful shutdown waits for a close in flight, from the start of the shutdown or
 /// of the close if it is later. The Worker has no other bound for the work of its runs at a
 /// shutdown, and a Store that never answers must not hold the shutdown for ever.
@@ -249,8 +271,8 @@ impl ReadFlow {
         self.taken.notified().await;
     }
 
-    async fn wait_for_room(&self) {
-        while self.undelivered.load(Ordering::Acquire) >= MAX_UNDELIVERED_BYTES {
+    async fn wait_for_room(&self, read_ahead_bytes: usize) {
+        while self.undelivered.load(Ordering::Acquire) >= read_ahead_bytes {
             self.taken.notified().await;
         }
     }
@@ -416,7 +438,11 @@ impl StreamManager {
                             if let Some(metrics) = &metrics {
                                 metrics.stream_read_started();
                             }
-                            let call = read(runtime, spec, sink, metrics);
+                            let read_ahead = self
+                                .runtimes
+                                .read_ahead_bytes
+                                .unwrap_or(DEFAULT_READ_AHEAD_BYTES);
+                            let call = read(runtime, spec, sink, metrics, read_ahead);
                             self.spawn(run_id, call_id, false, call);
                         }
                         None => self.no_runtime(run_id, call_id, seq, Call::Read),
@@ -617,6 +643,7 @@ async fn read(
     spec: ReadSpec,
     sink: impl Fn(StreamCallResult),
     metrics: Option<MetricsContext>,
+    read_ahead_bytes: usize,
 ) {
     let deadline = spec.deadline.map(|deadline| {
         Instant::now()
@@ -648,7 +675,7 @@ async fn read(
     // short read with no Record, and a loop of such reads could stand still.
     let mut looked = spec.took_a_record;
     loop {
-        spec.flow.wait_for_room().await;
+        spec.flow.wait_for_room(read_ahead_bytes).await;
         let now = Instant::now();
         if looked && deadline.is_some_and(|deadline| deadline <= now) {
             sink(StreamCallResult::Page {
@@ -993,6 +1020,17 @@ pub(crate) async fn hydrate_stream_markers(
             .iter()
             .any(|entry| entry.count > 0 && entry.records.is_empty())
         {
+            if let Some(entry) = data
+                .reads
+                .iter()
+                .find(|entry| data.streams.get(entry.stream_index as usize).is_none())
+            {
+                return Err(replay_error(format!(
+                    "StreamReplayError: a Stream marker is bad: read {} has Stream {}, which the \
+                     marker doesn't have",
+                    entry.seq, entry.stream_index
+                )));
+            }
             markers.push((at, data));
         }
     }
@@ -1007,17 +1045,19 @@ pub(crate) async fn hydrate_stream_markers(
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| entry.count > 0 && entry.records.is_empty())
-                .map(move |(entry, read)| (marker, entry, read.clone()))
+                .map(move |(entry, read)| {
+                    let stream = data.streams[read.stream_index as usize].clone();
+                    (marker, entry, stream, read.clone())
+                })
         })
         .collect();
-    let results: Vec<_> =
-        futures_util::stream::iter(reads)
-            .map(|(marker, entry, read)| async move {
-                (marker, entry, read_range(runtimes, &read).await)
-            })
-            .buffer_unordered(HYDRATE_CONCURRENCY)
-            .collect()
-            .await;
+    let results: Vec<_> = futures_util::stream::iter(reads)
+        .map(|(marker, entry, stream, read)| async move {
+            (marker, entry, read_range(runtimes, &stream, &read).await)
+        })
+        .buffer_unordered(HYDRATE_CONCURRENCY)
+        .collect()
+        .await;
     for (marker, entry, records) in results {
         markers[marker].1.reads[entry].records = records?;
     }
@@ -1032,18 +1072,15 @@ pub(crate) async fn hydrate_stream_markers(
 /// Reads the Records of one entry and checks them, and counts the read in the metrics.
 async fn read_range(
     runtimes: &StreamRuntimes,
+    stream: &StreamRef,
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
-    let store = entry
-        .stream
-        .as_ref()
-        .map_or("", |stream| stream.store.as_str());
-    let Some(metrics) = runtimes.replay_metrics(store) else {
-        return read_and_check(runtimes, entry).await;
+    let Some(metrics) = runtimes.replay_metrics(&stream.store) else {
+        return read_and_check(runtimes, stream, entry).await;
     };
     metrics.stream_replay_read_started();
     let started = Instant::now();
-    let records = read_and_check(runtimes, entry).await;
+    let records = read_and_check(runtimes, stream, entry).await;
     metrics.stream_replay_read_latency(started.elapsed());
     if records.is_err() {
         metrics.stream_replay_read_failed();
@@ -1054,9 +1091,9 @@ async fn read_range(
 /// Reads the Records of one entry, with no wait, and checks them against the entry.
 async fn read_and_check(
     runtimes: &StreamRuntimes,
+    stream: &StreamRef,
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
-    let stream = entry.stream.clone().unwrap_or_default();
     let fail = |cause: String| {
         replay_error(format!(
             "StreamReplayError: Stream `{}` in Store `{}`, the Records after {} through {}: {cause}",
