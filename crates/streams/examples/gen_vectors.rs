@@ -418,15 +418,25 @@ fn hash_body(out: &mut Sha256, record: &Record) {
     }
 }
 
-/// A Record that a read gave, with its wire offset and its encoded Producer.
+/// The Producer of a Record that a read gave: its encoding for the file, and its kind number, id
+/// and epoch key for the digest.
+struct ReadProducer {
+    encoded: Vec<u8>,
+    kind: u8,
+    id: String,
+    epoch: Epoch,
+}
+
+/// A Record that a read gave, with its wire offset and its Producer.
 struct ReadRecord {
     offset: Vec<u8>,
-    producer: Option<Vec<u8>>,
+    producer: Option<ReadProducer>,
     body: Record,
 }
 
 /// The digest of the Records of a read, as the first 16 bytes of the SHA-256. A tag byte `R`
-/// starts it, then each Record gives its offset, its Producer and its body.
+/// starts it, then each Record gives its offset, its Producer and its body. A Producer is the
+/// byte 1, its kind number as one byte, its id, and its 40-byte epoch key.
 fn records_digest(records: &[ReadRecord]) -> Vec<u8> {
     let mut out = Sha256::new();
     out.update(b"R");
@@ -434,8 +444,9 @@ fn records_digest(records: &[ReadRecord]) -> Vec<u8> {
         hash_part(&mut out, &record.offset);
         match &record.producer {
             Some(producer) => {
-                out.update([1u8]);
-                hash_part(&mut out, producer);
+                out.update([1u8, producer.kind]);
+                hash_part(&mut out, producer.id.as_bytes());
+                out.update(producer.epoch.key());
             }
             None => out.update([0u8]),
         }
@@ -454,19 +465,29 @@ fn proto_field(number: u8, wire_type: u8, value: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The encoded Producer `wf:<run>` of kind Workflow, in Workflow Task `started_event_id`, attempt 1.
-fn workflow_producer(run: &str, started_event_id: u8) -> Vec<u8> {
+/// The Producer `wf:<run>` of kind Workflow, in Workflow Task `started_event_id`, attempt 1.
+fn workflow_producer(run: &str, started_event_id: u8) -> ReadProducer {
     let epoch = [
         proto_field(1, 0, &[started_event_id]),
         proto_field(2, 0, &[1]),
     ]
     .concat();
     let workflow = [proto_field(1, 2, run.as_bytes()), proto_field(2, 2, &epoch)].concat();
-    [
-        proto_field(1, 2, format!("wf:{run}").as_bytes()),
-        proto_field(2, 2, &workflow),
-    ]
-    .concat()
+    let id = format!("wf:{run}");
+    ReadProducer {
+        encoded: [
+            proto_field(1, 2, id.as_bytes()),
+            proto_field(2, 2, &workflow),
+        ]
+        .concat(),
+        kind: 1,
+        id,
+        epoch: Epoch {
+            task_started_event_id: Some(started_event_id.into()),
+            task_attempt: Some(1),
+            ..Epoch::default()
+        },
+    }
 }
 
 fn record_digests() -> Json {
@@ -526,7 +547,7 @@ fn record_digests() -> Json {
                     .map(|record| {
                         let mut fields = vec![("offset", Json::str(hex(&record.offset)))];
                         if let Some(producer) = &record.producer {
-                            fields.push(("producer", Json::str(hex(producer))));
+                            fields.push(("producer", Json::str(hex(&producer.encoded))));
                         }
                         fields.push(("body", record.body.json()));
                         Json::Obj(fields)
