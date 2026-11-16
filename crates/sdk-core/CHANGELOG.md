@@ -57,6 +57,8 @@ relevant information.
   A graceful shutdown of the Worker waits for each close in flight, for at most 10 s.
   `StreamRuntimes::with_read_ahead_bytes` sets how many bytes of one read's Records may wait for
   Workflow code before the read stops asking the Store, 4 MiB by default.
+  `StreamRuntimes::with_read_batch_window` sets the least time between two batches of one read, so
+  that a busy Stream doesn't activate Workflow code for each Record, 50 ms by default.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
