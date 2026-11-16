@@ -53,6 +53,7 @@ relevant information.
   activations. A close takes effect only after the server took the task that asked for it, so its
   result comes in a later task. The Worker's meter counts these calls, their failures and the
   Records that reads gave, and records append, close and replay read latencies, as `stream_*`.
+  A graceful shutdown of the Worker waits for each close in flight, for at most 10 s.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
