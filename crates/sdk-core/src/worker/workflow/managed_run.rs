@@ -80,7 +80,7 @@ pub(super) struct ManagedRun {
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
     /// Runs the run's Stream calls on the Worker's runtime.
     stream_manager: Arc<StreamManager>,
-    /// Set if the run is currently waiting on the execution of some local activities.
+    /// Set if the run is currently waiting on local work: local activities, or Stream calls.
     waiting_on_la: Option<WaitingOnLAs>,
     /// The time in this Workflow Task in which only Stream calls held it open.
     stream_hold: StreamHold,
@@ -292,8 +292,8 @@ impl ManagedRun {
 
         if activation.jobs.is_empty() {
             if self.wfm.machines.outstanding_local_work() > 0 {
-                // If the activation has no jobs but there are outstanding LAs, we need to restart
-                // the WFT heartbeat.
+                // If the activation has no jobs but there is outstanding local work (LAs or
+                // Stream calls), we need to restart the WFT heartbeat.
                 let wft_timeout = self.waiting_on_la.as_ref().map(|w| w.wft_timeout);
                 if let Some(wft_timeout) = wft_timeout {
                     let hb_timeout_handle = self.start_heartbeat_timeout(start_time, wft_timeout);
@@ -305,7 +305,7 @@ impl ManagedRun {
                     lawait.hb_timeout_handle = hb_timeout_handle;
                     self.start_stream_hold();
                     // No activation needs to be sent to lang. We just need to wait for another
-                    // heartbeat timeout or LAs to resolve
+                    // heartbeat timeout or for the local work to resolve
                     return Ok(None);
                 }
             }
@@ -904,9 +904,9 @@ impl ManagedRun {
             self.dispatch_stream_requests();
 
             if self.wfm.machines.outstanding_local_work() == 0 {
-                Ok(None)
+                Ok(AfterCompletion::Complete)
             } else if self.wfm.machines.outstanding_local_activity_count() == 0
-                && self.wfm.machines.outstanding_stream_appends() == 0
+                && self.wfm.machines.outstanding_stream_writes() == 0
                 && (self.wfm.machines.has_server_commands()
                     || self.wfm.machines.has_messages_for_server()
                     || self.wfm.machines.has_pending_close_intents()
@@ -915,7 +915,7 @@ impl ManagedRun {
                 // Only reads are left. A command or a message for the server, or a close, must not
                 // wait for a read, so the task completes immediately, and the read gives its next
                 // pages to the next task.
-                Ok(Some(None))
+                Ok(AfterCompletion::CompleteBeforeReads)
             } else {
                 let wft_timeout: Duration = self
                     .wfm
@@ -928,12 +928,15 @@ impl ManagedRun {
                                 .to_string(),
                         )
                     })?;
-                Ok(Some(Some((completion.start_time, wft_timeout))))
+                Ok(AfterCompletion::Wait {
+                    start_time: completion.start_time,
+                    wft_timeout,
+                })
             }
         })();
 
         match outcome {
-            Ok(None) => {
+            Ok(AfterCompletion::Complete) => {
                 if let Some(waiting) = self.waiting_on_la.take() {
                     waiting.hb_timeout_handle.abort();
                 }
@@ -947,7 +950,7 @@ impl ManagedRun {
                     completing_heartbeat_autocomplete || closing,
                 )))
             }
-            Ok(Some(None)) => {
+            Ok(AfterCompletion::CompleteBeforeReads) => {
                 if let Some(waiting) = self.waiting_on_la.take() {
                     waiting.hb_timeout_handle.abort();
                 }
@@ -957,7 +960,10 @@ impl ManagedRun {
                     true,
                 )))
             }
-            Ok(Some(Some((start_t, wft_timeout)))) => {
+            Ok(AfterCompletion::Wait {
+                start_time: start_t,
+                wft_timeout,
+            }) => {
                 if let Some(wola) = self.waiting_on_la.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
@@ -1406,8 +1412,8 @@ impl ManagedRun {
         let query_responses = data.query_responses;
         let has_query_responses = !query_responses.is_empty();
         let is_query_playback = data.has_pending_query && !has_query_responses;
-        // Unrecorded LAs must get a replacement task on which to execute after eviction, just
-        // like LAs that remain outstanding across a workflow-task heartbeat.
+        // Unrecorded local work (LAs or Stream calls) must get a replacement task on which to
+        // finish after eviction, just like work that remains outstanding across a heartbeat.
         let mut force_new_wft =
             due_to_heartbeat_timeout || (eviction_has_output && outstanding_las);
 
@@ -1767,7 +1773,22 @@ impl StreamHold {
     }
 }
 
-/// Tracks the heartbeat while a workflow task has outstanding local activities.
+/// What a completion of lang does to the Workflow Task.
+enum AfterCompletion {
+    /// Nothing holds the task, so it completes.
+    Complete,
+    /// Only reads hold the task, and something must not wait for them. The task completes, and
+    /// a new one takes the read's next pages.
+    CompleteBeforeReads,
+    /// Local work holds the task, so it waits, with a heartbeat at its timeout.
+    Wait {
+        start_time: Instant,
+        wft_timeout: Duration,
+    },
+}
+
+/// Tracks the heartbeat while a workflow task has outstanding local work: local activities, and
+/// Stream calls.
 struct WaitingOnLAs {
     wft_timeout: Duration,
     /// Can be used to abort heartbeat timeouts
