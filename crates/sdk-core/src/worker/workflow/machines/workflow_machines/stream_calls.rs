@@ -977,9 +977,9 @@ impl StreamCalls {
             .count()
     }
 
-    /// The appends that have no result, and the closes that wait in a queue or run, once replay
-    /// ended. A close holds a Workflow Task after the one of its intent, as an append does.
-    pub(super) fn open_appends(&self) -> usize {
+    /// The writes that have no result: appends, and closes that wait in a queue or run, once
+    /// replay ended. A close holds a Workflow Task after the one of its intent, as an append does.
+    pub(super) fn open_writes(&self) -> usize {
         if !self.live {
             return 0;
         }
