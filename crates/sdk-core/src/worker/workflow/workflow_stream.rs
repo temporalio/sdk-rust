@@ -220,6 +220,9 @@ impl WFStream {
 
                 activations.extend(maybe_act);
                 activations.extend(state.reconcile_buffered());
+                if state.shutdown_token.is_cancelled() {
+                    activations.extend(state.end_reads_for_shutdown());
+                }
                 actions.extend(
                     activations
                         .into_iter()
@@ -631,6 +634,19 @@ impl WFStream {
             );
         }
         acts
+    }
+
+    /// Completes each Workflow Task that only reads hold open, so that a graceful shutdown ends.
+    fn end_reads_for_shutdown(&mut self) -> Vec<ActivationOrAuto> {
+        let run_ids: Vec<_> = self
+            .runs
+            .runs_lru_order()
+            .map(|(run_id, _)| run_id.to_string())
+            .collect();
+        run_ids
+            .iter()
+            .filter_map(|run_id| self.runs.get_mut(run_id)?.end_reads_for_shutdown())
+            .collect()
     }
 
     fn shutdown_done(&self) -> bool {
