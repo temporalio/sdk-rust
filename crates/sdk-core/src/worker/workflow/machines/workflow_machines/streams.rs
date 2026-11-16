@@ -6,8 +6,9 @@ use crate::{
     worker::workflow::{
         OutgoingJob, WFMachinesError, fatal, nondeterminism,
         streams::{
-            AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, ReadFlow, ReadSpec, StreamCallResult,
-            StreamRequest, StreamResolution, next_call_id, store_metrics,
+            AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_RECORD_BYTES, ReadFlow,
+            ReadSpec, StreamCallResult, StreamRequest, StreamResolution, next_call_id,
+            store_metrics,
         },
     },
 };
@@ -96,6 +97,51 @@ struct Read {
     open: bool,
     /// True once the Worker runs the read. A replayed read takes its results from history.
     dispatched: bool,
+    /// Records, and the end, that the read gave past this task's marker bound. The next task
+    /// takes them.
+    carried: Option<ResolveStreamRead>,
+}
+
+/// Takes as much of `page` as the task's marker has room for, and keeps the rest in `read` for the
+/// next task. `used` is what the task's marker holds already. The first Record of a task always
+/// comes, also when it is larger than the bound alone.
+fn fit_in_marker(
+    read: &mut Read,
+    page: ResolveStreamRead,
+    used: &mut usize,
+) -> Option<ResolveStreamRead> {
+    let ResolveStreamRead { seq, records, end } = page;
+    if let Some(carried) = read.carried.as_mut() {
+        carried.records.extend(records);
+        carried.end = end;
+        return None;
+    }
+    let mut records = records.into_iter();
+    let mut taken = vec![];
+    while let Some(record) = records.next() {
+        let size = record.encoded_len();
+        if *used > 0 && *used + size > MAX_MARKER_RECORD_BYTES {
+            let mut rest = vec![record];
+            rest.extend(records);
+            read.carried = Some(ResolveStreamRead {
+                seq,
+                records: rest,
+                end,
+            });
+            return (!taken.is_empty()).then_some(ResolveStreamRead {
+                seq,
+                records: taken,
+                end: None,
+            });
+        }
+        *used += size;
+        taken.push(record);
+    }
+    Some(ResolveStreamRead {
+        seq,
+        records: taken,
+        end,
+    })
 }
 
 impl Read {
@@ -177,6 +223,9 @@ pub(super) struct StreamCalls {
     /// False on a replay Worker, where a run never goes live and a call that history leaves open
     /// stays open, as a Local Activity does there.
     calls_stores: bool,
+    /// The bytes of Records that this task's marker holds for reads with their Records in
+    /// History, counted when a page becomes a job.
+    marker_record_bytes: usize,
 }
 
 impl StreamCalls {
@@ -225,6 +274,7 @@ impl StreamCalls {
             delivered: (0, 0),
             open: true,
             dispatched: self.live,
+            carried: None,
         };
         if self.live {
             self.requests.push(StreamRequest::Read(read.spec()));
@@ -397,6 +447,7 @@ impl StreamCalls {
             return Ok(false);
         }
         read.open = false;
+        read.carried = None;
         if read.dispatched {
             self.requests.push(StreamRequest::Cancel(read.call_id));
         }
@@ -477,10 +528,14 @@ impl StreamCalls {
                 if read.call_id != call_id || !read.open {
                     return None;
                 }
-                if end.is_some() {
+                let mut page = ResolveStreamRead { seq, records, end };
+                if read.records_in_history {
+                    page = fit_in_marker(read, page, &mut self.marker_record_bytes)?;
+                }
+                if page.end.is_some() {
                     read.open = false;
                 }
-                Some(StreamJob::Read(ResolveStreamRead { seq, records, end }))
+                Some(StreamJob::Read(page))
             }
             StreamCallResult::Append(status) => {
                 let append = self.appends.get_mut(&seq)?;
@@ -826,12 +881,48 @@ impl StreamCalls {
         self.marker_closes.clear();
     }
 
+    /// The pages that reads gave past the marker bound of the last task, as jobs of this task.
+    /// They count against this task's bound too.
+    pub(super) fn release_carried(&mut self) -> Vec<StreamJob> {
+        let mut seqs: Vec<_> = self
+            .reads
+            .iter()
+            .filter(|(_, read)| read.carried.is_some())
+            .map(|(seq, _)| *seq)
+            .collect();
+        seqs.sort();
+        let mut jobs = vec![];
+        for seq in seqs {
+            let Some(read) = self.reads.get_mut(&seq) else {
+                continue;
+            };
+            let Some(page) = read.carried.take() else {
+                continue;
+            };
+            if let Some(page) = fit_in_marker(read, page, &mut self.marker_record_bytes) {
+                if page.end.is_some() {
+                    read.open = false;
+                }
+                jobs.push(StreamJob::Read(page));
+            }
+        }
+        jobs
+    }
+
+    /// True once the Records of this task's marker reached their bound, so that the task
+    /// completes and a new one takes the rest.
+    pub(super) fn marker_full(&self) -> bool {
+        self.marker_record_bytes >= MAX_MARKER_RECORD_BYTES
+            || self.reads.values().any(|read| read.carried.is_some())
+    }
+
     /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
     /// results must not reach Workflow code. It keeps the results that history holds, so that a
     /// replayed marker event still finds one that Workflow code never got.
     pub(super) fn stop_all(&mut self) {
         for read in self.reads.values_mut().filter(|read| read.open) {
             read.open = false;
+            read.carried = None;
             self.requests.push(StreamRequest::Cancel(read.call_id));
         }
         for append in self.appends.values_mut().filter(|a| !a.resolved) {
@@ -1018,6 +1109,7 @@ impl StreamCalls {
         &mut self,
         epoch: Option<WorkflowTaskEpoch>,
     ) -> Option<StreamMarkerData> {
+        self.marker_record_bytes = 0;
         if !self.has_marker_entries() {
             return None;
         }

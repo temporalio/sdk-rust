@@ -508,6 +508,11 @@ impl WorkflowMachines {
         self.stream_calls.stop_all();
     }
 
+    /// True once the Records of this task's Stream marker reached their bound.
+    pub(crate) fn stream_marker_full(&self) -> bool {
+        self.stream_calls.marker_full()
+    }
+
     /// True if Workflow code ever started a Stream call in this run.
     pub(crate) fn has_stream_calls(&self) -> bool {
         self.stream_calls.has_calls()
@@ -897,6 +902,9 @@ impl WorkflowMachines {
         if num_events_to_process > 0 {
             self.local_activity_data.wft_applied();
             self.stream_calls.wft_applied();
+            for job in self.stream_calls.release_carried() {
+                self.push_stream_job(job);
+            }
         }
 
         // Process any WFT completed events in the next sequence, as well as peek ahead to the
