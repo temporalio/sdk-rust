@@ -39,7 +39,7 @@ otel = [
   "dep:opentelemetry-otlp",
   "temporalio-common/otel",
 ]
-ephemeral-server = ["dep:flate2", "dep:reqwest", "dep:tar", "dep:zip"]
+ephemeral-server = ["dep:flate2", "dep:hyper", "dep:reqwest", "dep:tar", "dep:zip"]
 debug-plugin = ["dep:reqwest", "dep:hyper"]
 # Exposes mocks and helpers used by sdk-core's own integration tests, benches,
 # and the `histfetch` binary. Not part of the public API surface; downstream
