@@ -15,6 +15,8 @@ mod nexus;
 mod patches;
 mod priority;
 mod queries;
+// Legacy patch-only activations can poll routines earlier on replay; preserve that behavior.
+#[cfg(feature = "disable_workflow_task_chunking")]
 mod rejected_update_persistence;
 mod replay;
 mod resets;
