@@ -129,7 +129,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu
-      options: --cpus=1 --memory=512m
+      # A swap limit equal to the memory limit gives the container no swap. With swap, the kernel
+      # can move the buffer of the memory test out of memory, and the test then reads too little.
+      options: --cpus=1 --memory=512m --memory-swap=512m
     env:
       CGROUP_TESTS_ENABLED: true
     steps:
