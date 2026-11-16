@@ -61,6 +61,8 @@ relevant information.
   that a busy Stream doesn't activate Workflow code for each Record, 50 ms by default.
   A read with no `idle_timeout` ends after 1 minute with no Record. A graceful shutdown completes a
   task that only reads hold open, and a cached run that gets another Worker's events is evicted.
+  With `WorkflowErrorType::StreamReplay`, a replay that can't read its Records fails the Workflow
+  instead of its task, and the marker of one task holds at most 1 MiB of Records.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
