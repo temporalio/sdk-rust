@@ -58,6 +58,8 @@ relevant information.
   Workflow code before the read stops asking the Store, 4 MiB by default.
   `StreamRuntimes::with_read_batch_window` sets the least time between two batches of one read, so
   that a busy Stream doesn't activate Workflow code for each Record, 50 ms by default.
+  A read with no `idle_timeout` ends after 1 minute with no Record. A graceful shutdown completes a
+  task that only reads hold open, and a cached run that gets another Worker's events is evicted.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
