@@ -247,15 +247,20 @@ impl StreamCalls {
         if self.reads.contains_key(&attrs.seq) {
             return Err(fatal!("Stream read {} was started twice", attrs.seq));
         }
-        let duration = |value: Option<prost_types::Duration>| {
-            value
-                .and_then(|value| Duration::try_from(value).ok())
-                .filter(|value| !value.is_zero())
-        };
+        // A set timeout must bound the read. Lang leaves it unset for no bound.
+        let timeout = attrs
+            .timeout
+            .map(|timeout| Duration::try_from(timeout).unwrap_or_default());
+        if timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(fatal!(
+                "Stream read {} has a timeout of zero or less. Leave it unset for no bound",
+                attrs.seq
+            ));
+        }
         // The bound counts from the Workflow time of the start, which a replay has too, so no
         // restart can stretch it.
-        let deadline = duration(attrs.timeout)
-            .map(|timeout| workflow_time.unwrap_or_else(SystemTime::now) + timeout);
+        let deadline =
+            timeout.map(|timeout| workflow_time.unwrap_or_else(SystemTime::now) + timeout);
         let read = Read {
             call_id: next_call_id(),
             seq: attrs.seq,
