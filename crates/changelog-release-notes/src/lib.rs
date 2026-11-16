@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
 use std::{
+    collections::HashSet,
     fs,
     path::{Component, Path},
     process::Command,
@@ -192,6 +193,34 @@ pub fn release_section(text: &str, version: &str) -> Result<String> {
         return Ok(String::new());
     }
     Ok(format!("{body}\n"))
+}
+
+pub fn check_changelog(text: &str) -> Result<()> {
+    let mut versions = HashSet::new();
+    for (_, _, heading) in headings(text, "## ") {
+        if heading == "Unreleased" || heading.starts_with('[') {
+            let version = version_heading(heading);
+            if version == "Unreleased" {
+                bail!("migrate Unreleased notes to category folders");
+            }
+            if !versions.insert(version) {
+                bail!("duplicate changelog section for {version:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn notes(text: &str, version: &str, date: Option<NaiveDate>) -> Result<String> {
+    check_changelog(text)?;
+    if let Some(date) = date {
+        let (_, _, _, heading) = section(text, version)?;
+        let expected = format!("[{version}] - {date}");
+        if heading != expected {
+            bail!("expected release heading {expected:?}, found {heading:?}");
+        }
+    }
+    release_section(text, version)
 }
 
 pub(crate) fn category_sections(text: &str) -> Vec<(String, String)> {
@@ -427,10 +456,11 @@ pub fn published_release_notes(
     changelog: &Path,
     submodule: &Path,
     version: &str,
+    date: Option<NaiveDate>,
     from: Option<&str>,
     to: &str,
 ) -> Result<String> {
-    let mut notes = published_changelog_release_notes(repo, changelog, version)?;
+    let mut notes = published_changelog_release_notes(repo, changelog, version, date)?;
     let (core, old, new) = core_range(repo, submodule, version, from, to)?;
     let commits = range::commit_notes(&core, &old, &new)?;
     if !commits.is_empty() {
@@ -446,8 +476,9 @@ pub fn published_changelog_release_notes(
     repo: &Path,
     changelog: &Path,
     version: &str,
+    date: Option<NaiveDate>,
 ) -> Result<String> {
     relative(changelog)?;
-    let section = release_section(&read(&repo.join(changelog))?, version)?;
+    let section = notes(&read(&repo.join(changelog))?, version, date)?;
     Ok(format!("## Notable Changes\n\n{section}"))
 }
