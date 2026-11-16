@@ -4429,10 +4429,13 @@ async fn a_read_gives_the_records_of_its_window_in_one_batch() {
     move_clock(LONG_WINDOW).await;
     let page = w.next().await;
     assert_eq!(texts(&reads(&page)[0].records), ["b", "c"]);
+    // The Store may give one page in several reads of its log, so the check is on time.
     let gave = w.gave.lock().clone();
-    assert_eq!(gave.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(gave.iter().map(|(_, n)| *n).sum::<usize>(), 3);
     assert!(
-        gave[1].0 - gave[0].0 >= LONG_WINDOW,
+        gave[1..]
+            .iter()
+            .all(|(at, _)| *at - gave[0].0 >= LONG_WINDOW),
         "the read asked the Store again before its window passed"
     );
     w.finish(&page).await;
@@ -4881,4 +4884,35 @@ async fn a_marker_with_records_in_history_stays_under_its_bound() {
             .all(|size| *size <= MAX_MARKER_RECORD_BYTES + largest),
         "{sizes:?}"
     );
+}
+
+/// A read asks the Store for no more bytes than the room left under its `read_ahead_bytes`, so
+/// one page can't pass that bound by more than one Record.
+#[tokio::test]
+async fn a_page_fits_the_room_under_read_ahead_bytes() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let body = "x".repeat(1 << 10);
+    put(&runtime, "s", &[body.as_str(); 10]).await;
+    let runtimes = runtimes(&runtime).with_read_ahead_bytes(SMALL_READ_AHEAD);
+    let run = start(
+        one_task_history(),
+        [ResponseType::AllHistory],
+        runtimes,
+        1,
+        0,
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let page = run.worker.poll_workflow_activation().await.unwrap();
+    let records = &reads(&page)[0].records;
+    let bytes: usize = records.iter().map(Message::encoded_len).sum();
+    let largest = records.iter().map(Message::encoded_len).max().unwrap();
+    assert!(
+        bytes <= SMALL_READ_AHEAD + largest,
+        "the first page has {} Records, {bytes} bytes",
+        records.len()
+    );
+    run.worker.complete_execution(&page.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
 }
