@@ -42,6 +42,8 @@ pub(crate) use activities::{
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
 pub use workflow::StreamRuntimes;
+#[cfg(test)]
+pub(crate) use workflow::TASK_DURATIONS;
 
 use crate::{
     ActivityHeartbeat,
