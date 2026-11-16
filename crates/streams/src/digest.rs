@@ -4,8 +4,10 @@
 //! values. Core records the digest of the Records that a read gave, and checks it when it reads
 //! them again in a replay. `testdata/record_digests.json` has the values of [records_digest].
 
-use crate::proto::{AppendRecord, StreamRecord};
-use prost::Message;
+use crate::{
+    epoch::{epoch_key, kind_of},
+    proto::{AppendRecord, StreamRecord},
+};
 use sha2::{Digest, Sha256};
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 
@@ -26,9 +28,14 @@ pub fn batch_digest(records: &[AppendRecord]) -> [u8; DIGEST_LEN] {
     finish(hasher)
 }
 
-/// The first 16 bytes of a SHA-256 over Records that a read gave, in order. It covers each Record's
-/// wire offset, its encoded Producer and its body, the body as [batch_digest] hashes it. A Producer
-/// has no map field, so its encoding is the same each time.
+/// The first 16 bytes of a SHA-256 over Records that a read gave, in order. History keeps the
+/// digest for good, so it hashes a fixed list of fields in an encoding that this crate owns. A
+/// field that a later version adds to a message then changes no old digest.
+///
+/// The input is the byte `R`, then for each Record: its wire offset; the byte 0 for no Producer,
+/// or the byte 1, the Producer's kind number as one byte (0 for none), its id, and the 40 bytes of
+/// its [epoch_key]; and then its body, as [batch_digest] hashes it. An offset and an id each have
+/// their length before them, as a big-endian `u64`.
 pub fn records_digest(records: &[StreamRecord]) -> [u8; DIGEST_LEN] {
     let mut hasher = Sha256::new();
     hasher.update([RECORDS_TAG]);
@@ -37,7 +44,9 @@ pub fn records_digest(records: &[StreamRecord]) -> [u8; DIGEST_LEN] {
         match &record.producer {
             Some(producer) => {
                 hasher.update([1]);
-                part(&mut hasher, &producer.encode_to_vec());
+                hasher.update([kind_of(producer).map_or(0, |kind| kind as u8)]);
+                part(&mut hasher, producer.id.as_bytes());
+                hasher.update(epoch_key(producer.kind.as_ref()));
             }
             None => hasher.update([0]),
         }

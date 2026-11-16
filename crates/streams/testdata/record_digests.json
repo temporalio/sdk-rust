@@ -15,7 +15,7 @@
         }
       }
     ],
-    "digest": "ff3c4b8606b66c9c29c2bf23ad1ca8f6"
+    "digest": "545864e4fef7b6261e6cf2f2c6991243"
   },
   {
     "name": "one record at another offset",
@@ -28,7 +28,7 @@
         }
       }
     ],
-    "digest": "4b42ad54b21a08972114dc5b45c9f932"
+    "digest": "881e87ad079a423ec937f227441636a2"
   },
   {
     "name": "one record of another task",
@@ -41,7 +41,7 @@
         }
       }
     ],
-    "digest": "b01d768732b17ae13eb0da7b9a039c33"
+    "digest": "34244dd10338b15ebaea09c98aaefeee"
   },
   {
     "name": "no Producer and no body",
@@ -74,6 +74,6 @@
         }
       }
     ],
-    "digest": "a0c2461e634355cfb4be20a64407e634"
+    "digest": "8f3a15193645a044783cd77f6a1a1575"
   }
 ]
