@@ -280,6 +280,11 @@ pub(crate) struct ReadFlow {
 }
 
 impl ReadFlow {
+    /// The bytes of the read's Records that no activation took yet.
+    fn undelivered(&self) -> usize {
+        self.undelivered.load(Ordering::Acquire)
+    }
+
     fn sent(&self, bytes: usize) {
         self.undelivered.fetch_add(bytes, Ordering::AcqRel);
     }
@@ -759,8 +764,7 @@ async fn read(
             r#ref: Some(spec.stream.clone()),
             from_offset: last_offset.clone(),
             max_records: records_left.map_or(0, |left| left.min(i32::MAX as u32) as i32),
-            // A cap of zero bytes left still asks for one Record, which then ends the read.
-            max_bytes: bytes_left.map_or(0, |left| left.clamp(1, i64::MAX as u64) as i64),
+            max_bytes: page_bytes_cap(bytes_left, &spec.flow, options.read_ahead_bytes),
             wait: Some(proto_duration(wait_until.saturating_duration_since(now))),
         };
         let response = match runtime.read_records(request).await {
@@ -855,6 +859,16 @@ async fn read(
             None => {}
         }
     }
+}
+
+/// The byte cap of the next page: the room left under `read_ahead_bytes`, and under the read's
+/// `max_bytes` if it set one. A cap of one byte still gives one Record, so the read moves on, and
+/// a cap of zero bytes left ends the read with that Record.
+fn page_bytes_cap(bytes_left: Option<u64>, flow: &ReadFlow, read_ahead_bytes: usize) -> i64 {
+    let room = read_ahead_bytes.saturating_sub(flow.undelivered()) as u64;
+    bytes_left
+        .map_or(room, |left| left.min(room))
+        .clamp(1, i64::MAX as u64) as i64
 }
 
 /// The metrics of an append or a close, and when Core started it.
