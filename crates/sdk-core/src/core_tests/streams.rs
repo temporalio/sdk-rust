@@ -4431,3 +4431,168 @@ async fn a_read_holds_its_task_apart_from_the_duration_warning() {
     assert!(held > Duration::ZERO, "the read's hold wasn't counted");
     assert!(held <= duration, "{held:?} of {duration:?}");
 }
+
+/// A history in which the first Workflow Task, on this Worker, started read 1 and a timer, and a
+/// second one, on another Worker, recorded `marker` if it is given. A signal starts each later
+/// task, and the third one is the task that comes back to this Worker.
+fn foreign_task_history(marker: Option<&StreamMarkerData>) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    t.add_full_wf_task();
+    t.add_timer_started("1".to_string());
+    t.add_we_signaled("go", vec![]);
+    t.add_full_wf_task();
+    if let Some(marker) = marker {
+        stream_marker_event(&mut t, 9, marker);
+    }
+    t.add_we_signaled("again", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// A runtime on a [WatchedStore], and the reads of it that gave Records.
+type Watched = (
+    Arc<StreamRuntime>,
+    Arc<Mutex<Vec<(tokio::time::Instant, usize)>>>,
+);
+
+/// A runtime on a [WatchedStore] with Stream `s` and one Record, "a", and the reads that gave
+/// Records.
+async fn watched_with_a() -> Watched {
+    let gave = Arc::new(Mutex::new(vec![]));
+    let store = WatchedStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        gave: gave.clone(),
+        waits: Arc::new(AtomicUsize::new(0)),
+    };
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a"]).await;
+    gave.lock().clear();
+    (runtime, gave)
+}
+
+/// What Workflow code got from a run that came back to its Worker after another Worker ran a task.
+#[derive(Debug, Default)]
+struct BackAgain {
+    /// Each read page, with whether its activation replayed.
+    pages: Vec<(bool, Vec<String>)>,
+    evictions: Vec<String>,
+}
+
+/// Runs the first task of `t` on a Worker whose read takes the Record in the Store with no task
+/// in hand, and then gives it the third task. Workflow code starts read 1 and a timer, and ends
+/// the Workflow once the second signal came live and it got one Record.
+async fn back_again(
+    t: TestHistoryBuilder,
+    (runtime, gave): Watched,
+    records_in_history: bool,
+) -> BackAgain {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let gate = async move {
+        released.await.ok();
+    }
+    .boxed();
+    let responses = [
+        ResponseType::ToTaskNum(1),
+        ResponseType::UntilResolved(gate, 3),
+    ];
+    let run = start_with(t, responses, runtimes(&runtime), 1, 0, true);
+    let read = StartStreamRead {
+        records_in_history,
+        idle_timeout: None,
+        ..read_cmd(1, "s")
+    };
+    let mut seen = BackAgain::default();
+    let mut gate = Some(release);
+    let (mut got, mut again) = (0, false);
+    loop {
+        let next = tokio::time::timeout(
+            Duration::from_secs(30),
+            run.worker.poll_workflow_activation(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("no activation came: {seen:?}"))
+        .unwrap();
+        let mut first = false;
+        for job in next.jobs.iter().filter_map(|job| job.variant.as_ref()) {
+            match job {
+                workflow_activation_job::Variant::InitializeWorkflow(_) => first = true,
+                workflow_activation_job::Variant::RemoveFromCache(evict) => {
+                    seen.evictions.push(evict.message.clone());
+                }
+                workflow_activation_job::Variant::ResolveStreamRead(page) => {
+                    got += page.records.len();
+                    seen.pages.push((next.is_replaying, texts(&page.records)));
+                }
+                workflow_activation_job::Variant::SignalWorkflow(signal) => {
+                    again |= signal.signal_name == "again" && !next.is_replaying;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            run.failed.lock().is_empty(),
+            "{:?} after {seen:?}",
+            run.failed.lock()
+        );
+        if first {
+            complete(&run.worker, &next, vec![read.clone().into(), timer_cmd(1)]).await;
+            // The read takes the Record with no task in hand. Its page is in the run by the time
+            // the Store gave the Record, since the read sends it in the same poll on this thread.
+            if let Some(release) = gate.take() {
+                until("the read of the Record", || !gave.lock().is_empty()).await;
+                release.send(()).unwrap();
+            }
+        } else if again && got >= 1 {
+            run.worker.complete_execution(&next.run_id).await;
+            break;
+        } else {
+            complete(&run.worker, &next, vec![]).await;
+        }
+    }
+    run.worker.drain_pollers_and_shutdown().await;
+    seen
+}
+
+/// The marker of a page of `records` that read 1 gave in the second activation of a task.
+fn one_page_marker(records: &[StreamRecord], records_in_history: bool) -> StreamMarkerData {
+    let page = Page {
+        records,
+        activation: 1,
+    };
+    StreamMarkerData {
+        reads: vec![read_entry(1, vec![], &[page], None, records_in_history)],
+        streams: vec![stream("s")],
+        ..Default::default()
+    }
+}
+
+/// A cached run gets a task with a page that another Worker recorded, with its Records in the
+/// Store. Its replay reads them, so Workflow code gets the Record once, in the replayed task.
+#[tokio::test]
+async fn a_cached_run_replays_a_page_that_another_worker_recorded() {
+    let watched = watched_with_a().await;
+    let marker = one_page_marker(&all_records(&watched.0, "s").await, false);
+    let seen = back_again(foreign_task_history(Some(&marker)), watched, false).await;
+    assert_eq!(seen.pages, [(true, vec!["a".to_string()])], "{seen:?}");
+}
+
+/// The same with the Records in History, while the cached run's own read took the Record with no
+/// task in hand. Workflow code gets it once, and not also from that read.
+#[tokio::test]
+async fn a_cached_run_drops_its_own_page_for_one_in_history() {
+    let watched = watched_with_a().await;
+    let marker = one_page_marker(&all_records(&watched.0, "s").await, true);
+    let seen = back_again(foreign_task_history(Some(&marker)), watched, true).await;
+    assert_eq!(seen.pages, [(true, vec!["a".to_string()])], "{seen:?}");
+}
+
+/// Another Worker's task gave read 1 no page. The cached run's own read took the Record with no
+/// task in hand, and it must not reach Workflow code in that replayed task, since no marker has
+/// it. It comes in a live task instead.
+#[tokio::test]
+async fn a_cached_run_gives_no_page_that_history_lacks() {
+    let seen = back_again(foreign_task_history(None), watched_with_a().await, false).await;
+    assert_eq!(seen.pages, [(false, vec!["a".to_string()])], "{seen:?}");
+}

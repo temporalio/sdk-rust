@@ -869,6 +869,11 @@ impl StreamCalls {
         std::mem::take(&mut self.requests)
     }
 
+    /// True if Workflow code ever started a Stream call in this run.
+    pub(super) fn has_calls(&self) -> bool {
+        !self.reads.is_empty() || !self.appends.is_empty() || !self.closes.is_empty()
+    }
+
     pub(super) fn has_requests(&self) -> bool {
         !self.requests.is_empty()
     }
