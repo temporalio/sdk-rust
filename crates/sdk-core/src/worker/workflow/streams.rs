@@ -28,6 +28,7 @@ use temporalio_common::protos::{
         common::StreamReadStop,
         external_data::{StreamMarkerData, StreamReadEntry},
         workflow_activation::{StreamAppended, StreamReadEnd, resolve_stream_append},
+        workflow_completion,
     },
     temporal::api::{
         common::v1::{Payload, Payloads},
@@ -51,6 +52,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, warn};
 
+/// Says for a Workflow type whether a replay that can't read its Records fails the Workflow.
+type FailsWorkflow = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The Stream runtimes of a Worker, by the name of the Store that each serves. A Workflow call on
 /// a Stream uses the runtime of its `StreamRef.store`.
 #[derive(Clone, derive_more::Debug)]
@@ -71,6 +75,10 @@ pub struct StreamRuntimes {
     /// The Workflow type of the run whose history these runtimes read, which the Worker's metrics
     /// lack.
     workflow_type: Option<String>,
+    /// True for a Workflow type that the Worker fails, and not only its task, when a replay can't
+    /// read its Records. `None` fails the task only.
+    #[debug(skip)]
+    fails_workflow: Option<FailsWorkflow>,
     /// A shorter bound for a close in flight at a graceful shutdown, so that a test needn't wait
     /// for the real one.
     #[cfg(test)]
@@ -98,6 +106,7 @@ impl StreamRuntimes {
             read_batch_window: None,
             metrics: None,
             workflow_type: None,
+            fails_workflow: None,
             #[cfg(test)]
             close_bound: None,
             #[cfg(test)]
@@ -212,6 +221,25 @@ impl StreamRuntimes {
     /// False for a replay Worker, which makes no live call.
     pub(crate) fn calls_stores(&self) -> bool {
         self.calls_stores
+    }
+
+    /// The runtimes with `fails_workflow`, which says for a Workflow type whether the Worker fails
+    /// the Workflow when a replay can't read its Records.
+    pub(crate) fn with_workflow_failure(
+        self,
+        fails_workflow: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            fails_workflow: Some(Arc::new(fails_workflow)),
+            ..self
+        }
+    }
+
+    /// True if a replay of `workflow_type` that can't read its Records fails the Workflow.
+    pub(crate) fn fails_workflow(&self, workflow_type: &str) -> bool {
+        self.fails_workflow
+            .as_ref()
+            .is_some_and(|fails| fails(workflow_type))
     }
 
     /// The runtime of the Store `store`, if the Worker has one.
@@ -1073,6 +1101,18 @@ pub(crate) fn needs_stream_records(events: &[HistoryEvent]) -> bool {
                     .any(|entry| entry.count > 0 && entry.records.is_empty())
             })
     })
+}
+
+/// The type of the failure of a replay that can't read or check the Records of a marker.
+pub(crate) const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
+
+/// True if a failure of a Workflow Task is one of a replay that can't read its Records.
+pub(crate) fn is_stream_replay_failure(failure: &workflow_completion::Failure) -> bool {
+    failure
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.maybe_application_failure())
+        .is_some_and(|info| info.r#type == STREAM_REPLAY_ERROR_TYPE)
 }
 
 /// True if the status comes from a failed hydrate.

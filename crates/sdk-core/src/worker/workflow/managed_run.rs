@@ -7,16 +7,16 @@ use crate::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
-            ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
+            ActivationOrAuto, BufferedTasks, CommandAnnotations, DrivenWorkflow,
+            EvictionRequestResult, FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
-            OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
+            OutstandingTask, PermittedWFT, ProtoCommandExt, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
             WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
-            streams::{StreamManager, stream_marker_payload_of},
+            streams::{StreamManager, is_stream_replay_failure, stream_marker_payload_of},
         },
     },
 };
@@ -42,6 +42,9 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
+        command::v1::{
+            Command as ProtoCommand, FailWorkflowExecutionCommandAttributes, command::Attributes,
+        },
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
         stream::v1::WorkflowTaskEpoch,
@@ -250,7 +253,7 @@ impl ManagedRun {
             waiting.heartbeat_timeout_pending = false;
         }
         if let Some(message) = stream_replay_error {
-            return Err(WFMachinesError::Stream(message).into());
+            return Err(WFMachinesError::StreamReplay(message).into());
         }
 
         if was_legacy_query
@@ -672,22 +675,6 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let rur = if is_no_report_query_fail {
-            None
-        } else {
-            // A failed task writes no marker, so no result of its Stream calls may reach Workflow
-            // code. A query that failed with no report keeps the run, and with it its calls.
-            self.stop_stream_calls();
-            // Blow up any cached data associated with the workflow
-            self.request_eviction(RequestEvictMsg {
-                run_id: self.run_id().to_string(),
-                message,
-                reason,
-                auto_reply_fail: None,
-            })
-            .into_run_update_resp()
-        };
-
         let kind = if !self.pending_work_is_legacy_query() {
             WftFailureKind::Task
         } else if is_no_report_query_fail {
@@ -696,18 +683,57 @@ impl ManagedRun {
             WftFailureKind::LegacyQuery
         };
 
+        // A replay that can't read its Records fails the run on its own, with a typed failure.
+        let error_type = if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError) {
+            Some(WorkflowErrorType::Nondeterminism)
+        } else if is_auto_fail && is_stream_replay_failure(&failure) {
+            Some(WorkflowErrorType::StreamReplay)
+        } else {
+            None
+        };
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
         // Only done on the first attempt: if that attempt's completion didn't reach the server,
         // later attempts fall through to the normal task failure path, which won't re-report.
-        if kind == WftFailureKind::Task
+        let fails_workflow = kind == WftFailureKind::Task
             && attempt <= 1
-            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-            && self.config.should_fail_workflow(
-                &self.wfm.machines.workflow_type,
-                &WorkflowErrorType::Nondeterminism,
-            )
-        {
-            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            && error_type.as_ref().is_some_and(|error_type| {
+                self.config
+                    .should_fail_workflow(&self.wfm.machines.workflow_type, error_type)
+            });
+
+        let rur = if is_no_report_query_fail {
+            None
+        } else {
+            // A failed task writes no marker, so no result of its Stream calls may reach Workflow
+            // code. A query that failed with no report keeps the run, and with it its calls.
+            self.stop_stream_calls();
+            let evict = RequestEvictMsg {
+                run_id: self.run_id().to_string(),
+                message,
+                reason,
+                auto_reply_fail: None,
+            };
+            if fails_workflow && self.activation.is_none() {
+                // The completion that fails the Workflow goes out first. The eviction follows it,
+                // as it does when lang's activation is still out.
+                self.trying_to_evict = Some(evict);
+                None
+            } else {
+                // Blow up any cached data associated with the workflow
+                self.request_eviction(evict).into_run_update_resp()
+            }
+        };
+
+        if fails_workflow && let Some(error_type) = error_type {
+            match error_type {
+                WorkflowErrorType::Nondeterminism => {
+                    warn!(failure=?failure, "Failing workflow due to nondeterminism error")
+                }
+                WorkflowErrorType::StreamReplay => {
+                    warn!(failure=?failure, "Failing workflow due to a Stream replay error");
+                    return self.fail_workflow_with_no_history(tt, attempt, failure, resp_chan);
+                }
+            }
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -738,6 +764,43 @@ impl ManagedRun {
             resp_chan,
         );
         rur
+    }
+
+    /// Fails the Workflow in a completion that has only the failure. A run whose replay couldn't
+    /// read its Records applied no history, so its machines can't take a command.
+    fn fail_workflow_with_no_history(
+        &mut self,
+        task_token: TaskToken,
+        attempt: u32,
+        failure: workflow_completion::Failure,
+        resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
+    ) -> RunUpdateAct {
+        let command = ProtoCommand::new(
+            Attributes::FailWorkflowExecutionCommandAttributes(
+                FailWorkflowExecutionCommandAttributes {
+                    failure: failure.failure,
+                },
+            ),
+            CommandAnnotations::default(),
+        );
+        self.reply_to_complete(
+            ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
+                task_token,
+                action: ActivationAction::WftComplete {
+                    commands: vec![command],
+                    messages: vec![],
+                    query_responses: vec![],
+                    force_new_wft: false,
+                    return_new_wft: true,
+                    sdk_metadata: Default::default(),
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    attempt,
+                },
+                metrics: self.metrics.clone(),
+            }),
+            resp_chan,
+        );
+        None
     }
 
     /// Must be called after the processing of the activation completion and WFT reporting.

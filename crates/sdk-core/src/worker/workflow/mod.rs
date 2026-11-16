@@ -43,7 +43,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
-            streams::StreamManager,
+            streams::{STREAM_REPLAY_ERROR_TYPE, StreamManager},
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -204,7 +204,16 @@ impl Workflows {
             .worker_config
             .stream_runtimes
             .clone()
-            .with_metrics(&basics.metrics);
+            .with_metrics(&basics.metrics)
+            .with_workflow_failure({
+                let config = basics.worker_config.clone();
+                move |workflow_type| {
+                    config.should_fail_workflow(
+                        workflow_type,
+                        &crate::WorkflowErrorType::StreamReplay,
+                    )
+                }
+            });
         let stream_manager = Arc::new(StreamManager::new(
             stream_runtimes.clone(),
             tokio::runtime::Handle::current(),
@@ -1808,6 +1817,10 @@ pub(crate) enum WFMachinesError {
     /// failed Workflow Task names the cause in its own words.
     #[error("{0}")]
     Stream(String),
+    /// A replay that can't read or check the Records of a Stream marker from the Store. It fails
+    /// the Workflow Task, or the Workflow with [WorkflowErrorType::StreamReplay].
+    #[error("{0}")]
+    StreamReplay(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1842,18 +1855,26 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_)
+            | WFMachinesError::Stream(_)
+            | WFMachinesError::StreamReplay(_) => EvictionReason::Fatal,
         }
     }
 
     fn as_failure(&self) -> Failure {
+        let mut failure =
+            temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
+                self.to_string(),
+                false,
+            );
+        // The type lets a Workflow failure of this error tell its cause, as the text does.
+        if let WFMachinesError::StreamReplay(_) = self
+            && let Some(FailureInfo::ApplicationFailureInfo(info)) = failure.failure_info.as_mut()
+        {
+            info.r#type = STREAM_REPLAY_ERROR_TYPE.to_string();
+        }
         Failure {
-            failure: Some(
-                temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
-                    self.to_string(),
-                    false,
-                ),
-            ),
+            failure: Some(failure),
             force_cause: WorkflowTaskFailedCause::from(self.evict_reason()) as i32,
         }
     }
