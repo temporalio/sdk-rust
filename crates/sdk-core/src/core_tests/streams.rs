@@ -4401,3 +4401,33 @@ async fn a_close_in_the_window_stops_the_read() {
     );
     w.finish(&page).await;
 }
+
+/// A task that a read holds open until its heartbeat counts that hold apart from its duration, so
+/// that the duration warning leaves it out.
+#[tokio::test]
+async fn a_read_holds_its_task_apart_from_the_duration_warning() {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(500));
+    t.add_full_wf_task();
+    marker_event(&mut t, 4);
+    t.add_workflow_task_scheduled_and_started();
+    let (worker, sent) = worker(t, [1, 2].map(ResponseType::ToTaskNum), &runtime, 0);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
+    put(&runtime, "s", &["a"]).await;
+    let page = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &page, vec![]).await;
+    let page = poll_after_heartbeat(&worker, &sent, || put(&runtime, "s", &["b"])).await;
+    worker.complete_execution(&page.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    let tasks = crate::worker::TASK_DURATIONS
+        .lock()
+        .remove(&run_id)
+        .expect("the run recorded its tasks");
+    let (duration, held) = tasks[0];
+    assert!(held > Duration::ZERO, "the read's hold wasn't counted");
+    assert!(held <= duration, "{held:?} of {duration:?}");
+}
