@@ -51,7 +51,6 @@ struct RejectedUpdatePersistenceWf;
 impl RejectedUpdatePersistenceWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        // Let flag adoption finish before an LA can prevent a safe chunking transition.
         ctx.timer(Duration::from_millis(1)).await;
         ctx.timer(Duration::from_millis(1)).await;
         let clock = ctx.clone();
@@ -253,21 +252,19 @@ async fn rejected_update_on_forced_task_replays_real_history(
                 .any(|e| e.event_type() == EventType::WorkflowExecutionUpdateAccepted)
         );
         if cfg!(feature = "disable_workflow_task_chunking") {
-            let before_la = events
+            let first_completed = events
                 .iter()
-                .rfind(|e| e.event_type() == EventType::TimerFired)
-                .unwrap()
-                .event_id;
+                .find(|e| e.event_type() == EventType::WorkflowTaskCompleted)
+                .unwrap();
             assert!(
-                events.iter().any(|e| matches!(
-                    e.attributes.as_ref(),
+                matches!(
+                    first_completed.attributes.as_ref(),
                     Some(Attributes::WorkflowTaskCompletedEventAttributes(a))
-                        if e.event_id < before_la
-                            && a.sdk_metadata.as_ref().is_some_and(|m| m.core_used_flags.contains(
+                        if a.sdk_metadata.as_ref().is_some_and(|m| m.core_used_flags.contains(
                                 &(CoreInternalFlags::DisableWorkflowTaskChunking as u32)
                             ))
-                )),
-                "flag 5 must be recorded before the LA starts"
+                ),
+                "flag 5 must be recorded on the first completed task"
             );
         }
         // Holding the LA until the server has committed this task prevents its marker

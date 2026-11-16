@@ -70,9 +70,9 @@ use temporalio_sdk_core::{
     },
     test_help::{
         CoreInternalFlags, LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType,
-        WorkerExt, WorkerTestHelpers, build_mock_pollers,
-        hist_to_poll_resp, mock_worker, mock_worker_client, query_ok, schedule_activity_cmd,
-        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
+        WorkerExt, WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
+        mock_worker_client, query_ok, schedule_activity_cmd, schedule_local_activity_cmd,
+        single_hist_mock_sg, start_timer_cmd,
     },
 };
 use tokio::{

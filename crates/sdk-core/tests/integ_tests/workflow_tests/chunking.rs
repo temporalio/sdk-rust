@@ -35,7 +35,6 @@ struct HeartbeatWorkflow;
 impl HeartbeatWorkflow {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
-        // Both timer tasks permit safe flag adoption before any LA is outstanding.
         ctx.timer(Duration::from_millis(1)).await;
         ctx.timer(Duration::from_millis(1)).await;
         let clock = ctx.clone();
@@ -63,7 +62,7 @@ impl WorkerInterceptor for NoEmptyActivations {
 // then the LA marker and workflow result in the fifth task. The activity was released only after
 // task 4's completion appeared in history. Jobless heartbeats must not activate lang or shift
 // the LA's activation index when the chunking flag is added.
-fn heartbeat_history(flag_task: Option<usize>) -> History {
+fn heartbeat_history(unchunked: bool) -> History {
     let mut history = TestHistoryBuilder::default();
     history.add_wfe_started_with_wft_timeout(Duration::from_secs(2));
     for task in 1..=5 {
@@ -78,7 +77,7 @@ fn heartbeat_history(flag_task: Option<usize>) -> History {
         } else {
             vec![]
         };
-        if Some(task) == flag_task {
+        if task == 1 && unchunked {
             flags.push(CoreInternalFlags::DisableWorkflowTaskChunking);
         }
         history.set_flags_last_wft(&flags, &[]);
@@ -128,11 +127,10 @@ fn heartbeat_history(flag_task: Option<usize>) -> History {
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
-#[case::flag_from_start(Some(1))]
-#[case::never_flagged(None)]
-#[case::flag_before_heartbeats(Some(2))]
+#[case::unchunked(true)]
+#[case::legacy(false)]
 #[tokio::test]
-async fn workflow_task_chunking_replays_compatible_histories(#[case] flag_task: Option<usize>) {
+async fn workflow_task_chunking_replays_compatible_histories(#[case] unchunked: bool) {
     let replayer = WorkflowReplayer::new(
         WorkflowReplayerOptions::new()
             .register_workflow::<HeartbeatWorkflow>()
@@ -142,7 +140,7 @@ async fn workflow_task_chunking_replays_compatible_histories(#[case] flag_task: 
     )
     .unwrap();
     replayer
-        .replay_workflow(heartbeat_history(flag_task).into())
+        .replay_workflow(heartbeat_history(unchunked).into())
         .await
         .unwrap();
 }
