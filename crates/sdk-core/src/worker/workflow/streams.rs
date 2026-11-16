@@ -2,7 +2,6 @@
 //! tasks on the Worker's runtime, and gives each result to the run as a [LocalResolution].
 
 use crate::{
-    abstractions::dbg_panic,
     telemetry::metrics::{MetricsContext, stream_store, workflow_type},
     worker::workflow::{
         LocalResolution, LocalResolutionMsg,
@@ -525,8 +524,9 @@ impl StreamManager {
                             }
                             let in_flight = CloseInFlight::new(&self.closes_in_flight);
                             let stream = spec.stream.clone();
+                            let abandoned = timer.as_ref().map(|timer| timer.metrics.clone());
                             let call = close(runtime, spec, epoch, sink, timer, in_flight);
-                            let call = self.bounded_by_shutdown(stream, call);
+                            let call = self.bounded_by_shutdown(stream, call, abandoned);
                             // History recorded the close, so the end of the run must not stop it.
                             self.spawn(run_id, call_id, true, call);
                         }
@@ -584,6 +584,7 @@ impl StreamManager {
         &self,
         stream: StreamRef,
         call: impl Future<Output = ()> + Send + 'static,
+        metrics: Option<MetricsContext>,
     ) -> impl Future<Output = ()> + Send + 'static {
         let shutdown = self.shutdown.clone();
         let bound = self.runtimes.close_bound();
@@ -605,6 +606,9 @@ impl StreamManager {
                         "A graceful shutdown gave up a Stream close that the Store didn't answer \
                          in {bound:?}"
                     );
+                    if let Some(metrics) = metrics {
+                        metrics.stream_close_abandoned();
+                    }
                     let _ = local_tx.send(LocalInput {
                         input: LocalInputs::BumpStream,
                         span: Span::current(),
@@ -619,13 +623,17 @@ impl StreamManager {
     }
 
     /// The machines check the Store of each call, so a call with no runtime only comes when the
-    /// runtimes and the machines disagree. It still resolves, so that the run doesn't wait forever.
+    /// runtimes and the machines disagree. It still resolves, so that the run doesn't wait forever,
+    /// with a failure of the type that a Store gives for a call it can't serve.
     fn no_runtime(&self, run_id: &str, call_id: u64, seq: u32, call: Call) {
-        dbg_panic!("A Stream call reached the Worker with no runtime or no epoch");
-        let failure = Failure {
-            message: "This Worker has no Stream runtime for the Store of the call".to_string(),
-            ..Default::default()
-        };
+        warn!(
+            run_id,
+            seq, "A Stream call reached the Worker with no runtime or no epoch"
+        );
+        let failure = failure(&StreamError::new(
+            Reason::Unsupported,
+            "This Worker has no Stream runtime for the Store of the call",
+        ));
         let result = match call {
             Call::Read => StreamCallResult::Page {
                 records: vec![],
