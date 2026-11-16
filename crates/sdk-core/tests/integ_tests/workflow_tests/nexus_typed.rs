@@ -243,7 +243,6 @@ impl TypedAsyncCompleter {
         Self { outcome }
     }
 
-    #[allow(dead_code)] // Started via untyped submitter handle
     #[run]
     pub(crate) async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<TypedOutput> {
         match ctx.state(|wf| wf.outcome) {

@@ -1,0 +1,1 @@
+Workflows can call typed Nexus service operations with `nexus_client`, `execute`, and `start` when the `experimental` feature is enabled, using service definitions from the [`nexus-rpc`](https://crates.io/crates/nexus-rpc) crate. Calls support typed results, operation handles, and cancellation.
