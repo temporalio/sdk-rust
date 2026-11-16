@@ -230,6 +230,11 @@ impl StreamRuntimes {
 /// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
 /// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// The idle timeout of a read that sets none. A quiet read holds its Workflow Task open, and each
+/// heartbeat adds three events to History, so a read with no bound would grow History for good.
+/// The server also ends a chain of heartbeat tasks after 30 minutes. One constant in Core gives
+/// every SDK the same default.
+pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The least time between two batches of one read when the Worker sets no `read_batch_window`.
 /// A read that gave each Record in its own batch would activate Workflow code once for each
 /// Record of a busy Stream, which costs lang far more than one activation for several Records.
@@ -336,9 +341,9 @@ pub(crate) struct ReadSpec {
     pub(crate) from_offset: Vec<u8>,
     /// The Workflow time at which the read started, plus its `timeout`.
     pub(crate) deadline: Option<SystemTime>,
-    /// How long the read waits for the Store with no Record, or `None` for no bound. Zero gives
-    /// what is in the Stream and doesn't wait.
-    pub(crate) idle_timeout: Option<Duration>,
+    /// How long the read waits for the Store with no Record. Zero gives what is in the Stream and
+    /// doesn't wait.
+    pub(crate) idle_timeout: Duration,
     /// The Records left under `max_records`, or `None` for no cap.
     pub(crate) records_left: Option<u32>,
     /// The bytes left under `max_bytes`, or `None` for no cap.
@@ -546,9 +551,15 @@ impl StreamManager {
     ) {
         let local_tx = self.local_tx.clone();
         let span = Span::current();
+        // A duration, so that the timer runs on the runtime's own clock, as the read's timers do.
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let sleep = {
+            let _runtime = self.handle.enter();
+            tokio::time::sleep(wait)
+        };
         self.handle.spawn(Abortable::new(
             async move {
-                tokio::time::sleep_until(deadline.into()).await;
+                sleep.await;
                 let _ = local_tx.send(LocalInput {
                     input: LocalInputs::HeartbeatTimeout(run_id),
                     span,
@@ -730,20 +741,15 @@ async fn read(
             return;
         }
         let idle_deadline = |last_record_at: Instant| {
-            spec.idle_timeout.and_then(|idle| {
-                spec.flow
-                    .idle_since(last_record_at)
-                    .map(|since| since + idle)
-            })
+            spec.flow
+                .idle_since(last_record_at)
+                .map(|since| since + spec.idle_timeout)
         };
         // While the idle time doesn't count, the read looks again after one idle timeout.
-        let idle_check = spec
-            .idle_timeout
-            .map(|idle| idle_deadline(last_record_at).unwrap_or(now + idle));
-        let wait_until = [deadline, idle_check]
+        let idle_check = idle_deadline(last_record_at).unwrap_or(now + spec.idle_timeout);
+        let wait_until = deadline
             .into_iter()
-            .flatten()
-            .fold(now + MAX_WAIT, Instant::min);
+            .fold(idle_check.min(now + MAX_WAIT), Instant::min);
         let request = ReadRecordsRequest {
             namespace: String::new(),
             r#ref: Some(spec.stream.clone()),
@@ -836,7 +842,7 @@ async fn read(
             }
             // A read that doesn't wait for the Store found nothing, while its idle time doesn't
             // count. It looks again once Workflow code takes its Records, and not in a loop.
-            None if spec.idle_timeout == Some(Duration::ZERO) => match deadline {
+            None if spec.idle_timeout.is_zero() => match deadline {
                 Some(deadline) => {
                     let _ = tokio::time::timeout_at(deadline, spec.flow.wait_for_take()).await;
                 }
