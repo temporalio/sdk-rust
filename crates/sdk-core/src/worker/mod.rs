@@ -386,6 +386,9 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         if matches!(config.max_outstanding_nexus_tasks, Some(v) if v == 0) {
             return Err("`max_outstanding_nexus_tasks` must be > 0".to_string());
         }
+        if config.stream_runtimes.read_ahead_bytes() == Some(0) {
+            return Err("`read_ahead_bytes` of `stream_runtimes` must be > 0".to_string());
+        }
 
         if config.max_cached_workflows > 0 {
             if let Some(max_wft) = config.max_outstanding_workflow_tasks
