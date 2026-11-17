@@ -87,4 +87,7 @@ message Endpoint {
 
     // The date and time when the endpoint was last modified.
     google.protobuf.Timestamp last_modified_time = 7;
+
+    // The id of the project this endpoint belongs to.
+    string project_id = 8;
 }

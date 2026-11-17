@@ -30,6 +30,7 @@ message Region {
     enum CloudProvider {
         CLOUD_PROVIDER_UNSPECIFIED = 0;
         CLOUD_PROVIDER_AWS = 1;
-	CLOUD_PROVIDER_GCP = 2;
+	    CLOUD_PROVIDER_GCP = 2;
+        CLOUD_PROVIDER_AZURE = 3;
     }
 }

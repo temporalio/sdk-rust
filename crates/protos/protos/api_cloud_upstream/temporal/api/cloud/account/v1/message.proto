@@ -19,10 +19,18 @@ message MetricsSpec {
     bytes accepted_client_ca = 2;
 }
 
+message AuthenticationSettings {
+    // Restricts Cloud web UI session lifetimes for users in this account.
+    bool restrict_session_lifetimes = 1;
+}
+
 message AccountSpec {
     // The metrics specification for this account.
     // If not specified, metrics will not be enabled.
     MetricsSpec metrics = 1;
+    // Authentication settings for this account.
+    // temporal:versioning:min_version=v0.20.0
+    AuthenticationSettings authentication_settings = 2;
 }
 
 message Metrics {
