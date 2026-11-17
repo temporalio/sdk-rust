@@ -282,6 +282,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 last_heartbeat_details,
                                 resource_id: Default::default(),
+                                // API 1.63.6 field beyond the Server 1.32.0 (API 1.63.5)
+                                // baseline: left UNSPECIFIED so it is not sent.
+                                cause: Default::default(),
                             }
                             .into_request();
                             rpc_options.apply_to(&mut request);

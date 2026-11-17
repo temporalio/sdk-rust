@@ -9,12 +9,16 @@ option java_outer_classname = "MessageProto";
 option ruby_package = "Temporalio::Api::Replication::V1";
 option csharp_namespace = "Temporalio.Api.Replication.V1";
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 import "temporal/api/enums/v1/namespace.proto";
 
 message ClusterReplicationConfig {
     string cluster_name = 1;
+    // Ramp duration when this cluster is added as passive by UpdateNamespace; unset or non-positive disables gradual connect.
+    // This field is not persisted and is omitted from namespace responses.
+    google.protobuf.Duration replication_ramp_duration = 2;
 }
 
 message NamespaceReplicationConfig {

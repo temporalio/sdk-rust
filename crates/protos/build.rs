@@ -31,6 +31,7 @@ const SERDE_DERIVE_PREFIXES: &[&str] = &[
     ".temporal.api.history",
     ".temporal.api.namespace",
     ".temporal.api.nexus",
+    ".temporal.api.nexusoperation",
     ".temporal.api.nexusservices",
     ".temporal.api.operatorservice",
     ".temporal.api.protocol",

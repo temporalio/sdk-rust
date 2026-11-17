@@ -871,6 +871,9 @@ impl WorkerClient for WorkerClientBag {
                     deployment: None,
                     deployment_options: self.deployment_options(),
                     resource_id: Default::default(),
+                    // API 1.63.6 field beyond the Server 1.32.0 (API 1.63.5) baseline: left
+                    // UNSPECIFIED so it is not sent; `_cause` stays unused as in U0.
+                    cause: Default::default(),
                 }
                 .into_request(),
             )
