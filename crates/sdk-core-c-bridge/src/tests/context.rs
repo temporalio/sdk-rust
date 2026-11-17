@@ -66,7 +66,7 @@ impl Default for InnerContext {
     }
 }
 
-pub struct Context {
+pub(super) struct Context {
     inner: Mutex<InnerContext>,
     condvar: Condvar,
 }
@@ -79,7 +79,7 @@ impl Context {
         })
     }
 
-    pub fn with(func: impl FnOnce(&Arc<Self>) + UnwindSafe) {
+    pub(super) fn with(func: impl FnOnce(&Arc<Self>) + UnwindSafe) {
         let context = Self::new(Default::default());
         let func_panic = std::panic::catch_unwind(|| func(&context));
         let dispose_panic = std::panic::catch_unwind(|| context.dispose());
@@ -89,26 +89,26 @@ impl Context {
     }
 
     #[allow(dead_code)]
-    pub fn runtime(&self) -> anyhow::Result<Option<NonNull<Runtime>>> {
+    pub(super) fn runtime(&self) -> anyhow::Result<Option<NonNull<Runtime>>> {
         Ok(NonNull::new(self.wait_for_available()?.runtime))
     }
 
     #[allow(dead_code)]
-    pub fn ephemeral_server(&self) -> anyhow::Result<Option<NonNull<EphemeralServer>>> {
+    pub(super) fn ephemeral_server(&self) -> anyhow::Result<Option<NonNull<EphemeralServer>>> {
         Ok(NonNull::new(self.wait_for_available()?.ephemeral_server))
     }
 
-    pub fn ephemeral_server_target(&self) -> anyhow::Result<Option<String>> {
+    pub(super) fn ephemeral_server_target(&self) -> anyhow::Result<Option<String>> {
         let guard = self.wait_for_available()?;
         Ok((!guard.ephemeral_server.is_null()).then(|| guard.ephemeral_server_target.clone()))
     }
 
     #[allow(dead_code)]
-    pub fn client(&self) -> anyhow::Result<Option<NonNull<Connection>>> {
+    pub(super) fn client(&self) -> anyhow::Result<Option<NonNull<Connection>>> {
         Ok(NonNull::new(self.wait_for_available()?.client))
     }
 
-    pub fn dispose(self: Arc<Context>) -> anyhow::Result<()> {
+    pub(super) fn dispose(self: Arc<Context>) -> anyhow::Result<()> {
         let inner = {
             let mut guard = self
                 .inner
@@ -145,7 +145,7 @@ impl Context {
         Ok(())
     }
 
-    pub fn runtime_new(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub(super) fn runtime_new(self: &Arc<Self>) -> anyhow::Result<()> {
         let mut guard = self.wait_for_available()?;
         if !guard.runtime.is_null() {
             return Err(anyhow!("Runtime already exists"));
@@ -177,7 +177,7 @@ impl Context {
         }
     }
 
-    pub fn start_dev_server(
+    pub(super) fn start_dev_server(
         self: &Arc<Self>,
         config: Box<TemporalDevServerConfig>,
     ) -> anyhow::Result<()> {
@@ -259,7 +259,7 @@ impl Context {
         self.wait_for_operation()
     }
 
-    pub fn ephemeral_server_shutdown(self: &Arc<Context>) -> anyhow::Result<()> {
+    pub(super) fn ephemeral_server_shutdown(self: &Arc<Context>) -> anyhow::Result<()> {
         let server = {
             let mut guard = self.wait_for_available()?;
             let server = guard.ephemeral_server;
@@ -285,11 +285,14 @@ impl Context {
         self.wait_for_operation()
     }
 
-    pub fn client_connect(self: &Arc<Self>, options: Box<ConnectionOptions>) -> anyhow::Result<()> {
+    pub(super) fn client_connect(
+        self: &Arc<Self>,
+        options: Box<ConnectionOptions>,
+    ) -> anyhow::Result<()> {
         Self::client_connect_with_override(self, options, None, std::ptr::null_mut())
     }
 
-    pub fn client_connect_with_override(
+    pub(super) fn client_connect_with_override(
         self: &Arc<Self>,
         options: Box<ConnectionOptions>,
         grpc_override_callback: crate::client::ClientGrpcOverrideCallback,
@@ -412,7 +415,7 @@ impl Context {
         self.wait_for_operation()
     }
 
-    pub fn rpc_call(
+    pub(super) fn rpc_call(
         self: &Arc<Self>,
         options: Box<OwnedRpcCallOptions>,
     ) -> anyhow::Result<Vec<u8>> {

@@ -217,7 +217,7 @@ struct ClientOverrideError {
 }
 
 impl ClientOverrideError {
-    pub fn new(message: String) -> Self {
+    fn new(message: String) -> Self {
         Self {
             message,
             details: None,
