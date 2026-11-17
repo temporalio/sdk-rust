@@ -26,3 +26,6 @@ derive_more = { workspace = true }
 
 [package.metadata.workspaces]
 independent = true
+
+[lints]
+workspace = true

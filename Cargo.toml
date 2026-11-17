@@ -15,7 +15,6 @@ members = [
 resolver = "3"
 
 [workspace.package]
-license = "MIT"
 license-file = "LICENSE.txt"
 
 [workspace.dependencies]

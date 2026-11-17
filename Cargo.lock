@@ -4426,7 +4426,6 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -4454,8 +4453,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-core",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
