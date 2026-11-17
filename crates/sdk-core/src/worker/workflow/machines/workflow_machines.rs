@@ -432,10 +432,16 @@ impl WorkflowMachines {
                 }
                 self.local_activity_data.done_executing(seq);
             }
-            LocalResolution::Stream(resolution) => match self.stream_calls.resolve(resolution) {
-                Some(job) => self.push_stream_job(job),
-                None => result_important = false,
-            },
+            LocalResolution::Stream(resolution) => {
+                let drive_me = &self.drive_me;
+                let job = self
+                    .stream_calls
+                    .resolve(resolution, |seq| drive_me.pending_stream_records(seq));
+                match job {
+                    Some(job) => self.push_stream_job(job),
+                    None => result_important = false,
+                }
+            }
         }
         Ok(result_important)
     }
@@ -731,6 +737,11 @@ impl WorkflowMachines {
                 &self.metrics,
             );
             self.local_activity_data.activation_dispatched();
+            // A pending job makes the next activation, so the Records over the page cap come
+            // right after this one and need no new result of their read.
+            for job in self.stream_calls.release_over_cap() {
+                self.push_stream_job(job);
+            }
         }
         let is_replaying = self.replaying || all_query;
         let deployment_version_for_current_task = if is_replaying {
@@ -921,7 +932,11 @@ impl WorkflowMachines {
         if num_events_to_process > 0 {
             self.local_activity_data.wft_applied();
             self.stream_calls.wft_applied();
-            for job in self.stream_calls.release_carried() {
+            let drive_me = &self.drive_me;
+            let jobs = self
+                .stream_calls
+                .release_carried(|seq| drive_me.pending_stream_records(seq));
+            for job in jobs {
                 self.push_stream_job(job);
             }
         }

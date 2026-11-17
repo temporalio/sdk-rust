@@ -101,6 +101,21 @@ impl DrivenWorkflow {
         }
     }
 
+    /// The Records in the pending job of read `seq`, or zero if it has none.
+    pub(super) fn pending_stream_records(&self, seq: u32) -> usize {
+        self.outgoing_wf_activation_jobs
+            .iter()
+            .find_map(|job| match &job.variant {
+                workflow_activation_job::Variant::ResolveStreamRead(pending)
+                    if pending.seq == seq =>
+                {
+                    Some(pending.records.len())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// Drops the pending job of a read that Workflow code closed.
     pub(super) fn drop_stream_read(&mut self, seq: u32) {
         self.outgoing_wf_activation_jobs.retain(|job| {
