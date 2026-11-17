@@ -84,9 +84,9 @@ pub(super) struct ManagedRun {
     waiting_on_la: Option<WaitingOnLAs>,
     /// The time in this Workflow Task in which only Stream calls held it open.
     stream_hold: StreamHold,
-    /// True while a graceful shutdown completes a task that only reads held open. That completion
-    /// asks for no new task.
-    ending_for_shutdown: bool,
+    /// True once a graceful shutdown stopped the run's reads with no job. Workflow code still
+    /// waits on them, so each later completion of the run on this Worker leaves it to another one.
+    reads_ended_for_shutdown: bool,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
     /// do is be evicted.
     am_broken: bool,
@@ -131,7 +131,7 @@ impl ManagedRun {
             stream_manager,
             waiting_on_la: None,
             stream_hold: StreamHold::default(),
-            ending_for_shutdown: false,
+            reads_ended_for_shutdown: false,
             am_broken: false,
             wft: None,
             activation: None,
@@ -791,7 +791,7 @@ impl ManagedRun {
                     messages: vec![],
                     query_responses: vec![],
                     force_new_wft: false,
-                    return_new_wft: true,
+                    leaves_worker: false,
                     sdk_metadata: Default::default(),
                     versioning_behavior: VersioningBehavior::Unspecified,
                     attempt,
@@ -1118,8 +1118,10 @@ impl ManagedRun {
     }
 
     /// At a graceful shutdown, completes a Workflow Task that only reads hold open, with what they
-    /// gave, and asks for no new task. Each heartbeat would otherwise get the run a new task, and
-    /// the shutdown would never end. The reads stop, and a later Worker resumes each from History.
+    /// gave. Each heartbeat would otherwise get the run a new task inline, and the shutdown would
+    /// never end. The completion forces a new task for the task queue, since the run would sleep
+    /// with no task until a Signal or a timer came. The reads stop, and the Worker that takes the
+    /// new task resumes each from History.
     pub(super) fn end_reads_for_shutdown(&mut self) -> RunUpdateAct {
         if self.activation.is_some()
             || self.wft.is_none()
@@ -1132,7 +1134,7 @@ impl ManagedRun {
         self.waiting_on_la.take()?.hb_timeout_handle.abort();
         self.wfm.machines.stop_stream_reads();
         self.dispatch_stream_requests();
-        self.ending_for_shutdown = true;
+        self.reads_ended_for_shutdown = true;
         self.update_to_acts(Ok(Some(ActivationOrAuto::Autocomplete {
             run_id: self.run_id().to_string(),
         })
@@ -1401,6 +1403,10 @@ impl ManagedRun {
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
         let outstanding_las = self.wfm.machines.outstanding_local_work() > 0;
+        // Workflow code waits on reads that the shutdown stopped, and this Worker resumes none. A
+        // task that came back here through a poll still open goes on to another Worker.
+        let leaves_worker =
+            self.reads_ended_for_shutdown && !self.wfm.machines.workflow_is_finished();
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
@@ -1415,7 +1421,7 @@ impl ManagedRun {
         // Unrecorded local work (LAs or Stream calls) must get a replacement task on which to
         // finish after eviction, just like work that remains outstanding across a heartbeat.
         let mut force_new_wft =
-            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las);
+            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las) || leaves_worker;
 
         // We only actually want to send commands back to the server if there are no more pending
         // activations and we are caught up on replay. We don't want to complete a wft if we already
@@ -1453,7 +1459,7 @@ impl ManagedRun {
                 task_token: data.task_token,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
-                    return_new_wft: !std::mem::take(&mut self.ending_for_shutdown),
+                    leaves_worker,
                     commands,
                     messages,
                     query_responses,

@@ -404,7 +404,7 @@ impl Workflows {
                         messages,
                         query_responses,
                         force_new_wft,
-                        return_new_wft,
+                        leaves_worker,
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
@@ -434,7 +434,7 @@ impl Workflows {
                     messages,
                     query_responses,
                     sticky_attributes: None,
-                    return_new_workflow_task: return_new_wft,
+                    return_new_workflow_task: !leaves_worker,
                     force_create_new_workflow_task: force_new_wft,
                     sdk_metadata,
                     metering_metadata: MeteringMetadata {
@@ -448,7 +448,9 @@ impl Workflows {
                         .namespace_capabilities
                         .workflow_task_completion_size_limit(),
                 };
-                let sticky_attrs = self.sticky_attrs.clone();
+                // A run that leaves this Worker must not have its next task on the sticky queue
+                // of a Worker that shuts down. With no sticky attributes the server clears it.
+                let sticky_attrs = self.sticky_attrs.clone().filter(|_| !leaves_worker);
                 // Do not return new WFT if we would not cache, because returned new WFTs are
                 // always partial.
                 if sticky_attrs.is_none() {
@@ -1223,8 +1225,10 @@ pub(crate) enum ActivationAction {
         messages: Vec<ProtocolMessage>,
         query_responses: Vec<QueryResult>,
         force_new_wft: bool,
-        /// False when the run asks for no new task, as at a graceful shutdown.
-        return_new_wft: bool,
+        /// True when the run goes on another Worker, as after a graceful shutdown stopped its
+        /// reads. The completion then asks for no task inline and drops the sticky queue, so
+        /// that the next task goes to the task queue.
+        leaves_worker: bool,
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
