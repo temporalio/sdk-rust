@@ -65,8 +65,9 @@ relevant information.
   instead of its task, and the marker of one task holds at most 1 MiB of Records.
   A read, an append or a close whose Store is unavailable is tried again, from 100 ms up to 2 s
   apart, for 30 s, before Workflow code gets `stream_storage_unavailable`. An append whose Store
-  `sequence` is zero has no dedupe, so it isn't tried again. A replay read retries the same way,
-  and if the Store stays down the task fails with `StreamReplayUnavailable`, never the Workflow.
+  `sequence` is zero has no dedupe, so it isn't tried again. A replay read retries the same way
+  for 5 s, and if the Store stays down the task fails with `StreamReplayUnavailable`, never the
+  Workflow.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
