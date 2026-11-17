@@ -41,6 +41,8 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+#[cfg(test)]
+pub(crate) use workflow::STORE_RETRY_BOUND;
 pub use workflow::StreamRuntimes;
 #[cfg(test)]
 pub(crate) use workflow::{MAX_MARKER_RECORD_BYTES, StreamTestHooks, TASK_DURATIONS};
