@@ -387,7 +387,7 @@ operation markers on the service, including any wire-name overrides in its defin
 ```rust
 use temporalio_client::WorkflowStartOptions;
 use temporalio_sdk::nexus::{
-    TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
+    NexusContext, TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
     temporal_nexus_service_handler,
 };
 
@@ -398,6 +398,7 @@ impl PaymentHandlers {
     #[temporal_operation]
     async fn charge(
         &self,
+        ctx: NexusContext,
         client: TemporalNexusClient,
         input: String,
     ) -> Result<TemporalOperationResult<String>, TemporalOperationError> {
@@ -407,7 +408,7 @@ impl PaymentHandlers {
                 input,
                 WorkflowStartOptions::new(
                     "payments",
-                    format!("charge-{}", client.info().request_id),
+                    format!("charge-{}", ctx.info().request_id),
                 )
                 .build(),
             )
@@ -422,10 +423,11 @@ let options = WorkerOptions::new("payments")
 ```
 
 Request metadata, including headers, request ID, deadline, and cancellation, is available on the
-`NexusInfo` returned by `client.info()`. Return
-`TemporalOperationResult::Sync(output)` for a synchronous result, or use `start_workflow` to attach
-the Nexus completion callback to a typed workflow. Supplied workflow options, including the task
-queue, are passed through unchanged; the helper uses the Nexus request ID for start idempotency.
+`NexusInfo` returned by `ctx.info()`. The request-scoped client is supplied as the second handler
+parameter, after the context and before the input. Return `TemporalOperationResult::Sync(output)`
+for a synchronous result, or use `client.start_workflow`
+to attach the Nexus completion callback to a typed workflow. Supplied workflow options, including the
+task queue, are passed through unchanged; the helper uses the Nexus request ID for start idempotency.
 Workflow-backed operation tokens identify a workflow by namespace and workflow ID, so use a unique
 workflow ID for each independent operation. Nexus polling is enabled only when services are registered.
 
