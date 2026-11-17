@@ -4,7 +4,7 @@ world system {
   export notification-service;
 }
 
-/// @nexus.doc "Notification models for Nexus Handler Callbacks."
+/// Notification models for Nexus Handler Callbacks.
 /// @nexus.experimental
 interface notification-service {
   use nexus:temporal-types/model@1.0.0.{
@@ -12,11 +12,11 @@ interface notification-service {
     placeholder,
   };
 
-  /// @nexus.doc "Type of the user-supplied data associated with the source invocation."
+  /// Type of the user-supplied data associated with the source invocation.
   /// @nexus.type-parameter
   type source-context-t = placeholder;
 
-  /// @nexus.doc "Type of the successful output of the source operation."
+  /// Type of the successful output of the source operation.
   /// @nexus.type-parameter
   type output-t = placeholder;
 

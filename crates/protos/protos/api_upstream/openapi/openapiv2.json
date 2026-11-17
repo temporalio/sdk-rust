@@ -4429,6 +4429,8 @@
     },
     "/api/v1/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/time-skipping/poll": {
       "get": {
+        "summary": "PollWorkflowExecutionTimeSkipping waits for a fast-forward outcome for a workflow execution.",
+        "description": "Experimental. Might change in the future.",
         "operationId": "PollWorkflowExecutionTimeSkipping2",
         "responses": {
           "200": {
@@ -10012,6 +10014,8 @@
     },
     "/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/time-skipping/poll": {
       "get": {
+        "summary": "PollWorkflowExecutionTimeSkipping waits for a fast-forward outcome for a workflow execution.",
+        "description": "Experimental. Might change in the future.",
         "operationId": "PollWorkflowExecutionTimeSkipping",
         "responses": {
           "200": {
@@ -11373,16 +11377,29 @@
       "default": "RUNTIME_TYPE_UNSPECIFIED",
       "description": " - RUNTIME_TYPE_UNSPECIFIED: Should never actually be set, exists to follow convention of having a default.\nSDKs should just leave `runtimes` empty if none can be determined.\n - RUNTIME_TYPE_GRAAL_AOT: Report when the application is compiled ahead-of-time as a GraalVM native image.\n - RUNTIME_TYPE_KOTLIN: Report when any registered Workflow or Activity implementation is a Kotlin class."
     },
+    "UpdateTaskQueueConfigRequestConcurrencyLimitUpdate": {
+      "type": "object",
+      "properties": {
+        "concurrencyLimit": {
+          "$ref": "#/definitions/v1ConcurrencyLimit",
+          "title": "Limit to be updated"
+        },
+        "reason": {
+          "type": "string",
+          "title": "Reason why the limit was updated"
+        }
+      }
+    },
     "UpdateTaskQueueConfigRequestRateLimitUpdate": {
       "type": "object",
       "properties": {
         "rateLimit": {
           "$ref": "#/definitions/v1RateLimit",
-          "title": "Rate Limit to be updated"
+          "title": "Rate limit to be updated"
         },
         "reason": {
           "type": "string",
-          "description": "Reason for why the rate limit was set."
+          "title": "Reason why the rate limit was updated"
         }
       }
     },
@@ -12499,7 +12516,7 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "Time-skipping configuration. If not set, time skipping is disabled."
+          "description": "Experimental.\nTime-skipping configuration. If not set, time skipping is disabled."
         }
       }
     },
@@ -12912,7 +12929,7 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "Time-skipping configuration. If not set, time skipping is disabled."
+          "description": "Experimental.\nTime-skipping configuration. If not set, time skipping is disabled."
         },
         "propagatedNexusSerializationContext": {
           "$ref": "#/definitions/v1PropagatedSerializationContext",
@@ -12920,7 +12937,7 @@
         },
         "timeSkippingStatePropagation": {
           "$ref": "#/definitions/v1TimeSkippingStatePropagation",
-          "description": "Time-skipping state propagated by the execution that started this workflow.\nThis field is intended for use by the Temporal server, for example when a schedule\nstarts a workflow, and is not intended to be set by external clients."
+          "description": "Experimental.\nTime-skipping state propagated by the execution that started this workflow.\nThis field is intended for use by the Temporal server, for example when a schedule\nstarts a workflow, and is not intended to be set by external clients."
         }
       }
     },
@@ -13285,6 +13302,10 @@
             "type": "string"
           },
           "description": "If set, removes any existing fairness weight overrides for each specified fairness key.\nFairness weights for corresponding keys fall back to the values set during task creation (if any),\nor to the default weight of 1.0."
+        },
+        "updateQueueConcurrencyLimit": {
+          "$ref": "#/definitions/UpdateTaskQueueConfigRequestConcurrencyLimitUpdate",
+          "description": "Update queue-wide concurrency limit.\nIf not set, this configuration is unchanged.\nIf the `concurrency_limit` field in the `ConcurrencyLimitUpdate` is missing, remove the existing limit."
         }
       }
     },
@@ -15253,6 +15274,27 @@
       },
       "description": "ComputeStatus represents compute-related configuration and health for a Worker Deployment Version."
     },
+    "v1ConcurrencyLimit": {
+      "type": "object",
+      "properties": {
+        "concurrentTasks": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Maximum number of concurrent tasks that may be running at a time across the scope of the\nlimit. e.g. in TaskQueueConfig, the scope is the whole task queue.\n\nNote that in situations like network partitions, the server's idea of what is running on\nworkers may be out of date, and this limit could be exceeded from the point of view of\nworkers."
+        }
+      }
+    },
+    "v1ConcurrencyLimitConfig": {
+      "type": "object",
+      "properties": {
+        "concurrencyLimit": {
+          "$ref": "#/definitions/v1ConcurrencyLimit"
+        },
+        "metadata": {
+          "$ref": "#/definitions/v1ConfigMetadata"
+        }
+      }
+    },
     "v1ConfigMetadata": {
       "type": "object",
       "properties": {
@@ -16174,7 +16216,7 @@
         "EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED"
       ],
       "default": "EVENT_TYPE_UNSPECIFIED",
-      "description": "- EVENT_TYPE_UNSPECIFIED: Place holder and should never appear in a Workflow execution history\n - EVENT_TYPE_WORKFLOW_EXECUTION_STARTED: Workflow execution has been triggered/started\nIt contains Workflow execution inputs, as well as Workflow timeout configurations\n - EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED: Workflow execution has successfully completed and contains Workflow execution results\n - EVENT_TYPE_WORKFLOW_EXECUTION_FAILED: Workflow execution has unsuccessfully completed and contains the Workflow execution error\n - EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT: Workflow execution has timed out by the Temporal Server\nUsually due to the Workflow having not been completed within timeout settings\n - EVENT_TYPE_WORKFLOW_TASK_SCHEDULED: Workflow Task has been scheduled and the SDK client should now be able to process any new history events\n - EVENT_TYPE_WORKFLOW_TASK_STARTED: Workflow Task has started and the SDK client has picked up the Workflow Task and is processing new history events\n - EVENT_TYPE_WORKFLOW_TASK_COMPLETED: Workflow Task has completed\nThe SDK client picked up the Workflow Task and processed new history events\nSDK client may or may not ask the Temporal Server to do additional work, such as:\nEVENT_TYPE_ACTIVITY_TASK_SCHEDULED\nEVENT_TYPE_TIMER_STARTED\nEVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES\nEVENT_TYPE_MARKER_RECORDED\nEVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED\nEVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED\nEVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED\nEVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\nEVENT_TYPE_WORKFLOW_EXECUTION_FAILED\nEVENT_TYPE_WORKFLOW_EXECUTION_CANCELED\nEVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW\n - EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT: Workflow Task encountered a timeout\nEither an SDK client with a local cache was not available at the time, or it took too long for the SDK client to process the task\n - EVENT_TYPE_WORKFLOW_TASK_FAILED: Workflow Task encountered a failure\nUsually this means that the Workflow was non-deterministic\nHowever, the Workflow reset functionality also uses this event\n - EVENT_TYPE_ACTIVITY_TASK_SCHEDULED: Activity Task was scheduled\nThe SDK client should pick up this activity task and execute\nThis event type contains activity inputs, as well as activity timeout configurations\n - EVENT_TYPE_ACTIVITY_TASK_STARTED: Activity Task has started executing\nThe SDK client has picked up the Activity Task and is processing the Activity invocation\n - EVENT_TYPE_ACTIVITY_TASK_COMPLETED: Activity Task has finished successfully\nThe SDK client has picked up and successfully completed the Activity Task\nThis event type contains Activity execution results\n - EVENT_TYPE_ACTIVITY_TASK_FAILED: Activity Task has finished unsuccessfully\nThe SDK picked up the Activity Task but unsuccessfully completed it\nThis event type contains Activity execution errors\n - EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT: Activity has timed out according to the Temporal Server\nActivity did not complete within the timeout settings\n - EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED: A request to cancel the Activity has occurred\nThe SDK client will be able to confirm cancellation of an Activity during an Activity heartbeat\n - EVENT_TYPE_ACTIVITY_TASK_CANCELED: Activity has been cancelled\n - EVENT_TYPE_TIMER_STARTED: A timer has started\n - EVENT_TYPE_TIMER_FIRED: A timer has fired\n - EVENT_TYPE_TIMER_CANCELED: A time has been cancelled\n - EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED: A request has been made to cancel the Workflow execution\n - EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED: SDK client has confirmed the cancellation request and the Workflow execution has been cancelled\n - EVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED: Workflow has requested that the Temporal Server try to cancel another Workflow\n - EVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED: Temporal Server could not cancel the targeted Workflow\nThis is usually because the target Workflow could not be found\n - EVENT_TYPE_EXTERNAL_WORKFLOW_EXECUTION_CANCEL_REQUESTED: Temporal Server has successfully requested the cancellation of the target Workflow\n - EVENT_TYPE_MARKER_RECORDED: A marker has been recorded.\nThis event type is transparent to the Temporal Server\nThe Server will only store it and will not try to understand it.\n - EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED: Workflow has received a Signal event\nThe event type contains the Signal name, as well as a Signal payload\n - EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED: Workflow execution has been forcefully terminated\nThis is usually because the terminate Workflow API was called\n - EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW: Workflow has successfully completed and a new Workflow has been started within the same transaction\nContains last Workflow execution results as well as new Workflow execution inputs\n - EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED: Temporal Server will try to start a child Workflow\n - EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_FAILED: Child Workflow execution cannot be started/triggered\nUsually due to a child Workflow ID collision\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED: Child Workflow execution has successfully started/triggered\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED: Child Workflow execution has successfully completed\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_FAILED: Child Workflow execution has unsuccessfully completed\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_CANCELED: Child Workflow execution has been cancelled\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_TIMED_OUT: Child Workflow execution has timed out by the Temporal Server\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_TERMINATED: Child Workflow execution has been terminated\n - EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED: Temporal Server will try to Signal the targeted Workflow\nContains the Signal name, as well as a Signal payload\n - EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED: Temporal Server cannot Signal the targeted Workflow\nUsually because the Workflow could not be found\n - EVENT_TYPE_EXTERNAL_WORKFLOW_EXECUTION_SIGNALED: Temporal Server has successfully Signaled the targeted Workflow\n - EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES: Workflow search attributes should be updated and synchronized with the visibility store\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ADMITTED: An update was admitted. Note that not all admitted updates result in this\nevent. See UpdateAdmittedEventOrigin for situations in which this event\nis created.\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED: An update was accepted (i.e. passed validation, perhaps because no validator was defined)\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_REJECTED: This event is never written to history.\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED: An update completed\n - EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED_EXTERNALLY: Some property or properties of the workflow as a whole have changed by non-workflow code.\nThe distinction of external vs. command-based modification is important so the SDK can\nmaintain determinism when using the command-based approach.\n - EVENT_TYPE_ACTIVITY_PROPERTIES_MODIFIED_EXTERNALLY: Some property or properties of an already-scheduled activity have changed by non-workflow code.\nThe distinction of external vs. command-based modification is important so the SDK can\nmaintain determinism when using the command-based approach.\n - EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED: Workflow properties modified by user workflow code\n - EVENT_TYPE_NEXUS_OPERATION_SCHEDULED: A Nexus operation was scheduled using a ScheduleNexusOperation command.\n - EVENT_TYPE_NEXUS_OPERATION_STARTED: An asynchronous Nexus operation was started by a Nexus handler.\n - EVENT_TYPE_NEXUS_OPERATION_COMPLETED: A Nexus operation completed successfully.\n - EVENT_TYPE_NEXUS_OPERATION_FAILED: A Nexus operation failed.\n - EVENT_TYPE_NEXUS_OPERATION_CANCELED: A Nexus operation completed as canceled.\n - EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT: A Nexus operation timed out.\n - EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED: A Nexus operation was requested to be canceled using a RequestCancelNexusOperation command.\n - EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED: Workflow execution options updated by user.\n - EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED: A cancellation request for a Nexus operation was successfully delivered to the Nexus handler.\n - EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_FAILED: A cancellation request for a Nexus operation resulted in an error.\n - EVENT_TYPE_WORKFLOW_EXECUTION_PAUSED: An event that indicates that the workflow execution has been paused.\n - EVENT_TYPE_WORKFLOW_EXECUTION_UNPAUSED: An event that indicates that the previously paused workflow execution has been unpaused.\n - EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED: An event that indicates time skipping advanced time or was disabled automatically after a bound was reached.",
+      "description": "- EVENT_TYPE_UNSPECIFIED: Place holder and should never appear in a Workflow execution history\n - EVENT_TYPE_WORKFLOW_EXECUTION_STARTED: Workflow execution has been triggered/started\nIt contains Workflow execution inputs, as well as Workflow timeout configurations\n - EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED: Workflow execution has successfully completed and contains Workflow execution results\n - EVENT_TYPE_WORKFLOW_EXECUTION_FAILED: Workflow execution has unsuccessfully completed and contains the Workflow execution error\n - EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT: Workflow execution has timed out by the Temporal Server\nUsually due to the Workflow having not been completed within timeout settings\n - EVENT_TYPE_WORKFLOW_TASK_SCHEDULED: Workflow Task has been scheduled and the SDK client should now be able to process any new history events\n - EVENT_TYPE_WORKFLOW_TASK_STARTED: Workflow Task has started and the SDK client has picked up the Workflow Task and is processing new history events\n - EVENT_TYPE_WORKFLOW_TASK_COMPLETED: Workflow Task has completed\nThe SDK client picked up the Workflow Task and processed new history events\nSDK client may or may not ask the Temporal Server to do additional work, such as:\nEVENT_TYPE_ACTIVITY_TASK_SCHEDULED\nEVENT_TYPE_TIMER_STARTED\nEVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES\nEVENT_TYPE_MARKER_RECORDED\nEVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED\nEVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED\nEVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED\nEVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED\nEVENT_TYPE_WORKFLOW_EXECUTION_FAILED\nEVENT_TYPE_WORKFLOW_EXECUTION_CANCELED\nEVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW\n - EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT: Workflow Task encountered a timeout\nEither an SDK client with a local cache was not available at the time, or it took too long for the SDK client to process the task\n - EVENT_TYPE_WORKFLOW_TASK_FAILED: Workflow Task encountered a failure\nUsually this means that the Workflow was non-deterministic\nHowever, the Workflow reset functionality also uses this event\n - EVENT_TYPE_ACTIVITY_TASK_SCHEDULED: Activity Task was scheduled\nThe SDK client should pick up this activity task and execute\nThis event type contains activity inputs, as well as activity timeout configurations\n - EVENT_TYPE_ACTIVITY_TASK_STARTED: Activity Task has started executing\nThe SDK client has picked up the Activity Task and is processing the Activity invocation\n - EVENT_TYPE_ACTIVITY_TASK_COMPLETED: Activity Task has finished successfully\nThe SDK client has picked up and successfully completed the Activity Task\nThis event type contains Activity execution results\n - EVENT_TYPE_ACTIVITY_TASK_FAILED: Activity Task has finished unsuccessfully\nThe SDK picked up the Activity Task but unsuccessfully completed it\nThis event type contains Activity execution errors\n - EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT: Activity has timed out according to the Temporal Server\nActivity did not complete within the timeout settings\n - EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED: A request to cancel the Activity has occurred\nThe SDK client will be able to confirm cancellation of an Activity during an Activity heartbeat\n - EVENT_TYPE_ACTIVITY_TASK_CANCELED: Activity has been cancelled\n - EVENT_TYPE_TIMER_STARTED: A timer has started\n - EVENT_TYPE_TIMER_FIRED: A timer has fired\n - EVENT_TYPE_TIMER_CANCELED: A time has been cancelled\n - EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED: A request has been made to cancel the Workflow execution\n - EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED: SDK client has confirmed the cancellation request and the Workflow execution has been cancelled\n - EVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED: Workflow has requested that the Temporal Server try to cancel another Workflow\n - EVENT_TYPE_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED: Temporal Server could not cancel the targeted Workflow\nThis is usually because the target Workflow could not be found\n - EVENT_TYPE_EXTERNAL_WORKFLOW_EXECUTION_CANCEL_REQUESTED: Temporal Server has successfully requested the cancellation of the target Workflow\n - EVENT_TYPE_MARKER_RECORDED: A marker has been recorded.\nThis event type is transparent to the Temporal Server\nThe Server will only store it and will not try to understand it.\n - EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED: Workflow has received a Signal event\nThe event type contains the Signal name, as well as a Signal payload\n - EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED: Workflow execution has been forcefully terminated\nThis is usually because the terminate Workflow API was called\n - EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW: Workflow has successfully completed and a new Workflow has been started within the same transaction\nContains last Workflow execution results as well as new Workflow execution inputs\n - EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED: Temporal Server will try to start a child Workflow\n - EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_FAILED: Child Workflow execution cannot be started/triggered\nUsually due to a child Workflow ID collision\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED: Child Workflow execution has successfully started/triggered\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED: Child Workflow execution has successfully completed\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_FAILED: Child Workflow execution has unsuccessfully completed\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_CANCELED: Child Workflow execution has been cancelled\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_TIMED_OUT: Child Workflow execution has timed out by the Temporal Server\n - EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_TERMINATED: Child Workflow execution has been terminated\n - EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED: Temporal Server will try to Signal the targeted Workflow\nContains the Signal name, as well as a Signal payload\n - EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED: Temporal Server cannot Signal the targeted Workflow\nUsually because the Workflow could not be found\n - EVENT_TYPE_EXTERNAL_WORKFLOW_EXECUTION_SIGNALED: Temporal Server has successfully Signaled the targeted Workflow\n - EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES: Workflow search attributes should be updated and synchronized with the visibility store\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ADMITTED: An update was admitted. Note that not all admitted updates result in this\nevent. See UpdateAdmittedEventOrigin for situations in which this event\nis created.\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED: An update was accepted (i.e. passed validation, perhaps because no validator was defined)\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_REJECTED: This event is never written to history.\n - EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED: An update completed\n - EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED_EXTERNALLY: Some property or properties of the workflow as a whole have changed by non-workflow code.\nThe distinction of external vs. command-based modification is important so the SDK can\nmaintain determinism when using the command-based approach.\n - EVENT_TYPE_ACTIVITY_PROPERTIES_MODIFIED_EXTERNALLY: Some property or properties of an already-scheduled activity have changed by non-workflow code.\nThe distinction of external vs. command-based modification is important so the SDK can\nmaintain determinism when using the command-based approach.\n - EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED: Workflow properties modified by user workflow code\n - EVENT_TYPE_NEXUS_OPERATION_SCHEDULED: A Nexus operation was scheduled using a ScheduleNexusOperation command.\n - EVENT_TYPE_NEXUS_OPERATION_STARTED: An asynchronous Nexus operation was started by a Nexus handler.\n - EVENT_TYPE_NEXUS_OPERATION_COMPLETED: A Nexus operation completed successfully.\n - EVENT_TYPE_NEXUS_OPERATION_FAILED: A Nexus operation failed.\n - EVENT_TYPE_NEXUS_OPERATION_CANCELED: A Nexus operation completed as canceled.\n - EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT: A Nexus operation timed out.\n - EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED: A Nexus operation was requested to be canceled using a RequestCancelNexusOperation command.\n - EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED: Workflow execution options updated by user.\n - EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED: A cancellation request for a Nexus operation was successfully delivered to the Nexus handler.\n - EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_FAILED: A cancellation request for a Nexus operation resulted in an error.\n - EVENT_TYPE_WORKFLOW_EXECUTION_PAUSED: An event that indicates that the workflow execution has been paused.\n - EVENT_TYPE_WORKFLOW_EXECUTION_UNPAUSED: An event that indicates that the previously paused workflow execution has been unpaused.\n - EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED: Experimental.\nAn event that indicates time skipping advanced time or was disabled automatically after a bound was reached.",
       "title": "Whenever this list of events is changed do change the function shouldBufferEvent in mutableStateBuilder.go to make sure to do the correct event ordering"
     },
     "v1Execution": {
@@ -16325,7 +16367,8 @@
           "type": "string",
           "description": "Fast-forward the current execution by this duration ahead of the current execution time; required field.\nThe duration yields a target time (current execution time + duration), surfaced as `target_time` in\nTimeSkippingFastForwardInfo. Once virtual time reaches that target, the fast-forward completes, time\nskipping is disabled, and no further time is skipped. Time skipping can be resumed either\nby updating the TimeSkippingConfig with a new FastForwardConfig, or by clearing the FastForwardConfig\nto skip through to the end of the execution.\n\nIf this duration exceeds the remaining execution timeout, time will not pass beyond the end\nof the execution, and the fast-forward won't have a chance to complete."
         }
-      }
+      },
+      "description": "Controls a time-skipping fast-forward for an execution.\nExperimental. Might change in the future."
     },
     "v1FastForwardPollingResult": {
       "type": "string",
@@ -16336,7 +16379,7 @@
         "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED"
       ],
       "default": "FAST_FORWARD_POLLING_RESULT_UNSPECIFIED",
-      "description": "FastForwardPollingResult is the result of polling and waiting for a fast-forward to complete\non a time-skipping execution.\nFAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT and FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED\nare the normal poll outcomes; FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED means the\nfast-forward can no longer complete.\n\n - FAST_FORWARD_POLLING_RESULT_UNSPECIFIED: Never returned; guards against an unset result.\n - FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT: The poll timed out server-side before the fast-forward completed. The caller may poll again.\n - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED: The fast-forward identified by the request's `fast_forward_id` reached its target time and completed.\n - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED: The fast-forward can no longer complete, which usually indicates improper usage of\nfast-forward on the client side. Possible reasons: the `fast_forward_id` does not match\nthe execution's current fast-forward, the execution ended before the fast-forward\ncompleted, the fast-forward config was updated while the poll was in flight, etc.\nSee `failed_reason` in the response for the specific cause."
+      "description": "FastForwardPollingResult is the result of polling and waiting for a fast-forward to complete\non a time-skipping execution.\nFAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT and FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED\nare the normal poll outcomes; FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED means the\nfast-forward can no longer complete.\nExperimental. Might change in the future.\n\n - FAST_FORWARD_POLLING_RESULT_UNSPECIFIED: Never returned; guards against an unset result.\n - FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT: The poll timed out server-side before the fast-forward completed. The caller may poll again.\n - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED: The fast-forward identified by the request's `fast_forward_id` reached its target time and completed.\n - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED: The fast-forward can no longer complete, which usually indicates improper usage of\nfast-forward on the client side. Possible reasons: the `fast_forward_id` does not match\nthe execution's current fast-forward, the execution ended before the fast-forward\ncompleted, the fast-forward config was updated while the poll was in flight, etc.\nSee `failed_reason` in the response for the specific cause."
     },
     "v1FetchWorkerConfigResponse": {
       "type": "object",
@@ -16844,7 +16887,8 @@
           "$ref": "#/definitions/v1WorkflowExecutionUnpausedEventAttributes"
         },
         "workflowExecutionTimeSkippingTransitionedEventAttributes": {
-          "$ref": "#/definitions/v1WorkflowExecutionTimeSkippingTransitionedEventAttributes"
+          "$ref": "#/definitions/v1WorkflowExecutionTimeSkippingTransitionedEventAttributes",
+          "description": "Experimental."
         }
       },
       "description": "History events are the method by which Temporal SDKs advance (or recreate) workflow state.\nSee the `EventType` enum for more info about what each event is for."
@@ -17481,9 +17525,11 @@
         "NAMESPACE_STATE_UNSPECIFIED",
         "NAMESPACE_STATE_REGISTERED",
         "NAMESPACE_STATE_DEPRECATED",
-        "NAMESPACE_STATE_DELETED"
+        "NAMESPACE_STATE_DELETED",
+        "NAMESPACE_STATE_SOFT_DELETED"
       ],
-      "default": "NAMESPACE_STATE_UNSPECIFIED"
+      "default": "NAMESPACE_STATE_UNSPECIFIED",
+      "description": " - NAMESPACE_STATE_SOFT_DELETED: Set by OperatorService.SoftDeleteNamespace. Executions make no progress, but no data is\nremoved until the namespace is restored or deleted."
     },
     "v1NewWorkflowExecutionInfo": {
       "type": "object",
@@ -18635,7 +18681,8 @@
           "$ref": "#/definitions/v1TimeSkippingFastForwardInfo",
           "description": "The execution's current fast-forward, if any."
         }
-      }
+      },
+      "description": "Result of polling a workflow execution's time-skipping fast-forward.\nExperimental. Might change in the future."
     },
     "v1PollWorkflowTaskQueueResponse": {
       "type": "object",
@@ -19624,7 +19671,7 @@
         },
         "timeSkippingInfo": {
           "$ref": "#/definitions/v1TimeSkippingInfo",
-          "description": "Information about time skipping for this schedule.\nIf the schedule has never enabled time skipping, this will be unset."
+          "description": "Experimental.\nInformation about time skipping for this schedule.\nIf the schedule has never enabled time skipping, this will be unset."
         }
       }
     },
@@ -19725,7 +19772,7 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "If set, applies the specified time-skipping configuration to this schedule,\nreplacing any existing time-skipping configuration."
+          "description": "Experimental.\nIf set, applies the specified time-skipping configuration to this schedule,\nreplacing any existing time-skipping configuration."
         }
       }
     },
@@ -20200,11 +20247,11 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "The propagated time-skipping configuration for the child workflow."
+          "description": "Experimental.\nThe propagated time-skipping configuration for the child workflow."
         },
         "timeSkippingStatePropagation": {
           "$ref": "#/definitions/v1TimeSkippingStatePropagation",
-          "description": "The time-skipping state propagated from the parent workflow. This can be nil if no time skipping\nhas occurred or there is no previous run."
+          "description": "Experimental.\nThe time-skipping state propagated from the parent workflow. This can be nil if no time skipping\nhas occurred or there is no previous run."
         },
         "versioningOverride": {
           "$ref": "#/definitions/v1VersioningOverride",
@@ -20378,7 +20425,7 @@
       "properties": {
         "queueRateLimit": {
           "$ref": "#/definitions/v1RateLimitConfig",
-          "description": "Unless modified, this is the system-defined rate limit."
+          "description": "Rate limit for the whole queue."
         },
         "fairnessKeysRateLimitDefault": {
           "$ref": "#/definitions/v1RateLimitConfig",
@@ -20391,6 +20438,10 @@
             "format": "float"
           },
           "description": "If set, overrides the fairness weights for the corresponding fairness keys."
+        },
+        "queueConcurrencyLimit": {
+          "$ref": "#/definitions/v1ConcurrencyLimitConfig",
+          "description": "Concurrency limit for the whole queue."
         }
       }
     },
@@ -20621,7 +20672,7 @@
           "description": "The maximum number of skips allowed every time this field is updated. It protects the execution from\nsituations like unlimited retries when backoff is skipped.\n\nEvery time the execution skips time, the skip count is incremented by one, and when it reaches\nmax_session_skip_count, time skipping stops. Whenever this config field is updated, the accumulated\nskip count is cleared, marking the start of a new session.\nFor an execution with a chain of runs (retry, cron, continue-as-new), the count is accumulated\nacross all runs within the same session.\n\nIf this field is not set, the server applies a large default value (e.g. 100). The default can\nbe changed through dynamic config, and is overridden by this field when set."
         }
       },
-      "description": "The configuration for time skipping of an execution.\nWhen time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.\nOptions like fast_forward, disable_propagation, and max_session_skip_count are provided for granular\ncontrol of the execution's time skipping behavior. See each field's comment for a detailed explanation.\n\nAn example of workflows with time skipping:\nFor workflows, an execution is a chain of runs including retries, cron, and continue-as-new.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.\nUser timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the\ntime point of the registered fast-forward when there is no in-flight work.\nWhenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.\nFor child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,\nbut a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the\n\"enabled\" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the\nparent execution as its start time."
+      "description": "The configuration for time skipping of an execution.\nWhen time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.\nOptions like fast_forward, disable_propagation, and max_session_skip_count are provided for granular\ncontrol of the execution's time skipping behavior. See each field's comment for a detailed explanation.\n\nAn example of workflows with time skipping:\nFor workflows, an execution is a chain of runs including retries, cron, and continue-as-new.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.\nUser timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the\ntime point of the registered fast-forward when there is no in-flight work.\nWhenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.\nFor child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,\nbut a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the\n\"enabled\" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the\nparent execution as its start time.\nExperimental. Might change in the future."
     },
     "v1TimeSkippingFastForwardInfo": {
       "type": "object",
@@ -20644,7 +20695,7 @@
           "description": "True once `target_time` has been reached."
         }
       },
-      "description": "TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution."
+      "description": "TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.\nExperimental. Might change in the future."
     },
     "v1TimeSkippingInfo": {
       "type": "object",
@@ -20668,7 +20719,7 @@
           "description": "The number of skips accumulated in the current session, bounded by `max_session_skip_count`.\nA new session begins — and this resets to 0 — each time `max_session_skip_count` is updated."
         }
       },
-      "description": "Describes the current time-skipping state of a workflow execution."
+      "description": "Describes the current time-skipping state of a workflow execution.\nExperimental. Might change in the future."
     },
     "v1TimeSkippingStatePropagation": {
       "type": "object",
@@ -20688,7 +20739,7 @@
           "description": "The initial skip count. It only propagates across a chain of runs within the same execution."
         }
       },
-      "description": "The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs\nwithin the same execution."
+      "description": "The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs\nwithin the same execution.\nExperimental. Might change in the future."
     },
     "v1TimeoutFailureInfo": {
       "type": "object",
@@ -20989,7 +21040,7 @@
         "updateTime": {
           "type": "string",
           "format": "date-time",
-          "description": "The Workflow Execution time when the options were updated. When time skipping is\nenabled, this is the workflow's virtual time rather than wall-clock time.\n\nThis timestamp cannot be used for time-skipping fast-forward verification,\nuse `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead."
+          "description": "Deprecated. Not populated by the server; for time-skipping fast-forward verification,\nuse `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead."
         }
       }
     },
@@ -21573,6 +21624,11 @@
         "isAutoscaling": {
           "type": "boolean",
           "title": "Set true if the number of concurrent pollers is auto-scaled"
+        },
+        "targetPollers": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Number of pollers this poller pool is currently targeting, which may differ from current_pollers.\n0 if unknown, such as a poller pool of fixed size."
         }
       }
     },
@@ -21869,7 +21925,7 @@
         },
         "timeSkippingInfo": {
           "$ref": "#/definitions/v1TimeSkippingInfo",
-          "description": "Information about time skipping of the workflow execution.\nIf the execution has never enabled time skipping, it will be nil."
+          "description": "Experimental.\nInformation about time skipping of the workflow execution.\nIf the execution has never enabled time skipping, it will be nil."
         },
         "propagatedNexusSerializationContext": {
           "$ref": "#/definitions/v1PropagatedSerializationContext",
@@ -22015,7 +22071,7 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "The time-skipping configuration for this workflow execution.\nWhen `fast_forward` is set, time will be fast-forwarded to a future point relative\nto the current workflow timestamp. Each call takes effect, even if\n`fast_forward` is set to the same duration, since the target time is recalculated\nfrom the current timestamp on every call.\n\nThis field must be updated as a whole; updating individual sub-fields is not supported.\nWhen setting the update mask in `UpdateWorkflowExecutionOptionsRequest`, \n`BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field."
+          "description": "Experimental.\nThe time-skipping configuration for this workflow execution.\nWhen `fast_forward` is set, time will be fast-forwarded to a future point relative\nto the current workflow timestamp. Each call takes effect, even if\n`fast_forward` is set to the same duration, since the target time is recalculated\nfrom the current timestamp on every call.\n\nThis field must be updated as a whole; updating individual sub-fields is not supported.\nWhen setting the update mask in `UpdateWorkflowExecutionOptionsRequest`, \n`BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field."
         }
       }
     },
@@ -22052,11 +22108,11 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "TimeSkippingConfig override upserted in this event. Represents the full config."
+          "description": "Experimental.\nTimeSkippingConfig override upserted in this event. Represents the full config."
         },
         "timeSkippingConfigUpdated": {
           "type": "boolean",
-          "description": "Indicates the time skipping config was updated by the recent call to update\nworkflow execution options."
+          "description": "Experimental.\nIndicates the time skipping config was updated by the recent call to update\nworkflow execution options."
         },
         "workflowUpdateOptions": {
           "type": "array",
@@ -22296,11 +22352,11 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "Initial time-skipping configuration for this workflow execution, recorded at start time.\nThis may have been set explicitly via the start workflow request, or propagated from a\nparent/previous execution.\n\nThe configuration may be updated after start via UpdateWorkflowExecutionOptions, which\nwill be reflected in the WorkflowExecutionOptionsUpdatedEvent."
+          "description": "Experimental.\nInitial time-skipping configuration for this workflow execution, recorded at start time.\nThis may have been set explicitly via the start workflow request, or propagated from a\nparent/previous execution.\n\nThe configuration may be updated after start via UpdateWorkflowExecutionOptions, which\nwill be reflected in the WorkflowExecutionOptionsUpdatedEvent."
         },
         "timeSkippingStatePropagation": {
           "$ref": "#/definitions/v1TimeSkippingStatePropagation",
-          "description": "The time-skipping state propagated from a previous run of this workflow. This can be nil\nif no time skipping has occurred or there is no previous run."
+          "description": "Experimental.\nThe time-skipping state propagated from a previous run of this workflow. This can be nil\nif no time skipping has occurred or there is no previous run."
         },
         "propagatedNexusSerializationContext": {
           "$ref": "#/definitions/v1PropagatedSerializationContext",
@@ -22359,7 +22415,7 @@
           "description": "The wall-clock time when the time-skipping state changed event was generated."
         }
       },
-      "description": "Attributes for an event indicating that time skipping state changed for a workflow execution:\neither time was advanced, or time skipping was stopped automatically due to the fast_forward completing.\nThe worker_may_ignore field in HistoryEvent should always be set true for this event."
+      "description": "Attributes for an event indicating that time skipping state changed for a workflow execution:\neither time was advanced, or time skipping was stopped automatically due to the fast_forward completing.\nThe worker_may_ignore field in HistoryEvent should always be set true for this event.\nExperimental. Might change in the future."
     },
     "v1WorkflowExecutionTimedOutEventAttributes": {
       "type": "object",
