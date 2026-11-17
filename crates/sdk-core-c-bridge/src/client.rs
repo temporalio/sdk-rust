@@ -1336,6 +1336,83 @@ async fn call_cloud_service(
                 get_user_group_namespace_assignments
             )
         }
+        "MoveNexusEndpointToProject" => {
+            rpc_call_on_trait!(client, call, CloudService, move_nexus_endpoint_to_project)
+        }
+        "CreateCallerRateLimit" => {
+            rpc_call_on_trait!(client, call, CloudService, create_caller_rate_limit)
+        }
+        "GetCallerRateLimit" => {
+            rpc_call_on_trait!(client, call, CloudService, get_caller_rate_limit)
+        }
+        "GetCallerRateLimits" => {
+            rpc_call_on_trait!(client, call, CloudService, get_caller_rate_limits)
+        }
+        "UpdateCallerRateLimit" => {
+            rpc_call_on_trait!(client, call, CloudService, update_caller_rate_limit)
+        }
+        "DeleteCallerRateLimit" => {
+            rpc_call_on_trait!(client, call, CloudService, delete_caller_rate_limit)
+        }
+        "GetProjects" => {
+            rpc_call_on_trait!(client, call, CloudService, get_projects)
+        }
+        "GetProject" => {
+            rpc_call_on_trait!(client, call, CloudService, get_project)
+        }
+        "CreateProject" => {
+            rpc_call_on_trait!(client, call, CloudService, create_project)
+        }
+        "UpdateProject" => {
+            rpc_call_on_trait!(client, call, CloudService, update_project)
+        }
+        "MoveNamespaceToProject" => {
+            rpc_call_on_trait!(client, call, CloudService, move_namespace_to_project)
+        }
+        "DeleteProject" => {
+            rpc_call_on_trait!(client, call, CloudService, delete_project)
+        }
+        "SetUserProjectAccess" => {
+            rpc_call_on_trait!(client, call, CloudService, set_user_project_access)
+        }
+        "SetUserGroupProjectAccess" => {
+            rpc_call_on_trait!(client, call, CloudService, set_user_group_project_access)
+        }
+        "SetServiceAccountProjectAccess" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                set_service_account_project_access
+            )
+        }
+        "GetUserProjectAssignments" => {
+            rpc_call_on_trait!(client, call, CloudService, get_user_project_assignments)
+        }
+        "GetServiceAccountProjectAssignments" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_service_account_project_assignments
+            )
+        }
+        "GetUserGroupProjectAssignments" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_user_group_project_assignments
+            )
+        }
+        "GetProjectScopedServiceAccounts" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_project_scoped_service_accounts
+            )
+        }
         rpc => Err(anyhow::anyhow!("Unknown RPC call {rpc}")),
     }
 }
