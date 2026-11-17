@@ -431,6 +431,11 @@ task queue, are passed through unchanged; the helper uses the Nexus request ID f
 Workflow-backed operation tokens identify a workflow by namespace and workflow ID, so use a unique
 workflow ID for each independent operation. Nexus polling is enabled only when services are registered.
 
+Return `nexus_rpc::OperationError::failed(...)` or `OperationError::canceled(...)` through
+`TemporalOperationError` for terminal operation outcomes. Both support `with_source` to preserve an
+application cause and its details. `nexus_rpc::HandlerError` retains its error type, optional cause,
+and retry override; unexpected implementation or application errors are retryable handler failures.
+
 ## Activities in detail
 
 Use Activities to perform side effects like I/O operations, API calls, or any non-deterministic

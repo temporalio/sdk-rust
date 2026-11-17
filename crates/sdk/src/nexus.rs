@@ -51,6 +51,9 @@ use base64::{
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig, general_purpose},
 };
 use futures_util::{FutureExt, future::BoxFuture};
+use nexus_rpc::{
+    HandlerError, HandlerErrorRetryBehavior, HandlerErrorType, OperationError, OperationErrorState,
+};
 pub use nexus_rpc::{NexusOperation, NexusService};
 use serde::{Deserialize, Serialize};
 use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
@@ -76,7 +79,7 @@ use temporalio_common::{
         temporal::api::{
             common::v1::{Callback, callback},
             enums::v1::NexusHandlerErrorRetryBehavior,
-            failure::v1::{Failure, NexusHandlerFailureInfo, failure::FailureInfo},
+            failure::v1::{CanceledFailureInfo, NexusHandlerFailureInfo, failure::FailureInfo},
             nexus::v1::{self as proto, request, response, start_operation_response},
         },
     },
@@ -519,82 +522,91 @@ impl<S: NexusService> TemporalNexusServiceHandler for NexusServiceHandler<S> {
 /// An operation failure or a failure to handle a Nexus request.
 #[derive(Debug, thiserror::Error)]
 pub enum TemporalOperationError {
-    /// The operation ran and failed. This is not retried as a handler failure.
-    #[error("{0}")]
-    Operation(String),
-    /// An application failure, including typed details handled by the configured converter.
+    /// A terminal failed or canceled operation, including its application cause.
+    #[error(transparent)]
+    Operation(#[from] OperationError),
+    /// An unexpected application failure, reported as a retryable handler failure.
     #[error(transparent)]
     Application(#[from] Box<ApplicationFailure>),
-    /// The operation was canceled.
-    #[error("{0}")]
-    Canceled(String),
     /// A Nexus handler failure, whose type and retry behavior follow the Nexus protocol.
-    #[error("{message}")]
-    Handler {
-        /// Nexus handler error type, for example `BAD_REQUEST` or `INTERNAL`.
-        error_type: String,
-        /// Human-readable error message.
-        message: String,
-        /// Whether the request can be retried.
-        retryable: bool,
-    },
+    #[error(transparent)]
+    Handler(#[from] HandlerError),
+    /// An unexpected implementation error, reported as a retryable handler failure.
+    #[error(transparent)]
+    Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl TemporalOperationError {
     pub(crate) fn handler(error_type: &str, message: impl ToString, retryable: bool) -> Self {
-        Self::Handler {
-            error_type: error_type.to_owned(),
-            message: message.to_string(),
-            retryable,
-        }
+        HandlerError::from_raw_type(error_type, message.to_string())
+            .with_retry_behavior(if retryable {
+                HandlerErrorRetryBehavior::Retryable
+            } else {
+                HandlerErrorRetryBehavior::NonRetryable
+            })
+            .into()
     }
 
     fn into_status(self, converter: &DataConverter) -> nexus_task_completion::Status {
         match self {
-            Self::Operation(message) => start_status(start_operation_response::Variant::Failure(
-                converter.to_failure(
+            Self::Operation(error) => {
+                let message = error.message().to_owned();
+                let state = error.state();
+                let stack_trace = error.stack_trace().unwrap_or_default().to_owned();
+                let mut failure = converter.to_failure(
                     &serialization_context(),
                     OutgoingError::Activity(OutgoingActivityError::Application(
-                        ApplicationFailure::builder(message)
-                            .non_retryable(true)
+                        ApplicationFailure::builder(error)
+                            .type_name("OperationError".to_owned())
                             .build()
                             .into(),
                     )),
-                ),
-            )),
-            Self::Application(failure) => start_status(start_operation_response::Variant::Failure(
-                converter.to_failure(
-                    &serialization_context(),
-                    OutgoingError::Activity(OutgoingActivityError::Application(failure)),
-                ),
-            )),
-            Self::Canceled(message) => {
-                let mut failure = converter.to_failure(
-                    &serialization_context(),
-                    OutgoingError::Activity(OutgoingActivityError::Cancelled { details: None }),
                 );
                 failure.message = message;
+                failure.stack_trace = stack_trace;
+                if state == OperationErrorState::Canceled {
+                    failure.failure_info = Some(FailureInfo::CanceledFailureInfo(
+                        CanceledFailureInfo::default(),
+                    ));
+                }
                 start_status(start_operation_response::Variant::Failure(failure))
             }
-            Self::Handler {
-                error_type,
-                message,
-                retryable,
-            } => nexus_task_completion::Status::Failure(Failure {
-                message,
-                failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
+            Self::Application(failure) => Self::Unexpected(failure).into_status(converter),
+            Self::Unexpected(error) => Self::Handler(
+                HandlerError::new(HandlerErrorType::Internal, error.to_string()).with_source(error),
+            )
+            .into_status(converter),
+            Self::Handler(error) => {
+                let message = error.message().to_owned();
+                let error_type = error.raw_error_type().to_owned();
+                let stack_trace = error.stack_trace().unwrap_or_default().to_owned();
+                let retry_behavior = match error.retry_behavior() {
+                    HandlerErrorRetryBehavior::Unspecified => {
+                        NexusHandlerErrorRetryBehavior::Unspecified
+                    }
+                    HandlerErrorRetryBehavior::Retryable => {
+                        NexusHandlerErrorRetryBehavior::Retryable
+                    }
+                    HandlerErrorRetryBehavior::NonRetryable => {
+                        NexusHandlerErrorRetryBehavior::NonRetryable
+                    }
+                };
+                let mut failure = converter.to_failure(
+                    &serialization_context(),
+                    OutgoingError::Activity(OutgoingActivityError::Application(
+                        ApplicationFailure::new(error).into(),
+                    )),
+                );
+                failure.message = message;
+                failure.stack_trace = stack_trace;
+                failure.failure_info = Some(FailureInfo::NexusHandlerFailureInfo(
                     NexusHandlerFailureInfo {
                         r#type: error_type,
-                        retry_behavior: if retryable {
-                            NexusHandlerErrorRetryBehavior::Retryable
-                        } else {
-                            NexusHandlerErrorRetryBehavior::NonRetryable
-                        }
-                        .into(),
+                        retry_behavior: retry_behavior.into(),
                     },
-                )),
-                ..Default::default()
-            }),
+                ));
+                nexus_task_completion::Status::Failure(failure)
+            }
         }
     }
 }
@@ -759,10 +771,16 @@ async fn dispatch(
     match request.variant {
         Some(request::Variant::StartOperation(start)) => {
             let service = services.operations.get(&start.service).ok_or_else(|| {
-                TemporalOperationError::handler("NOT_FOUND", "Unknown Nexus service", false)
+                HandlerError::new(
+                    HandlerErrorType::NotFound,
+                    format!("Unknown Nexus service {:?}", start.service),
+                )
             })?;
             let handler = service.get(&start.operation).ok_or_else(|| {
-                TemporalOperationError::handler("NOT_FOUND", "Unknown Nexus operation", false)
+                HandlerError::new(
+                    HandlerErrorType::NotFound,
+                    format!("Unknown Nexus operation {:?}", start.operation),
+                )
             })?;
             let mut info = NexusInfo {
                 headers: request.header,
@@ -909,6 +927,7 @@ mod tests {
         data_converters::{PayloadCodec, PayloadConversionError, PayloadConverter},
         protos::temporal::api::{
             common::v1::Payload,
+            failure::v1::Failure,
             workflowservice::v1::{
                 RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
                 StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
@@ -977,10 +996,8 @@ mod tests {
             let token = general_purpose::URL_SAFE_NO_PAD.encode(json);
             assert!(matches!(
                 WorkflowOperationToken::decode_token(&token),
-                Err(TemporalOperationError::Handler {
-                    retryable: false,
-                    ..
-                })
+                Err(TemporalOperationError::Handler(error))
+                    if error.effective_retry_behavior() == HandlerErrorRetryBehavior::NonRetryable
             ));
         }
         for token in ["", "!!!invalid!!!", "rust-nexus-v1:1234"] {
@@ -1529,7 +1546,7 @@ mod tests {
             })
         ));
         let failed = execute_request(
-            async { Err(TemporalOperationError::Operation("declined".to_owned())) },
+            async { Err(OperationError::failed("declined").into()) },
             &token,
             &converter,
         )
@@ -1547,5 +1564,97 @@ mod tests {
                 )),
             })
         ));
+    }
+
+    #[test]
+    fn nexus_error_causes_and_retry_overrides_survive_conversion() {
+        let converter = DataConverter::default();
+        for kind in ["failed", "canceled", "handler", "application"] {
+            let cause = ApplicationFailure::builder("original cause")
+                .type_name("OriginalCause".to_owned())
+                .details("typed detail".to_owned())
+                .build();
+            let error: TemporalOperationError = match kind {
+                "failed" => OperationError::failed("operation failed")
+                    .with_source(cause)
+                    .into(),
+                "canceled" => OperationError::canceled("operation canceled")
+                    .with_source(cause)
+                    .into(),
+                "handler" => HandlerError::new(HandlerErrorType::Unavailable, "handler rejected")
+                    .with_retry_behavior(HandlerErrorRetryBehavior::NonRetryable)
+                    .with_source(cause)
+                    .into(),
+                _ => TemporalOperationError::Application(Box::new(cause)),
+            };
+            let failure = match error.into_status(&converter) {
+                nexus_task_completion::Status::Failure(failure) => {
+                    let Some(FailureInfo::NexusHandlerFailureInfo(info)) = &failure.failure_info
+                    else {
+                        panic!("expected handler failure");
+                    };
+                    assert_eq!(
+                        info.r#type,
+                        if kind == "handler" {
+                            "UNAVAILABLE"
+                        } else {
+                            "INTERNAL"
+                        }
+                    );
+                    assert_eq!(
+                        info.retry_behavior,
+                        if kind == "handler" {
+                            NexusHandlerErrorRetryBehavior::NonRetryable
+                        } else {
+                            NexusHandlerErrorRetryBehavior::Unspecified
+                        } as i32
+                    );
+                    failure
+                }
+                nexus_task_completion::Status::Completed(proto::Response {
+                    variant:
+                        Some(response::Variant::StartOperation(proto::StartOperationResponse {
+                            variant: Some(start_operation_response::Variant::Failure(failure)),
+                        })),
+                }) => {
+                    assert_eq!(
+                        failure.message,
+                        if kind == "failed" {
+                            "operation failed"
+                        } else {
+                            "operation canceled"
+                        }
+                    );
+                    assert_eq!(
+                        matches!(
+                            failure.failure_info,
+                            Some(FailureInfo::CanceledFailureInfo(_))
+                        ),
+                        kind == "canceled"
+                    );
+                    failure
+                }
+                status => panic!("unexpected result: {status:?}"),
+            };
+            let cause = converter
+                .failure_converter()
+                .to_error(
+                    *failure.cause.expect("original cause must be immediate"),
+                    converter.payload_converter(),
+                    &serialization_context(),
+                )
+                .unwrap();
+            let temporalio_common::error::IncomingError::Application(cause) = cause else {
+                panic!("expected application cause");
+            };
+            assert_eq!(cause.type_name(), Some("OriginalCause"));
+            assert_eq!(cause.to_string(), "original cause");
+            assert!(!cause.is_non_retryable());
+            assert_eq!(
+                cause.details::<String>().unwrap().as_deref(),
+                Some("typed detail")
+            );
+            assert!(cause.cause().is_none());
+        }
     }
 }
