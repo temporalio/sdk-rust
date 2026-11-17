@@ -1064,10 +1064,10 @@ struct PreparedWFT {
     query_requests: Vec<QueryWorkflow>,
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
-    /// Set on a replay Worker when the Records of a marker couldn't be read. The run then fails
-    /// with it, so that lang gets the eviction and the replay ends, as for a non-determinism
-    /// error.
-    stream_replay_error: Option<String>,
+    /// Set when the Records of a marker couldn't be read, on a replay Worker or on a Worker that
+    /// may fail the Workflow for it. The run then fails with it, so that lang gets the eviction
+    /// and a replay ends, as for a non-determinism error.
+    stream_replay_error: Option<WFMachinesError>,
 }
 
 impl PreparedWFT {
@@ -1806,6 +1806,10 @@ pub(crate) enum WFMachinesError {
     /// the Workflow Task, or the Workflow with [WorkflowErrorType::StreamReplay].
     #[error("{0}")]
     StreamReplay(String),
+    /// A replay whose Store stayed unavailable for each try. The Records may still be there, so it
+    /// fails only the Workflow Task, also with [WorkflowErrorType::StreamReplay].
+    #[error("{0}")]
+    StreamReplayUnavailable(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1842,7 +1846,8 @@ impl WFMachinesError {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
             WFMachinesError::Fatal(_)
             | WFMachinesError::Stream(_)
-            | WFMachinesError::StreamReplay(_) => EvictionReason::Fatal,
+            | WFMachinesError::StreamReplay(_)
+            | WFMachinesError::StreamReplayUnavailable(_) => EvictionReason::Fatal,
         }
     }
 

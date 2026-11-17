@@ -1875,6 +1875,8 @@ pub enum WorkflowErrorType {
     Nondeterminism,
     /// A replay that can't read or check the Records of a Stream marker from the Store, such as
     /// after the Stream's Retention. The Workflow Task fails with `StreamReplayError` otherwise.
+    /// A Store that stays unavailable through each try fails only the task, with
+    /// `StreamReplayUnavailable`, since the Records may still be there.
     StreamReplay,
 }
 
