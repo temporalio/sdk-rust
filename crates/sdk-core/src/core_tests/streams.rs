@@ -4444,6 +4444,11 @@ struct Watching {
 
 impl Watching {
     async fn new() -> Self {
+        Self::with(|runtimes| runtimes).await
+    }
+
+    /// A Worker whose Stream runtimes `settings` gives from the default ones.
+    async fn with(settings: impl FnOnce(StreamRuntimes) -> StreamRuntimes) -> Self {
         let gave = Arc::new(Mutex::new(vec![]));
         let waits = Arc::new(AtomicUsize::new(0));
         let store = WatchedStore {
@@ -4461,7 +4466,7 @@ impl Watching {
         let run = start_with(
             t,
             [ResponseType::AllHistory],
-            runtimes(&runtime),
+            settings(runtimes(&runtime)),
             1,
             0,
             true,
@@ -4646,6 +4651,106 @@ async fn a_replayed_page_over_the_cap_comes_as_recorded() {
         1,
         0,
     );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    let read = reads(&replayed).pop().unwrap();
+    assert_eq!(read.records, records);
+    assert_eq!(stop(&read), StreamReadStop::Done);
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&live));
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
+}
+
+/// Gives the pages of read 1 until Workflow code got `count` Records, and the last activation.
+async fn pages_until(w: &Watching, count: usize) -> (Vec<usize>, Vec<String>, WorkflowActivation) {
+    let (mut sizes, mut got) = (vec![], vec![]);
+    loop {
+        let page = w.next().await;
+        let read = reads(&page).pop().unwrap();
+        sizes.push(read.records.len());
+        got.extend(texts(&read.records));
+        if got.len() >= count {
+            return (sizes, got, page);
+        }
+        complete(&w.run.worker, &page, vec![]).await;
+    }
+}
+
+/// A Worker with a `read_page_records` of 10 gives a backlog of 25 Records in pages of at most 10,
+/// from one Store answer, each Record once and in order.
+#[tokio::test]
+async fn a_page_cap_of_ten_gives_pages_of_at_most_ten() {
+    let w = Watching::with(|runtimes| runtimes.with_read_page_records(10)).await;
+    put_numbered(&w.runtime, "s", 0, 25).await;
+    complete(&w.run.worker, &w.first, vec![long_read(1, "s").into()]).await;
+    let (sizes, got, last) = pages_until(&w, 25).await;
+    assert_eq!(sizes, [10, 10, 5]);
+    assert_eq!(got, numbered(0, 25));
+    assert_eq!(w.given(), 25);
+    let sent = w.run.sent.clone();
+    w.finish(&last).await;
+    let entry = marker(&sent.lock()[0]).unwrap().reads.remove(0);
+    assert_eq!(entry.page_counts, [10, 10, 5]);
+}
+
+/// A Worker whose `read_page_records` is under 1 or over 1000 is refused when its config is built.
+#[rstest::rstest]
+#[case::zero(0)]
+#[case::over_the_bound(1001)]
+fn a_page_cap_out_of_its_bounds_is_refused(#[case] records: usize) {
+    let runtimes = runtimes(&runtime()).with_read_page_records(records);
+    let Err(refused) = test_worker_cfg().stream_runtimes(runtimes).build() else {
+        panic!("a `read_page_records` of {records} was taken");
+    };
+    assert_eq!(
+        refused,
+        "`read_page_records` of `stream_runtimes` must be 1 to 1000"
+    );
+}
+
+/// The bounds themselves are taken.
+#[test]
+fn a_page_cap_of_one_or_1000_is_taken() {
+    for records in [1, 1000] {
+        let runtimes = runtimes(&runtime()).with_read_page_records(records);
+        test_worker_cfg()
+            .stream_runtimes(runtimes)
+            .build()
+            .expect("a `read_page_records` in its bounds was refused");
+    }
+}
+
+/// Replay gives a page of History as it is, also one over the Worker's `read_page_records`.
+#[tokio::test]
+async fn a_replay_ignores_the_read_settings() {
+    let records: Vec<_> = (0..30u64)
+        .map(|at| StreamRecord {
+            producer: Some(client()),
+            body: Some(body(&at.to_string())),
+            offset: (at + 1).to_be_bytes().to_vec(),
+        })
+        .collect();
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), true);
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        streams: vec![stream("s")],
+        ..Default::default()
+    });
+    let settings = StreamRuntimes::default().with_read_page_records(10);
+    let run = start(t, [ResponseType::AllHistory], settings, 1, 0);
     let first = run.worker.poll_workflow_activation().await.unwrap();
     let read = StartStreamRead {
         records_in_history: true,
