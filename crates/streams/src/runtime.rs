@@ -3,7 +3,6 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
-    epoch::ProducerKind,
     ids::{check_producer, check_required, check_stream_id},
     memory::MemoryStore,
     metrics::Metrics,
@@ -11,7 +10,7 @@ use crate::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, StreamIdConflictPolicy, StreamRef, StreamStatus,
+        Producer, StreamIdConflictPolicy, StreamRef, StreamStatus, producer::Kind,
     },
     record::{check_records, data_records},
     store::{
@@ -70,10 +69,19 @@ pub(crate) fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
     Ok(id)
 }
 
-/// Checks the Producer of a close. Any kind may close.
+/// Checks the Producer of a close. Any kind may close, and a Workflow closes with its Workflow
+/// Task as the epoch, as it appends.
 fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
+    // With no epoch, a close from a failed Workflow Task would pass the fence.
+    if let Some(Kind::Workflow(workflow)) = producer.kind.as_ref()
+        && workflow.epoch.is_none()
+    {
+        return Err(StreamError::invalid(
+            "A close from a Workflow needs the Workflow Task as its epoch",
+        ));
+    }
     check_required(producer)?;
     Ok(producer)
 }
@@ -120,8 +128,8 @@ impl StreamRuntime {
         })
     }
 
-    /// Appends one batch as one Producer. A Workflow appends as the Producer of its Local Activity,
-    /// so a Workflow Producer is refused.
+    /// Appends one batch as one Producer. A Workflow Producer appends with its Workflow Task as the
+    /// epoch, so that the fence refuses a write of an older task.
     pub async fn append_records(
         &self,
         request: AppendRecordsRequest,
@@ -133,9 +141,12 @@ impl StreamRuntime {
             .as_ref()
             .ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
         check_producer(producer)?;
-        if ProducerKind::try_from(producer)? == ProducerKind::Workflow {
+        // With no epoch, a write from an older Workflow Task would pass the fence.
+        if let Some(Kind::Workflow(workflow)) = producer.kind.as_ref()
+            && workflow.epoch.is_none()
+        {
             return Err(StreamError::invalid(
-                "A Workflow writes with the Producer of its Local Activity",
+                "An append from a Workflow needs the Workflow Task as its epoch",
             ));
         }
         check_required(producer)?;
