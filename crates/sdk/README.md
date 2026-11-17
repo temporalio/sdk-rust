@@ -434,7 +434,10 @@ workflow ID for each independent operation. Nexus polling is enabled only when s
 Return `nexus_rpc::OperationError::failed(...)` or `OperationError::canceled(...)` through
 `TemporalOperationError` for terminal operation outcomes. Both support `with_source` to preserve an
 application cause and its details. `nexus_rpc::HandlerError` retains its error type, optional cause,
-and retry override; unexpected implementation or application errors are retryable handler failures.
+and retry override. Unexpected implementation errors are retryable handler failures; direct
+application failures retain their non-retryable override as `INTERNAL` handler failures. See the
+[failure-handling comparison](../../arch_docs/nexus_failure_handling.md) for RPC mappings and
+cross-SDK conventions.
 
 ## Activities in detail
 
