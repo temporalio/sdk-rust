@@ -60,6 +60,8 @@ relevant information.
   that a busy Stream doesn't activate Workflow code for each Record, 50 ms by default.
   A read with no `idle_timeout` ends after 1 minute with no Record. A graceful shutdown completes a
   task that only reads hold open, and a cached run that gets another Worker's events is evicted.
+  That completion forces a new task, with none inline and no sticky queue, so that another Worker
+  resumes the reads. No read starts on a Worker after its shutdown began.
   With `WorkflowErrorType::StreamReplay`, a replay that can't read its Records fails the Workflow
   instead of its task, and the marker of one task holds at most 1 MiB of Records.
   A read, an append or a close whose Store is unavailable is tried again, from 100 ms up to 2 s
