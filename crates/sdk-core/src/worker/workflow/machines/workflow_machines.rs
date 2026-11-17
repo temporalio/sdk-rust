@@ -345,7 +345,10 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
-            stream_calls: StreamCalls::new(!basics.worker_config.replays_only),
+            stream_calls: StreamCalls::new(
+                !basics.worker_config.replays_only,
+                basics.worker_config.stream_runtimes.page_cap(),
+            ),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }

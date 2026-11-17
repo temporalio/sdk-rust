@@ -47,8 +47,10 @@ relevant information.
   `StreamRuntimes::with_read_ahead_bytes` sets how many bytes of one read's Records may wait for
   Workflow code before the read stops asking the Store, 4 MiB by default.
   A read gives Workflow code what it has as soon as no activation of the run is out, and one page
-  holds at most 256 Records. Core gives the Records over it in the next activation, with no wait.
-  Replay gives each page as History has it, also one of more than 256 Records.
+  holds at most 256 Records by default. Core gives the Records over it in the next activation,
+  with no wait. `StreamRuntimes::with_read_page_records` sets that cap, from 1 to 1000. Another
+  value fails the build of the `WorkerConfig`.
+  Replay gives each page as History has it, also one over the cap.
   Core refuses a read, an append or a close whose Stream id or Store name has more than 4096 bytes,
   or a read whose `from_offset` has more than 1024 bytes, which is
   `temporalio_streams::ids::MAX_OFFSET_BYTES`. Workflow code gets `stream_invalid` in the next
