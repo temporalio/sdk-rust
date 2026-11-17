@@ -61,9 +61,6 @@ pub struct StreamRuntimes {
     /// The bytes of one read's Records that may wait for Workflow code, or `None` for
     /// [DEFAULT_READ_AHEAD_BYTES].
     read_ahead_bytes: Option<usize>,
-    /// The least time between two batches of one read, or `None` for
-    /// [DEFAULT_READ_BATCH_WINDOW].
-    read_batch_window: Option<Duration>,
 }
 
 impl StreamRuntimes {
@@ -72,7 +69,6 @@ impl StreamRuntimes {
         Self {
             runtimes: runtimes.into_iter().collect(),
             read_ahead_bytes: None,
-            read_batch_window: None,
         }
     }
 
@@ -93,28 +89,10 @@ impl StreamRuntimes {
         self.read_ahead_bytes
     }
 
-    /// The runtimes with `window` as the least time between two batches of one read. A read gives
-    /// its first batch immediately. After it gave a batch to its run, it asks the Store again only
-    /// once `window` has passed, so the Records that came in between go in one batch. On a busy
-    /// Stream this caps how often Workflow code is activated, and a Record waits at most one
-    /// window. Unset is 50 ms, and zero is no window.
-    pub fn with_read_batch_window(self, window: Duration) -> Self {
-        Self {
-            read_batch_window: Some(window),
-            ..self
-        }
-    }
-
-    /// The window that [StreamRuntimes::with_read_batch_window] set, if it set one.
-    pub fn read_batch_window(&self) -> Option<Duration> {
-        self.read_batch_window
-    }
-
     /// The Worker's options of a read.
     fn read_options(&self) -> ReadOptions {
         ReadOptions {
             read_ahead_bytes: self.read_ahead_bytes.unwrap_or(DEFAULT_READ_AHEAD_BYTES),
-            batch_window: self.read_batch_window.unwrap_or(DEFAULT_READ_BATCH_WINDOW),
         }
     }
 
@@ -247,6 +225,12 @@ pub(crate) struct StreamTestHooks {
 /// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
 /// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// The Records of one read in one activation. With no bound, a read of a long backlog would give
+/// Workflow code all of it in one page, which lang must handle in one activation. A count adds no
+/// wait, unlike a time gap, and means the same on any machine. Core keeps the Records over it and
+/// gives them in the next activation, which it issues with no wait. Replay gives the pages of
+/// History as they are, so the bound doesn't apply there.
+pub(crate) const STREAM_PAGE_MAX_RECORDS: usize = 256;
 /// The wait before the second try of a Store call that failed with `StorageUnavailable`. A short
 /// Store outage should not reach Workflow code, as the retry of a Local Activity keeps it away.
 pub(crate) const STORE_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(100);
@@ -267,16 +251,11 @@ pub(crate) const MAX_MARKER_RECORD_BYTES: usize = 1024 * 1024;
 /// The server also ends a chain of heartbeat tasks after 30 minutes. One constant in Core gives
 /// every SDK the same default.
 pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// The least time between two batches of one read when the Worker sets no `read_batch_window`.
-/// A read that gave each Record in its own batch would activate Workflow code once for each
-/// Record of a busy Stream, which costs lang far more than one activation for several Records.
-pub(crate) const DEFAULT_READ_BATCH_WINDOW: Duration = Duration::from_millis(50);
 
 /// The Worker's options of a read.
 #[derive(Clone, Copy, Debug)]
 struct ReadOptions {
     read_ahead_bytes: usize,
-    batch_window: Duration,
 }
 /// How long a graceful shutdown waits for a close in flight, from the start of the shutdown or
 /// of the close if it is later. The Worker has no other bound for the work of its runs at a
@@ -806,7 +785,8 @@ impl StreamManager {
 }
 
 /// Reads until the first stop. It sends each response with Records as one batch immediately, and
-/// looks at the Store again only once the batch window after that batch has passed.
+/// looks at the Store again right after. Batches that come while an activation of the run is out
+/// join, up to [STREAM_PAGE_MAX_RECORDS] for one activation.
 async fn read(
     runtime: Arc<StreamRuntime>,
     spec: ReadSpec,
@@ -843,17 +823,10 @@ async fn read(
     // deadline counts from the Workflow time of its task, so a slow start would otherwise end a
     // short read with no Record, and a loop of such reads could stand still.
     let mut looked = spec.took_a_record;
-    // When the window after the last batch ends. The read asks the Store again only then, so the
-    // Records that come in the window go in one batch.
-    let mut next_batch_at: Option<Instant> = None;
     // The tries of the current Store outage. A read that fails asks again from `last_offset`, so
     // it gives no Record twice and skips none.
     let mut retry = StoreRetry::new();
     loop {
-        if let Some(at) = next_batch_at.take() {
-            // A deadline in the window ends the read at the deadline, and not at the window's end.
-            tokio::time::sleep_until(deadline.map_or(at, |deadline| deadline.min(at))).await;
-        }
         spec.flow.wait_for_room(options.read_ahead_bytes).await;
         let now = Instant::now();
         if looked && deadline.is_some_and(|deadline| deadline <= now) {
@@ -956,9 +929,6 @@ async fn read(
                     records: page,
                     end: None,
                 });
-                if !options.batch_window.is_zero() {
-                    next_batch_at = Some(Instant::now() + options.batch_window);
-                }
             }
             // The idle end comes after a look at the Store, so that a read with a zero idle
             // timeout gives the Records that are there.

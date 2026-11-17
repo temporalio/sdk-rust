@@ -7,8 +7,8 @@ use crate::{
         OutgoingJob, WFMachinesError, fatal, nondeterminism,
         streams::{
             AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_RECORD_BYTES, ReadFlow,
-            ReadSpec, StreamCallResult, StreamRequest, StreamResolution, next_call_id,
-            store_metrics,
+            ReadSpec, STREAM_PAGE_MAX_RECORDS, StreamCallResult, StreamRequest, StreamResolution,
+            next_call_id, store_metrics,
         },
     },
 };
@@ -100,6 +100,46 @@ struct Read {
     /// Records, and the end, that the read gave past this task's marker bound. The next task
     /// takes them.
     carried: Option<ResolveStreamRead>,
+    /// Records, and the end, past [STREAM_PAGE_MAX_RECORDS] in the read's next activation. The
+    /// activation after it takes them.
+    over_cap: Option<ResolveStreamRead>,
+}
+
+/// Takes as much of a live `page` as the read's next activation has room for, when its pending
+/// job holds `pending` Records, and keeps the rest in `read` for the activation after it. Records
+/// come in order, so a page joins the ones that wait already.
+fn fit_in_activation(
+    read: &mut Read,
+    page: ResolveStreamRead,
+    pending: usize,
+) -> Option<ResolveStreamRead> {
+    if let Some(over_cap) = read.over_cap.as_mut() {
+        over_cap.records.extend(page.records);
+        if page.end.is_some() {
+            over_cap.end = page.end;
+        }
+        return None;
+    }
+    let room = STREAM_PAGE_MAX_RECORDS.saturating_sub(pending);
+    let ResolveStreamRead {
+        seq,
+        mut records,
+        end,
+    } = page;
+    if records.len() <= room {
+        return Some(ResolveStreamRead { seq, records, end });
+    }
+    let rest = records.split_off(room);
+    read.over_cap = Some(ResolveStreamRead {
+        seq,
+        records: rest,
+        end,
+    });
+    (!records.is_empty()).then_some(ResolveStreamRead {
+        seq,
+        records,
+        end: None,
+    })
 }
 
 /// Takes as much of `page` as the task's marker has room for, and keeps the rest in `read` for the
@@ -280,6 +320,7 @@ impl StreamCalls {
             open: true,
             dispatched: self.live,
             carried: None,
+            over_cap: None,
         };
         if self.live {
             self.requests.push(StreamRequest::Read(read.spec()));
@@ -453,6 +494,7 @@ impl StreamCalls {
         }
         read.open = false;
         read.carried = None;
+        read.over_cap = None;
         if read.dispatched {
             self.requests.push(StreamRequest::Cancel(read.call_id));
         }
@@ -520,8 +562,13 @@ impl StreamCalls {
     }
 
     /// Applies a result. Returns the job it makes, or `None` when its call is gone, stopped or
-    /// from an older dispatch.
-    pub(super) fn resolve(&mut self, resolution: StreamResolution) -> Option<StreamJob> {
+    /// from an older dispatch, or when its Records wait for a later activation. `pending` gives
+    /// the Records in the pending job of a read.
+    pub(super) fn resolve(
+        &mut self,
+        resolution: StreamResolution,
+        pending: impl FnOnce(u32) -> usize,
+    ) -> Option<StreamJob> {
         let StreamResolution {
             call_id,
             seq,
@@ -537,6 +584,7 @@ impl StreamCalls {
                 if read.records_in_history {
                     page = fit_in_marker(read, page, &mut self.marker_record_bytes)?;
                 }
+                let page = fit_in_activation(read, page, pending(seq))?;
                 if page.end.is_some() {
                     read.open = false;
                 }
@@ -887,8 +935,9 @@ impl StreamCalls {
     }
 
     /// The pages that reads gave past the marker bound of the last task, as jobs of this task.
-    /// They count against this task's bound too.
-    pub(super) fn release_carried(&mut self) -> Vec<StreamJob> {
+    /// They count against this task's bound too, and against the page cap. `pending` gives the
+    /// Records in the pending job of a read.
+    pub(super) fn release_carried(&mut self, pending: impl Fn(u32) -> usize) -> Vec<StreamJob> {
         let mut seqs: Vec<_> = self
             .reads
             .iter()
@@ -904,7 +953,38 @@ impl StreamCalls {
             let Some(page) = read.carried.take() else {
                 continue;
             };
-            if let Some(page) = fit_in_marker(read, page, &mut self.marker_record_bytes) {
+            if let Some(page) = fit_in_marker(read, page, &mut self.marker_record_bytes)
+                && let Some(page) = fit_in_activation(read, page, pending(seq))
+            {
+                if page.end.is_some() {
+                    read.open = false;
+                }
+                jobs.push(StreamJob::Read(page));
+            }
+        }
+        jobs
+    }
+
+    /// The Records that reads gave past the page cap, as jobs of the next activation. Called once
+    /// an activation took the pending jobs, so that the next one comes with no wait, also when the
+    /// Store has nothing new.
+    pub(super) fn release_over_cap(&mut self) -> Vec<StreamJob> {
+        let mut seqs: Vec<_> = self
+            .reads
+            .iter()
+            .filter(|(_, read)| read.over_cap.is_some())
+            .map(|(seq, _)| *seq)
+            .collect();
+        seqs.sort();
+        let mut jobs = vec![];
+        for seq in seqs {
+            let Some(read) = self.reads.get_mut(&seq) else {
+                continue;
+            };
+            let Some(page) = read.over_cap.take() else {
+                continue;
+            };
+            if let Some(page) = fit_in_activation(read, page, 0) {
                 if page.end.is_some() {
                     read.open = false;
                 }
@@ -928,6 +1008,7 @@ impl StreamCalls {
         for read in self.reads.values_mut().filter(|read| read.open) {
             read.open = false;
             read.carried = None;
+            read.over_cap = None;
             self.requests.push(StreamRequest::Cancel(read.call_id));
         }
         for append in self.appends.values_mut().filter(|a| !a.resolved) {

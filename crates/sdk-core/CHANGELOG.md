@@ -46,8 +46,9 @@ relevant information.
   A graceful shutdown of the Worker waits for each close in flight, for at most 10 s.
   `StreamRuntimes::with_read_ahead_bytes` sets how many bytes of one read's Records may wait for
   Workflow code before the read stops asking the Store, 4 MiB by default.
-  `StreamRuntimes::with_read_batch_window` sets the least time between two batches of one read, so
-  that a busy Stream doesn't activate Workflow code for each Record, 50 ms by default.
+  A read gives Workflow code what it has as soon as no activation of the run is out, and one page
+  holds at most 256 Records. Core gives the Records over it in the next activation, with no wait.
+  Replay gives each page as History has it, also one of more than 256 Records.
   A read with no `idle_timeout` ends after 1 minute with no Record. A graceful shutdown completes a
   task that only reads hold open, and a cached run that gets another Worker's events is evicted.
   That completion forces a new task, with none inline and no sticky queue, so that another Worker
