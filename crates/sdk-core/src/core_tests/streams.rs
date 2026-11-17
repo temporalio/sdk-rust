@@ -4972,7 +4972,8 @@ async fn a_shutdown_ends_when_its_forced_task_comes_back_to_it(#[case] new_read:
     let sent = Arc::new(Mutex::new(vec![]));
     let kept = sent.clone();
     cfg.completion_mock_fn = Some(Box::new(move |completion| {
-        if completion.resource_id == "workflow:b-reader" {
+        // The busy run's one completion ends its Workflow, so it has a command and forces nothing.
+        if completion.commands.is_empty() {
             kept.lock().push(completion.clone());
         }
         // The forced task reaches the poll of this Worker that waits.
@@ -5032,7 +5033,19 @@ async fn a_shutdown_ends_when_its_forced_task_comes_back_to_it(#[case] new_read:
             .await;
     };
     let drained = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(busy_ends, worker.drain_workflow_poller())
+        let drain = async {
+            loop {
+                match worker.poll_workflow_activation().await {
+                    Err(crate::PollError::ShutDown) => break,
+                    Ok(activation) if activation.is_only_eviction() => {
+                        let empty = WorkflowActivationCompletion::empty(activation.run_id);
+                        worker.complete_workflow_activation(empty).await.unwrap();
+                    }
+                    other => panic!("Unexpected activation while draining: {other:?}"),
+                }
+            }
+        };
+        tokio::join!(busy_ends, drain)
     });
     assert!(drained.await.is_ok(), "the shutdown didn't end");
     worker.shutdown().await;
