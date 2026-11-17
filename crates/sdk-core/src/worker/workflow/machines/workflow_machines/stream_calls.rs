@@ -8,7 +8,7 @@ use crate::{
         streams::{
             AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_RECORD_BYTES, ReadFlow,
             ReadSpec, STREAM_PAGE_MAX_RECORDS, StreamCallResult, StreamRequest, StreamResolution,
-            next_call_id, store_metrics,
+            input_over_limit, next_call_id, store_metrics,
         },
     },
 };
@@ -75,6 +75,8 @@ struct Close {
     /// True once the Worker runs the close.
     dispatched: bool,
     resolved: bool,
+    /// True for a close that Core refused for an input over its limit. The marker has nothing of it.
+    refused: bool,
 }
 
 struct Read {
@@ -103,6 +105,8 @@ struct Read {
     /// Records, and the end, past [STREAM_PAGE_MAX_RECORDS] in the read's next activation. The
     /// activation after it takes them.
     over_cap: Option<ResolveStreamRead>,
+    /// True for a read that Core refused for an input over its limit. The marker has nothing of it.
+    refused: bool,
 }
 
 /// Takes as much of a live `page` as the read's next activation has room for, when its pending
@@ -209,6 +213,9 @@ struct Append {
     /// Taken when the append is dispatched.
     spec: Option<AppendSpec>,
     resolved: bool,
+    /// True for an append that Core refused for an input over its limit. The marker has nothing
+    /// of it.
+    refused: bool,
 }
 
 /// A result that history has for a call, which waits for its activation in a replay.
@@ -276,11 +283,12 @@ impl StreamCalls {
         }
     }
 
+    /// Starts a read. Returns the job of its refusal, for a read with an input over its limit.
     pub(super) fn start_read(
         &mut self,
         attrs: StartStreamRead,
         workflow_time: Option<SystemTime>,
-    ) -> Result<()> {
+    ) -> Result<Option<StreamJob>> {
         let stream = attrs
             .stream
             .ok_or_else(|| fatal!("Stream read {} has no Stream", attrs.seq))?;
@@ -301,6 +309,8 @@ impl StreamCalls {
         // restart can stretch it.
         let deadline =
             timeout.map(|timeout| workflow_time.unwrap_or_else(SystemTime::now) + timeout);
+        let refusal = input_over_limit(&stream, &attrs.from_offset);
+        let refused = refusal.is_some();
         let read = Read {
             call_id: next_call_id(),
             seq: attrs.seq,
@@ -317,16 +327,29 @@ impl StreamCalls {
             max_bytes: attrs.max_bytes,
             flow: Arc::new(ReadFlow::default()),
             delivered: (0, 0),
-            open: true,
-            dispatched: self.live,
+            open: !refused,
+            dispatched: self.live && !refused,
             carried: None,
             over_cap: None,
+            refused,
         };
-        if self.live {
+        // A replay refuses the same input again, so the refusal needs no marker entry.
+        let job = refusal.map(|failure| {
+            StreamJob::Read(ResolveStreamRead {
+                seq: attrs.seq,
+                records: vec![],
+                end: Some(StreamReadEnd {
+                    last_offset: read.from_offset.clone(),
+                    failure: Some(failure),
+                    ..Default::default()
+                }),
+            })
+        });
+        if read.dispatched {
             self.requests.push(StreamRequest::Read(read.spec()));
         }
         self.reads.insert(attrs.seq, read);
-        Ok(())
+        Ok(job)
     }
 
     /// True once replay ended, so that the Worker runs new calls.
@@ -366,8 +389,9 @@ impl StreamCalls {
         stores
     }
 
-    /// Records a close, which the Worker runs only after History has this task.
-    pub(super) fn close(&mut self, attrs: CloseStream) -> Result<()> {
+    /// Records a close, which the Worker runs only after History has this task. Returns the job of
+    /// its refusal, for a close with an input over its limit.
+    pub(super) fn close(&mut self, attrs: CloseStream) -> Result<Option<StreamJob>> {
         let seq = attrs.seq;
         let stream = attrs
             .stream
@@ -383,19 +407,32 @@ impl StreamCalls {
         if self.closes.contains_key(&seq) {
             return Err(fatal!("Stream close {seq} was issued twice"));
         }
+        let refusal = input_over_limit(&stream, &[]);
+        let refused = refusal.is_some();
         self.closes.insert(
             seq,
             Close {
                 call_id: next_call_id(),
                 stream,
                 producer,
-                intent: Intent::Pending,
+                // A refused close has no intent for a task to record, and never runs.
+                intent: if refused {
+                    Intent::Recorded(None)
+                } else {
+                    Intent::Pending
+                },
                 queued: false,
-                dispatched: false,
-                resolved: false,
+                dispatched: refused,
+                resolved: refused,
+                refused,
             },
         );
-        Ok(())
+        Ok(refusal.map(|failure| {
+            StreamJob::Close(ResolveStreamClose {
+                seq,
+                failed: Some(failure),
+            })
+        }))
     }
 
     /// True if Workflow code asked for a close that no completion carries. The task completes
@@ -501,7 +538,9 @@ impl StreamCalls {
         Ok(true)
     }
 
-    pub(super) fn append(&mut self, attrs: AppendToStream) -> Result<()> {
+    /// Starts an append. Returns the job of its refusal, for an append with an input over its
+    /// limit.
+    pub(super) fn append(&mut self, attrs: AppendToStream) -> Result<Option<StreamJob>> {
         let seq = attrs.seq;
         let stream = attrs
             .stream
@@ -518,6 +557,22 @@ impl StreamCalls {
             return Err(fatal!("Stream append {seq} was issued twice"));
         }
         let call_id = next_call_id();
+        if let Some(failure) = input_over_limit(&stream, &[]) {
+            self.appends.insert(
+                seq,
+                Append {
+                    call_id,
+                    stream,
+                    spec: None,
+                    resolved: true,
+                    refused: true,
+                },
+            );
+            return Ok(Some(StreamJob::Append(ResolveStreamAppend {
+                seq,
+                status: Some(resolve_stream_append::Status::Failed(failure)),
+            })));
+        }
         let spec = AppendSpec {
             call_id,
             seq,
@@ -543,12 +598,13 @@ impl StreamCalls {
                 stream,
                 spec: Some(spec),
                 resolved: false,
+                refused: false,
             },
         );
         if runs_now && self.live {
             self.dispatch_head(&(stream_key.0, stream_key.1));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Takes a resolved call off its Stream's queue, and runs the next one once replay ended.
@@ -1086,7 +1142,7 @@ impl StreamCalls {
                     self.note_page(page, activation, metrics);
                 }
                 workflow_activation_job::Variant::ResolveStreamAppend(result) => {
-                    let Some(append) = self.appends.get(&result.seq) else {
+                    let Some(append) = self.appends.get(&result.seq).filter(|a| !a.refused) else {
                         continue;
                     };
                     let mut entry = StreamAppendEntry {
@@ -1107,7 +1163,7 @@ impl StreamCalls {
                     self.marker_appends.push((append.stream.clone(), entry));
                 }
                 workflow_activation_job::Variant::ResolveStreamClose(result) => {
-                    let Some(close) = self.closes.get(&result.seq) else {
+                    let Some(close) = self.closes.get(&result.seq).filter(|c| !c.refused) else {
                         continue;
                     };
                     self.marker_closes.push((
@@ -1127,7 +1183,7 @@ impl StreamCalls {
     }
 
     fn note_page(&mut self, page: &ResolveStreamRead, activation: u32, metrics: &MetricsContext) {
-        let Some(read) = self.reads.get_mut(&page.seq) else {
+        let Some(read) = self.reads.get_mut(&page.seq).filter(|read| !read.refused) else {
             return;
         };
         // Only a read that the Worker runs got its Records from the Store. A replayed one got

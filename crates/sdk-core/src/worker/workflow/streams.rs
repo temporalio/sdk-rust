@@ -40,6 +40,7 @@ use temporalio_common::protos::{
 use temporalio_streams::{
     MAX_WAIT, Reason, StreamError, StreamRuntime,
     digest::records_digest,
+    ids::{MAX_OFFSET_BYTES, MAX_STREAM_ID_BYTES},
     proto::{
         AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, ReadRecordsRequest,
         StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
@@ -854,7 +855,14 @@ async fn read(
             max_bytes: page_bytes_cap(bytes_left, &spec.flow, options.read_ahead_bytes),
             wait: Some(proto_duration(wait_until.saturating_duration_since(now))),
         };
-        let response = match runtime.read_records(request).await {
+        let answer = runtime.read_records(request).await.and_then(|response| {
+            let offsets = response
+                .records
+                .iter()
+                .map(|record| record.offset.as_slice());
+            store_offsets(offsets).map(|()| response)
+        });
+        let response = match answer {
             Ok(response) => {
                 retry = StoreRetry::new();
                 response
@@ -1078,6 +1086,13 @@ async fn append(
         )
         .await
     };
+    let answer = answer.and_then(|response| {
+        store_offsets([
+            response.first_offset.as_slice(),
+            response.last_offset.as_slice(),
+        ])
+        .map(|()| response)
+    });
     let status = match answer {
         Ok(response) => resolve_stream_append::Status::Appended(StreamAppended {
             first_offset: response.first_offset,
@@ -1092,6 +1107,47 @@ async fn append(
         }
     }
     sink(StreamCallResult::Append(status));
+}
+
+/// Fails a Store answer with an offset over [MAX_OFFSET_BYTES]. Core records the offsets of a call
+/// in History, so it takes none of any size, also from a Store.
+fn store_offsets<'a>(offsets: impl IntoIterator<Item = &'a [u8]>) -> Result<(), StreamError> {
+    match offsets
+        .into_iter()
+        .find(|offset| offset.len() > MAX_OFFSET_BYTES)
+    {
+        Some(offset) => Err(StreamError::storage_corrupt(format!(
+            "The Store gave an offset of {} bytes, more than the limit of {MAX_OFFSET_BYTES}",
+            offset.len()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The longest Store name of a Stream call, in bytes. The marker records the Store of each call.
+pub(crate) const MAX_STORE_NAME_BYTES: usize = 4096;
+
+/// The failure of a Stream call of Workflow code whose Stream or `from_offset` is over its limit,
+/// if it is. Core refuses such a call before any Store call and records nothing of it in the
+/// marker, so that no input of Workflow code makes a marker entry of any size. The message gives
+/// the limit and not the value.
+pub(crate) fn input_over_limit(stream: &StreamRef, from_offset: &[u8]) -> Option<Failure> {
+    let over = |what: &str, bytes: usize, limit: usize| {
+        (bytes > limit).then(|| {
+            failure(&StreamError::invalid(format!(
+                "{what} has {bytes} bytes, more than the limit of {limit}"
+            )))
+        })
+    };
+    over("The Stream id", stream.id.len(), MAX_STREAM_ID_BYTES)
+        .or_else(|| over("The Store name", stream.store.len(), MAX_STORE_NAME_BYTES))
+        .or_else(|| {
+            over(
+                "The offset `from_offset`",
+                from_offset.len(),
+                MAX_OFFSET_BYTES,
+            )
+        })
 }
 
 fn proto_duration(duration: Duration) -> prost_types::Duration {
@@ -1410,4 +1466,45 @@ fn replay_error(code: tonic::Code, message: String) -> tonic::Status {
         "true".parse().expect("valid metadata"),
     );
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Store answer with an offset over the limit is a Store error of the call. An offset at
+    /// the limit passes.
+    #[test]
+    fn a_store_offset_over_its_limit_fails_the_answer() {
+        let at_limit = vec![1; MAX_OFFSET_BYTES];
+        let over = vec![1; MAX_OFFSET_BYTES + 1];
+        assert!(store_offsets([at_limit.as_slice(), &[]]).is_ok());
+        let error = store_offsets([at_limit.as_slice(), over.as_slice()]).unwrap_err();
+        assert_eq!(error.reason, Reason::StorageCorrupt);
+        assert_eq!(
+            error.message,
+            "The Store gave an offset of 1025 bytes, more than the limit of 1024"
+        );
+    }
+
+    /// Each input of a call may reach its limit and not pass it.
+    #[test]
+    fn an_input_at_its_limit_passes() {
+        let at_limit = StreamRef {
+            id: "x".repeat(MAX_STREAM_ID_BYTES),
+            store: "m".repeat(MAX_STORE_NAME_BYTES),
+        };
+        assert!(input_over_limit(&at_limit, &[1; MAX_OFFSET_BYTES]).is_none());
+        let over = |what: &str, stream: &StreamRef, from_offset: &[u8]| {
+            let failure = input_over_limit(stream, from_offset).expect("no refusal");
+            assert!(failure.message.contains(what), "{}", failure.message);
+        };
+        let mut long_id = at_limit.clone();
+        long_id.id.push('x');
+        over("Stream id", &long_id, &[]);
+        let mut long_store = at_limit.clone();
+        long_store.store.push('m');
+        over("Store name", &long_store, &[]);
+        over("from_offset", &at_limit, &[1; MAX_OFFSET_BYTES + 1]);
+    }
 }
