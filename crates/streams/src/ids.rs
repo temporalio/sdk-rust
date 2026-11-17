@@ -21,6 +21,11 @@ use crate::{
 /// The longest Stream id, in bytes.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
 
+/// The longest offset, in bytes, that a caller may give or a Store may give back. An offset is
+/// opaque to a caller, and a Worker records the offsets of its calls in History, so an offset of
+/// any size could make a History event of any size. The crate's own offsets have 8 bytes.
+pub const MAX_OFFSET_BYTES: usize = 1024;
+
 /// The longest Producer id, in bytes. A caller builds the id from names that Temporal limits to
 /// 1000 characters, so an id with two of them still fits. A Store keeps the id in one meta field of
 /// each Producer for as long as the Stream lives. Each Record of a batch holds its Producer, so the

@@ -11,7 +11,8 @@ use crate::{
     },
     worker::client::WorkflowTaskCompletion,
     worker::{
-        MAX_MARKER_RECORD_BYTES, STORE_RETRY_BOUND, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
+        MAX_MARKER_RECORD_BYTES, MAX_STORE_NAME_BYTES, STORE_RETRY_BOUND, STREAM_PAGE_MAX_RECORDS,
+        StreamTestHooks,
     },
 };
 use futures_util::FutureExt;
@@ -58,6 +59,7 @@ use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_streams::{
     MemoryStreamOptions, MemoryStreamRuntime, Reason, StreamError, StreamResult, StreamRuntime,
     digest::records_digest,
+    ids::{MAX_OFFSET_BYTES, MAX_STREAM_ID_BYTES},
     memory::MemoryStore,
     proto::{
         AppendRecord, AppendRecordsRequest, ClientProducer, CloseStreamRequest,
@@ -5886,4 +5888,180 @@ async fn a_replay_worker_whose_store_stays_down_ends_the_history() {
             .iter()
             .all(|sent| workflow_failure(sent).is_none())
     );
+}
+
+/// Checks that `failure` is the `stream_invalid` refusal of an input over `limit`.
+fn assert_refused(failure: Option<&Failure>, what: &str, limit: usize) {
+    let failure = failure.expect("the call has no failure");
+    assert_eq!(failure_info(failure).r#type, "stream_invalid");
+    let tail = format!("bytes, more than the limit of {limit}");
+    assert!(
+        failure
+            .message
+            .starts_with(&format!("stream_invalid: {what} has "))
+            && failure.message.ends_with(&tail),
+        "{}",
+        failure.message
+    );
+}
+
+/// Runs a Workflow on the memory Store that issues `commands` in its first activation and ends in
+/// the next. Returns that activation, the completion of the task and the counts of Store calls.
+async fn refused_calls(
+    commands: impl FnOnce(&str) -> Vec<workflow_command::Variant>,
+) -> (WorkflowActivation, WorkflowTaskCompletion, Vec<u64>) {
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    t.add_workflow_task_scheduled_and_started();
+    let run = served(t, runtimes(&runtime), Some(&meter), |_| {}, |_| {});
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, commands(&first.run_id)).await;
+    let refused = run.worker.poll_workflow_activation().await.unwrap();
+    run.worker.complete_execution(&refused.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
+    let sent = run.sent.lock()[0].clone();
+    let names = [
+        "stream_read_total",
+        "stream_append_total",
+        "stream_close_total",
+    ];
+    let calls = names
+        .iter()
+        .map(|name| meter.counter_total(name, &[]))
+        .collect();
+    (refused, sent, calls)
+}
+
+/// A read, an append and a close of a Stream id over its limit are refused with `stream_invalid`
+/// in the next activation, with no Store call and nothing in the marker.
+#[tokio::test]
+async fn a_stream_id_over_its_limit_is_refused() {
+    let long = StreamRef {
+        id: "x".repeat(MAX_STREAM_ID_BYTES + 1),
+        ..stream("s")
+    };
+    let (refused, sent, calls) = refused_calls(|run_id| {
+        vec![
+            StartStreamRead {
+                stream: Some(long.clone()),
+                ..read_cmd(1, "s")
+            }
+            .into(),
+            AppendToStream {
+                stream: Some(long.clone()),
+                ..append_cmd(1, "s", run_id, &["a"])
+            }
+            .into(),
+            CloseStream {
+                stream: Some(long.clone()),
+                ..close_cmd(1, "s", run_id)
+            }
+            .into(),
+        ]
+    })
+    .await;
+    let read = reads(&refused).pop().unwrap();
+    assert!(read.records.is_empty());
+    let end = read.end.unwrap();
+    assert!(!end.done);
+    assert_eq!(end.stop, StreamReadStop::Unspecified as i32);
+    assert_refused(end.failure.as_ref(), "The Stream id", MAX_STREAM_ID_BYTES);
+    let append = appends(&refused).pop().unwrap();
+    let Some(resolve_stream_append::Status::Failed(failed)) = &append.status else {
+        panic!("{append:?}");
+    };
+    assert_refused(Some(failed), "The Stream id", MAX_STREAM_ID_BYTES);
+    let close = closes(&refused).pop().unwrap();
+    assert_refused(close.failed.as_ref(), "The Stream id", MAX_STREAM_ID_BYTES);
+    assert!(marker(&sent).is_none(), "{:?}", marker(&sent));
+    assert_eq!(calls, [0, 0, 0]);
+}
+
+/// An append to a Store name over its limit is refused before the Worker looks for a runtime of
+/// that name, so the Workflow Task doesn't fail.
+#[tokio::test]
+async fn a_store_name_over_its_limit_is_refused() {
+    let long = StreamRef {
+        store: "m".repeat(MAX_STORE_NAME_BYTES + 1),
+        ..stream("s")
+    };
+    let (refused, sent, calls) = refused_calls(|run_id| {
+        vec![
+            AppendToStream {
+                stream: Some(long.clone()),
+                ..append_cmd(1, "s", run_id, &["a"])
+            }
+            .into(),
+        ]
+    })
+    .await;
+    let append = appends(&refused).pop().unwrap();
+    let Some(resolve_stream_append::Status::Failed(failed)) = &append.status else {
+        panic!("{append:?}");
+    };
+    assert_refused(Some(failed), "The Store name", MAX_STORE_NAME_BYTES);
+    assert!(marker(&sent).is_none(), "{:?}", marker(&sent));
+    assert_eq!(calls, [0, 0, 0]);
+}
+
+/// A read from an offset over its limit is refused, and its end gives back that offset.
+#[tokio::test]
+async fn a_from_offset_over_its_limit_is_refused() {
+    let long = vec![7; MAX_OFFSET_BYTES + 1];
+    let (refused, sent, calls) = refused_calls(|_| {
+        vec![
+            StartStreamRead {
+                from_offset: long.clone(),
+                ..read_cmd(1, "s")
+            }
+            .into(),
+        ]
+    })
+    .await;
+    let end = reads(&refused).pop().unwrap().end.unwrap();
+    assert_eq!(end.last_offset, long);
+    assert_refused(
+        end.failure.as_ref(),
+        "The offset `from_offset`",
+        MAX_OFFSET_BYTES,
+    );
+    assert!(marker(&sent).is_none(), "{:?}", marker(&sent));
+    assert_eq!(calls, [0, 0, 0]);
+}
+
+/// A replay refuses the same read again, so a History with no marker of the refusal replays.
+#[tokio::test]
+async fn a_replay_refuses_a_read_over_its_limit_again() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+    let run = start(
+        t,
+        [ResponseType::AllHistory],
+        StreamRuntimes::default(),
+        1,
+        0,
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        from_offset: vec![7; MAX_OFFSET_BYTES + 1],
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let refused = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(refused.is_replaying);
+    let end = reads(&refused).pop().unwrap().end.unwrap();
+    assert_refused(
+        end.failure.as_ref(),
+        "The offset `from_offset`",
+        MAX_OFFSET_BYTES,
+    );
+    run.worker.complete_execution(&refused.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
 }
