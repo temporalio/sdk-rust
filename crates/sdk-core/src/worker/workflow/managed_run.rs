@@ -179,7 +179,7 @@ impl ManagedRun {
     pub(super) fn validate_batch_completion(
         &mut self,
         mut completions: Vec<ValidatedCompletion>,
-    ) -> std::result::Result<(ValidatedCompletion, bool, usize), CompleteWfError> {
+    ) -> std::result::Result<(ValidatedCompletion, usize), CompleteWfError> {
         let malformed = |reason: &str| CompleteWfError::MalformedWorkflowCompletion {
             run_id: self.run_id().to_owned(),
             reason: reason.to_owned(),
@@ -246,12 +246,11 @@ impl ManagedRun {
                         failure: error.as_failure(),
                         is_autocomplete: true,
                     },
-                    true,
                     index + 1,
                 ));
             }
         }
-        Ok((last, outstanding.activations[count - 1].is_replaying, count))
+        Ok((last, count))
     }
 
     /// Returns true if lang needs another activation.

@@ -668,7 +668,6 @@ impl Workflows {
                 is_empty_completion,
                 is_autocomplete,
                 task_storage_metrics,
-                replaying: None,
             },
             rx,
             post_activate_hook,
@@ -687,7 +686,6 @@ impl Workflows {
             is_empty_completion,
             is_autocomplete,
             task_storage_metrics,
-            replaying,
         } = context;
         let completion_outcome = if let Ok(c) = rx.await {
             c
@@ -705,7 +703,7 @@ impl Workflows {
             );
             return Ok(());
         };
-        let replaying = replaying.unwrap_or(completion_outcome.replaying);
+        let replaying = completion_outcome.replaying;
 
         let mut wft_from_complete = None;
         let wft_report_status = self
@@ -798,7 +796,7 @@ impl Workflows {
             response_tx,
             validation_tx,
         });
-        let (replaying, applied_count) =
+        let applied_count =
             validation_rx
                 .await
                 .map_err(|_| CompleteWfError::MalformedWorkflowCompletion {
@@ -833,7 +831,6 @@ impl Workflows {
                 is_empty_completion,
                 is_autocomplete: false,
                 task_storage_metrics,
-                replaying: Some(replaying),
             },
             response_rx,
             post_activate_hook,
@@ -1415,7 +1412,6 @@ struct ActivationCompletionContext {
     is_empty_completion: bool,
     is_autocomplete: bool,
     task_storage_metrics: TaskStorageMetrics,
-    replaying: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -1429,7 +1425,7 @@ struct BatchCompleteMsg {
     run_id: String,
     completions: Vec<ValidatedCompletion>,
     response_tx: oneshot::Sender<ActivationCompleteResult>,
-    validation_tx: oneshot::Sender<Result<(bool, usize), CompleteWfError>>,
+    validation_tx: oneshot::Sender<Result<usize, CompleteWfError>>,
 }
 
 #[derive(Debug)]

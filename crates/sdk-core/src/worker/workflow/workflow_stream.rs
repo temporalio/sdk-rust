@@ -140,10 +140,8 @@ impl WFStream {
                                         run.validate_batch_completion(request.completions)
                                     });
                                 match result {
-                                    Ok((completion, replaying, applied_count)) => {
-                                        let _ = request
-                                            .validation_tx
-                                            .send(Ok((replaying, applied_count)));
+                                    Ok((completion, applied_count)) => {
+                                        let _ = request.validation_tx.send(Ok(applied_count));
                                         activations.extend(state.process_completion(
                                             NewOrFetchedComplete::New(Box::new(WFActCompleteMsg {
                                                 completion,
