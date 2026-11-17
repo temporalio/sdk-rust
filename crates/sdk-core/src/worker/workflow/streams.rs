@@ -10,7 +10,7 @@ use crate::{
     },
 };
 use futures_util::{
-    StreamExt,
+    StreamExt, TryStreamExt,
     future::{AbortHandle, AbortRegistration, Abortable},
 };
 use parking_lot::Mutex;
@@ -181,6 +181,15 @@ impl WorkerStreams {
         (self.fails_workflow)(workflow_type)
     }
 
+    /// How long a replay's read of the Store tries again after its first `StorageUnavailable`.
+    fn replay_retry_bound(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(bound) = self.hooks.replay_retry_bound {
+            return bound;
+        }
+        STORE_RETRY_BOUND
+    }
+
     fn close_bound(&self) -> Duration {
         #[cfg(test)]
         if let Some(bound) = self.hooks.close_bound {
@@ -229,6 +238,9 @@ pub(crate) struct StreamTestHooks {
     pub(crate) close_bound: Option<Duration>,
     /// Told each time a graceful shutdown waits for a close in flight.
     pub(crate) shutdown_waits: Option<Arc<Notify>>,
+    /// A shorter bound in place of [STORE_RETRY_BOUND] for a replay's reads. They run on the
+    /// Worker's own thread, whose clock a test can't pause.
+    pub(crate) replay_retry_bound: Option<Duration>,
 }
 
 /// The bytes of one read's Records that may wait for Workflow code when the Worker sets no
@@ -269,17 +281,23 @@ struct ReadOptions {
 pub(crate) const CLOSE_SHUTDOWN_BOUND: Duration = Duration::from_secs(10);
 
 /// The tries of one Store call that fails with `StorageUnavailable`.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct StoreRetry {
     first_failure: Option<Instant>,
     backoff: Duration,
+    bound: Duration,
 }
 
 impl StoreRetry {
     fn new() -> Self {
+        Self::with_bound(STORE_RETRY_BOUND)
+    }
+
+    fn with_bound(bound: Duration) -> Self {
         Self {
             first_failure: None,
             backoff: STORE_RETRY_FIRST_BACKOFF,
+            bound,
         }
     }
 
@@ -292,7 +310,7 @@ impl StoreRetry {
         }
         let now = Instant::now();
         let first = *self.first_failure.get_or_insert(now);
-        let left = (first + STORE_RETRY_BOUND).saturating_duration_since(now);
+        let left = (first + self.bound).saturating_duration_since(now);
         if left.is_zero() {
             return None;
         }
@@ -1185,7 +1203,8 @@ pub(crate) fn needs_stream_records(events: &[HistoryEvent]) -> bool {
     })
 }
 
-/// The type of the failure of a replay that can't read or check the Records of a marker.
+/// The type of the failure of a replay that can't read or check the Records of a marker. A replay
+/// whose Store stays unavailable has no type, so that it never fails the Workflow.
 pub(crate) const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
 
 /// True if a failure of a Workflow Task is one of a replay that can't read its Records.
@@ -1202,6 +1221,12 @@ pub(crate) fn is_stream_replay_error(status: &tonic::Status) -> bool {
     status.metadata().contains_key(STREAM_REPLAY_ERROR_KEY)
 }
 
+/// True if the status comes from a hydrate whose Store stayed unavailable. The Records may still be
+/// there, so such a replay fails only its task, and a later attempt may pass.
+pub(crate) fn is_stream_replay_unavailable(status: &tonic::Status) -> bool {
+    is_stream_replay_error(status) && status.code() == tonic::Code::Unavailable
+}
+
 /// Reads the Records of each `core_stream` marker that has their count and digest but not the
 /// Records themselves, and puts them in the marker. The machines are sync, so a replay reads the
 /// Store here, where history enters in async code, and gives them a marker that has its Records.
@@ -1215,9 +1240,10 @@ pub(crate) async fn hydrate_stream_markers(
             continue;
         };
         let data = StreamMarkerData::decode(payload.data.as_slice()).map_err(|error| {
-            replay_error(format!(
-                "StreamReplayError: a Stream marker is bad: {error}"
-            ))
+            replay_error(
+                tonic::Code::DataLoss,
+                format!("StreamReplayError: a Stream marker is bad: {error}"),
+            )
         })?;
         if data
             .reads
@@ -1229,11 +1255,14 @@ pub(crate) async fn hydrate_stream_markers(
                 .iter()
                 .find(|entry| data.streams.get(entry.stream_index as usize).is_none())
             {
-                return Err(replay_error(format!(
-                    "StreamReplayError: a Stream marker is bad: read {} has Stream {}, which the \
+                return Err(replay_error(
+                    tonic::Code::DataLoss,
+                    format!(
+                        "StreamReplayError: a Stream marker is bad: read {} has Stream {}, which the \
                      marker doesn't have",
-                    entry.seq, entry.stream_index
-                )));
+                        entry.seq, entry.stream_index
+                    ),
+                ));
             }
             markers.push((at, data));
         }
@@ -1255,15 +1284,18 @@ pub(crate) async fn hydrate_stream_markers(
                 })
         })
         .collect();
+    // The first failure ends the hydrate. Each read may retry an unavailable Store for its
+    // bound, and the reads behind it would each wait that long again for the same outage.
     let results: Vec<_> = futures_util::stream::iter(reads)
         .map(|(marker, entry, stream, read)| async move {
-            (marker, entry, read_range(streams, &stream, &read).await)
+            let records = read_range(streams, &stream, &read).await?;
+            Ok::<_, tonic::Status>((marker, entry, records))
         })
         .buffer_unordered(HYDRATE_CONCURRENCY)
-        .collect()
-        .await;
+        .try_collect()
+        .await?;
     for (marker, entry, records) in results {
-        markers[marker].1.reads[entry].records = records?;
+        markers[marker].1.reads[entry].records = records;
     }
     for (at, data) in markers {
         if let Some(payload) = stream_marker_payload(&mut events[at]) {
@@ -1280,12 +1312,15 @@ async fn read_range(
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
     let runtime = streams.and_then(|streams| streams.worker.get(&stream.store));
+    let retry = StoreRetry::with_bound(streams.map_or(STORE_RETRY_BOUND, |streams| {
+        streams.worker.replay_retry_bound()
+    }));
     let Some(metrics) = streams.and_then(|streams| streams.replay_metrics(&stream.store)) else {
-        return read_and_check(runtime, stream, entry).await;
+        return read_and_check(runtime, stream, entry, retry).await;
     };
     metrics.stream_replay_read_started();
     let started = Instant::now();
-    let records = read_and_check(runtime, stream, entry).await;
+    let records = read_and_check(runtime, stream, entry, retry).await;
     metrics.stream_replay_read_latency(started.elapsed());
     if records.is_err() {
         metrics.stream_replay_read_failed();
@@ -1298,15 +1333,22 @@ async fn read_and_check(
     runtime: Option<&Arc<StreamRuntime>>,
     stream: &StreamRef,
     entry: &StreamReadEntry,
+    fresh_retry: StoreRetry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
-    let fail = |cause: String| {
-        replay_error(format!(
-            "StreamReplayError: Stream `{}` in Store `{}`, the Records after {} through {}: {cause}",
+    let range = || {
+        format!(
+            "Stream `{}` in Store `{}`, the Records after {} through {}",
             stream.id,
             stream.store,
             offset_text(&entry.after_offset),
             offset_text(&entry.last_offset),
-        ))
+        )
+    };
+    let fail = |cause: String| {
+        replay_error(
+            tonic::Code::DataLoss,
+            format!("StreamReplayError: {}: {cause}", range()),
+        )
     };
     let runtime = runtime.ok_or_else(|| {
         fail(format!(
@@ -1317,19 +1359,40 @@ async fn read_and_check(
     let count = entry.count as usize;
     let mut records: Vec<StreamRecord> = Vec::with_capacity(count);
     let mut from_offset = entry.after_offset.clone();
+    let mut retry = fresh_retry;
     while records.len() < count {
         let left = count - records.len();
-        let response = runtime
+        let answer = runtime
             .read_records(ReadRecordsRequest {
                 namespace: String::new(),
                 r#ref: Some(stream.clone()),
-                from_offset,
+                from_offset: from_offset.clone(),
                 max_records: i32::try_from(left).unwrap_or(i32::MAX),
                 wait: None,
                 max_bytes: 0,
             })
-            .await
-            .map_err(|error| fail(error.to_string()))?;
+            .await;
+        let response = match answer {
+            Ok(response) => {
+                retry = fresh_retry;
+                response
+            }
+            Err(error) => {
+                if let Some(wait) = retry.next_wait(&error) {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                // A Store that didn't answer says nothing of the Records, so this failure must not
+                // count as Records that are gone.
+                if error.reason == Reason::StorageUnavailable {
+                    return Err(replay_error(
+                        tonic::Code::Unavailable,
+                        format!("StreamReplayUnavailable: {}: {error}", range()),
+                    ));
+                }
+                return Err(fail(error.to_string()));
+            }
+        };
         if response.records.is_empty() {
             return Err(fail(format!(
                 "the Store has {} of the {count} Records",
@@ -1360,8 +1423,10 @@ fn offset_text(offset: &[u8]) -> String {
     format!("offset {hex}")
 }
 
-fn replay_error(message: String) -> tonic::Status {
-    let mut status = tonic::Status::new(tonic::Code::DataLoss, message);
+/// A status that carries `message` as is, with `code` to tell a Store that stayed unavailable
+/// from Records that a replay can't use.
+fn replay_error(code: tonic::Code, message: String) -> tonic::Status {
+    let mut status = tonic::Status::new(code, message);
     status.metadata_mut().insert(
         STREAM_REPLAY_ERROR_KEY,
         "true".parse().expect("valid metadata"),
