@@ -1,1 +1,1 @@
-Workers can serve typed Nexus service operations with experimental `temporal_nexus_service_handler` handlers, including synchronous results and workflow-backed asynchronous operations with cancellation.
+Workers can serve typed Nexus service operations with experimental `temporal_nexus_service_handler` handlers, including synchronous results and workflow-backed asynchronous operations with cancellation. Handler and operation errors preserve application causes, serialized details, and retry overrides.
