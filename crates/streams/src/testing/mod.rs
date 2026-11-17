@@ -41,8 +41,8 @@ pub struct RuntimeConfig {
     pub store_name: String,
     /// The Retention of each Stream that the runtime creates.
     pub retention: Option<Duration>,
-    /// How long an open Stream stays after its last write.
-    pub last_write_ttl: Option<Duration>,
+    /// How long an open Stream stays after the last write of any Producer.
+    pub producer_idle_ttl: Option<Duration>,
 }
 
 /// A Store that the suites run on, with the server under it.
@@ -74,7 +74,7 @@ impl TestStore for MemoryTestStore {
     fn runtime(&self, config: &RuntimeConfig) -> Arc<StreamRuntime> {
         let options = MemoryStreamOptions {
             retention: config.retention,
-            last_write_ttl: config.last_write_ttl,
+            producer_idle_ttl: config.producer_idle_ttl,
         };
         MemoryStreamRuntime::new(config.store_name.clone(), options, None)
     }
