@@ -101,16 +101,21 @@ fn check_task(task: &WorkflowTaskEpoch) -> StreamResult<()> {
     at_least_one(task.attempt, "Workflow Task")
 }
 
-/// Refuses a Producer that lacks a field the API requires. A Workflow Producer only closes a
-/// Stream, so it may send no epoch, but an epoch that it sends must order. A Workflow Task's
-/// started time stays optional, since Core leaves it empty when the server gave the task none.
+/// Refuses a Producer that lacks a field the API requires. A Workflow Producer writes with its
+/// Workflow Task as the epoch, for an append as for a close, and the epoch must order. A
+/// Workflow Task's started time stays optional, since Core leaves it empty when the server gave the
+/// task none.
 pub fn check_required(producer: &Producer) -> StreamResult<()> {
     match producer.kind.as_ref() {
         Some(Kind::Workflow(workflow)) => {
             if workflow.run_id.is_empty() {
                 return missing("run id");
             }
-            workflow.epoch.as_ref().map_or(Ok(()), check_task)
+            // With no epoch, a write from an older Workflow Task would pass the fence.
+            let Some(epoch) = workflow.epoch.as_ref() else {
+                return missing("Workflow Task as its epoch");
+            };
+            check_task(epoch)
         }
         Some(Kind::LocalActivity(local)) => {
             if local.run_id.is_empty() {
@@ -309,8 +314,12 @@ mod tests {
 
     #[test]
     fn a_producer_with_its_required_fields_passes() {
-        // A Workflow Producer only closes, with no epoch, and a standalone Activity has no run.
-        let workflow = producer(ProducerKind::Workflow, "wf:r", "r");
+        // A standalone Activity has no run.
+        let workflow = workflow_with(WorkflowTaskEpoch {
+            started_event_id: 3,
+            attempt: 1,
+            started_time: None,
+        });
         let mut standalone = activity();
         let Some(Kind::WorkflowActivity(kind)) = standalone.kind.take() else {
             unreachable!()
@@ -328,6 +337,12 @@ mod tests {
     fn a_workflow_producer_needs_its_run_id() {
         let workflow = producer(ProducerKind::Workflow, "wf:", "");
         assert!(refused(&workflow).contains("run id"));
+    }
+
+    #[test]
+    fn a_workflow_producer_needs_its_epoch() {
+        let workflow = producer(ProducerKind::Workflow, "wf:r", "r");
+        assert!(refused(&workflow).contains("Workflow Task as its epoch"));
     }
 
     /// A Workflow Producer with `epoch`.
