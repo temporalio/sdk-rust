@@ -30,7 +30,7 @@ pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 /// How long the meta key stays after the log key expires, so that a read can tell an expired Stream
 /// from a missing one.
 pub const TOMBSTONE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// The longest Retention or last-write TTL, which is the largest proto Duration. Its ms plus the
+/// The longest Retention or Producer idle TTL, which is the largest proto Duration. Its ms plus the
 /// time of a write stay exact in a Lua number.
 pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
 
@@ -121,7 +121,7 @@ pub struct StreamState {
     /// The newest offset when a write found the log gone, zero if none.
     pub trimmed: i64,
     /// When the Stream stops taking writes, in ms since 1970. Zero for an open Stream with no
-    /// last-write TTL, which stays until its close.
+    /// Producer idle TTL, which stays until its close.
     pub expires_ms: i64,
     /// The server time of the read, in ms since 1970.
     pub now_ms: i64,

@@ -894,11 +894,11 @@ async fn the_retention_counts_from_the_close() {
     }
 }
 
-/// With a last-write TTL in the Store config, an open Stream expires that long after its last
-/// write. Each write starts the TTL again.
-async fn an_open_stream_expires_its_last_write_ttl_after_its_last_write() {
+/// With a Producer idle TTL in the Store config, an open Stream expires that long after the last
+/// write of any Producer. Each write starts the TTL again.
+async fn an_open_stream_expires_after_its_producer_idle_ttl() {
     let config = RuntimeConfig {
-        last_write_ttl: Some(Duration::from_millis(500)),
+        producer_idle_ttl: Some(Duration::from_millis(500)),
         ..Default::default()
     };
     for case in cases_with(Needs::SHORT_TIMES, &config).await {
@@ -1078,7 +1078,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_close_ends_every_read_with_done),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(the_retention_counts_from_the_close),
-    case!(an_open_stream_expires_its_last_write_ttl_after_its_last_write),
+    case!(an_open_stream_expires_after_its_producer_idle_ttl),
     case!(a_create_answer_names_the_store_and_the_store_never_reads_it),
     case!(a_read_of_a_closed_stream_with_no_record_left_answers_at_once),
     case!(a_waiting_read_wakes_with_done_on_a_close),
