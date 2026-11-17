@@ -38,7 +38,7 @@ enum StreamErrorReason {
     STREAM_ERROR_REASON_UNSPECIFIED = 0;
     // Nobody created the Stream. NOT_FOUND.
     STREAM_ERROR_REASON_NOT_FOUND = 1;
-    // The Stream's Retention or its last-write TTL passed. NOT_FOUND.
+    // The Stream's Retention or its Producer idle TTL passed. NOT_FOUND.
     STREAM_ERROR_REASON_EXPIRED = 2;
     // The Stream is closed. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_CLOSED = 3;
