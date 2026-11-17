@@ -40,11 +40,8 @@ mod workflow_status;
 #[cfg(feature = "experimental")]
 #[doc(hidden)]
 pub mod __internal {
-    use crate::{
-        Client, WorkflowClientTrait, WorkflowHandle, WorkflowStartOptions,
-        errors::WorkflowStartError,
-    };
-    use temporalio_common::HasWorkflowDefinition;
+    use crate::{Client, WorkflowClientTrait, WorkflowStartOptions, errors::WorkflowStartError};
+    use temporalio_common::{HasWorkflowDefinition, protos::temporal::api::common::v1::Link};
 
     pub async fn start_nexus_workflow<W>(
         client: &Client,
@@ -52,7 +49,7 @@ pub mod __internal {
         input: W::Input,
         options: WorkflowStartOptions,
         request_id: &str,
-    ) -> Result<WorkflowHandle<Client, W>, WorkflowStartError>
+    ) -> Result<Option<Link>, WorkflowStartError>
     where
         W: HasWorkflowDefinition,
         W::Input: Send,
@@ -60,6 +57,7 @@ pub mod __internal {
         client
             .start_workflow_with_request_id(workflow, input, options, Some(request_id.to_owned()))
             .await
+            .map(|(_, link)| link)
     }
 }
 
@@ -171,7 +169,9 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{ActivityType, Memo as ProtoMemo, Payloads, WorkflowType},
+            common::v1::{
+                ActivityType, Link as ProtoLink, Memo as ProtoMemo, Payloads, WorkflowType,
+            },
             enums::v1::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
@@ -1444,7 +1444,11 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         W: HasWorkflowDefinition,
         W::Input: Send,
     {
-        self.start_workflow_with_request_id(workflow, input, options, None)
+        async {
+            self.start_workflow_with_request_id(workflow, input, options, None)
+                .await
+                .map(|(handle, _)| handle)
+        }
     }
 
     fn start_workflow_with_request_id<W>(
@@ -1453,7 +1457,7 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         input: W::Input,
         options: WorkflowStartOptions,
         request_id: Option<String>,
-    ) -> impl Future<Output = Result<WorkflowHandle<Self, W>, WorkflowStartError>>
+    ) -> impl Future<Output = Result<(WorkflowHandle<Self, W>, Option<ProtoLink>), WorkflowStartError>>
     where
         Self: Sized,
         W: HasWorkflowDefinition,
@@ -1919,7 +1923,7 @@ where
         input: W::Input,
         options: WorkflowStartOptions,
         request_id: Option<String>,
-    ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
+    ) -> Result<(WorkflowHandle<Self, W>, Option<ProtoLink>), WorkflowStartError>
     where
         W: HasWorkflowDefinition,
         W::Input: Send,
@@ -1980,14 +1984,15 @@ where
                         store_external_payloads(&mut request, &data_converter, &client.namespace(), Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
-                        let run_id = client
+                        let response = client
                             .start_workflow_execution(request)
                             .await
                             .map_err(WorkflowStartError::from_status)?
-                            .into_inner()
-                            .run_id;
+                            .into_inner();
 
-                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                        let mut output = StartWorkflowOutput::new(workflow_id, response.run_id);
+                        output.link = response.link;
+                        Ok(output)
                     })
                 }
             }),
@@ -1996,16 +2001,20 @@ where
         let StartWorkflowOutput {
             workflow_id,
             run_id,
+            link,
         } = interceptor_output;
 
-        Ok(WorkflowHandle::new(
-            self.clone(),
-            WorkflowExecutionInfo {
-                namespace,
-                workflow_id,
-                run_id: Some(run_id.clone()),
-                first_execution_run_id: Some(run_id),
-            },
+        Ok((
+            WorkflowHandle::new(
+                self.clone(),
+                WorkflowExecutionInfo {
+                    namespace,
+                    workflow_id,
+                    run_id: Some(run_id.clone()),
+                    first_execution_run_id: Some(run_id),
+                },
+            ),
+            link,
         ))
     }
 
@@ -2139,6 +2148,7 @@ where
         let StartWorkflowOutput {
             workflow_id,
             run_id,
+            ..
         } = interceptor_output;
 
         Ok(WorkflowHandle::new(
