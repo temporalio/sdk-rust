@@ -11,8 +11,8 @@ use crate::{
     },
     worker::client::WorkflowTaskCompletion,
     worker::{
-        MAX_MARKER_RECORD_BYTES, MAX_STORE_NAME_BYTES, STORE_RETRY_BOUND, STREAM_PAGE_MAX_RECORDS,
-        StreamTestHooks,
+        MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES,
+        MAX_STORE_NAME_BYTES, STORE_RETRY_BOUND, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
     },
 };
 use futures_util::FutureExt;
@@ -205,6 +205,8 @@ struct Run {
     sent: Arc<Mutex<Vec<WorkflowTaskCompletion>>>,
     /// The cause and the message of each failed Workflow Task.
     failed: Arc<Mutex<Vec<(WorkflowTaskFailedCause, String)>>>,
+    /// The History that a mock server of [served] wrote, which a test can replay.
+    history: Option<Arc<Mutex<TestHistoryBuilder>>>,
 }
 
 /// A Worker whose mock poller stays alive. The end of a poller begins a shutdown, which ends a
@@ -303,6 +305,7 @@ fn start_configured(
         worker: mock_worker(mock),
         sent,
         failed,
+        history: None,
     }
 }
 
@@ -319,7 +322,8 @@ fn served(
 ) -> Run {
     let sent = Arc::new(Mutex::new(vec![]));
     let failed = Arc::new(Mutex::new(vec![]));
-    let mut history = t.clone();
+    let written = Arc::new(Mutex::new(t.clone()));
+    let kept_history = written.clone();
     let mut cfg = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
     cfg.make_poll_stream_interminable = true;
     cfg.num_expected_completions = Some((0..).into());
@@ -327,6 +331,7 @@ fn served(
     cfg.completion_mock_fn = Some(Box::new(move |completion| {
         observe(completion);
         kept.lock().push(completion.clone());
+        let mut history = kept_history.lock();
         history.add_workflow_task_completed();
         let completed = history.current_event_id();
         for command in &completion.commands {
@@ -381,6 +386,7 @@ fn served(
         worker: mock_worker(mock),
         sent,
         failed,
+        history: Some(written),
     }
 }
 
@@ -6064,4 +6070,164 @@ async fn a_replay_refuses_a_read_over_its_limit_again() {
     run.worker.complete_execution(&refused.run_id).await;
     run.worker.drain_pollers_and_shutdown().await;
     assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
+}
+
+/// The seqs of the append entries of a completion's marker.
+fn marker_appends(completion: &WorkflowTaskCompletion) -> Vec<u32> {
+    marker(completion).map_or(vec![], |data| {
+        data.appends.iter().map(|entry| entry.seq).collect()
+    })
+}
+
+/// Polls `worker` until Workflow code got the results of appends 1 to `count`, each once, and
+/// completes the Workflow then. Returns the results of each activation.
+async fn take_appends(worker: &Worker, count: u32) -> Vec<Vec<u32>> {
+    let mut got = HashSet::new();
+    let mut activations = vec![];
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(60), worker.poll_workflow_activation())
+            .await
+            .expect("no activation came")
+            .unwrap();
+        let seqs: Vec<u32> = appends(&next).iter().map(|append| append.seq).collect();
+        for seq in &seqs {
+            assert!(got.insert(*seq), "append {seq} came twice");
+        }
+        activations.push(seqs);
+        if got.len() == count as usize {
+            worker.complete_execution(&next.run_id).await;
+            return activations;
+        }
+        complete(worker, &next, vec![]).await;
+    }
+}
+
+/// A task with more append results than its marker has room for completes with a marker under the
+/// entry bound and a forced new task, which takes the rest. Each append is in one marker, and a
+/// replay of the tasks gives each result in the activation of the first run.
+#[tokio::test]
+async fn many_appends_keep_each_marker_under_the_entry_bound() {
+    const COUNT: u32 = 7000;
+    let runtime = runtime();
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    t.add_workflow_task_scheduled_and_started();
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let writes = |run_id: &str| -> Vec<workflow_command::Variant> {
+        (1..=COUNT)
+            .map(|seq| append_cmd(seq, "s", run_id, &["r"]).into())
+            .collect()
+    };
+    complete(&run.worker, &first, writes(&first.run_id)).await;
+    let live = take_appends(&run.worker, COUNT).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
+
+    let sent = run.sent.lock().clone();
+    let with_appends: Vec<_> = sent
+        .iter()
+        .filter(|completion| !marker_appends(completion).is_empty())
+        .collect();
+    assert!(with_appends.len() >= 2, "{} tasks", with_appends.len());
+    for completion in &with_appends[..with_appends.len() - 1] {
+        assert!(completion.force_create_new_workflow_task);
+    }
+    for completion in &with_appends {
+        let size = marker(completion).unwrap().encoded_len();
+        assert!(size < MAX_MARKER_ENTRY_BYTES, "{size}");
+    }
+    let mut recorded: Vec<u32> = with_appends
+        .iter()
+        .flat_map(|completion| marker_appends(completion))
+        .collect();
+    recorded.sort();
+    assert_eq!(recorded, (1..=COUNT).collect::<Vec<_>>());
+
+    let history = run.history.unwrap().lock().clone();
+    let replay = replay_worker(history, StreamRuntimes::default());
+    let first = replay.poll_workflow_activation().await.unwrap();
+    complete(&replay, &first, writes(&first.run_id)).await;
+    let replayed = take_appends(&replay, COUNT).await;
+    assert_eq!(replayed, live);
+    let ended = activations_until_the_end(&replay).await;
+    assert!(!has_failure_eviction(&ended), "{ended:?}");
+}
+
+/// A Store that fails each append with a long message.
+struct WordyStore(MemoryStore);
+
+#[async_trait::async_trait]
+impl Store for WordyStore {
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.0.create(stream_ref, create).await
+    }
+
+    async fn append(&self, _: &StreamRef, _: &Batch<'_>) -> StreamResult<Appended> {
+        // A sign of three bytes, so that the cut must find a character boundary.
+        Err(StreamError::new(
+            Reason::Fenced,
+            "\u{20ac}".repeat(100 * 1024),
+        ))
+    }
+
+    async fn read(
+        &self,
+        stream_ref: &StreamRef,
+        from: i64,
+        count: usize,
+    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        self.0.read(stream_ref, from, count).await
+    }
+
+    async fn wait_after(
+        &self,
+        stream_ref: &StreamRef,
+        after: i64,
+        deadline: tokio::time::Instant,
+    ) -> StreamResult<bool> {
+        self.0.wait_after(stream_ref, after, deadline).await
+    }
+
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.0.close(stream_ref, producer).await
+    }
+}
+
+/// A Store failure with a message of 300 KiB gives Workflow code the message cut at its bound,
+/// with its reason, and the marker records the same small entry.
+#[tokio::test]
+async fn a_long_store_failure_message_is_cut() {
+    let store = WordyStore(MemoryStore::new(DEFAULT_RETENTION, None));
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    create(&runtime, "s").await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    t.add_workflow_task_scheduled_and_started();
+    let run = served(t, runtimes(&runtime), None, |_| {}, |_| {});
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let append = append_cmd(1, "s", &first.run_id, &["a"]);
+    complete(&run.worker, &first, vec![append.into()]).await;
+    let next = run.worker.poll_workflow_activation().await.unwrap();
+    let got = append_failure(&appends(&next)[0]);
+    run.worker.complete_execution(&next.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(
+        got.message.len() <= MAX_FAILURE_MESSAGE_BYTES,
+        "{}",
+        got.message.len()
+    );
+    assert!(got.message.starts_with("stream_fenced: \u{20ac}"));
+    assert!(got.message.ends_with("\u{20ac}..."));
+    let info = failure_info(&got);
+    assert_eq!(info.r#type, "stream_fenced");
+    assert!(info.non_retryable);
+    let entry = marker(&run.sent.lock()[0]).unwrap().appends.remove(0);
+    assert_eq!(entry.failure.as_ref(), Some(&got));
+    assert!(entry.encoded_len() < 8 * 1024, "{}", entry.encoded_len());
 }

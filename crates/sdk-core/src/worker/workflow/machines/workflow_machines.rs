@@ -514,9 +514,14 @@ impl WorkflowMachines {
         self.stream_calls.stop_all();
     }
 
-    /// True once the Records of this task's Stream marker reached their bound.
+    /// True once the Records or the entries of this task's Stream marker reached their bound.
     pub(crate) fn stream_marker_full(&self) -> bool {
         self.stream_calls.marker_full()
+    }
+
+    /// True if Stream results or close intents wait for a later task, which must then be forced.
+    pub(crate) fn has_carried_stream_results(&self) -> bool {
+        self.stream_calls.has_carried()
     }
 
     /// True if Workflow code ever started a Stream call in this run.
