@@ -4729,7 +4729,143 @@ fn a_page_cap_of_one_or_1000_is_taken() {
     }
 }
 
-/// Replay gives a page of History as it is, also one over the Worker's `read_page_records`.
+/// The bound of `read_min_gap`.
+const GAP: Duration = Duration::from_secs(1);
+/// A gap that real time doesn't reach in a test, so that only [move_clock] ends it. The test
+/// harness sets the runtimes past the check of the config build, which refuses a gap over [GAP].
+const LONG_GAP: Duration = Duration::from_secs(60);
+
+/// A Worker with a gap of [LONG_GAP], whose read 1 of Stream `s` waits on the Store.
+async fn gapped_read(settings: impl FnOnce(StreamRuntimes) -> StreamRuntimes) -> Watching {
+    let w = Watching::with(|runtimes| settings(runtimes.with_read_min_gap(LONG_GAP))).await;
+    complete(&w.run.worker, &w.first, vec![long_read(1, "s").into()]).await;
+    until("the read's wait on the Store", || {
+        w.waits.load(Ordering::Acquire) == 1
+    })
+    .await;
+    w
+}
+
+/// True if the Store gave no Record to a read in the gap after its first answer.
+fn no_answer_in_the_gap(w: &Watching) -> bool {
+    let gave = w.gave.lock();
+    gave.iter()
+        .all(|(at, _)| *at == gave[0].0 || *at - gave[0].0 >= LONG_GAP)
+}
+
+/// With a gap, a read gives its first Record with no wait, since [Watching::next] gives up long
+/// before the gap ends. Single appends that come in the gap after that batch come in one page once
+/// the gap passed, so Workflow code gets 2 pages for 10 Records.
+#[tokio::test]
+async fn a_gap_gives_single_appends_in_fewer_pages() {
+    let w = gapped_read(|runtimes| runtimes).await;
+    put(&w.runtime, "s", &["0"]).await;
+    let first = w.next().await;
+    assert_eq!(texts(&reads(&first)[0].records), ["0"]);
+    complete(&w.run.worker, &first, vec![]).await;
+    let page = {
+        let next = w.run.worker.poll_workflow_activation();
+        tokio::pin!(next);
+        for at in 1..10 {
+            put(&w.runtime, "s", &[at.to_string().as_str()]).await;
+            // The read runs on this thread, so a short real wait lets it look at the Store. With
+            // no gap, each of these Records would make its own page.
+            tokio::select! {
+                early = &mut next => panic!("a page came in the gap: {early:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        move_clock(LONG_GAP).await;
+        tokio::time::timeout(Duration::from_secs(30), &mut next).await
+    };
+    let last = page.expect("no page came after the gap").unwrap();
+    assert_eq!(texts(&reads(&last)[0].records), numbered(1, 9));
+    assert_eq!(w.given(), 10);
+    assert!(
+        no_answer_in_the_gap(&w),
+        "the read asked the Store in its gap"
+    );
+    w.finish(&last).await;
+}
+
+/// The end of a read waits at most one gap too. A Stream closed in the gap after a batch ends the
+/// read with `Done` once that gap has passed, and not before.
+#[tokio::test]
+async fn a_gap_holds_the_end_of_a_read_for_at_most_one_gap() {
+    let w = gapped_read(|runtimes| runtimes).await;
+    put(&w.runtime, "s", &["a"]).await;
+    let page = w.next().await;
+    assert_eq!(texts(&reads(&page)[0].records), ["a"]);
+    complete(&w.run.worker, &page, vec![]).await;
+    close(&w.runtime, "s").await;
+    let ended = {
+        let next = w.run.worker.poll_workflow_activation();
+        tokio::pin!(next);
+        tokio::select! {
+            early = &mut next => panic!("the end came in the gap: {early:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        move_clock(LONG_GAP).await;
+        tokio::time::timeout(Duration::from_secs(30), &mut next).await
+    };
+    let ended = ended.expect("the end didn't come after the gap").unwrap();
+    let read = &reads(&ended)[0];
+    assert!(read.records.is_empty(), "{:?}", texts(&read.records));
+    assert_eq!(stop(read), StreamReadStop::Done);
+    w.finish(&ended).await;
+}
+
+/// The gap applies to new batches from the Store, and not to Records that the page cap held back.
+/// With a cap of 10, the 15 Records of one Store answer after the gap come as 10 and then 5, and
+/// the 5 come with no wait for another gap.
+#[tokio::test]
+async fn records_over_the_cap_come_with_no_wait_for_the_gap() {
+    let w = gapped_read(|runtimes| runtimes.with_read_page_records(10)).await;
+    put(&w.runtime, "s", &["0"]).await;
+    let first = w.next().await;
+    assert_eq!(texts(&reads(&first)[0].records), ["0"]);
+    for at in 1..16 {
+        put(&w.runtime, "s", &[at.to_string().as_str()]).await;
+    }
+    complete(&w.run.worker, &first, vec![]).await;
+    move_clock(LONG_GAP).await;
+    let full = w.next().await;
+    assert_eq!(texts(&reads(&full)[0].records), numbered(1, 10));
+    complete(&w.run.worker, &full, vec![]).await;
+    // No clock move, so a page that waited for a gap would not come.
+    let rest = w.next().await;
+    assert_eq!(texts(&reads(&rest)[0].records), numbered(11, 5));
+    assert_eq!(w.given(), 16);
+    assert!(
+        no_answer_in_the_gap(&w),
+        "the read asked the Store in its gap"
+    );
+    w.finish(&rest).await;
+}
+
+/// A Worker whose `read_min_gap` is over 1 s is refused when its config is built, and one of
+/// 1 s or zero is taken.
+#[test]
+fn a_gap_over_one_second_is_refused() {
+    let settings = runtimes(&runtime()).with_read_min_gap(GAP + Duration::from_nanos(1));
+    let Err(refused) = test_worker_cfg().stream_runtimes(settings).build() else {
+        panic!("a `read_min_gap` over 1 s was taken");
+    };
+    assert_eq!(
+        refused,
+        "`read_min_gap` of `stream_runtimes` must be at most 1s"
+    );
+    for gap in [GAP, Duration::ZERO] {
+        let settings = runtimes(&runtime()).with_read_min_gap(gap);
+        test_worker_cfg()
+            .stream_runtimes(settings)
+            .build()
+            .expect("a `read_min_gap` in its bound was refused");
+    }
+}
+
+/// Replay gives a page of History as it is, also one over the Worker's `read_page_records`, and
+/// with no wait for its `read_min_gap`.
 #[tokio::test]
 async fn a_replay_ignores_the_read_settings() {
     let records: Vec<_> = (0..30u64)
@@ -4749,7 +4885,9 @@ async fn a_replay_ignores_the_read_settings() {
         streams: vec![stream("s")],
         ..Default::default()
     });
-    let settings = StreamRuntimes::default().with_read_page_records(10);
+    let settings = StreamRuntimes::default()
+        .with_read_page_records(10)
+        .with_read_min_gap(GAP);
     let run = start(t, [ResponseType::AllHistory], settings, 1, 0);
     let first = run.worker.poll_workflow_activation().await.unwrap();
     let read = StartStreamRead {
