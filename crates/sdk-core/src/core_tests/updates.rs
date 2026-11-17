@@ -25,7 +25,7 @@ use temporalio_common::protos::{
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
-        command::v1::Command,
+        command::v1::{Command, command},
         common::v1::Payload,
         enums::v1::{CommandType, EventType, TimeoutType},
         history::v1::history_event::Attributes,
@@ -501,15 +501,48 @@ fn rejection_and_update_completions(
     (completions[0].clone(), completions[1].clone())
 }
 
-/// Appends what the server persists from the update completion, replays the result on a fresh
-/// worker, and returns the nondeterminism error if there was one. `respond` produces lang's
+/// What a replay of the persisted history did
+struct ReplayOutcome {
+    /// Replay activations that delivered the accepted update
+    update_activations: Vec<WorkflowActivation>,
+    /// Every eviction, with how many accepted-update activations preceded it
+    evictions: Vec<(EvictionReason, String, usize)>,
+}
+
+impl ReplayOutcome {
+    /// Asserts that replay delivered the accepted update exactly once, then ran to the end of
+    /// history. The replay worker evicts a run only after it stops replaying, so a single
+    /// `LangRequested` eviction after the update is its routine cleanup. Any other eviction
+    /// (nondeterminism, lang failure, fatal, ...) means replay failed.
+    fn assert_replayed_update(&self, context: &str) {
+        assert_eq!(
+            self.update_activations.len(),
+            1,
+            "Replay must deliver the accepted update exactly once. {context}"
+        );
+        assert!(
+            self.update_activations[0].is_replaying,
+            "The accepted update must be delivered while replaying. {context}"
+        );
+        assert_matches!(
+            self.evictions.as_slice(),
+            [(EvictionReason::LangRequested, _, 1)],
+            "Replay must finish with only the replay worker's routine eviction, after the update. \
+             Evictions: {:?}. {context}",
+            self.evictions
+        );
+    }
+}
+
+/// Appends what the server persists from the update completion and replays the result on a fresh
+/// worker, recording the accepted-update activations and all evictions. `respond` produces lang's
 /// commands for the replay activation that delivers the accepted update.
 async fn replay_persisted_update_completion(
     mut history: TestHistoryBuilder,
     (commands, metadata): &CapturedCompletion,
     patch_id: &str,
     mut respond: impl FnMut(&WorkflowActivation) -> Vec<workflow_command::Variant>,
-) -> Option<String> {
+) -> ReplayOutcome {
     history.add_workflow_task_completed();
     if let Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) =
         history.last_event().and_then(|e| e.attributes.as_mut())
@@ -539,7 +572,10 @@ async fn replay_persisted_update_completion(
         stream::iter([HistoryForReplay::from(history)]),
     ))
     .unwrap();
-    let mut nondeterminism = None;
+    let mut outcome = ReplayOutcome {
+        update_activations: vec![],
+        evictions: vec![],
+    };
     loop {
         let act = match replay_worker.poll_workflow_activation().await {
             Ok(act) => act,
@@ -552,12 +588,15 @@ async fn replay_persisted_update_completion(
                 Some(workflow_activation_job::Variant::DoUpdate(u))
                     if u.protocol_instance_id == ACCEPTED_UPDATE_ID =>
                 {
+                    outcome.update_activations.push(act.clone());
                     cmds.extend(respond(&act));
                 }
-                Some(workflow_activation_job::Variant::RemoveFromCache(r))
-                    if r.reason() == EvictionReason::Nondeterminism =>
-                {
-                    nondeterminism = Some(r.message.clone());
+                Some(workflow_activation_job::Variant::RemoveFromCache(r)) => {
+                    outcome.evictions.push((
+                        r.reason(),
+                        r.message.clone(),
+                        outcome.update_activations.len(),
+                    ));
                 }
                 _ => {}
             }
@@ -567,7 +606,7 @@ async fn replay_persisted_update_completion(
             .await
             .unwrap();
     }
-    nondeterminism
+    outcome
 }
 
 fn reject_update() -> workflow_command::Variant {
@@ -652,32 +691,61 @@ async fn patch_after_discarded_first_task_rejection_replays() {
 
     let ((_, rejection_metadata), update_completion) =
         rejection_and_update_completions(&completions);
-    let upserted_patch = update_completion
+    let upsert_flag = CoreInternalFlags::UpsertSearchAttributeOnPatch as u32;
+    // Without this the dropped completion would not have carried the flag this test is about
+    assert!(
+        rejection_metadata.core_used_flags.contains(&upsert_flag),
+        "The dropped rejection completion must have sent the flag. Got: {rejection_metadata:?}"
+    );
+    // The live `patched` call must produce its marker followed by the search attribute upsert, or
+    // the replay below would not exercise the flag at all
+    let command_types: Vec<_> = update_completion
         .0
         .iter()
-        .any(|c| c.command_type() == CommandType::UpsertWorkflowSearchAttributes);
-    let nondeterminism =
+        .map(|c| c.command_type())
+        .collect();
+    let marker_at = command_types
+        .iter()
+        .position(|t| *t == CommandType::RecordMarker);
+    let upsert_at = command_types
+        .iter()
+        .position(|t| *t == CommandType::UpsertWorkflowSearchAttributes);
+    assert_matches!(
+        (marker_at, upsert_at),
+        (Some(m), Some(u)) if m < u,
+        "Update completion must record the patch marker and then upsert. Got: {command_types:?}"
+    );
+    assert_matches!(
+        update_completion.0[upsert_at.unwrap()].attributes.as_ref(),
+        Some(command::Attributes::UpsertWorkflowSearchAttributesCommandAttributes(a))
+            if a.search_attributes
+                .as_ref()
+                .is_some_and(|sa| sa.indexed_fields.contains_key("TemporalChangeVersion"))
+    );
+    let outcome =
         replay_persisted_update_completion(persisted, &update_completion, patch_id, |_| {
             accept_update(Some(patch_id))
         })
         .await;
     let update_metadata = update_completion.1;
 
-    assert_eq!(
-        nondeterminism, None,
+    outcome.assert_replayed_update(&format!(
         "History persisted from the update completion must replay deterministically. \
          Rejection completion metadata: {rejection_metadata:?}, \
          update completion metadata: {update_metadata:?}"
+    ));
+    assert!(
+        outcome.update_activations[0].jobs.iter().any(|j| matches!(
+            j.variant.as_ref(),
+            Some(workflow_activation_job::Variant::NotifyHasPatch(p)) if p.patch_id == patch_id
+        )),
+        "Replay must see the persisted patch marker alongside the update"
     );
-    if upserted_patch {
-        assert!(
-            update_metadata
-                .core_used_flags
-                .contains(&(CoreInternalFlags::UpsertSearchAttributeOnPatch as u32)),
-            "No earlier WorkflowTaskCompleted event is in history, so the completion that upserts \
-             the patch search attribute must record the flag. Got: {update_metadata:?}"
-        );
-    }
+    assert!(
+        update_metadata.core_used_flags.contains(&upsert_flag),
+        "No earlier WorkflowTaskCompleted event is in history, so the completion that upserts \
+         the patch search attribute must record the flag. Got: {update_metadata:?}"
+    );
 }
 
 /// Mirrors how the Python SDK (1.36.0) decides whether to use a default-enabled lang flag on each
@@ -731,19 +799,24 @@ async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay
 
     let ((_, rejection_metadata), update_completion) =
         rejection_and_update_completions(&completions);
+    // Without this the dropped completion would not have carried the flag this test is about
+    assert!(
+        rejection_metadata.lang_used_flags.contains(&lang_flag),
+        "The dropped rejection completion must have sent lang flag {lang_flag}. \
+         Got: {rejection_metadata:?}"
+    );
     let mut replay_choice = None;
-    let nondeterminism =
-        replay_persisted_update_completion(persisted, &update_completion, "", |act| {
-            replay_choice = Some((
-                python_default_lang_flag(act, lang_flag).0,
-                act.available_internal_flags.clone(),
-            ));
-            accept_update(None)
-        })
-        .await;
+    let outcome = replay_persisted_update_completion(persisted, &update_completion, "", |act| {
+        replay_choice = Some((
+            python_default_lang_flag(act, lang_flag).0,
+            act.available_internal_flags.clone(),
+        ));
+        accept_update(None)
+    })
+    .await;
     let update_metadata = update_completion.1;
 
-    assert_eq!(nondeterminism, None);
+    outcome.assert_replayed_update(&format!("Update completion metadata: {update_metadata:?}"));
     let (replay_uses_flag, replay_available) =
         replay_choice.expect("Replay must deliver the accepted update");
     assert_eq!(
@@ -752,5 +825,12 @@ async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay
          Live available: {live_available:?}, replay available: {replay_available:?}, \
          rejection completion metadata: {rejection_metadata:?}, \
          update completion metadata: {update_metadata:?}"
+    );
+    // The live task used the flag, and history has no earlier record of it, so the persisted
+    // completion is the one that must carry it
+    assert!(
+        update_metadata.lang_used_flags.contains(&lang_flag),
+        "The persisted update completion must record lang flag {lang_flag}. \
+         Got: {update_metadata:?}"
     );
 }
