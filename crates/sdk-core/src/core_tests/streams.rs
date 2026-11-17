@@ -5,8 +5,8 @@ use crate::{
     StreamRuntimes, Worker, WorkerConfig, WorkflowErrorType,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
-        CounterRecordingMeter, MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
+        CounterRecordingMeter, FakeWfResponses, MockPollCfg, PollWFTRespExt, ResponseType,
+        WorkerExt, WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
         schedule_local_activity_cmd, test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
@@ -4824,7 +4824,8 @@ async fn a_cached_run_gives_no_page_that_history_lacks() {
 
 /// A graceful shutdown ends a Workflow Task that only a read holds open, also when the server
 /// returns the next task inline after each heartbeat, as a real server does. The task completes
-/// with no new task, and the read resumes from History on the Worker that takes the run later.
+/// and forces a new one for the task queue, with no task inline and no sticky queue, so that the
+/// Worker that takes it resumes the read from History.
 #[tokio::test]
 async fn a_shutdown_ends_a_task_that_only_a_read_holds() {
     let runtime = runtime();
@@ -4875,7 +4876,137 @@ async fn a_shutdown_ends_a_task_that_only_a_read_holds() {
     }
     let sent = sent.lock();
     let last = sent.last().unwrap();
-    assert!(!last.force_create_new_workflow_task && !last.return_new_workflow_task);
+    assert!(last.force_create_new_workflow_task && !last.return_new_workflow_task);
+    assert!(last.sticky_attributes.is_none());
+}
+
+/// The task that a shutdown forced comes back to the same Worker with a Signal, through a poll
+/// that was still open while a second Workflow kept the Worker busy. Workflow code starts a second
+/// read there, or still waits on the first one. No read starts, the task goes on to another Worker
+/// again, and the shutdown ends.
+#[rstest::rstest]
+#[case::with_a_new_read(true)]
+#[case::with_no_command(false)]
+#[tokio::test]
+async fn a_shutdown_ends_when_its_forced_task_comes_back_to_it(#[case] new_read: bool) {
+    let waits = Arc::new(AtomicUsize::new(0));
+    let store = WatchedStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        gave: Default::default(),
+        waits: waits.clone(),
+        closes: Default::default(),
+    };
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    create(&runtime, "s").await;
+    let mut reader = TestHistoryBuilder::default();
+    reader.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    reader.add_full_wf_task();
+    reader.add_we_signaled("back", vec![]);
+    reader.add_workflow_task_scheduled_and_started();
+    let mut busy = TestHistoryBuilder::default();
+    busy.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    busy.add_workflow_task_scheduled_and_started();
+    let (forced, comes_back) = tokio::sync::oneshot::channel::<()>();
+    let forced = Mutex::new(Some(forced));
+    let gate = async move {
+        comes_back.await.ok();
+    }
+    .boxed();
+    // The mock poller hands out tasks in the order of the Workflow ids.
+    let hists = [
+        FakeWfResponses {
+            wf_id: "a-busy".to_string(),
+            hist: busy,
+            response_batches: vec![ResponseType::ToTaskNum(1)],
+        },
+        FakeWfResponses {
+            wf_id: "b-reader".to_string(),
+            hist: reader,
+            response_batches: vec![
+                ResponseType::ToTaskNum(1),
+                ResponseType::UntilResolved(gate, 2),
+            ],
+        },
+    ];
+    let mut cfg = MockPollCfg::new(hists.into(), true, 0);
+    cfg.make_poll_stream_interminable = true;
+    cfg.num_expected_completions = Some((0..).into());
+    let sent = Arc::new(Mutex::new(vec![]));
+    let kept = sent.clone();
+    cfg.completion_mock_fn = Some(Box::new(move |completion| {
+        if completion.resource_id == "workflow:b-reader" {
+            kept.lock().push(completion.clone());
+        }
+        // The forced task reaches the poll of this Worker that waits.
+        if completion.force_create_new_workflow_task
+            && let Some(forced) = forced.lock().take()
+        {
+            let _ = forced.send(());
+        }
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 2;
+        wc.stream_runtimes = runtimes(&runtime);
+    });
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    let worker = mock_worker(mock);
+    let mut busy_first = None;
+    for _ in 0..2 {
+        let first = worker.poll_workflow_activation().await.unwrap();
+        let reads = first.jobs.iter().any(|job| {
+            matches!(&job.variant,
+                Some(workflow_activation_job::Variant::InitializeWorkflow(init))
+                    if init.workflow_id == "b-reader")
+        });
+        if reads {
+            complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
+        } else {
+            busy_first = Some(first);
+        }
+    }
+    until("the wait of read 1 on the Store", || {
+        waits.load(Ordering::Acquire) == 1
+    })
+    .await;
+    worker.initiate_shutdown();
+    let back = tokio::time::timeout(Duration::from_secs(10), worker.poll_workflow_activation())
+        .await
+        .expect("the forced task didn't come back")
+        .unwrap();
+    assert!(signaled(&back), "{back:?}");
+    let commands = if new_read {
+        vec![read_cmd(2, "s").into()]
+    } else {
+        vec![]
+    };
+    complete(&worker, &back, commands).await;
+    // Core completes the task of the reader only while lang polls.
+    let busy_ends = async {
+        until("the second completion of the reader", || {
+            sent.lock().len() == 2
+        })
+        .await;
+        worker
+            .complete_execution(&busy_first.expect("the busy run started").run_id)
+            .await;
+    };
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(busy_ends, worker.drain_workflow_poller())
+    });
+    assert!(drained.await.is_ok(), "the shutdown didn't end");
+    worker.shutdown().await;
+    let sent = sent.lock();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for completion in sent.iter() {
+        assert!(completion.force_create_new_workflow_task);
+        assert!(!completion.return_new_workflow_task);
+        assert!(completion.sticky_attributes.is_none());
+    }
+    // Core counts a read when it starts it, so read 2 never started.
+    assert_eq!(totals(&meter, &["stream_read_total"]), [1]);
 }
 
 /// An Update rejection is a message for the server and no command. With only a read open, the

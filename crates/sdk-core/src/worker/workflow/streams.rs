@@ -516,7 +516,8 @@ pub(crate) struct StreamManager {
     /// The closes that the Store didn't answer yet. A graceful shutdown waits for them, since
     /// History has their intent and Workflow code may never await them.
     closes_in_flight: Arc<AtomicUsize>,
-    /// The Worker's shutdown, from whose start a close in flight has [CLOSE_SHUTDOWN_BOUND].
+    /// The Worker's shutdown, from whose start a close in flight has [CLOSE_SHUTDOWN_BOUND] and
+    /// no read starts.
     shutdown: CancellationToken,
 }
 
@@ -579,6 +580,10 @@ impl StreamManager {
                         task.handle.abort();
                     }
                 }
+                // A graceful shutdown ends each task that only reads hold, and the next Worker
+                // resumes the reads from History. A read that started now would only hold the
+                // shutdown, also in a task that came back here through a poll still open.
+                StreamRequest::Read(_) if self.shutdown.is_cancelled() => {}
                 StreamRequest::Read(spec) => {
                     let (call_id, seq) = (spec.call_id, spec.seq);
                     match self.runtime(&spec.stream) {
