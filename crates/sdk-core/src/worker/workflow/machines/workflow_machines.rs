@@ -45,7 +45,7 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
-            streams::StreamRequest,
+            streams::{StreamRequest, input_over_limit},
         },
     },
 };
@@ -1933,8 +1933,10 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::StartStreamRead(attrs) => {
-                    self.check_stream_call(attrs.stream.as_ref())?;
-                    self.stream_calls.start_read(attrs, self.current_wf_time)?;
+                    self.check_stream_call(attrs.stream.as_ref(), &attrs.from_offset)?;
+                    if let Some(job) = self.stream_calls.start_read(attrs, self.current_wf_time)? {
+                        self.push_stream_job(job);
+                    }
                 }
                 WFCommandVariant::CloseStreamRead(attrs) => {
                     if self.stream_calls.close_read(attrs.seq)? {
@@ -1942,14 +1944,18 @@ impl WorkflowMachines {
                     }
                 }
                 WFCommandVariant::CloseStream(attrs) => {
-                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.check_stream_call(attrs.stream.as_ref(), &[])?;
                     self.check_producer_run("close", attrs.seq, attrs.producer.as_ref())?;
-                    self.stream_calls.close(attrs)?;
+                    if let Some(job) = self.stream_calls.close(attrs)? {
+                        self.push_stream_job(job);
+                    }
                 }
                 WFCommandVariant::AppendToStream(attrs) => {
-                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.check_stream_call(attrs.stream.as_ref(), &[])?;
                     self.check_producer_run("append", attrs.seq, attrs.producer.as_ref())?;
-                    self.stream_calls.append(attrs)?;
+                    if let Some(job) = self.stream_calls.append(attrs)? {
+                        self.push_stream_job(job);
+                    }
                 }
             }
         }
@@ -1958,9 +1964,13 @@ impl WorkflowMachines {
 
     /// Fails the Workflow Task for a Stream call that this Worker can't make. Nothing goes into
     /// history, so a Worker with the runtime can run the task again.
-    fn check_stream_call(&self, stream: Option<&StreamRef>) -> Result<()> {
+    fn check_stream_call(&self, stream: Option<&StreamRef>, from_offset: &[u8]) -> Result<()> {
         // A replayed call takes its results from history, so only a live one needs the runtime.
         if !self.stream_calls.is_live() {
+            return Ok(());
+        }
+        // A call with an input over its limit is refused with no Store call, so it needs none.
+        if stream.is_some_and(|stream| input_over_limit(stream, from_offset).is_some()) {
             return Ok(());
         }
         let store = stream

@@ -20,7 +20,9 @@ pub(crate) use managed_run::TASK_DURATIONS;
 pub(crate) use streams::STORE_RETRY_BOUND;
 pub use streams::StreamRuntimes;
 #[cfg(test)]
-pub(crate) use streams::{MAX_MARKER_RECORD_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks};
+pub(crate) use streams::{
+    MAX_MARKER_RECORD_BYTES, MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
+};
 
 use crate::{
     MetricsContext, WorkerConfig,
