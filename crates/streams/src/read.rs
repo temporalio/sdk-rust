@@ -3,9 +3,10 @@
 use crate::{
     Reason, StreamError, StreamResult, StreamRuntime,
     offset::{offset_from_wire, offset_to_wire},
+    operations,
     proto::{ReadRecordsRequest, ReadRecordsResponse, StreamRecord, StreamRef},
-    runtime::{duration, stream_id},
-    store::{FORMAT_VERSION, StreamState},
+    runtime::{Backing, duration, stream_id},
+    store::{FORMAT_VERSION, Store, StreamState},
 };
 use prost::Message;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use tokio::time::Instant;
 /// The longest wait of one read for new Records.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
-const MAX_RECORDS: usize = 1000;
+pub(crate) const MAX_RECORDS: usize = 1000;
 
 impl StreamRuntime {
     /// A long poll that returns the Records it found, or nothing after `wait`. On a closed Stream
@@ -24,6 +25,10 @@ impl StreamRuntime {
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
         stream_id(request.r#ref.as_ref())?;
+        let store = match &self.backing {
+            Backing::Log(store) => store.as_ref(),
+            Backing::Operations(store) => return operations::read(store.as_ref(), request).await,
+        };
         let stream = request.r#ref.clone().unwrap_or_default();
         // The wire from_offset is exclusive, so a read starts after it. The empty value is a read
         // from the start.
@@ -41,7 +46,7 @@ impl StreamRuntime {
         let deadline = started + wait;
 
         // A creator hands out the ref only after its create, so a read never waits for one.
-        let (mut state, _) = self.store.read(&stream, 0, 0).await?;
+        let (mut state, _) = store.read(&stream, 0, 0).await?;
         if !state.exists {
             return Err(StreamError::new(
                 Reason::NotFound,
@@ -69,7 +74,10 @@ impl StreamRuntime {
         };
         loop {
             check_expiry(&state, from)?;
-            if let Some(page) = self.page(&stream, &state, from, (max, max_bytes)).await? {
+            if let Some(page) = self
+                .page(store, &stream, &state, from, (max, max_bytes))
+                .await?
+            {
                 return Ok(page);
             }
             if deadline <= Instant::now() {
@@ -82,10 +90,10 @@ impl StreamRuntime {
             }
             let after = (from - 1).max(state.newest);
             self.metrics.read_waits(true);
-            let woke = self.store.wait_after(&stream, after, deadline).await;
+            let woke = store.wait_after(&stream, after, deadline).await;
             self.metrics.read_waits(false);
             woke?;
-            state = self.store.read(&stream, 0, 0).await?.0;
+            state = store.read(&stream, 0, 0).await?.0;
         }
     }
 
@@ -94,6 +102,7 @@ impl StreamRuntime {
     /// `(max, max_bytes)` caps the Records and their bytes.
     async fn page(
         &self,
+        store: &dyn Store,
         stream: &StreamRef,
         state: &StreamState,
         from: i64,
@@ -113,7 +122,7 @@ impl StreamRuntime {
         while records.len() < max && !full {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
-            let (chunk_state, entries) = self.store.read(stream, start, chunk).await?;
+            let (chunk_state, entries) = store.read(stream, start, chunk).await?;
             // Records that the log lost after the state read leave a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
@@ -203,7 +212,7 @@ fn check_expiry(state: &StreamState, from: i64) -> StreamResult<()> {
 }
 
 /// The byte cap of a page, from a request's `max_bytes`. Zero is no cap.
-fn max_bytes(value: i64) -> StreamResult<usize> {
+pub(crate) fn max_bytes(value: i64) -> StreamResult<usize> {
     match value {
         0 => Ok(usize::MAX),
         n if n < 0 => Err(StreamError::invalid("max_bytes must be 0 or more")),
