@@ -45,7 +45,9 @@ pub use workflow::LEGACY_QUERY_ID;
 pub(crate) use workflow::STORE_RETRY_BOUND;
 pub use workflow::StreamRuntimes;
 #[cfg(test)]
-pub(crate) use workflow::{MAX_MARKER_RECORD_BYTES, StreamTestHooks, TASK_DURATIONS};
+pub(crate) use workflow::{
+    MAX_MARKER_RECORD_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks, TASK_DURATIONS,
+};
 
 use crate::{
     ActivityHeartbeat,

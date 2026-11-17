@@ -10,7 +10,9 @@ use crate::{
         schedule_local_activity_cmd, test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
-    worker::{MAX_MARKER_RECORD_BYTES, STORE_RETRY_BOUND, StreamTestHooks},
+    worker::{
+        MAX_MARKER_RECORD_BYTES, STORE_RETRY_BOUND, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
+    },
 };
 use futures_util::FutureExt;
 use parking_lot::Mutex;
@@ -190,7 +192,7 @@ fn worker(
     runtime: &Arc<StreamRuntime>,
     expected_fails: usize,
 ) -> (Worker, Arc<Mutex<Vec<WorkflowTaskCompletion>>>) {
-    let runtimes = unbatched([(STORE.to_string(), runtime.clone())]);
+    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime.clone())]);
     let run = start(t, responses, runtimes, 1, expected_fails);
     (run.worker, run.sent)
 }
@@ -1164,7 +1166,7 @@ async fn call_on_unknown_store_fails() {
         })
     });
     let mut mock = build_mock_pollers(cfg);
-    let runtimes = unbatched([(STORE.to_string(), runtime)]);
+    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime)]);
     mock.worker_cfg(|wc| wc.stream_runtimes = runtimes);
     let worker = mock_worker(mock);
 
@@ -1196,7 +1198,7 @@ async fn append_without_a_workflow_producer_fails_the_task() {
             .is_some_and(|failure| failure.message.contains("not of kind Workflow"))
     });
     let mut mock = build_mock_pollers(cfg);
-    let runtimes = unbatched([(STORE.to_string(), runtime.clone())]);
+    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime.clone())]);
     mock.worker_cfg(|wc| wc.stream_runtimes = runtimes);
     let worker = mock_worker(mock);
 
@@ -1314,13 +1316,7 @@ fn replayed_read_history(data: &StreamMarkerData) -> TestHistoryBuilder {
 }
 
 fn runtimes(runtime: &Arc<StreamRuntime>) -> StreamRuntimes {
-    unbatched([(STORE.to_string(), runtime.clone())])
-}
-
-/// Runtimes with no batch window, so that a read gives each batch as it comes and a test can check
-/// exact pages. The tests of the window set their own.
-fn unbatched(runtimes: impl IntoIterator<Item = (String, Arc<StreamRuntime>)>) -> StreamRuntimes {
-    StreamRuntimes::new(runtimes).with_read_batch_window(Duration::ZERO)
+    StreamRuntimes::new([(STORE.to_string(), runtime.clone())])
 }
 
 fn signaled(activation: &WorkflowActivation) -> bool {
@@ -3918,7 +3914,7 @@ async fn stream_metrics_have_the_store_of_the_call() {
         .unwrap();
     let t = one_task_history();
     let run_id = t.get_orig_run_id().to_string();
-    let runtimes = unbatched([
+    let runtimes = StreamRuntimes::new([
         (STORE.to_string(), mem.clone()),
         ("other".to_string(), other.clone()),
     ]);
@@ -4428,10 +4424,9 @@ impl Store for WatchedStore {
     }
 }
 
-/// A Worker with a batch window of `window` on a [WatchedStore] with Stream `s`, whose first
-/// Workflow Task is out. Its task timeout is long, so that no heartbeat comes while a test moves
-/// the clock.
-struct Windowed {
+/// A Worker on a [WatchedStore] with Streams `s` and `t`, whose first Workflow Task is out. Its
+/// task timeout is long, so that no heartbeat comes in a test.
+struct Watching {
     runtime: Arc<StreamRuntime>,
     gave: Arc<Mutex<Vec<(tokio::time::Instant, usize)>>>,
     waits: Arc<AtomicUsize>,
@@ -4439,8 +4434,8 @@ struct Windowed {
     first: WorkflowActivation,
 }
 
-impl Windowed {
-    async fn new(window: Duration) -> Self {
+impl Watching {
+    async fn new() -> Self {
         let gave = Arc::new(Mutex::new(vec![]));
         let waits = Arc::new(AtomicUsize::new(0));
         let store = WatchedStore {
@@ -4451,12 +4446,18 @@ impl Windowed {
         };
         let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
         create(&runtime, "s").await;
+        create(&runtime, "t").await;
         let mut t = TestHistoryBuilder::default();
         t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
         t.add_workflow_task_scheduled_and_started();
-        let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime.clone())])
-            .with_read_batch_window(window);
-        let run = start_with(t, [ResponseType::AllHistory], runtimes, 1, 0, true);
+        let run = start_with(
+            t,
+            [ResponseType::AllHistory],
+            runtimes(&runtime),
+            1,
+            0,
+            true,
+        );
         let first = run.worker.poll_workflow_activation().await.unwrap();
         Self {
             runtime,
@@ -4467,7 +4468,7 @@ impl Windowed {
         }
     }
 
-    /// The next activation, which must come without a wait for a window.
+    /// The next activation. No heartbeat comes in the bound, so a page that waits for one fails.
     async fn next(&self) -> WorkflowActivation {
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -4478,153 +4479,182 @@ impl Windowed {
         .unwrap()
     }
 
+    /// The Records that the Store gave to reads.
+    fn given(&self) -> usize {
+        self.gave.lock().iter().map(|(_, count)| count).sum()
+    }
+
     async fn finish(self, last: &WorkflowActivation) {
         self.run.worker.complete_execution(&last.run_id).await;
         self.run.worker.drain_pollers_and_shutdown().await;
     }
 }
 
-/// A read whose idle timeout is far past the clock moves of a test with a long window.
-fn long_read(seq: u32) -> StartStreamRead {
+/// A read whose idle timeout is far past the length of a test.
+fn long_read(seq: u32, id: &str) -> StartStreamRead {
     StartStreamRead {
         idle_timeout: Some(Duration::from_secs(3600).try_into().unwrap()),
-        ..read_cmd(seq, "s")
+        ..read_cmd(seq, id)
     }
 }
 
-/// Moves Tokio's clock by `by`, so that a long window passes with no real wait.
+/// Moves Tokio's clock by `by`, so that a long timeout passes with no real wait.
 async fn move_clock(by: Duration) {
     tokio::time::pause();
     tokio::time::advance(by).await;
     tokio::time::resume();
 }
 
-const LONG_WINDOW: Duration = Duration::from_secs(60);
+/// Appends `count` Records to Stream `id`, whose texts are their numbers from `from`.
+async fn put_numbered(runtime: &StreamRuntime, id: &str, from: usize, count: usize) {
+    let texts: Vec<String> = (from..from + count).map(|at| at.to_string()).collect();
+    for batch in texts.chunks(250) {
+        let batch: Vec<&str> = batch.iter().map(String::as_str).collect();
+        put(runtime, id, &batch).await;
+    }
+}
 
-/// A read gives its first Record immediately. The Records that come in the window after that
-/// batch go in one batch, which the read asks the Store for only once the window passed.
+fn numbered(from: usize, count: usize) -> Vec<String> {
+    (from..from + count).map(|at| at.to_string()).collect()
+}
+
+/// A read of 1000 Records that wait in the Store gets them in one Store answer. Workflow code gets
+/// them in pages of at most 256, in back to back activations, each Record once and in order.
 #[tokio::test]
-async fn a_read_gives_the_records_of_its_window_in_one_batch() {
-    let w = Windowed::new(LONG_WINDOW).await;
-    complete(&w.run.worker, &w.first, vec![long_read(1).into()]).await;
+async fn a_backlog_comes_in_pages_of_at_most_256_records() {
+    let w = Watching::new().await;
+    put_numbered(&w.runtime, "s", 0, 1000).await;
+    complete(&w.run.worker, &w.first, vec![long_read(1, "s").into()]).await;
+    let (mut sizes, mut got) = (vec![], vec![]);
+    let last = loop {
+        let page = w.next().await;
+        let read = reads(&page).pop().unwrap();
+        sizes.push(read.records.len());
+        got.extend(texts(&read.records));
+        if got.len() >= 1000 {
+            break page;
+        }
+        complete(&w.run.worker, &page, vec![]).await;
+    };
+    assert_eq!(STREAM_PAGE_MAX_RECORDS, 256);
+    assert_eq!(sizes, [256, 256, 256, 232]);
+    assert_eq!(got, numbered(0, 1000));
+    // The Records past the first page came from Core and not from a new answer of the Store.
+    assert_eq!(w.given(), 1000);
+    let sent = w.run.sent.clone();
+    w.finish(&last).await;
+    // The marker has each page in its own activation, which a replay gives as it is.
+    let entry = marker(&sent.lock()[0]).unwrap().reads.remove(0);
+    assert_eq!(entry.page_counts, [256, 256, 256, 232]);
+    assert_eq!(entry.page_activations, [1, 1, 1, 1]);
+}
+
+/// A read whose next activation holds 256 Records takes a later page in full past the cap. Once the
+/// Store has nothing new, the Records past the cap still come, in the activation after.
+#[tokio::test]
+async fn a_capped_read_gives_the_rest_while_the_store_is_quiet() {
+    let w = Watching::new().await;
+    complete(&w.run.worker, &w.first, vec![long_read(1, "s").into()]).await;
     until("the read's wait on the Store", || {
         w.waits.load(Ordering::Acquire) == 1
     })
     .await;
-    put(&w.runtime, "s", &["a"]).await;
-    let page = w.next().await;
-    assert_eq!(texts(&reads(&page)[0].records), ["a"]);
-    // The read task gives a batch and goes on in one poll on this thread, so it waits in its
-    // window before this test runs again. With no window it would wait on the Store again.
-    assert_eq!(
-        w.waits.load(Ordering::Acquire),
-        1,
-        "the read asked the Store again in its window"
-    );
-    complete(&w.run.worker, &page, vec![]).await;
-    put(&w.runtime, "s", &["b"]).await;
-    put(&w.runtime, "s", &["c"]).await;
-    move_clock(LONG_WINDOW).await;
-    let page = w.next().await;
-    assert_eq!(texts(&reads(&page)[0].records), ["b", "c"]);
-    // The Store may give one page in several reads of its log, so the check is on time.
-    let gave = w.gave.lock().clone();
-    assert_eq!(gave.iter().map(|(_, n)| *n).sum::<usize>(), 3);
-    assert!(
-        gave[1..]
-            .iter()
-            .all(|(at, _)| *at - gave[0].0 >= LONG_WINDOW),
-        "the read asked the Store again before its window passed"
-    );
-    w.finish(&page).await;
+    put_numbered(&w.runtime, "s", 0, 5).await;
+    let first = w.next().await;
+    assert_eq!(texts(&reads(&first)[0].records), numbered(0, 5));
+    // The pages come while an activation is out. The first fills the next activation, and all of
+    // the second is over the cap.
+    put_numbered(&w.runtime, "s", 5, 300).await;
+    until("the Store's answer of 300", || w.given() == 305).await;
+    put_numbered(&w.runtime, "s", 305, 10).await;
+    until("the Store's answer of 10", || w.given() == 315).await;
+    complete(&w.run.worker, &first, vec![]).await;
+    let full = w.next().await;
+    assert_eq!(texts(&reads(&full)[0].records), numbered(5, 256));
+    complete(&w.run.worker, &full, vec![]).await;
+    let rest = w.next().await;
+    assert_eq!(texts(&reads(&rest)[0].records), numbered(261, 54));
+    assert_eq!(w.given(), 315);
+    w.finish(&rest).await;
 }
 
-/// With a zero window, the read waits on the Store again right after each batch, and gives each
-/// batch as it comes.
+/// The cap holds for each read. Two reads of a run each give up to 256 Records in one activation.
 #[tokio::test]
-async fn a_zero_window_gives_each_batch_as_it_comes() {
-    let w = Windowed::new(Duration::ZERO).await;
-    complete(&w.run.worker, &w.first, vec![long_read(1).into()]).await;
-    let mut last = None;
-    for (at, text) in ["a", "b", "c"].into_iter().enumerate() {
-        // The read waits on the Store before the Record comes, so no window holds it.
-        until("the read's wait on the Store", || {
-            w.waits.load(Ordering::Acquire) > at
-        })
-        .await;
-        put(&w.runtime, "s", &[text]).await;
+async fn two_reads_each_give_up_to_256_records_in_one_activation() {
+    let w = Watching::new().await;
+    put_numbered(&w.runtime, "s", 0, 1000).await;
+    put_numbered(&w.runtime, "t", 0, 1000).await;
+    let reads_both = vec![long_read(1, "s").into(), long_read(2, "t").into()];
+    complete(&w.run.worker, &w.first, reads_both).await;
+    until("the Store's answers", || w.given() == 2000).await;
+    let mut got: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut both_full = false;
+    let last = loop {
         let page = w.next().await;
-        assert_eq!(texts(&reads(&page)[0].records), [text]);
-        if at < 2 {
-            complete(&w.run.worker, &page, vec![]).await;
-        } else {
-            last = Some(page);
+        let pages = reads(&page);
+        for read in &pages {
+            assert!(read.records.len() <= STREAM_PAGE_MAX_RECORDS);
+            got.entry(read.seq)
+                .or_default()
+                .extend(texts(&read.records));
         }
-    }
-    assert_eq!(w.gave.lock().len(), 3);
-    w.finish(&last.unwrap()).await;
+        both_full |= pages.len() == 2 && pages.iter().all(|read| read.records.len() == 256);
+        if got.values().map(Vec::len).sum::<usize>() >= 2000 {
+            break page;
+        }
+        complete(&w.run.worker, &page, vec![]).await;
+    };
+    assert!(both_full, "no activation had 256 Records of each read");
+    assert_eq!(got[&1], numbered(0, 1000));
+    assert_eq!(got[&2], numbered(0, 1000));
+    w.finish(&last).await;
 }
 
-/// A `timeout` that passes in the window ends the read at its deadline, with no look at the
-/// Store for the Record that came in the window.
+/// Replay gives a page of History as it is, also one of more than 256 Records, which a Worker
+/// wrote before the cap.
 #[tokio::test]
-async fn a_timeout_in_the_window_ends_the_read() {
-    let w = Windowed::new(LONG_WINDOW).await;
-    let read = StartStreamRead {
-        timeout: Some(Duration::from_secs(30).try_into().unwrap()),
-        ..long_read(1)
+async fn a_replayed_page_over_the_cap_comes_as_recorded() {
+    let records: Vec<_> = (0..300u64)
+        .map(|at| StreamRecord {
+            producer: Some(client()),
+            body: Some(body(&at.to_string())),
+            offset: (at + 1).to_be_bytes().to_vec(),
+        })
+        .collect();
+    let page = Page {
+        records: &records,
+        activation: 1,
     };
-    complete(&w.run.worker, &w.first, vec![read.into()]).await;
-    put(&w.runtime, "s", &["a"]).await;
-    let page = w.next().await;
-    assert_eq!(texts(&reads(&page)[0].records), ["a"]);
-    complete(&w.run.worker, &page, vec![]).await;
-    put(&w.runtime, "s", &["b"]).await;
-    move_clock(Duration::from_secs(30)).await;
-    let ended = w.next().await;
-    let read = &reads(&ended)[0];
-    assert!(read.records.is_empty(), "{:?}", texts(&read.records));
-    assert_eq!(stop(read), StreamReadStop::Timeout);
-    assert_eq!(w.gave.lock().len(), 1);
-    w.finish(&ended).await;
-}
-
-/// A close of a read in its window stops it. A second read takes the Records that came, and the
-/// first never asks the Store again, also once its window passed.
-#[tokio::test]
-async fn a_close_in_the_window_stops_the_read() {
-    let w = Windowed::new(LONG_WINDOW).await;
-    complete(&w.run.worker, &w.first, vec![long_read(1).into()]).await;
-    put(&w.runtime, "s", &["a"]).await;
-    let page = w.next().await;
-    let after_a = reads(&page)[0].records[0].offset.clone();
-    let second = StartStreamRead {
-        from_offset: after_a,
-        ..long_read(2)
-    };
-    complete(
-        &w.run.worker,
-        &page,
-        vec![CloseStreamRead { seq: 1 }.into(), second.into()],
-    )
-    .await;
-    put(&w.runtime, "s", &["b"]).await;
-    let page = w.next().await;
-    assert_eq!(reads(&page).iter().map(|r| r.seq).collect::<Vec<_>>(), [2]);
-    assert_eq!(texts(&reads(&page)[0].records), ["b"]);
-    complete(&w.run.worker, &page, vec![]).await;
-    // Both windows pass. A read that still ran would look at the Store again here.
-    move_clock(LONG_WINDOW).await;
-    put(&w.runtime, "s", &["c"]).await;
-    let page = w.next().await;
-    assert_eq!(reads(&page).iter().map(|r| r.seq).collect::<Vec<_>>(), [2]);
-    assert_eq!(texts(&reads(&page)[0].records), ["c"]);
-    assert_eq!(
-        w.gave.lock().len(),
-        3,
-        "the closed read asked the Store again"
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), true);
+    let t = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        streams: vec![stream("s")],
+        ..Default::default()
+    });
+    let run = start(
+        t,
+        [ResponseType::AllHistory],
+        StreamRuntimes::default(),
+        1,
+        0,
     );
-    w.finish(&page).await;
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
+    complete(&run.worker, &first, vec![read.into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    let read = reads(&replayed).pop().unwrap();
+    assert_eq!(read.records, records);
+    assert_eq!(stop(&read), StreamReadStop::Done);
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&live));
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
 }
 
 /// A task that a read holds open until its heartbeat counts that hold apart from its duration, so
