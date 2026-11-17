@@ -342,6 +342,11 @@ impl WorkflowInterceptorContext {
         self.base.history_length()
     }
 
+    /// Return the history size in bytes as of the last workflow task started event.
+    pub fn history_size_bytes(&self) -> u64 {
+        self.base.history_size_bytes()
+    }
+
     /// Return current values for workflow search attributes.
     pub fn search_attributes(&self) -> SearchAttributes {
         self.base.search_attributes()
@@ -501,6 +506,11 @@ impl SyncWorkflowInterceptorContext {
     /// Return the length of history so far at this point in the workflow.
     pub fn history_length(&self) -> u32 {
         self.base.history_length()
+    }
+
+    /// Return the history size in bytes as of the last workflow task started event.
+    pub fn history_size_bytes(&self) -> u64 {
+        self.base.history_size_bytes()
     }
 
     /// Return current values for workflow search attributes.

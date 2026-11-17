@@ -88,6 +88,10 @@ pub(crate) struct WorkflowMachines {
     last_history_from_server: HistoryUpdate,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    /// Event sequencing positions from the protocol messages originally delivered with the
+    /// current server WFT. Kept separately because processing drains `protocol_msgs` while paged
+    /// history still needs the original positions to determine logical WFT boundaries.
+    live_message_sequencing_event_ids: Vec<i64>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The event id of the next workflow task started event that the machines need to process.
@@ -272,6 +276,7 @@ impl WorkflowMachines {
         Self {
             last_history_from_server: basics.history,
             protocol_msgs: vec![],
+            live_message_sequencing_event_ids: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
@@ -329,6 +334,15 @@ impl WorkflowMachines {
         if !self.protocol_msgs.is_empty() {
             dbg_panic!("There are unprocessed protocol messages while receiving new work");
         }
+        self.live_message_sequencing_event_ids = protocol_messages
+            .iter()
+            .filter_map(|message| match message.sequencing_id {
+                Some(SequencingId::EventId(event_id)) => Some(event_id),
+                _ => None,
+            })
+            .collect();
+        self.live_message_sequencing_event_ids.sort_unstable();
+        self.live_message_sequencing_event_ids.dedup();
         self.protocol_msgs = protocol_messages;
         self.new_history_from_server(update)?;
         Ok(())
@@ -548,8 +562,10 @@ impl WorkflowMachines {
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
     /// to be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn ready_to_apply_next_wft(&self) -> bool {
-        self.last_history_from_server
-            .can_take_next_wft_sequence(self.current_started_event_id)
+        self.last_history_from_server.can_take_next_wft_sequence(
+            self.current_started_event_id,
+            &self.live_message_sequencing_event_ids,
+        )
     }
 
     /// Apply the next (unapplied) entire workflow task from history to these machines. Will replay
@@ -565,10 +581,10 @@ impl WorkflowMachines {
         }
 
         let last_handled_wft_started_id = self.current_started_event_id;
-        let (events, has_final_event) = match self
-            .last_history_from_server
-            .take_next_wft_sequence(last_handled_wft_started_id)
-        {
+        let (events, has_final_event) = match self.last_history_from_server.take_next_wft_sequence(
+            last_handled_wft_started_id,
+            &self.live_message_sequencing_event_ids,
+        ) {
             NextWFT::ReplayOver => (vec![], true),
             NextWFT::WFT(mut evts, has_final_event) => {
                 // Do not re-process events we have already processed
@@ -763,10 +779,10 @@ impl WorkflowMachines {
         // Alternatively, lookahead can seemingly be avoided if we were to consider the commands
         // that follow a WFT to be _part of_ that wft rather than the next one. That change might
         // make sense to do, and maybe simplifies things slightly, but is a substantial alteration.
-        for e in self
-            .last_history_from_server
-            .peek_next_wft_sequence(last_handled_wft_started_id)
-        {
+        for e in self.last_history_from_server.peek_next_wft_sequence(
+            last_handled_wft_started_id,
+            &self.live_message_sequencing_event_ids,
+        ) {
             if let Some((patch_id, _)) = e.get_patch_marker_details() {
                 self.encountered_patch_markers.insert(
                     patch_id.clone(),

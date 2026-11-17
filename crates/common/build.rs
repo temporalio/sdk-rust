@@ -261,7 +261,11 @@ impl PayloadVisitorGenerator {
             }
         }
 
-        // Process oneofs
+        // Process oneofs in index order. This ordering reaches the generated file, and
+        // iterating the map directly emits a different field order on every build.
+        let mut oneof_fields: Vec<(i32, Vec<&FieldDescriptorProto>)> =
+            oneof_fields.into_iter().collect();
+        oneof_fields.sort_by_key(|(oneof_index, _)| *oneof_index);
         for (oneof_index, oneof_field_list) in oneof_fields {
             let oneof_desc = &msg.oneof_decl[oneof_index as usize];
             let oneof_name = oneof_desc.name.as_deref().unwrap_or("");
@@ -338,8 +342,12 @@ impl PayloadVisitorGenerator {
         let mut output = String::new();
         output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n\n");
 
-        // Generate impls for each payload-containing type
-        for name in self.model.payload_containing.iter() {
+        // Generate impls for each payload-containing type, in name order. This output is
+        // compiled, so iterating the set directly emits the same impls in a different
+        // order on every build.
+        let mut payload_containing: Vec<&String> = self.model.payload_containing.iter().collect();
+        payload_containing.sort();
+        for name in payload_containing {
             if name == "temporal.api.common.v1.Payload" || name == "temporal.api.common.v1.Payloads"
             {
                 continue;

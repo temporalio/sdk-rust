@@ -213,6 +213,10 @@ impl WorkflowUpdateError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WorkflowUpdateWithStartError {
+    /// The supplied start request ID is empty, so no RPC was sent.
+    #[error("Start request ID must not be empty")]
+    InvalidStartRequestId,
+
     /// The start operation failed.
     #[error("Workflow start failed: {0}")]
     Start(#[source] WorkflowStartError),

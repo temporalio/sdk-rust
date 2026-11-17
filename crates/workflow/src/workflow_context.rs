@@ -536,6 +536,13 @@ impl BaseWorkflowContext {
         self.inner.shared.borrow().activation.history_length
     }
 
+    /// Return the history size in bytes as of the last workflow task started event.
+    ///
+    /// This value is recorded in workflow history, so it is stable during replay.
+    pub fn history_size_bytes(&self) -> u64 {
+        self.inner.shared.borrow().activation.history_size_bytes
+    }
+
     /// Return current values for workflow search attributes.
     pub fn search_attributes(&self) -> SearchAttributes {
         SearchAttributes::from_proto(&self.inner.shared.borrow().search_attributes)
@@ -1691,6 +1698,13 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.shared.borrow().activation.history_length
     }
 
+    /// Return the history size in bytes as of the last workflow task started event.
+    ///
+    /// This value is recorded in workflow history, so it is stable during replay.
+    pub fn history_size_bytes(&self) -> u64 {
+        self.base.history_size_bytes()
+    }
+
     /// Return the deployment version, if any,  as it was when this point in the workflow was first
     /// reached. If this code is being executed for the first time, return this Worker's deployment
     /// version if it has one.
@@ -2236,6 +2250,13 @@ impl<W> WorkflowContext<W> {
     /// Return the length of history so far at this point in the workflow
     pub fn history_length(&self) -> u32 {
         self.sync.history_length()
+    }
+
+    /// Return the history size in bytes as of the last workflow task started event.
+    ///
+    /// This value is recorded in workflow history, so it is stable during replay.
+    pub fn history_size_bytes(&self) -> u64 {
+        self.sync.history_size_bytes()
     }
 
     /// Return the deployment version, if any, as it was when this point in the workflow was first
@@ -4207,6 +4228,25 @@ mod tests {
 
         assert!(ctx.patched("my-patch"));
         assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn history_size_bytes_is_shared_across_context_views_and_activation_replay() {
+        let ctx = test_context();
+        let sync = ctx.sync_context();
+        assert_eq!(ctx.history_size_bytes(), 0);
+        assert_eq!(sync.history_size_bytes(), 0);
+        assert_eq!(sync.base.history_size_bytes(), 0);
+
+        let activation = CoreWorkflowActivation {
+            history_size_bytes: 8_388_608,
+            ..Default::default()
+        };
+        sync.base.apply_activation_context(&activation, true);
+
+        assert_eq!(ctx.history_size_bytes(), 8_388_608);
+        assert_eq!(sync.history_size_bytes(), 8_388_608);
+        assert_eq!(sync.base.history_size_bytes(), 8_388_608);
     }
 
     #[test]

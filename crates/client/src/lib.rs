@@ -2107,7 +2107,11 @@ where
                             workflow_args,
                             update_args,
                         } = input;
-                        let (start_options, update_id, update_header) = options.into_parts();
+                        let (start_options, start_request_id, update_id, update_header) =
+                            options.into_parts();
+                        if start_request_id.as_deref() == Some("") {
+                            return Err(WorkflowUpdateWithStartError::InvalidStartRequestId);
+                        }
 
                         let data_converter = client.data_converter().clone();
                         let (unencoded_workflow_payloads, unencoded_update_payloads) = {
@@ -2145,13 +2149,16 @@ where
                         let namespace = client.namespace();
                         let workflow_id = start_options.workflow_id.clone();
                         let memo = start_options.encoded_memo(&data_converter).await?;
-                        let start_request = build_start_workflow_request(
+                        let mut start_request = build_start_workflow_request(
                             &client,
                             workflow_type,
                             workflow_payloads.into_payloads(),
                             memo,
                             start_options,
                         );
+                        if let Some(start_request_id) = start_request_id {
+                            start_request.request_id = start_request_id;
+                        }
 
                         let update_id = update_id.unwrap_or_else(|| Uuid::new_v4().to_string());
                         let update_request = workflow_handle::build_update_workflow_request(
@@ -4350,6 +4357,7 @@ mod tests {
                         "workflow-id",
                         WorkflowIdConflictPolicy::UseExisting,
                     )
+                    .start_request_id("my-start-request-id")
                     .update_id("my-update-id".to_owned())
                     .start_header(start_header.clone())
                     .update_header(update_header.clone())
@@ -4370,12 +4378,6 @@ mod tests {
                 .unwrap();
 
             let request = recorded.lock().take().unwrap();
-            let request_id = assert_matches!(
-                &request.operations[0].operation,
-                Some(execute_multi_operation_request::operation::Operation::StartWorkflow(r)) => r
-            )
-            .request_id
-            .clone();
             assert_eq!(
                 request,
                 ExecuteMultiOperationRequest {
@@ -4396,7 +4398,7 @@ mod tests {
                                     input: Some(Payloads {
                                         payloads: workflow_payloads,
                                     }),
-                                    request_id,
+                                    request_id: "my-start-request-id".to_owned(),
                                     identity: "test-identity".to_owned(),
                                     workflow_id_conflict_policy:
                                         ProtoWorkflowIdConflictPolicy::UseExisting as i32,
@@ -4450,6 +4452,34 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result, "update-result");
+        }
+
+        #[tokio::test]
+        async fn update_with_start_rejects_empty_start_request_id_before_rpc() {
+            let client = MockMultiOperationClient::new(Vec::new(), []);
+            let result = client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    WorkflowUpdateWithStartOptions::new(
+                        "task-queue",
+                        "workflow-id",
+                        WorkflowIdConflictPolicy::UseExisting,
+                    )
+                    .start_request_id("")
+                    .update_id("my-update-id")
+                    .build(),
+                )
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(WorkflowUpdateWithStartError::InvalidStartRequestId)
+            ));
+            assert_eq!(*client.call_count.lock(), 0);
+            assert!(client.recorded.lock().is_none());
         }
 
         #[tokio::test]

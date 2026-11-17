@@ -681,6 +681,10 @@ pub struct WorkflowUpdateWithStartOptions {
     /// Multi-line static details for the workflow, shown in the Temporal UI.
     pub static_details: Option<String>,
 
+    /// Request ID for the embedded start operation. If not provided, a UUID will be generated.
+    /// This is separate from the update ID and is retained across multi-operation retries.
+    pub start_request_id: Option<String>,
+
     /// Update ID for idempotency. If not provided, a UUID will be generated.
     pub update_id: Option<String>,
 
@@ -690,7 +694,14 @@ pub struct WorkflowUpdateWithStartOptions {
 }
 
 impl WorkflowUpdateWithStartOptions {
-    pub(crate) fn into_parts(self) -> (WorkflowStartOptions, Option<String>, Option<Header>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        WorkflowStartOptions,
+        Option<String>,
+        Option<String>,
+        Option<Header>,
+    ) {
         let Self {
             task_queue,
             workflow_id,
@@ -709,6 +720,7 @@ impl WorkflowUpdateWithStartOptions {
             memo,
             static_summary,
             static_details,
+            start_request_id,
             update_id,
             rpc_options: _,
         } = self;
@@ -734,6 +746,7 @@ impl WorkflowUpdateWithStartOptions {
                 static_details,
                 rpc_options: RpcOptions::default(),
             },
+            start_request_id,
             update_id,
             update_header,
         )
