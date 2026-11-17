@@ -46,7 +46,8 @@ pub(crate) use workflow::STORE_RETRY_BOUND;
 pub use workflow::StreamRuntimes;
 #[cfg(test)]
 pub(crate) use workflow::{
-    MAX_MARKER_RECORD_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks, TASK_DURATIONS,
+    MAX_MARKER_RECORD_BYTES, MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
+    TASK_DURATIONS,
 };
 
 use crate::{
