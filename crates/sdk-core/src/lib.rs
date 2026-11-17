@@ -21,6 +21,7 @@ mod environment;
 pub mod ephemeral_server;
 mod internal_flags;
 mod pollers;
+mod pollers_v2;
 mod protosext;
 pub mod replay;
 pub(crate) mod retry_logic;
