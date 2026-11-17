@@ -41,7 +41,6 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
-use workflow::MAX_READ_PAGE_RECORDS;
 #[cfg(test)]
 pub(crate) use workflow::STORE_RETRY_BOUND;
 pub use workflow::StreamRuntimes;
@@ -50,6 +49,7 @@ pub(crate) use workflow::{
     MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES,
     MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks, TASK_DURATIONS,
 };
+use workflow::{MAX_READ_MIN_GAP, MAX_READ_PAGE_RECORDS};
 
 use crate::{
     ActivityHeartbeat,
@@ -412,6 +412,15 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         {
             return Err(format!(
                 "`read_page_records` of `stream_runtimes` must be 1 to {MAX_READ_PAGE_RECORDS}"
+            ));
+        }
+        if config
+            .stream_runtimes
+            .read_min_gap()
+            .is_some_and(|gap| gap > MAX_READ_MIN_GAP)
+        {
+            return Err(format!(
+                "`read_min_gap` of `stream_runtimes` must be at most {MAX_READ_MIN_GAP:?}"
             ));
         }
 

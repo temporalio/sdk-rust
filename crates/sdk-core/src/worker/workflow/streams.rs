@@ -64,6 +64,8 @@ pub struct StreamRuntimes {
     read_ahead_bytes: Option<usize>,
     /// The Records of one read in one activation, or `None` for [STREAM_PAGE_MAX_RECORDS].
     read_page_records: Option<usize>,
+    /// The least time between two batches of one read from the Store, or `None` for no gap.
+    read_min_gap: Option<Duration>,
 }
 
 impl StreamRuntimes {
@@ -73,6 +75,7 @@ impl StreamRuntimes {
             runtimes: runtimes.into_iter().collect(),
             read_ahead_bytes: None,
             read_page_records: None,
+            read_min_gap: None,
         }
     }
 
@@ -109,6 +112,25 @@ impl StreamRuntimes {
         self.read_page_records
     }
 
+    /// The runtimes with `gap` as the least time between two batches of one read. A read gives its
+    /// first batch immediately. After it gave a batch to its run, it asks the Store again only once
+    /// `gap` has passed, so the Records that came in between go in one batch, still at most
+    /// `read_page_records` in one activation. On a Stream that gets single Records, this caps how
+    /// often Workflow code wakes, and a Record or the end of a read waits at most one gap. Unset
+    /// and zero are no gap. A gap over 1 s is refused when the Worker's config is built. A replay
+    /// gives each page as History has it, whatever this value is.
+    pub fn with_read_min_gap(self, gap: Duration) -> Self {
+        Self {
+            read_min_gap: Some(gap),
+            ..self
+        }
+    }
+
+    /// The gap that [StreamRuntimes::with_read_min_gap] set, if it set one.
+    pub fn read_min_gap(&self) -> Option<Duration> {
+        self.read_min_gap
+    }
+
     /// The Records of one read in one activation, with the default when the Worker set none.
     pub(crate) fn page_cap(&self) -> usize {
         self.read_page_records.unwrap_or(STREAM_PAGE_MAX_RECORDS)
@@ -118,6 +140,7 @@ impl StreamRuntimes {
     fn read_options(&self) -> ReadOptions {
         ReadOptions {
             read_ahead_bytes: self.read_ahead_bytes.unwrap_or(DEFAULT_READ_AHEAD_BYTES),
+            min_gap: self.read_min_gap.unwrap_or_default(),
         }
     }
 
@@ -259,6 +282,9 @@ pub(crate) const STREAM_PAGE_MAX_RECORDS: usize = 256;
 /// The highest `read_page_records` that a Worker may set. A larger page is one activation that
 /// lang must handle in one go, which is what the cap bounds.
 pub(crate) const MAX_READ_PAGE_RECORDS: usize = 1000;
+/// The longest `read_min_gap` that a Worker may set. Each Record and each end of a read may wait
+/// one gap, so the bound caps the wait that the gap adds.
+pub(crate) const MAX_READ_MIN_GAP: Duration = Duration::from_secs(1);
 /// The wait before the second try of a Store call that failed with `StorageUnavailable`. A short
 /// Store outage should not reach Workflow code, as the retry of a Local Activity keeps it away.
 pub(crate) const STORE_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(100);
@@ -300,6 +326,8 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy, Debug)]
 struct ReadOptions {
     read_ahead_bytes: usize,
+    /// Zero for no gap.
+    min_gap: Duration,
 }
 /// How long a graceful shutdown waits for a close in flight, from the start of the shutdown or
 /// of the close if it is later. The Worker has no other bound for the work of its runs at a
@@ -829,8 +857,9 @@ impl StreamManager {
 }
 
 /// Reads until the first stop. It sends each response with Records as one batch immediately, and
-/// looks at the Store again right after. Batches that come while an activation of the run is out
-/// join, up to the Worker's `read_page_records` for one activation.
+/// looks at the Store again right after, or once the Worker's `read_min_gap` after that batch has
+/// passed. Batches that come while an activation of the run is out join, up to the Worker's
+/// `read_page_records` for one activation.
 async fn read(
     runtime: Arc<StreamRuntime>,
     spec: ReadSpec,
@@ -870,7 +899,14 @@ async fn read(
     // The tries of the current Store outage. A read that fails asks again from `last_offset`, so
     // it gives no Record twice and skips none.
     let mut retry = StoreRetry::new();
+    // When the gap after the last batch ends. The read asks the Store again only then, so the
+    // Records that come in the gap go in one batch.
+    let mut next_batch_at: Option<Instant> = None;
     loop {
+        if let Some(at) = next_batch_at.take() {
+            // A deadline in the gap ends the read at the deadline, and not at the gap's end.
+            tokio::time::sleep_until(deadline.map_or(at, |deadline| deadline.min(at))).await;
+        }
         spec.flow.wait_for_room(options.read_ahead_bytes).await;
         let now = Instant::now();
         if looked && deadline.is_some_and(|deadline| deadline <= now) {
@@ -980,6 +1016,9 @@ async fn read(
                     records: page,
                     end: None,
                 });
+                if !options.min_gap.is_zero() {
+                    next_batch_at = Some(Instant::now() + options.min_gap);
+                }
             }
             // The idle end comes after a look at the Store, so that a read with a zero idle
             // timeout gives the Records that are there.
