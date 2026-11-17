@@ -235,6 +235,14 @@ pub(crate) struct StreamTestHooks {
 /// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
 /// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// The wait before the second try of a Store call that failed with `StorageUnavailable`. A short
+/// Store outage should not reach Workflow code, as the retry of a Local Activity keeps it away.
+pub(crate) const STORE_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(100);
+/// The longest wait between two tries of such a call. The wait doubles up to it.
+pub(crate) const STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// How long after its first failure a call stops trying and gives Workflow code the error. A
+/// longer outage is one that Workflow code should see and handle.
+pub(crate) const STORE_RETRY_BOUND: Duration = Duration::from_secs(30);
 /// The bytes of Records that one Workflow Task may put into its marker, for reads with their
 /// Records in History. A larger marker could pass the server's payload limit, and the task would
 /// then fail for good. The first Record of a task always comes, also when it is larger.
@@ -259,6 +267,68 @@ struct ReadOptions {
 /// of the close if it is later. The Worker has no other bound for the work of its runs at a
 /// shutdown, and a Store that never answers must not hold the shutdown for ever.
 pub(crate) const CLOSE_SHUTDOWN_BOUND: Duration = Duration::from_secs(10);
+
+/// The tries of one Store call that fails with `StorageUnavailable`.
+#[derive(Debug)]
+struct StoreRetry {
+    first_failure: Option<Instant>,
+    backoff: Duration,
+}
+
+impl StoreRetry {
+    fn new() -> Self {
+        Self {
+            first_failure: None,
+            backoff: STORE_RETRY_FIRST_BACKOFF,
+        }
+    }
+
+    /// The wait before the next try of a call that failed with `error`, or `None` when the call
+    /// resolves with it. Only `StorageUnavailable` may pass, since every other reason is the
+    /// Store's answer and a new try would get it again.
+    fn next_wait(&mut self, error: &StreamError) -> Option<Duration> {
+        if error.reason != Reason::StorageUnavailable {
+            return None;
+        }
+        let now = Instant::now();
+        let first = *self.first_failure.get_or_insert(now);
+        let left = (first + STORE_RETRY_BOUND).saturating_duration_since(now);
+        if left.is_zero() {
+            return None;
+        }
+        let wait = self.backoff.min(left);
+        self.backoff = (self.backoff * 2).min(STORE_RETRY_MAX_BACKOFF);
+        Some(wait)
+    }
+}
+
+/// Runs `call` again while it fails with `StorageUnavailable`, within [STORE_RETRY_BOUND] of its
+/// first failure. A cancelled `give_up` ends the wait and gives the last error.
+async fn retry_unavailable<T, F>(
+    mut call: impl FnMut() -> F,
+    give_up: Option<&CancellationToken>,
+) -> Result<T, StreamError>
+where
+    F: Future<Output = Result<T, StreamError>>,
+{
+    let mut retry = StoreRetry::new();
+    loop {
+        let error = match call().await {
+            Ok(answer) => return Ok(answer),
+            Err(error) => error,
+        };
+        let Some(wait) = retry.next_wait(&error) else {
+            return Err(error);
+        };
+        match give_up {
+            Some(give_up) => tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = give_up.cancelled() => return Err(error),
+            },
+            None => tokio::time::sleep(wait).await,
+        }
+    }
+}
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -513,7 +583,8 @@ impl StreamManager {
                             if let Some(timer) = &timer {
                                 timer.metrics.stream_append_started();
                             }
-                            let call = append(runtime, spec, epoch, sink, timer);
+                            let shutdown = self.shutdown.clone();
+                            let call = append(runtime, spec, epoch, sink, timer, shutdown);
                             self.spawn(run_id, call_id, false, call);
                         }
                         _ => self.no_runtime(run_id, call_id, seq, Call::Append),
@@ -749,6 +820,9 @@ async fn read(
     // When the window after the last batch ends. The read asks the Store again only then, so the
     // Records that come in the window go in one batch.
     let mut next_batch_at: Option<Instant> = None;
+    // The tries of the current Store outage. A read that fails asks again from `last_offset`, so
+    // it gives no Record twice and skips none.
+    let mut retry = StoreRetry::new();
     loop {
         if let Some(at) = next_batch_at.take() {
             // A deadline in the window ends the read at the deadline, and not at the window's end.
@@ -782,8 +856,15 @@ async fn read(
             wait: Some(proto_duration(wait_until.saturating_duration_since(now))),
         };
         let response = match runtime.read_records(request).await {
-            Ok(response) => response,
+            Ok(response) => {
+                retry = StoreRetry::new();
+                response
+            }
             Err(error) => {
+                if let Some(wait) = retry.next_wait(&error) {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 if let Some(metrics) = &metrics {
                     metrics.stream_read_failed();
                 }
@@ -943,7 +1024,13 @@ async fn close(
         r#ref: Some(spec.stream),
         producer: Some(producer),
     };
-    let result = runtime.close_stream(request).await.err();
+    // A second close of a closed Stream succeeds, so a try whose answer was lost is safe to send
+    // again. A graceful shutdown bounds the tries, as it bounds the first one.
+    let runtime = &*runtime;
+    let request = &request;
+    let result = retry_unavailable(move || runtime.close_stream(request.clone()), None)
+        .await
+        .err();
     // The Store answered, so the result that wakes the run also finds no close in flight.
     drop(in_flight);
     if let Some(timer) = timer {
@@ -962,6 +1049,7 @@ async fn append(
     epoch: WorkflowTaskEpoch,
     sink: impl Fn(StreamCallResult),
     timer: Option<CallTimer>,
+    shutdown: CancellationToken,
 ) {
     let mut producer = spec.producer;
     if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
@@ -978,7 +1066,23 @@ async fn append(
             .map(|body| AppendRecord { body: Some(body) })
             .collect(),
     };
-    let status = match runtime.append_records(request).await {
+    let answer = if request.sequence == 0 {
+        // The Store numbers a batch of sequence zero itself and keeps no dedupe for it, so a
+        // second try after a lost answer would write its Records again.
+        runtime.append_records(request).await
+    } else {
+        // The Store takes a resend of the same Producer, epoch, sequence and Records once, and
+        // gives the offsets of the first write. A shutdown stops the tries, since the task waits
+        // for this result.
+        let runtime = &*runtime;
+        let request = &request;
+        retry_unavailable(
+            move || runtime.append_records(request.clone()),
+            Some(&shutdown),
+        )
+        .await
+    };
+    let status = match answer {
         Ok(response) => resolve_stream_append::Status::Appended(StreamAppended {
             first_offset: response.first_offset,
             last_offset: response.last_offset,
