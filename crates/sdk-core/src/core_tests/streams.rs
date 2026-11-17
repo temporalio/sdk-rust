@@ -10,7 +10,7 @@ use crate::{
         schedule_local_activity_cmd, test_worker_cfg,
     },
     worker::client::WorkflowTaskCompletion,
-    worker::{MAX_MARKER_RECORD_BYTES, StreamTestHooks},
+    worker::{MAX_MARKER_RECORD_BYTES, STORE_RETRY_BOUND, StreamTestHooks},
 };
 use futures_util::FutureExt;
 use parking_lot::Mutex;
@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -47,14 +47,14 @@ use temporalio_common::protos::{
         command::v1::command::Attributes,
         common::v1::{Payload, Payloads},
         enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
-        failure::v1::{Failure, failure::FailureInfo},
+        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
         history::v1::MarkerRecordedEventAttributes,
         workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
 };
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_streams::{
-    MemoryStreamOptions, MemoryStreamRuntime, StreamResult, StreamRuntime,
+    MemoryStreamOptions, MemoryStreamRuntime, Reason, StreamError, StreamResult, StreamRuntime,
     digest::records_digest,
     memory::MemoryStore,
     proto::{
@@ -5227,4 +5227,346 @@ async fn a_cache_full_eviction_stops_a_call_in_flight() {
     held.release.add_permits(1);
     worker.drain_pollers_and_shutdown().await;
     assert!(all_records(&held.runtime, "s").await.is_empty());
+}
+
+/// What makes a [FlakyStore] fail, and what reached it.
+#[derive(Default)]
+struct Flaky {
+    /// The next reads of the Store that fail with `StorageUnavailable`.
+    fail_reads: AtomicUsize,
+    /// The next appends that fail with `StorageUnavailable`.
+    fail_appends: AtomicUsize,
+    /// True if a failed append writes its batch first, as when only the Store's answer is lost.
+    lose_answers: AtomicBool,
+    /// The appends that reached the Store.
+    appends: AtomicUsize,
+}
+
+impl Flaky {
+    /// Takes one failure from `left`, if it has one.
+    fn fails(left: &AtomicUsize) -> StreamResult<()> {
+        let mut now = left.load(Ordering::Acquire);
+        while now > 0 {
+            match left.compare_exchange_weak(now, now - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Err(StreamError::new(
+                        Reason::StorageUnavailable,
+                        "the Store is down",
+                    ));
+                }
+                Err(actual) => now = actual,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A memory Store whose next reads or appends fail with `StorageUnavailable`.
+struct FlakyStore {
+    inner: MemoryStore,
+    flaky: Arc<Flaky>,
+}
+
+#[async_trait::async_trait]
+impl Store for FlakyStore {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.inner.create(stream_ref, create).await
+    }
+
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        self.flaky.appends.fetch_add(1, Ordering::AcqRel);
+        if self.flaky.lose_answers.load(Ordering::Acquire) {
+            let appended = self.inner.append(stream_ref, batch).await?;
+            Flaky::fails(&self.flaky.fail_appends)?;
+            return Ok(appended);
+        }
+        Flaky::fails(&self.flaky.fail_appends)?;
+        self.inner.append(stream_ref, batch).await
+    }
+
+    async fn read(
+        &self,
+        stream_ref: &StreamRef,
+        from: i64,
+        count: usize,
+    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        Flaky::fails(&self.flaky.fail_reads)?;
+        self.inner.read(stream_ref, from, count).await
+    }
+
+    async fn wait_after(
+        &self,
+        stream_ref: &StreamRef,
+        after: i64,
+        deadline: tokio::time::Instant,
+    ) -> StreamResult<bool> {
+        self.inner.wait_after(stream_ref, after, deadline).await
+    }
+
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.inner.close(stream_ref, producer).await
+    }
+}
+
+/// A runtime on a [FlakyStore] with Stream `s`, and what makes the Store fail.
+async fn flaky_runtime() -> (Arc<StreamRuntime>, Arc<Flaky>) {
+    let flaky = Arc::new(Flaky::default());
+    let store = FlakyStore {
+        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        flaky: flaky.clone(),
+    };
+    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    create(&runtime, "s").await;
+    (runtime, flaky)
+}
+
+/// The failure of an append that failed.
+fn append_failure(append: &ResolveStreamAppend) -> Failure {
+    let Some(resolve_stream_append::Status::Failed(failure)) = &append.status else {
+        panic!("The append should fail: {append:?}");
+    };
+    failure.clone()
+}
+
+fn failure_info(failure: &Failure) -> &ApplicationFailureInfo {
+    let Some(FailureInfo::ApplicationFailureInfo(info)) = &failure.failure_info else {
+        panic!("The failure has no application info: {failure:?}");
+    };
+    info
+}
+
+/// What an append of `a` and `b` gave on a Store whose first two answers were lost.
+struct OutageAppend {
+    runtime: Arc<StreamRuntime>,
+    flaky: Arc<Flaky>,
+    meter: Arc<CounterRecordingMeter>,
+    offsets: (Vec<u8>, Vec<u8>),
+    marker: StreamMarkerData,
+}
+
+/// Appends `a` and `b` on a Store that writes the first two tries and loses their answers.
+async fn append_through_an_outage() -> OutageAppend {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.lose_answers.store(true, Ordering::Release);
+    flaky.fail_appends.store(2, Ordering::Release);
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (run, meter) = metered(t, [ResponseType::AllHistory], runtimes(&runtime));
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a", "b"]).into()],
+    )
+    .await;
+    let result = run.worker.poll_workflow_activation().await.unwrap();
+    let Some(resolve_stream_append::Status::Appended(appended)) = &appends(&result)[0].status
+    else {
+        panic!("The append failed: {:?}", appends(&result));
+    };
+    let offsets = (appended.first_offset.clone(), appended.last_offset.clone());
+    run.worker.complete_execution(&result.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    let marker = marker(&run.sent.lock()[0]).unwrap();
+    OutageAppend {
+        runtime,
+        flaky,
+        meter,
+        offsets,
+        marker,
+    }
+}
+
+/// An append whose first two tries reach the Store and lose their answers goes on. The Store
+/// takes the resends once, Workflow code gets the offsets of the first write, and the marker and
+/// the metrics have one append that didn't fail.
+#[tokio::test]
+async fn an_append_retries_a_store_outage() {
+    let done = append_through_an_outage().await;
+    assert_eq!(done.flaky.appends.load(Ordering::Acquire), 3);
+    let records = all_records(&done.runtime, "s").await;
+    assert_eq!(texts(&records), ["a", "b"]);
+    assert_eq!(
+        done.offsets,
+        (records[0].offset.clone(), records[1].offset.clone())
+    );
+    assert_eq!(done.marker.appends.len(), 1);
+    let entry = &done.marker.appends[0];
+    assert_eq!(
+        (entry.first_offset.clone(), entry.last_offset.clone()),
+        done.offsets
+    );
+    assert!(entry.failure.is_none());
+    assert_eq!(
+        totals(
+            &done.meter,
+            &["stream_append_total", "stream_append_failed"]
+        ),
+        [1, 0]
+    );
+}
+
+/// A replay of the marker of an append that the Store answered after an outage gives its offsets
+/// and makes no append.
+#[tokio::test]
+async fn a_replay_of_a_retried_append_calls_no_store() {
+    let done = append_through_an_outage().await;
+    let before = done.flaky.appends.load(Ordering::Acquire);
+    let t = replayed_read_history(&done.marker);
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start(t, [ResponseType::AllHistory], runtimes(&done.runtime), 1, 0);
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a", "b"]).into()],
+    )
+    .await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    let Some(resolve_stream_append::Status::Appended(result)) = &appends(&replayed)[0].status
+    else {
+        panic!("The replayed append has no offsets");
+    };
+    assert_eq!(
+        (result.first_offset.clone(), result.last_offset.clone()),
+        done.offsets
+    );
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(done.flaky.appends.load(Ordering::Acquire), before);
+    assert_eq!(all_records(&done.runtime, "s").await.len(), 2);
+}
+
+/// A read whose Store fails twice gives its Records once the Store answers. An outage in the
+/// middle of its long poll makes it go on from its last offset, with no Record twice and none
+/// lost.
+#[tokio::test]
+async fn a_read_retries_a_store_outage() {
+    let (runtime, flaky) = flaky_runtime().await;
+    put(&runtime, "s", &["a", "b"]).await;
+    flaky.fail_reads.store(2, Ordering::Release);
+    let (worker, sent) = worker(one_task_history(), [ResponseType::AllHistory], &runtime, 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let page = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(texts(&reads(&page)[0].records), ["a", "b"]);
+    assert_eq!(flaky.fail_reads.load(Ordering::Acquire), 0);
+    complete(&worker, &page, vec![]).await;
+    flaky.fail_reads.store(2, Ordering::Release);
+    put(&runtime, "s", &["c"]).await;
+    let next = worker.poll_workflow_activation().await.unwrap();
+    let read = &reads(&next)[0];
+    assert_eq!(texts(&read.records), ["c"]);
+    assert!(read.end.is_none());
+    assert_eq!(flaky.fail_reads.load(Ordering::Acquire), 0);
+    complete(
+        &worker,
+        &next,
+        vec![
+            CloseStreamRead { seq: 1 }.into(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ],
+    )
+    .await;
+    worker.drain_pollers_and_shutdown().await;
+    let entry = &marker(&sent.lock()[0]).unwrap().reads[0];
+    assert_eq!(entry.count, 3);
+    assert_eq!(entry.page_counts, [2, 1]);
+}
+
+/// An append whose Store stays down past the bound resolves with the retryable failure of the
+/// last try. Tokio's paused clock moves the 30 s.
+#[tokio::test]
+async fn an_append_gives_up_after_the_bound() {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.fail_appends.store(usize::MAX, Ordering::Release);
+    // The task timeout is long, so that no heartbeat comes in the 30 s.
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let result = worker.poll_workflow_activation().await.unwrap();
+    let waited = started.elapsed();
+    let failure = append_failure(&appends(&result)[0]);
+    assert_eq!(failure_info(&failure).r#type, "stream_storage_unavailable");
+    assert!(!failure_info(&failure).non_retryable);
+    assert!(
+        waited >= STORE_RETRY_BOUND && waited < STORE_RETRY_BOUND + Duration::from_secs(3),
+        "{waited:?}"
+    );
+    assert!(flaky.appends.load(Ordering::Acquire) > 10);
+    worker.complete_execution(&result.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    let entry = &marker(&sent.lock()[0]).unwrap().appends[0];
+    assert_eq!(entry.failure.as_ref(), Some(&failure));
+    assert!(all_records(&runtime, "s").await.is_empty());
+}
+
+/// An append to a closed Stream resolves on its first try, with no retry.
+#[tokio::test]
+async fn a_closed_stream_fails_an_append_on_the_first_try() {
+    let (runtime, flaky) = flaky_runtime().await;
+    close(&runtime, "s").await;
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    let result = worker.poll_workflow_activation().await.unwrap();
+    let failure = append_failure(&appends(&result)[0]);
+    assert_eq!(failure_info(&failure).r#type, "stream_closed");
+    assert_eq!(flaky.appends.load(Ordering::Acquire), 1);
+    worker.complete_execution(&result.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// An append that goes to the Store with sequence zero isn't tried again, since the Store keeps no
+/// dedupe for such a batch. Its first failure reaches Workflow code.
+#[tokio::test]
+async fn an_append_with_sequence_zero_is_not_retried() {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.fail_appends.store(1, Ordering::Release);
+    let t = one_task_history();
+    let run_id = t.get_orig_run_id().to_string();
+    let (worker, _sent) = worker(t, [ResponseType::AllHistory], &runtime, 0);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![append_cmd(0, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    let result = worker.poll_workflow_activation().await.unwrap();
+    let failure = append_failure(&appends(&result)[0]);
+    assert_eq!(failure_info(&failure).r#type, "stream_storage_unavailable");
+    assert_eq!(flaky.appends.load(Ordering::Acquire), 1);
+    worker.complete_execution(&result.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(all_records(&runtime, "s").await.is_empty());
 }
