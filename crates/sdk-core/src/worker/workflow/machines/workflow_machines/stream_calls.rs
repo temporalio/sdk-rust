@@ -7,8 +7,8 @@ use crate::{
         OutgoingJob, WFMachinesError, fatal, nondeterminism,
         streams::{
             AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_ENTRY_BYTES,
-            MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, STREAM_PAGE_MAX_RECORDS, StreamCallResult,
-            StreamRequest, StreamResolution, input_over_limit, next_call_id, store_metrics,
+            MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
+            StreamResolution, input_over_limit, next_call_id, store_metrics,
         },
     },
 };
@@ -108,20 +108,21 @@ struct Read {
     /// Records, and the end, that the read gave past this task's marker bound. The next task
     /// takes them.
     carried: Option<ResolveStreamRead>,
-    /// Records, and the end, past [STREAM_PAGE_MAX_RECORDS] in the read's next activation. The
-    /// activation after it takes them.
+    /// Records, and the end, past the page cap in the read's next activation. The activation after
+    /// it takes them.
     over_cap: Option<ResolveStreamRead>,
     /// True for a read that Core refused for an input over its limit. The marker has nothing of it.
     refused: bool,
 }
 
-/// Takes as much of a live `page` as the read's next activation has room for, when its pending
-/// job holds `pending` Records, and keeps the rest in `read` for the activation after it. Records
-/// come in order, so a page joins the ones that wait already.
+/// Takes as much of a live `page` as the read's next activation has room for under `cap`, when its
+/// pending job holds `pending` Records, and keeps the rest in `read` for the activation after it.
+/// Records come in order, so a page joins the ones that wait already.
 fn fit_in_activation(
     read: &mut Read,
     page: ResolveStreamRead,
     pending: usize,
+    cap: usize,
 ) -> Option<ResolveStreamRead> {
     if let Some(over_cap) = read.over_cap.as_mut() {
         over_cap.records.extend(page.records);
@@ -130,7 +131,7 @@ fn fit_in_activation(
         }
         return None;
     }
-    let room = STREAM_PAGE_MAX_RECORDS.saturating_sub(pending);
+    let room = cap.saturating_sub(pending);
     let ResolveStreamRead {
         seq,
         mut records,
@@ -282,12 +283,13 @@ impl EntryBudget {
 }
 
 /// Fits a live page of `read` in the Records bound and the entry bound of the task's marker, and in
-/// the page cap of the next activation, when the read's pending job holds `pending` Records.
+/// the page cap `cap` of the next activation, when the read's pending job holds `pending` Records.
 /// Returns the job, or `None` when the page waits for a later activation or task.
 fn fit_page(
     read: &mut Read,
     page: ResolveStreamRead,
     pending: usize,
+    cap: usize,
     record_bytes: &mut usize,
     budget: &mut EntryBudget,
 ) -> Option<ResolveStreamRead> {
@@ -296,7 +298,7 @@ fn fit_page(
     } else {
         page
     };
-    let page = fit_in_activation(read, page, pending)?;
+    let page = fit_in_activation(read, page, pending, cap)?;
     fit_entry(read, page, pending > 0, budget)
 }
 
@@ -438,6 +440,8 @@ pub(super) struct StreamCalls {
     /// False on a replay Worker, where a run never goes live and a call that history leaves open
     /// stays open, as a Local Activity does there.
     calls_stores: bool,
+    /// The most Records of one read in one live activation, from the Worker's `read_page_records`.
+    page_cap: usize,
     /// The bytes of Records that this task's marker holds for reads with their Records in
     /// History, counted when a page becomes a job.
     marker_record_bytes: usize,
@@ -449,9 +453,10 @@ pub(super) struct StreamCalls {
 }
 
 impl StreamCalls {
-    pub(super) fn new(calls_stores: bool) -> Self {
+    pub(super) fn new(calls_stores: bool, page_cap: usize) -> Self {
         Self {
             calls_stores,
+            page_cap,
             ..Default::default()
         }
     }
@@ -857,6 +862,7 @@ impl StreamCalls {
                     read,
                     page,
                     pending(seq),
+                    self.page_cap,
                     &mut self.marker_record_bytes,
                     &mut self.entry_budget,
                 )?;
@@ -1235,6 +1241,7 @@ impl StreamCalls {
                 read,
                 page,
                 pending(seq),
+                self.page_cap,
                 &mut self.marker_record_bytes,
                 &mut self.entry_budget,
             ) {
@@ -1300,7 +1307,7 @@ impl StreamCalls {
             let Some(page) = read.over_cap.take() else {
                 continue;
             };
-            if let Some(page) = fit_in_activation(read, page, 0)
+            if let Some(page) = fit_in_activation(read, page, 0, self.page_cap)
                 && let Some(page) = fit_entry(read, page, false, &mut self.entry_budget)
             {
                 jobs.push(StreamJob::Read(page));
