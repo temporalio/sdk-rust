@@ -14,7 +14,7 @@ categories = ["development-tools"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-experimental = []
+experimental = ["dep:nexus-rpc"]
 serde_serialize = ["temporalio-protos/serde_serialize"]
 grpc-clients = ["temporalio-protos/grpc-clients"]
 
@@ -30,6 +30,7 @@ erased-serde = "0.4"
 # wasm32-unknown-unknown without the `wasmbind` feature.
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
+nexus-rpc = { workspace = true, optional = true }
 parking_lot = { version = "0.12" }
 prost = { workspace = true }
 prost-types = { workspace = true }

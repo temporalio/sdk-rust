@@ -4442,6 +4442,7 @@ dependencies = [
  "erased-serde",
  "futures",
  "futures-util",
+ "nexus-rpc",
  "parking_lot",
  "prost",
  "prost-wkt-types",

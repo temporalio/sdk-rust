@@ -13,8 +13,6 @@ use super::{
     GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
     SerializationContextData,
 };
-#[cfg(feature = "experimental")]
-use crate::{error::NexusOperationError, protos::temporal::api::failure::v1::TimeoutFailureInfo};
 use crate::{
     error::{
         ActivityExecutionError, ActivityFailureError, ApplicationFailure,
@@ -33,6 +31,14 @@ use crate::{
             ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
             ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
         },
+    },
+};
+#[cfg(feature = "experimental")]
+use crate::{
+    error::{NexusOperationError, OutgoingNexusError},
+    protos::temporal::api::{
+        enums::v1::NexusHandlerErrorRetryBehavior,
+        failure::v1::{NexusHandlerFailureInfo, TimeoutFailureInfo},
     },
 };
 
@@ -336,12 +342,14 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Activity(activity) => {
                 encode_outgoing_activity_error(activity, payload_converter, context)
             }
+            #[cfg(feature = "experimental")]
+            OutgoingError::Nexus(error) => error.encode_failure(payload_converter, context),
             OutgoingError::Workflow(OutgoingWorkflowError::Application(app)) => {
                 app.encode_failure(payload_converter, context)
             }
-            OutgoingError::Workflow(OutgoingWorkflowError::PayloadConversion(err)) => {
-                Ok(encode_generic_application_failure(&err))
-            }
+            OutgoingError::Workflow(OutgoingWorkflowError::PayloadConversion(err)) => Ok(
+                encode_generic_application_failure(&err, payload_converter, context),
+            ),
             OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(activity)) => {
                 activity.encode_failure(payload_converter, context)
             }
@@ -407,6 +415,10 @@ enum ClassifiedFailure<'a> {
     CancelExternalWorkflow(&'a CancelExternalWorkflowError),
     #[cfg(feature = "experimental")]
     NexusOperation(&'a NexusOperationError),
+    #[cfg(feature = "experimental")]
+    NexusOperationOutcome(&'a nexus_rpc::OperationError),
+    #[cfg(feature = "experimental")]
+    NexusHandler(&'a nexus_rpc::HandlerError),
     Generic(&'a (dyn std::error::Error + 'static)),
 }
 
@@ -426,6 +438,14 @@ impl<'a> ClassifiedFailure<'a> {
         if let Some(operation) = err.downcast_ref::<NexusOperationError>() {
             return Self::NexusOperation(operation);
         }
+        #[cfg(feature = "experimental")]
+        if let Some(operation) = err.downcast_ref::<nexus_rpc::OperationError>() {
+            return Self::NexusOperationOutcome(operation);
+        }
+        #[cfg(feature = "experimental")]
+        if let Some(handler) = err.downcast_ref::<nexus_rpc::HandlerError>() {
+            return Self::NexusHandler(handler);
+        }
         if let Some(app) = err.downcast_ref::<ApplicationFailure>() {
             Self::Application(app)
         } else if let Some(activity) = err.downcast_ref::<ActivityExecutionError>() {
@@ -443,68 +463,53 @@ impl<'a> ClassifiedFailure<'a> {
         }
     }
 
-    fn encode(self) -> Failure {
+    fn encode(
+        self,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
+    ) -> Failure {
         match self {
-            Self::Application(app) => app
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(app, converter_error)
-                }),
-            Self::ActivityExecution(activity) => activity
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(activity, converter_error)
-                }),
-            Self::ChildWorkflowExecution(child) => child
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(child, converter_error)
-                }),
-            Self::ChildWorkflowStart(child) => child
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(child, converter_error)
-                }),
-            Self::WorkflowSignal(signal) => signal
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(signal, converter_error)
-                }),
-            Self::CancelExternalWorkflow(cancel) => cancel
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(cancel, converter_error)
-                }),
+            Self::Application(app) => encode_known_error(app, payload_converter, context),
+            Self::ActivityExecution(activity) => {
+                encode_known_error(activity, payload_converter, context)
+            }
+            Self::ChildWorkflowExecution(child) => {
+                encode_known_error(child, payload_converter, context)
+            }
+            Self::ChildWorkflowStart(child) => {
+                encode_known_error(child, payload_converter, context)
+            }
+            Self::WorkflowSignal(signal) => encode_known_error(signal, payload_converter, context),
+            Self::CancelExternalWorkflow(cancel) => {
+                encode_known_error(cancel, payload_converter, context)
+            }
             #[cfg(feature = "experimental")]
-            Self::NexusOperation(operation) => operation
-                .encode_failure(
-                    &PayloadConverter::default(),
-                    &SerializationContextData::None,
-                )
-                .unwrap_or_else(|converter_error| {
-                    encode_failed_error_conversion(operation, converter_error)
-                }),
-            Self::Generic(err) => encode_generic_application_failure(err),
+            Self::NexusOperation(operation) => {
+                encode_known_error(operation, payload_converter, context)
+            }
+            #[cfg(feature = "experimental")]
+            Self::NexusOperationOutcome(operation) => {
+                encode_known_error(operation, payload_converter, context)
+            }
+            #[cfg(feature = "experimental")]
+            Self::NexusHandler(handler) => encode_known_error(handler, payload_converter, context),
+            Self::Generic(err) => {
+                encode_generic_application_failure(err, payload_converter, context)
+            }
         }
     }
+}
+
+fn encode_known_error(
+    error: &(impl EncodeFailure + std::error::Error + 'static),
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
+) -> Failure {
+    error
+        .encode_failure(payload_converter, context)
+        .unwrap_or_else(|converter_error| {
+            encode_failed_error_conversion(error, converter_error, payload_converter, context)
+        })
 }
 
 impl EncodeFailure for ApplicationFailure {
@@ -522,7 +527,13 @@ impl EncodeFailure for ApplicationFailure {
             cause: self
                 .cause()
                 .map(|cause| Box::new(cause.failure().clone()))
-                .or_else(|| encode_application_failure_cause(self.source_error())),
+                .or_else(|| {
+                    encode_application_failure_cause(
+                        self.source_error(),
+                        payload_converter,
+                        context,
+                    )
+                }),
             failure_info: Some(FailureInfo::ApplicationFailureInfo(
                 ApplicationFailureInfo {
                     r#type: self.type_name().unwrap_or_default().to_owned(),
@@ -539,31 +550,121 @@ impl EncodeFailure for ApplicationFailure {
 
 fn encode_application_failure_cause(
     source: &(dyn std::error::Error + 'static),
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
 ) -> Option<Box<Failure>> {
     if matches!(
         ClassifiedFailure::from_error(source),
         ClassifiedFailure::Application(_) | ClassifiedFailure::Generic(_)
     ) {
-        source.source().map(encode_error_as_failure).map(Box::new)
+        source
+            .source()
+            .map(|source| encode_error_as_failure(source, payload_converter, context))
+            .map(Box::new)
     } else {
-        Some(Box::new(encode_error_as_failure(source)))
+        Some(Box::new(encode_error_as_failure(
+            source,
+            payload_converter,
+            context,
+        )))
     }
 }
 
-fn encode_error_as_failure(err: &(dyn std::error::Error + 'static)) -> Failure {
-    ClassifiedFailure::from_error(err).encode()
+fn encode_error_as_failure(
+    err: &(dyn std::error::Error + 'static),
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
+) -> Failure {
+    ClassifiedFailure::from_error(err).encode(payload_converter, context)
+}
+
+#[cfg(feature = "experimental")]
+impl EncodeFailure for OutgoingNexusError {
+    fn encode_failure(
+        &self,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
+    ) -> Result<Failure, PayloadConversionError> {
+        match self {
+            Self::Operation(error) => error.encode_failure(payload_converter, context),
+            Self::Handler(error) => error.encode_failure(payload_converter, context),
+        }
+    }
+}
+
+#[cfg(feature = "experimental")]
+impl EncodeFailure for nexus_rpc::OperationError {
+    fn encode_failure(
+        &self,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
+    ) -> Result<Failure, PayloadConversionError> {
+        Ok(Failure {
+            message: self.message().to_owned(),
+            stack_trace: self.stack_trace().unwrap_or_default().to_owned(),
+            cause: std::error::Error::source(self)
+                .map(|cause| Box::new(encode_error_as_failure(cause, payload_converter, context))),
+            failure_info: Some(match self.state() {
+                nexus_rpc::OperationErrorState::Failed => {
+                    FailureInfo::ApplicationFailureInfo(ApplicationFailureInfo {
+                        r#type: "OperationError".to_owned(),
+                        ..Default::default()
+                    })
+                }
+                nexus_rpc::OperationErrorState::Canceled => {
+                    FailureInfo::CanceledFailureInfo(CanceledFailureInfo::default())
+                }
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(feature = "experimental")]
+impl EncodeFailure for nexus_rpc::HandlerError {
+    fn encode_failure(
+        &self,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
+    ) -> Result<Failure, PayloadConversionError> {
+        Ok(Failure {
+            message: self.message().to_owned(),
+            stack_trace: self.stack_trace().unwrap_or_default().to_owned(),
+            cause: std::error::Error::source(self)
+                .map(|cause| Box::new(encode_error_as_failure(cause, payload_converter, context))),
+            failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
+                NexusHandlerFailureInfo {
+                    r#type: self.raw_error_type().to_owned(),
+                    retry_behavior: match self.retry_behavior() {
+                        nexus_rpc::HandlerErrorRetryBehavior::Unspecified => {
+                            NexusHandlerErrorRetryBehavior::Unspecified
+                        }
+                        nexus_rpc::HandlerErrorRetryBehavior::Retryable => {
+                            NexusHandlerErrorRetryBehavior::Retryable
+                        }
+                        nexus_rpc::HandlerErrorRetryBehavior::NonRetryable => {
+                            NexusHandlerErrorRetryBehavior::NonRetryable
+                        }
+                    } as i32,
+                },
+            )),
+            ..Default::default()
+        })
+    }
 }
 
 #[cfg(feature = "experimental")]
 impl EncodeFailure for NexusOperationError {
     fn encode_failure(
         &self,
-        _: &PayloadConverter,
-        _: &SerializationContextData,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::Failed(failure) => failure.failure().clone(),
-            Self::Serialization(err) => encode_generic_application_failure(err),
+            Self::Serialization(err) => {
+                encode_generic_application_failure(err, payload_converter, context)
+            }
         })
     }
 }
@@ -571,13 +672,15 @@ impl EncodeFailure for NexusOperationError {
 impl EncodeFailure for ActivityExecutionError {
     fn encode_failure(
         &self,
-        _: &PayloadConverter,
-        _: &SerializationContextData,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::Failed(failure) => failure.failure().clone(),
             Self::Cancelled(failure) => failure.failure().clone(),
-            Self::Serialization(err) => encode_generic_application_failure(err),
+            Self::Serialization(err) => {
+                encode_generic_application_failure(err, payload_converter, context)
+            }
         })
     }
 }
@@ -585,12 +688,14 @@ impl EncodeFailure for ActivityExecutionError {
 impl EncodeFailure for ChildWorkflowExecutionError {
     fn encode_failure(
         &self,
-        _: &PayloadConverter,
-        _: &SerializationContextData,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::Failed(failure) => failure.failure().clone(),
-            Self::Serialization(_) => encode_generic_application_failure(self),
+            Self::Serialization(_) => {
+                encode_generic_application_failure(self, payload_converter, context)
+            }
         })
     }
 }
@@ -598,13 +703,13 @@ impl EncodeFailure for ChildWorkflowExecutionError {
 impl EncodeFailure for ChildWorkflowStartError {
     fn encode_failure(
         &self,
-        _: &PayloadConverter,
-        _: &SerializationContextData,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::Cancelled(failure) => failure.failure().clone(),
             Self::StartFailed { .. } | Self::Serialization(_) => {
-                encode_generic_application_failure(self)
+                encode_generic_application_failure(self, payload_converter, context)
             }
         })
     }
@@ -613,12 +718,14 @@ impl EncodeFailure for ChildWorkflowStartError {
 impl EncodeFailure for WorkflowSignalError {
     fn encode_failure(
         &self,
-        _: &PayloadConverter,
-        _: &SerializationContextData,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::NotFound(failure) | Self::Failed(failure) => failure.failure().clone(),
-            Self::Serialization(err) => encode_generic_application_failure(err),
+            Self::Serialization(err) => {
+                encode_generic_application_failure(err, payload_converter, context)
+            }
         })
     }
 }
@@ -626,12 +733,14 @@ impl EncodeFailure for WorkflowSignalError {
 impl EncodeFailure for CancelExternalWorkflowError {
     fn encode_failure(
         &self,
-        _: &PayloadConverter,
-        _: &SerializationContextData,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::NotFound(error) | Self::Failed(error) => error.failure().clone(),
-            Self::Serialization(err) => encode_generic_application_failure(err),
+            Self::Serialization(err) => {
+                encode_generic_application_failure(err, payload_converter, context)
+            }
         })
     }
 }
@@ -658,10 +767,17 @@ fn encode_outgoing_activity_error(
     })
 }
 
-fn encode_generic_application_failure(err: &(dyn std::error::Error + 'static)) -> Failure {
+fn encode_generic_application_failure(
+    err: &(dyn std::error::Error + 'static),
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
+) -> Failure {
     Failure {
         message: err.to_string(),
-        cause: err.source().map(encode_error_as_failure).map(Box::new),
+        cause: err
+            .source()
+            .map(|source| encode_error_as_failure(source, payload_converter, context))
+            .map(Box::new),
         failure_info: Some(FailureInfo::ApplicationFailureInfo(
             ApplicationFailureInfo::default(),
         )),
@@ -672,10 +788,15 @@ fn encode_generic_application_failure(err: &(dyn std::error::Error + 'static)) -
 fn encode_failed_error_conversion(
     err: &(dyn std::error::Error + 'static),
     converter_error: PayloadConversionError,
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
 ) -> Failure {
     Failure {
         message: failed_error_conversion_message(err, &converter_error),
-        cause: err.source().map(encode_error_as_failure).map(Box::new),
+        cause: err
+            .source()
+            .map(|source| encode_error_as_failure(source, payload_converter, context))
+            .map(Box::new),
         failure_info: Some(FailureInfo::ApplicationFailureInfo(
             ApplicationFailureInfo::default(),
         )),
@@ -780,6 +901,143 @@ mod tests {
     };
     use rstest::rstest;
     use std::fmt;
+
+    #[cfg(feature = "experimental")]
+    mod nexus_outbound {
+        use super::*;
+        use crate::data_converters::{ErasedSerdePayloadConverter, NexusSerializationContext};
+        use nexus_rpc::{
+            HandlerError, HandlerErrorRetryBehavior, HandlerErrorType, OperationError,
+        };
+        use std::sync::Arc;
+
+        struct ContextualPayloadConverter;
+
+        impl ErasedSerdePayloadConverter for ContextualPayloadConverter {
+            fn to_payload(
+                &self,
+                context: &SerializationContextData,
+                value: &dyn erased_serde::Serialize,
+            ) -> Result<Payload, PayloadConversionError> {
+                assert!(matches!(context, SerializationContextData::Nexus(_)));
+                let mut data = b"nexus:".to_vec();
+                data.extend(
+                    serde_json::to_vec(value)
+                        .map_err(|error| PayloadConversionError::EncodingError(error.into()))?,
+                );
+                Ok(Payload {
+                    data,
+                    ..Default::default()
+                })
+            }
+
+            fn from_payload(
+                &self,
+                context: &SerializationContextData,
+                payload: Payload,
+            ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError>
+            {
+                assert!(matches!(context, SerializationContextData::Nexus(_)));
+                let data = payload
+                    .data
+                    .strip_prefix(b"nexus:")
+                    .ok_or(PayloadConversionError::WrongEncoding)?;
+                let value: serde_json::Value = serde_json::from_slice(data)
+                    .map_err(|error| PayloadConversionError::EncodingError(error.into()))?;
+                Ok(Box::new(<dyn erased_serde::Deserializer>::erase(value)))
+            }
+        }
+
+        #[rstest]
+        fn nested_nexus_failures_preserve_context_details_and_encoded_attributes(
+            #[values(false, true)] encode_attributes: bool,
+            #[values("failed", "canceled", "handler")] kind: &str,
+        ) {
+            let payload_converter = PayloadConverter::Serde(Arc::new(ContextualPayloadConverter));
+            let context = SerializationContextData::Nexus(NexusSerializationContext::new());
+            let converter = DefaultFailureConverter::new(encode_attributes);
+            let application = ApplicationFailure::builder(TestError::new(
+                "application cause",
+                Some(Box::new(TestError::new("root cause", None))),
+            ))
+            .type_name("ApplicationCause".to_owned())
+            .non_retryable(true)
+            .details("nested detail")
+            .build();
+            let cause = HandlerError::new(HandlerErrorType::Unavailable, "nested handler")
+                .with_retry_behavior(HandlerErrorRetryBehavior::Retryable)
+                .with_source(application);
+            let error = match kind {
+                "failed" => OutgoingNexusError::Operation(
+                    OperationError::failed("operation failed")
+                        .with_stack_trace("outer trace")
+                        .with_source(cause),
+                ),
+                "canceled" => OutgoingNexusError::Operation(
+                    OperationError::canceled("operation canceled")
+                        .with_stack_trace("outer trace")
+                        .with_source(cause),
+                ),
+                _ => OutgoingNexusError::Handler(
+                    HandlerError::new(HandlerErrorType::NotFound, "outer handler")
+                        .with_stack_trace("outer trace")
+                        .with_source(cause),
+                ),
+            };
+            let failure = converter.to_failure(
+                OutgoingError::Nexus(Box::new(error)),
+                &payload_converter,
+                &context,
+            );
+            assert_eq!(failure.encoded_attributes.is_some(), encode_attributes);
+            assert_eq!(
+                failure.cause.as_ref().unwrap().encoded_attributes.is_some(),
+                encode_attributes
+            );
+            let decoded = converter
+                .to_error(failure, &payload_converter, &context)
+                .unwrap();
+            assert_eq!(
+                decoded.failure().message,
+                match kind {
+                    "failed" => "operation failed",
+                    "canceled" => "operation canceled",
+                    _ => "outer handler",
+                }
+            );
+            assert_eq!(decoded.failure().stack_trace, "outer trace");
+            match (&decoded, kind) {
+                (IncomingError::Application(app), "failed") => {
+                    assert_eq!(app.type_name(), Some("OperationError"));
+                    assert!(!app.is_non_retryable());
+                }
+                (IncomingError::Cancelled(_), "canceled")
+                | (IncomingError::NexusHandler(_), "handler") => {}
+                other => panic!("unexpected root classification: {other:?}"),
+            }
+            let IncomingError::NexusHandler(handler) = decoded.cause().unwrap() else {
+                panic!("nested HandlerError must not turn into an application failure");
+            };
+            assert_eq!(handler.failure().message, "nested handler");
+            assert!(matches!(handler.failure().failure_info.as_ref(),
+                Some(FailureInfo::NexusHandlerFailureInfo(info))
+                    if info.r#type == "UNAVAILABLE"
+                        && info.retry_behavior == NexusHandlerErrorRetryBehavior::Retryable as i32));
+            let IncomingError::Application(app) = handler.cause().unwrap() else {
+                panic!("expected immediate application cause");
+            };
+            assert_eq!(app.type_name(), Some("ApplicationCause"));
+            assert!(app.is_non_retryable());
+            assert_eq!(
+                app.details::<String>().unwrap().as_deref(),
+                Some("nested detail")
+            );
+            let root = app.cause().unwrap();
+            assert!(matches!(root, IncomingError::Application(_)));
+            assert_eq!(root.failure().message, "root cause");
+            assert!(root.cause().is_none());
+        }
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum IncomingKind {

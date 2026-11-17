@@ -43,22 +43,18 @@
 pub use temporalio_macros::{temporal_nexus_service_handler, temporal_operation};
 pub use temporalio_workflow::nexus::*;
 
-use crate::{
-    ApplicationFailure, CommonWorker, OutgoingActivityError, OutgoingError, WorkerRunError,
-};
+use crate::{ApplicationFailure, CommonWorker, OutgoingError, WorkerRunError};
 use base64::{
     Engine,
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig, general_purpose},
 };
 use futures_util::{FutureExt, future::BoxFuture};
-use nexus_rpc::{
-    HandlerError, HandlerErrorRetryBehavior, HandlerErrorType, OperationError, OperationErrorState,
-};
+use nexus_rpc::{HandlerError, HandlerErrorRetryBehavior, HandlerErrorType, OperationError};
 pub use nexus_rpc::{NexusOperation, NexusService};
 use serde::{Deserialize, Serialize};
 use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
 use std::{
-    cell::RefCell, collections::HashMap, future::Future, io, marker::PhantomData,
+    any::Any, cell::RefCell, collections::HashMap, future::Future, io, marker::PhantomData,
     panic::AssertUnwindSafe, sync::Arc, time::SystemTime,
 };
 use temporalio_client::{
@@ -70,16 +66,18 @@ use temporalio_client::{
 use temporalio_common::{
     HasWorkflowDefinition,
     data_converters::{
-        DataConverter, NexusSerializationContext, SerializationContextData, TemporalDeserializable,
+        DataConverter, GenericPayloadConverter, NexusSerializationContext, PayloadConversionError,
+        SerializationContext, SerializationContextData, TemporalDeserializable,
         TemporalSerializable,
     },
+    error::OutgoingNexusError,
+    external_storage::{retrieve_external_payloads, store_external_payloads},
     payload_visitor::encode_payloads,
     protos::{
         coresdk::nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
         temporal::api::{
             common::v1::{Callback, callback},
-            enums::v1::NexusHandlerErrorRetryBehavior,
-            failure::v1::{CanceledFailureInfo, NexusHandlerFailureInfo, failure::FailureInfo},
+            failure::v1::{Failure, NexusHandlerFailureInfo, failure::FailureInfo},
             nexus::v1::{self as proto, request, response, start_operation_response},
         },
     },
@@ -307,21 +305,8 @@ impl TemporalNexusClient {
             options,
             &self.request.request_id,
         )
-            .await
-            .map_err(|error| {
-                if matches!(&error, WorkflowStartError::AlreadyStarted { .. }) {
-                    return TemporalOperationError::handler("CONFLICT", error, false);
-                }
-                let invalid = matches!(
-                    &error,
-                    WorkflowStartError::PayloadConversion(_)
-                ) || matches!(&error, WorkflowStartError::Rpc(status) if status.code() == Code::InvalidArgument);
-                TemporalOperationError::handler(
-                    if invalid { "BAD_REQUEST" } else { "INTERNAL" },
-                    error,
-                    !invalid,
-                )
-            })?;
+        .await
+        .map_err(TemporalOperationError::from)?;
         let info = handle.info();
         let run_id = info.run_id.as_deref().ok_or_else(|| {
             TemporalOperationError::handler("INTERNAL", "Workflow start returned no run ID", true)
@@ -466,20 +451,43 @@ impl<S: NexusService> NexusServiceHandler<S> {
                 let handler = handler.clone();
                 async move {
                     let payload = client.request.payload.clone().unwrap_or_default();
-                    let input = converter
-                        .from_payload::<O::Input>(&serialization_context(), payload)
+                    let mut decoded = converter
+                        .codec()
+                        .decode(&serialization_context(), vec![payload])
                         .await
-                        .map_err(|error| {
-                            TemporalOperationError::handler("BAD_REQUEST", error, false)
-                        })?;
+                        .map_err(TemporalOperationError::input_codec_error)?;
+                    let payload =
+                        decoded
+                            .pop()
+                            .filter(|_| decoded.is_empty())
+                            .ok_or_else(|| {
+                                HandlerError::new(
+                                    HandlerErrorType::Internal,
+                                    "Payload codec must return exactly one Nexus input payload",
+                                )
+                            })?;
+                    let input = converter
+                        .payload_converter()
+                        .from_payload::<O::Input>(
+                            &SerializationContext::new(
+                                &serialization_context(),
+                                converter.payload_converter(),
+                            ),
+                            payload,
+                        )
+                        .map_err(TemporalOperationError::input_conversion_error)?;
                     match handler(context, client, input).await? {
                         TemporalOperationResult::Sync(output) => {
                             let payload = converter
-                                .to_payload(&serialization_context(), &output)
-                                .await
-                                .map_err(|error| {
-                                    TemporalOperationError::handler("INTERNAL", error, true)
-                                })?;
+                                .payload_converter()
+                                .to_payload(
+                                    &SerializationContext::new(
+                                        &serialization_context(),
+                                        converter.payload_converter(),
+                                    ),
+                                    &output,
+                                )
+                                .map_err(TemporalOperationError::from)?;
                             Ok(start_operation_response::Variant::SyncSuccess(
                                 start_operation_response::Sync {
                                     payload: Some(payload),
@@ -525,13 +533,13 @@ pub enum TemporalOperationError {
     /// A terminal failed or canceled operation, including its application cause.
     #[error(transparent)]
     Operation(#[from] OperationError),
-    /// An unexpected application failure, reported as a retryable handler failure.
+    /// An application failure, reported as a handler failure with its retry policy.
     #[error(transparent)]
     Application(#[from] Box<ApplicationFailure>),
     /// A Nexus handler failure, whose type and retry behavior follow the Nexus protocol.
     #[error(transparent)]
     Handler(#[from] HandlerError),
-    /// An unexpected implementation error, reported as a retryable handler failure.
+    /// An implementation error; known Temporal and RPC errors retain their classification.
     #[error(transparent)]
     Unexpected(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -549,65 +557,165 @@ impl TemporalOperationError {
 
     fn into_status(self, converter: &DataConverter) -> nexus_task_completion::Status {
         match self {
-            Self::Operation(error) => {
-                let message = error.message().to_owned();
-                let state = error.state();
-                let stack_trace = error.stack_trace().unwrap_or_default().to_owned();
-                let mut failure = converter.to_failure(
+            Self::Operation(error) => start_status(start_operation_response::Variant::Failure(
+                converter.to_failure(
                     &serialization_context(),
-                    OutgoingError::Activity(OutgoingActivityError::Application(
-                        ApplicationFailure::builder(error)
-                            .type_name("OperationError".to_owned())
-                            .build()
-                            .into(),
-                    )),
-                );
-                failure.message = message;
-                failure.stack_trace = stack_trace;
-                if state == OperationErrorState::Canceled {
-                    failure.failure_info = Some(FailureInfo::CanceledFailureInfo(
-                        CanceledFailureInfo::default(),
-                    ));
-                }
-                start_status(start_operation_response::Variant::Failure(failure))
-            }
+                    OutgoingError::Nexus(Box::new(OutgoingNexusError::Operation(error))),
+                ),
+            )),
             Self::Application(failure) => Self::Unexpected(failure).into_status(converter),
-            Self::Unexpected(error) => Self::Handler(
-                HandlerError::new(HandlerErrorType::Internal, error.to_string()).with_source(error),
-            )
-            .into_status(converter),
-            Self::Handler(error) => {
-                let message = error.message().to_owned();
-                let error_type = error.raw_error_type().to_owned();
-                let stack_trace = error.stack_trace().unwrap_or_default().to_owned();
-                let retry_behavior = match error.retry_behavior() {
-                    HandlerErrorRetryBehavior::Unspecified => {
-                        NexusHandlerErrorRetryBehavior::Unspecified
-                    }
-                    HandlerErrorRetryBehavior::Retryable => {
-                        NexusHandlerErrorRetryBehavior::Retryable
-                    }
-                    HandlerErrorRetryBehavior::NonRetryable => {
-                        NexusHandlerErrorRetryBehavior::NonRetryable
-                    }
+            Self::Unexpected(error) => {
+                let error = match error.downcast::<HandlerError>() {
+                    Ok(handler) => return Self::Handler(*handler).into_status(converter),
+                    Err(error) => error,
                 };
-                let mut failure = converter.to_failure(
-                    &serialization_context(),
-                    OutgoingError::Activity(OutgoingActivityError::Application(
-                        ApplicationFailure::new(error).into(),
-                    )),
-                );
-                failure.message = message;
-                failure.stack_trace = stack_trace;
-                failure.failure_info = Some(FailureInfo::NexusHandlerFailureInfo(
-                    NexusHandlerFailureInfo {
-                        r#type: error_type,
-                        retry_behavior: retry_behavior.into(),
-                    },
-                ));
-                nexus_task_completion::Status::Failure(failure)
+                let error = match error.downcast::<OperationError>() {
+                    Ok(operation) => return Self::Operation(*operation).into_status(converter),
+                    Err(error) => error,
+                };
+                let error = match error.downcast::<WorkflowStartError>() {
+                    Ok(error) => return Self::from(*error).into_status(converter),
+                    Err(error) => error,
+                };
+                let error = match error.downcast::<WorkflowInteractionError>() {
+                    Ok(error) => return Self::from(*error).into_status(converter),
+                    Err(error) => error,
+                };
+                let handler = if let Some(app) = error.downcast_ref::<ApplicationFailure>() {
+                    if app.is_non_retryable() {
+                        HandlerError::new(
+                            HandlerErrorType::Internal,
+                            "Handler failed with non-retryable application error",
+                        )
+                        .with_retry_behavior(HandlerErrorRetryBehavior::NonRetryable)
+                    } else {
+                        HandlerError::new(HandlerErrorType::Internal, "Internal handler error")
+                    }
+                } else if let Some(status) =
+                    error.downcast_ref::<temporalio_client::tonic::Status>()
+                {
+                    rpc_handler_error(status)
+                } else {
+                    HandlerError::new(HandlerErrorType::Internal, "Internal handler error")
+                };
+                Self::Handler(handler.with_source(error)).into_status(converter)
             }
+            Self::Handler(error) => nexus_task_completion::Status::Failure(converter.to_failure(
+                &serialization_context(),
+                OutgoingError::Nexus(Box::new(OutgoingNexusError::Handler(error))),
+            )),
         }
+    }
+
+    fn input_conversion_error(error: PayloadConversionError) -> Self {
+        let source = match error {
+            PayloadConversionError::EncodingError(source) => source,
+            error => Box::new(error),
+        };
+        if source.is::<HandlerError>()
+            || source.is::<temporalio_client::tonic::Status>()
+            || source.is::<WorkflowStartError>()
+            || source.is::<WorkflowInteractionError>()
+        {
+            return Self::Unexpected(source);
+        }
+        if let Some(app) = source.downcast_ref::<ApplicationFailure>()
+            && !(app.is_non_retryable() && app.type_name() == Some("PayloadValidationError"))
+        {
+            return Self::Unexpected(source);
+        }
+        HandlerError::new(HandlerErrorType::BadRequest, "Invalid operation input")
+            .with_retry_behavior(HandlerErrorRetryBehavior::NonRetryable)
+            .with_source(source)
+            .into()
+    }
+
+    fn input_codec_error(error: PayloadConversionError) -> Self {
+        if let PayloadConversionError::EncodingError(source) = &error
+            && source
+                .downcast_ref::<ApplicationFailure>()
+                .is_some_and(|app| {
+                    app.is_non_retryable() && app.type_name() == Some("PayloadValidationError")
+                })
+        {
+            return Self::input_conversion_error(error);
+        }
+        Self::from(error)
+    }
+}
+
+impl From<ApplicationFailure> for TemporalOperationError {
+    fn from(error: ApplicationFailure) -> Self {
+        Self::Application(Box::new(error))
+    }
+}
+
+impl From<PayloadConversionError> for TemporalOperationError {
+    fn from(error: PayloadConversionError) -> Self {
+        match error {
+            PayloadConversionError::EncodingError(source) => Self::Unexpected(source),
+            error => Self::Unexpected(Box::new(error)),
+        }
+    }
+}
+
+impl From<temporalio_client::tonic::Status> for TemporalOperationError {
+    fn from(error: temporalio_client::tonic::Status) -> Self {
+        Self::Unexpected(Box::new(error))
+    }
+}
+
+impl From<WorkflowStartError> for TemporalOperationError {
+    fn from(error: WorkflowStartError) -> Self {
+        match error {
+            WorkflowStartError::Rpc(status) => status.into(),
+            WorkflowStartError::PayloadConversion(error) => error.into(),
+            error @ WorkflowStartError::AlreadyStarted { .. } => {
+                HandlerError::new(HandlerErrorType::Internal, error.to_string())
+                    .with_retry_behavior(HandlerErrorRetryBehavior::NonRetryable)
+                    .with_source(error)
+                    .into()
+            }
+            error => HandlerError::new(HandlerErrorType::Internal, "Internal handler error")
+                .with_source(error)
+                .into(),
+        }
+    }
+}
+
+impl From<WorkflowInteractionError> for TemporalOperationError {
+    fn from(error: WorkflowInteractionError) -> Self {
+        match error {
+            WorkflowInteractionError::Rpc(status) | WorkflowInteractionError::NotFound(status) => {
+                status.into()
+            }
+            WorkflowInteractionError::PayloadConversion(error) => error.into(),
+            WorkflowInteractionError::Other(error) => Self::Unexpected(error),
+            error => HandlerError::new(HandlerErrorType::Internal, "Internal handler error")
+                .with_source(error)
+                .into(),
+        }
+    }
+}
+
+fn rpc_handler_error(status: &temporalio_client::tonic::Status) -> HandlerError {
+    let error_type = match status.code() {
+        Code::InvalidArgument => HandlerErrorType::BadRequest,
+        Code::Aborted | Code::Unavailable => HandlerErrorType::Unavailable,
+        Code::NotFound => HandlerErrorType::NotFound,
+        Code::ResourceExhausted => HandlerErrorType::ResourceExhausted,
+        Code::Unimplemented => HandlerErrorType::NotImplemented,
+        Code::DeadlineExceeded => HandlerErrorType::UpstreamTimeout,
+        _ => HandlerErrorType::Internal,
+    };
+    let error = HandlerError::new(error_type, status.message());
+    if matches!(
+        status.code(),
+        Code::AlreadyExists | Code::FailedPrecondition | Code::OutOfRange
+    ) {
+        error.with_retry_behavior(HandlerErrorRetryBehavior::NonRetryable)
+    } else {
+        error
     }
 }
 
@@ -724,6 +832,7 @@ impl NexusHalf {
                             cancellations.insert(token.clone(), cancellation.clone());
                             let services = self.services.clone();
                             let worker = common.worker.clone();
+                            let namespace = worker.get_config().namespace.clone();
                             let converter = common.data_converter.clone();
                             let client = worker.get_client_connection()
                                 .map(|connection| Client::new(connection, common.client_options.clone()));
@@ -736,7 +845,7 @@ impl NexusHalf {
                                     dispatch(services, client, converter.clone(), task_request.request,
                                         task.endpoint, deadline, cancellation.clone()).await
                                 };
-                                let status = execute_request(execute, &cancellation, &converter).await;
+                                let status = execute_request(execute, &cancellation, &converter, &namespace).await;
                                 let result = worker.complete_nexus_task(NexusTaskCompletion {
                                     task_token: token.clone(),
                                     status: Some(status),
@@ -769,7 +878,7 @@ async fn dispatch(
         TemporalOperationError::handler("BAD_REQUEST", "Missing Nexus request", false)
     })?;
     match request.variant {
-        Some(request::Variant::StartOperation(start)) => {
+        Some(request::Variant::StartOperation(mut start)) => {
             let service = services.operations.get(&start.service).ok_or_else(|| {
                 HandlerError::new(
                     HandlerErrorType::NotFound,
@@ -794,6 +903,9 @@ async fn dispatch(
             for interceptor in &services.interceptors {
                 interceptor.on_start(&mut info).await?;
             }
+            retrieve_external_payloads(&mut start, &converter)
+                .await
+                .map_err(TemporalOperationError::from)?;
             let result = OUTBOUND_LINKS
                 .scope(
                     RefCell::new(Vec::new()),
@@ -816,14 +928,17 @@ async fn dispatch(
         }
         Some(request::Variant::CancelOperation(cancel)) => {
             let service = services.operations.get(&cancel.service).ok_or_else(|| {
-                TemporalOperationError::handler("NOT_FOUND", "Unknown Nexus service", false)
+                HandlerError::new(
+                    HandlerErrorType::NotFound,
+                    format!("Unknown Nexus service {:?}", cancel.service),
+                )
             })?;
             if !service.contains_key(&cancel.operation) {
-                return Err(TemporalOperationError::handler(
-                    "NOT_FOUND",
-                    "Unknown Nexus operation",
-                    false,
-                ));
+                return Err(HandlerError::new(
+                    HandlerErrorType::NotFound,
+                    format!("Unknown Nexus operation {:?}", cancel.operation),
+                )
+                .into());
             }
             let token = WorkflowOperationToken::decode_token(&cancel.operation_token)?;
             if token.namespace != client.namespace() {
@@ -840,12 +955,7 @@ async fn dispatch(
                 .bind_untyped(client)
                 .cancel(WorkflowCancelOptions::default())
                 .await
-                .or_else(|error| match error {
-                    // Retention may remove a completed workflow before a delayed cancel arrives.
-                    WorkflowInteractionError::NotFound(_) => Ok(()),
-                    error => Err(error),
-                })
-                .map_err(|error| TemporalOperationError::handler("INTERNAL", error, true))?;
+                .map_err(TemporalOperationError::from)?;
             Ok(nexus_task_completion::Status::Completed(proto::Response {
                 variant: Some(response::Variant::CancelOperation(
                     proto::CancelOperationResponse {},
@@ -868,33 +978,86 @@ async fn execute_request(
     execute: impl Future<Output = Result<nexus_task_completion::Status, TemporalOperationError>>,
     cancellation: &CancellationToken,
     converter: &DataConverter,
+    namespace: &str,
 ) -> nexus_task_completion::Status {
     let execute = async {
-        match execute.await {
-            Ok(status) => status,
-            Err(error) => {
-                let mut completion = NexusTaskCompletion {
-                    task_token: Vec::new(),
-                    status: Some(error.into_status(converter)),
-                };
-                if let Err(error) =
-                    encode_payloads(&mut completion, converter.codec(), &serialization_context())
-                        .await
-                {
-                    return TemporalOperationError::handler("INTERNAL", error, true)
-                        .into_status(converter);
-                }
-                completion.status.expect("error completion has a status")
+        let status = match AssertUnwindSafe(execute).catch_unwind().await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => error.into_status(converter),
+            Err(panic) => TemporalOperationError::Unexpected(Box::new(NexusHandlerPanic(
+                panic_message(panic),
+            )))
+            .into_status(converter),
+        };
+        let successful = match &status {
+            nexus_task_completion::Status::Completed(response) => match response.variant.as_ref() {
+                Some(response::Variant::StartOperation(response)) => matches!(
+                    response.variant.as_ref(),
+                    Some(
+                        start_operation_response::Variant::SyncSuccess(_)
+                            | start_operation_response::Variant::AsyncSuccess(_)
+                    )
+                ),
+                Some(response::Variant::CancelOperation(_)) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        let mut completion = NexusTaskCompletion {
+            task_token: Vec::new(),
+            status: Some(status),
+        };
+        if let Err(error) =
+            encode_payloads(&mut completion, converter.codec(), &serialization_context()).await
+        {
+            if !successful {
+                return Err(error);
             }
+            // A result codec can reject a value with an explicit application/handler error.
+            // Make one attempt to report that error; failure of this encoding uses the raw fallback.
+            completion.status = Some(TemporalOperationError::from(error).into_status(converter));
+            encode_payloads(&mut completion, converter.codec(), &serialization_context()).await?;
         }
+        store_external_payloads(&mut completion, converter, namespace, None).await?;
+        Ok::<_, PayloadConversionError>(completion.status.expect("completion has a status"))
     };
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => nexus_task_completion::Status::AckCancel(true),
-        result = AssertUnwindSafe(execute).catch_unwind() => result.unwrap_or_else(|_| {
-            TemporalOperationError::handler("INTERNAL", "Nexus handler panicked", true).into_status(converter)
-        }),
+        result = AssertUnwindSafe(execute).catch_unwind() => match result {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => failure_building_completion(error.to_string()),
+            Err(panic) => failure_building_completion(panic_message(panic)),
+        },
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Nexus handler panicked: {0}")]
+struct NexusHandlerPanic(String);
+
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic")
+        .to_owned()
+}
+
+fn failure_building_completion(error: String) -> nexus_task_completion::Status {
+    // Reusing a failing converter or codec here could strand the task and its worker slot.
+    tracing::warn!(%error, "Failed building Nexus task completion");
+    nexus_task_completion::Status::Failure(Failure {
+        message: format!("Failed building Nexus task completion: {error}"),
+        failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
+            NexusHandlerFailureInfo {
+                r#type: HandlerErrorType::Internal.as_str().to_owned(),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
 }
 
 /// Observe handler requests and outcomes, including propagated headers.
@@ -921,13 +1084,19 @@ mod tests {
     use temporalio_client::{
         ClientOptions, Connection, ConnectionOptions,
         callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
+        tonic::Status,
     };
     use temporalio_common::{
         WorkflowDefinition,
-        data_converters::{PayloadCodec, PayloadConversionError, PayloadConverter},
+        data_converters::{
+            DefaultFailureConverter, ExternalStorage, FailureConverter, PayloadCodec,
+            PayloadConversionError, PayloadConverter, StorageDriver, StorageDriverClaim,
+            StorageDriverError, StorageDriverRetrieveContext, StorageDriverStoreContext,
+        },
+        error::IncomingError,
         protos::temporal::api::{
             common::v1::Payload,
-            failure::v1::Failure,
+            enums::v1::NexusHandlerErrorRetryBehavior,
             workflowservice::v1::{
                 RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
                 StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
@@ -1466,7 +1635,7 @@ mod tests {
             .unwrap();
         let mut services = NexusServices::default();
         services.register(service()).unwrap();
-        let status = dispatch(
+        let execute = dispatch(
             services,
             client().await,
             converter.clone(),
@@ -1484,9 +1653,8 @@ mod tests {
             "payments".to_owned(),
             None,
             CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        );
+        let status = execute_request(execute, &CancellationToken::new(), &converter, "test").await;
         let nexus_task_completion::Status::Completed(proto::Response {
             variant:
                 Some(response::Variant::StartOperation(proto::StartOperationResponse {
@@ -1522,10 +1690,13 @@ mod tests {
             started.notify_one();
             std::future::pending().await
         };
-        let (status, ()) = tokio::join!(execute_request(execute, &token, &converter), async {
-            started.notified().await;
-            token.cancel();
-        },);
+        let (status, ()) = tokio::join!(
+            execute_request(execute, &token, &converter, "test"),
+            async {
+                started.notified().await;
+                token.cancel();
+            },
+        );
         assert!(matches!(
             status,
             nexus_task_completion::Status::AckCancel(true)
@@ -1537,7 +1708,13 @@ mod tests {
     async fn panics_and_operation_failures_have_distinct_protocol_results() {
         let converter = DataConverter::default();
         let token = CancellationToken::new();
-        let panic = execute_request(async { panic!("handler panic") }, &token, &converter).await;
+        let panic = execute_request(
+            async { panic!("handler panic") },
+            &token,
+            &converter,
+            "test",
+        )
+        .await;
         assert!(matches!(
             panic,
             nexus_task_completion::Status::Failure(Failure {
@@ -1549,6 +1726,7 @@ mod tests {
             async { Err(OperationError::failed("declined").into()) },
             &token,
             &converter,
+            "test",
         )
         .await;
         assert!(matches!(
@@ -1656,5 +1834,682 @@ mod tests {
             );
             assert!(cause.cause().is_none());
         }
+    }
+
+    #[test]
+    fn application_failures_preserve_their_non_retryable_override() {
+        for non_retryable in [false, true] {
+            let converter = DataConverter::default();
+            let error = ApplicationFailure::builder("application error")
+                .type_name("ApplicationCause".to_owned())
+                .non_retryable(non_retryable)
+                .details("detail".to_owned())
+                .build();
+            let nexus_task_completion::Status::Failure(failure) =
+                TemporalOperationError::from(error).into_status(&converter)
+            else {
+                panic!("application errors must fail the handler, not the operation");
+            };
+            let Some(FailureInfo::NexusHandlerFailureInfo(info)) = &failure.failure_info else {
+                panic!("expected Nexus handler failure");
+            };
+            assert_eq!(info.r#type, "INTERNAL");
+            assert_eq!(
+                info.retry_behavior,
+                if non_retryable {
+                    NexusHandlerErrorRetryBehavior::NonRetryable
+                } else {
+                    NexusHandlerErrorRetryBehavior::Unspecified
+                } as i32
+            );
+            let cause = converter
+                .failure_converter()
+                .to_error(
+                    *failure.cause.unwrap(),
+                    converter.payload_converter(),
+                    &serialization_context(),
+                )
+                .unwrap();
+            let IncomingError::Application(cause) = cause else {
+                panic!("expected application cause")
+            };
+            assert_eq!(cause.type_name(), Some("ApplicationCause"));
+            assert_eq!(cause.to_string(), "application error");
+            assert_eq!(cause.is_non_retryable(), non_retryable);
+            assert_eq!(
+                cause.details::<String>().unwrap().as_deref(),
+                Some("detail")
+            );
+            assert!(cause.cause().is_none());
+        }
+    }
+
+    #[test]
+    fn grpc_status_mapping_matches_python_and_java() {
+        for (code, error_type, non_retryable) in [
+            (Code::Cancelled, "INTERNAL", false),
+            (Code::Unknown, "INTERNAL", false),
+            (Code::InvalidArgument, "BAD_REQUEST", false),
+            (Code::DeadlineExceeded, "UPSTREAM_TIMEOUT", false),
+            (Code::NotFound, "NOT_FOUND", false),
+            (Code::AlreadyExists, "INTERNAL", true),
+            (Code::PermissionDenied, "INTERNAL", false),
+            (Code::ResourceExhausted, "RESOURCE_EXHAUSTED", false),
+            (Code::FailedPrecondition, "INTERNAL", true),
+            (Code::Aborted, "UNAVAILABLE", false),
+            (Code::OutOfRange, "INTERNAL", true),
+            (Code::Unimplemented, "NOT_IMPLEMENTED", false),
+            (Code::Internal, "INTERNAL", false),
+            (Code::Unavailable, "UNAVAILABLE", false),
+            (Code::DataLoss, "INTERNAL", false),
+            (Code::Unauthenticated, "INTERNAL", false),
+        ] {
+            let nexus_task_completion::Status::Failure(failure) =
+                TemporalOperationError::from(Status::new(code, "RPC failed"))
+                    .into_status(&DataConverter::default())
+            else {
+                panic!("expected handler failure for {code:?}");
+            };
+            let Some(FailureInfo::NexusHandlerFailureInfo(info)) = failure.failure_info else {
+                panic!("expected handler classification");
+            };
+            assert_eq!(info.r#type, error_type, "{code:?}");
+            assert_eq!(
+                info.retry_behavior,
+                if non_retryable {
+                    NexusHandlerErrorRetryBehavior::NonRetryable
+                } else {
+                    NexusHandlerErrorRetryBehavior::Unspecified
+                } as i32,
+                "{code:?}"
+            );
+            assert_eq!(failure.message, "RPC failed");
+            assert!(failure.cause.unwrap().message.contains("RPC failed"));
+        }
+    }
+
+    #[test]
+    fn client_errors_and_explicit_handler_overrides_are_not_reclassified() {
+        for error in [
+            TemporalOperationError::from(WorkflowStartError::Rpc(Status::unavailable(
+                "start failed",
+            ))),
+            TemporalOperationError::Unexpected(Box::new(WorkflowInteractionError::Rpc(
+                Status::unavailable("cancel failed"),
+            ))),
+        ] {
+            let nexus_task_completion::Status::Failure(failure) =
+                error.into_status(&DataConverter::default())
+            else {
+                panic!("expected handler failure");
+            };
+            assert!(matches!(failure.failure_info,
+                Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "UNAVAILABLE"
+                    && info.retry_behavior == NexusHandlerErrorRetryBehavior::Unspecified as i32));
+        }
+        let error = TemporalOperationError::Unexpected(Box::new(
+            HandlerError::new(HandlerErrorType::Unavailable, "explicit failure")
+                .with_retry_behavior(HandlerErrorRetryBehavior::NonRetryable)
+                .with_source(ApplicationFailure::non_retryable("cause")),
+        ));
+        let nexus_task_completion::Status::Failure(failure) =
+            error.into_status(&DataConverter::default())
+        else {
+            panic!("expected handler failure");
+        };
+        assert_eq!(failure.message, "explicit failure");
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "UNAVAILABLE"
+                && info.retry_behavior == NexusHandlerErrorRetryBehavior::NonRetryable as i32));
+        assert_eq!(failure.cause.unwrap().message, "cause");
+    }
+
+    #[test]
+    fn duplicate_workflow_start_is_a_non_retryable_internal_handler_error() {
+        let error = TemporalOperationError::from(WorkflowStartError::AlreadyStarted {
+            run_id: Some("existing-run".to_owned()),
+            source: Status::already_exists("already running"),
+        });
+        let nexus_task_completion::Status::Failure(failure) =
+            error.into_status(&DataConverter::default())
+        else {
+            panic!("duplicate starts are handler failures, not operation outcomes")
+        };
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "INTERNAL"
+                && info.retry_behavior == NexusHandlerErrorRetryBehavior::NonRetryable as i32));
+        assert!(failure.cause.unwrap().message.contains("existing-run"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum CodecFailure {
+        Decode,
+        Encode,
+        EncodePanic,
+        EncodeNonRetryableOnce,
+    }
+
+    struct FailingCodec {
+        failure: CodecFailure,
+        encodes: Arc<AtomicUsize>,
+    }
+
+    impl PayloadCodec for FailingCodec {
+        fn encode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            let attempt = self.encodes.fetch_add(1, Ordering::SeqCst);
+            let failure = self.failure;
+            async move {
+                match failure {
+                    CodecFailure::Encode => Err(PayloadConversionError::EncodingError(
+                        std::io::Error::other("encode outage").into(),
+                    )),
+                    CodecFailure::EncodePanic => panic!("encode panic"),
+                    CodecFailure::Decode => Ok(payloads),
+                    CodecFailure::EncodeNonRetryableOnce if attempt == 0 => {
+                        Err(PayloadConversionError::EncodingError(Box::new(
+                            ApplicationFailure::builder("result rejected")
+                                .non_retryable(true)
+                                .type_name("OutputRejected".to_owned())
+                                .details("rejection detail")
+                                .build(),
+                        )))
+                    }
+                    CodecFailure::EncodeNonRetryableOnce => Ok(payloads),
+                }
+            }
+            .boxed()
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            let failure = self.failure;
+            async move {
+                match failure {
+                    CodecFailure::Decode => Err(PayloadConversionError::EncodingError(
+                        std::io::Error::other("decode outage").into(),
+                    )),
+                    _ => Ok(payloads),
+                }
+            }
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn input_codec_outages_retry_but_invalid_inputs_do_not() {
+        for codec_fails in [false, true] {
+            let converter = if codec_fails {
+                DataConverter::new(
+                    PayloadConverter::default(),
+                    DefaultFailureConverter::default(),
+                    FailingCodec {
+                        failure: CodecFailure::Decode,
+                        encodes: Arc::new(AtomicUsize::new(0)),
+                    },
+                )
+            } else {
+                DataConverter::default()
+            };
+            let mut services = NexusServices::default();
+            services.register(service()).unwrap();
+            let payload = DataConverter::default()
+                .to_payload(&serialization_context(), &42_u32)
+                .await
+                .unwrap();
+            let execute = dispatch(
+                services,
+                client().await,
+                converter.clone(),
+                Some(proto::Request {
+                    variant: Some(request::Variant::StartOperation(
+                        proto::StartOperationRequest {
+                            service: Payments::name().to_owned(),
+                            operation: "quote".to_owned(),
+                            payload: Some(payload),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                "payments".to_owned(),
+                None,
+                CancellationToken::new(),
+            );
+            let nexus_task_completion::Status::Failure(failure) =
+                execute_request(execute, &CancellationToken::new(), &converter, "test").await
+            else {
+                panic!("invalid input must not invoke the handler")
+            };
+            assert!(matches!(failure.failure_info,
+                Some(FailureInfo::NexusHandlerFailureInfo(info))
+                    if info.r#type == if codec_fails { "INTERNAL" } else { "BAD_REQUEST" }
+                    && info.retry_behavior == if codec_fails {
+                        NexusHandlerErrorRetryBehavior::Unspecified
+                    } else {
+                        NexusHandlerErrorRetryBehavior::NonRetryable
+                    } as i32));
+            assert!(failure.cause.is_some());
+        }
+    }
+
+    #[test]
+    fn explicit_payload_validation_is_permanent_but_output_failures_are_internal() {
+        let validation = || {
+            PayloadConversionError::EncodingError(Box::new(
+                ApplicationFailure::builder("input rejected")
+                    .non_retryable(true)
+                    .type_name("PayloadValidationError".to_owned())
+                    .build(),
+            ))
+        };
+        for error in [
+            TemporalOperationError::input_conversion_error(validation()),
+            TemporalOperationError::input_codec_error(validation()),
+        ] {
+            let nexus_task_completion::Status::Failure(failure) =
+                error.into_status(&DataConverter::default())
+            else {
+                panic!("expected validation failure");
+            };
+            assert!(matches!(failure.failure_info,
+                Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "BAD_REQUEST"
+                    && info.retry_behavior == NexusHandlerErrorRetryBehavior::NonRetryable as i32));
+            assert_eq!(failure.cause.unwrap().message, "input rejected");
+        }
+        let nexus_task_completion::Status::Failure(failure) =
+            TemporalOperationError::from(validation()).into_status(&DataConverter::default())
+        else {
+            panic!("expected output conversion failure")
+        };
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "INTERNAL"
+                && info.retry_behavior == NexusHandlerErrorRetryBehavior::NonRetryable as i32));
+    }
+
+    struct PanickingFailureConverter;
+
+    impl FailureConverter for PanickingFailureConverter {
+        fn to_failure(
+            &self,
+            _: OutgoingError,
+            _: &PayloadConverter,
+            _: &SerializationContextData,
+        ) -> Failure {
+            panic!("failure converter panic");
+        }
+
+        fn to_error(
+            &self,
+            _: Failure,
+            _: &PayloadConverter,
+            _: &SerializationContextData,
+        ) -> Result<IncomingError, PayloadConversionError> {
+            unreachable!("this test only encodes failures");
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_completion_converters_cannot_strand_the_task() {
+        for codec_failure in [
+            None,
+            Some(CodecFailure::Encode),
+            Some(CodecFailure::EncodePanic),
+        ] {
+            let encodes = Arc::new(AtomicUsize::new(0));
+            let converter = if let Some(failure) = codec_failure {
+                DataConverter::new(
+                    PayloadConverter::default(),
+                    DefaultFailureConverter::default(),
+                    FailingCodec {
+                        failure,
+                        encodes: encodes.clone(),
+                    },
+                )
+            } else {
+                DataConverter::new(
+                    PayloadConverter::default(),
+                    PanickingFailureConverter,
+                    CountingCodec {
+                        encodes: encodes.clone(),
+                        ..Default::default()
+                    },
+                )
+            };
+            let status = execute_request(
+                async {
+                    Err(OperationError::failed("original failure")
+                        .with_source(
+                            ApplicationFailure::builder("cause")
+                                .details("detail")
+                                .build(),
+                        )
+                        .into())
+                },
+                &CancellationToken::new(),
+                &converter,
+                "test",
+            )
+            .await;
+            let nexus_task_completion::Status::Failure(failure) = status else {
+                panic!("Core must always receive a completion");
+            };
+            assert!(
+                failure
+                    .message
+                    .starts_with("Failed building Nexus task completion:")
+            );
+            assert!(failure.cause.is_none());
+            assert!(failure.encoded_attributes.is_none());
+            assert!(matches!(failure.failure_info,
+                Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "INTERNAL"
+                    && info.retry_behavior == NexusHandlerErrorRetryBehavior::Unspecified as i32));
+            assert_eq!(
+                encodes.load(Ordering::SeqCst),
+                usize::from(codec_failure.is_some())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_panics_retain_their_diagnostic_cause() {
+        let status = execute_request(
+            async { panic!("handler diagnostic") },
+            &CancellationToken::new(),
+            &DataConverter::default(),
+            "test",
+        )
+        .await;
+        let nexus_task_completion::Status::Failure(failure) = status else {
+            panic!("expected handler failure")
+        };
+        assert_eq!(failure.message, "Internal handler error");
+        assert_eq!(
+            failure.cause.unwrap().message,
+            "Nexus handler panicked: handler diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceling_a_missing_workflow_reports_not_found() {
+        let mut options = ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+            .dns_load_balancing(None)
+            .service_override(CallbackBasedGrpcService {
+                callback: Arc::new(|request| {
+                    assert_eq!(request.rpc, "RequestCancelWorkflowExecution");
+                    async { Err(Status::not_found("workflow no longer exists")) }.boxed()
+                }),
+            })
+            .build();
+        options.set_skip_get_system_info(true);
+        let client = Client::new(
+            Connection::connect(options).await.unwrap(),
+            ClientOptions::new("test").build(),
+        )
+        .unwrap();
+        let mut services = NexusServices::default();
+        services.register(service()).unwrap();
+        let converter = DataConverter::default();
+        let execute = dispatch(
+            services,
+            client,
+            converter.clone(),
+            Some(proto::Request {
+                variant: Some(request::Variant::CancelOperation(
+                    proto::CancelOperationRequest {
+                        service: Payments::name().to_owned(),
+                        operation: "quote".to_owned(),
+                        operation_token: WorkflowOperationToken::new(
+                            "test".to_owned(),
+                            "gone".to_owned(),
+                        )
+                        .encode_token(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            "payments".to_owned(),
+            None,
+            CancellationToken::new(),
+        );
+        let nexus_task_completion::Status::Failure(failure) =
+            execute_request(execute, &CancellationToken::new(), &converter, "test").await
+        else {
+            panic!("missing workflows must not be acknowledged as successfully canceled")
+        };
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "NOT_FOUND"
+                && info.retry_behavior == NexusHandlerErrorRetryBehavior::Unspecified as i32));
+        assert_eq!(failure.message, "workflow no longer exists");
+        assert!(failure.cause.is_some());
+    }
+
+    #[tokio::test]
+    async fn unavailable_external_input_is_a_retryable_handler_failure() {
+        let mut services = NexusServices::default();
+        services.register(service()).unwrap();
+        let converter = DataConverter::default();
+        let execute = dispatch(
+            services,
+            client().await,
+            converter.clone(),
+            Some(proto::Request {
+                variant: Some(request::Variant::StartOperation(
+                    proto::StartOperationRequest {
+                        service: Payments::name().to_owned(),
+                        operation: "quote".to_owned(),
+                        payload: Some(Payload {
+                            metadata: HashMap::from([
+                                ("encoding".to_owned(), b"json/protobuf".to_vec()),
+                                (
+                                    "messageType".to_owned(),
+                                    b"temporal.api.sdk.v1.ExternalStorageReference".to_vec(),
+                                ),
+                            ]),
+                            data: br#"{"driverName":"missing-driver","claimData":{}}"#.to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            "payments".to_owned(),
+            None,
+            CancellationToken::new(),
+        );
+        let nexus_task_completion::Status::Failure(failure) =
+            execute_request(execute, &CancellationToken::new(), &converter, "test").await
+        else {
+            panic!("the handler must not receive an unresolved storage reference")
+        };
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "INTERNAL"
+                && info.retry_behavior == NexusHandlerErrorRetryBehavior::Unspecified as i32));
+        assert!(failure.cause.unwrap().message.contains("TMPRL1105"));
+    }
+
+    struct FailingStore(Arc<AtomicUsize>);
+
+    impl StorageDriver for FailingStore {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn driver_type(&self) -> &str {
+            "test"
+        }
+
+        fn store(
+            &self,
+            context: &StorageDriverStoreContext,
+            _: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
+            assert_eq!(context.namespace.as_deref(), Some("test"));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            async { Err(StorageDriverError::Other(anyhow::anyhow!("store outage"))) }.boxed()
+        }
+
+        fn retrieve(
+            &self,
+            _: &StorageDriverRetrieveContext,
+            _: Vec<StorageDriverClaim>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
+            unreachable!("this test only stores completions");
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_storage_failure_is_reported_without_retrying_storage() {
+        let stores = Arc::new(AtomicUsize::new(0));
+        let storage = ExternalStorage::new(Arc::new(FailingStore(stores.clone())))
+            .unwrap()
+            .with_payload_size_threshold(0);
+        let converter = DataConverter::default().with_external_storage(storage);
+        let payload = converter
+            .to_payload(&serialization_context(), &"output")
+            .await
+            .unwrap();
+        let status = start_status(start_operation_response::Variant::SyncSuccess(
+            start_operation_response::Sync {
+                payload: Some(payload),
+                links: Vec::new(),
+            },
+        ));
+        let nexus_task_completion::Status::Failure(failure) = execute_request(
+            async { Ok(status) },
+            &CancellationToken::new(),
+            &converter,
+            "test",
+        )
+        .await
+        else {
+            panic!("failed storage must not send a partial completion")
+        };
+        assert!(failure.message.contains("store outage"));
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "INTERNAL"));
+        assert!(failure.cause.is_none());
+        assert_eq!(stores.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn result_codec_rejection_preserves_application_retry_policy() {
+        let encodes = Arc::new(AtomicUsize::new(0));
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            FailingCodec {
+                failure: CodecFailure::EncodeNonRetryableOnce,
+                encodes: encodes.clone(),
+            },
+        );
+        let payload = DataConverter::default()
+            .to_payload(&serialization_context(), &"output")
+            .await
+            .unwrap();
+        let response = start_status(start_operation_response::Variant::SyncSuccess(
+            start_operation_response::Sync {
+                payload: Some(payload),
+                links: Vec::new(),
+            },
+        ));
+        let nexus_task_completion::Status::Failure(failure) = execute_request(
+            async { Ok(response) },
+            &CancellationToken::new(),
+            &converter,
+            "test",
+        )
+        .await
+        else {
+            panic!("rejected output must not be reported as success")
+        };
+        assert!(matches!(failure.failure_info,
+            Some(FailureInfo::NexusHandlerFailureInfo(ref info)) if info.r#type == "INTERNAL"
+                && info.retry_behavior == NexusHandlerErrorRetryBehavior::NonRetryable as i32));
+        let IncomingError::NexusHandler(handler) = converter
+            .failure_converter()
+            .to_error(
+                failure,
+                converter.payload_converter(),
+                &serialization_context(),
+            )
+            .unwrap()
+        else {
+            panic!("expected handler failure")
+        };
+        let Some(IncomingError::Application(cause)) = handler.cause() else {
+            panic!("expected immediate application cause");
+        };
+        assert_eq!(cause.type_name(), Some("OutputRejected"));
+        assert!(cause.is_non_retryable());
+        assert_eq!(
+            cause.details::<String>().unwrap().as_deref(),
+            Some("rejection detail")
+        );
+        assert_eq!(encodes.load(Ordering::SeqCst), 2);
+    }
+
+    struct BlockingCodec(Arc<Notify>);
+
+    impl PayloadCodec for BlockingCodec {
+        fn encode(
+            &self,
+            _: &SerializationContextData,
+            _: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            let started = self.0.clone();
+            async move {
+                started.notify_one();
+                std::future::pending().await
+            }
+            .boxed()
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            async { Ok(payloads) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn task_cancellation_during_encoding_is_acknowledged() {
+        let started = Arc::new(Notify::new());
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            BlockingCodec(started.clone()),
+        );
+        let payload = DataConverter::default()
+            .to_payload(&serialization_context(), &"output")
+            .await
+            .unwrap();
+        let response = start_status(start_operation_response::Variant::SyncSuccess(
+            start_operation_response::Sync {
+                payload: Some(payload),
+                links: Vec::new(),
+            },
+        ));
+        let cancellation = CancellationToken::new();
+        let (completion, ()) = tokio::join!(
+            execute_request(async { Ok(response) }, &cancellation, &converter, "test"),
+            async {
+                started.notified().await;
+                cancellation.cancel();
+            },
+        );
+        assert!(matches!(
+            completion,
+            nexus_task_completion::Status::AckCancel(true)
+        ));
     }
 }
