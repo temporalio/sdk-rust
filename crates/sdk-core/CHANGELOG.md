@@ -37,6 +37,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* Low-level Operator Service calls support namespace soft deletion, restoration, and restore
+  progress queries.
 * Cloud API bindings support v0.27.0, including user group memberships, projects,
   project-scoped custom roles, and caller rate limit operations.
 
@@ -56,6 +58,8 @@ relevant information.
   late completions of abandoned activities already were.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
 ### Changed
+* [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
+  compatible with current nexgen default expressions and workflow-target generation.
 * Workflow task completions and failures set `resource_id` to `workflow:<workflow_id>`, on every
   page of a paginated completion. Activity task completions, failures, cancellations, and
   heartbeats set it to `workflow:<workflow_id>`, or `activity:<activity_id>` for a standalone

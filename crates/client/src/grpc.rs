@@ -1891,6 +1891,24 @@ proxier! {
             r.extensions_mut().insert(labels);
         }
     );
+    (soft_delete_namespace, SoftDeleteNamespaceRequest, SoftDeleteNamespaceResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (restore_namespace, RestoreNamespaceRequest, RestoreNamespaceResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (describe_namespace_restore, DescribeNamespaceRestoreRequest, DescribeNamespaceRestoreResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
     (add_or_update_remote_cluster, AddOrUpdateRemoteClusterRequest, AddOrUpdateRemoteClusterResponse);
     (remove_remote_cluster, RemoveRemoteClusterRequest, RemoveRemoteClusterResponse);
     (list_clusters, ListClustersRequest, ListClustersResponse);

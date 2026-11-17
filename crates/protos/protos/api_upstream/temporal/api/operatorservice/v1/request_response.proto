@@ -10,8 +10,10 @@ option ruby_package = "Temporalio::Api::OperatorService::V1";
 option csharp_namespace = "Temporalio.Api.OperatorService.V1";
 
 import "temporal/api/enums/v1/common.proto";
+import "temporal/api/enums/v1/namespace.proto";
 import "temporal/api/nexus/v1/message.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 // (-- Search Attribute --)
 
@@ -58,6 +60,46 @@ message DeleteNamespaceRequest {
 message DeleteNamespaceResponse {
     // Temporary namespace name that is used during reclaim resources step.
     string deleted_namespace = 1;
+}
+
+message SoftDeleteNamespaceRequest {
+    // Only one of namespace or namespace_id must be specified to identify namespace.
+    string namespace = 1;
+    string namespace_id = 2;
+}
+
+message SoftDeleteNamespaceResponse {
+}
+
+message RestoreNamespaceRequest {
+    // Only one of namespace or namespace_id must be specified to identify namespace.
+    string namespace = 1;
+    string namespace_id = 2;
+}
+
+message RestoreNamespaceResponse {
+}
+
+message DescribeNamespaceRestoreRequest {
+    // Only one of namespace or namespace_id must be specified to identify namespace.
+    string namespace = 1;
+    string namespace_id = 2;
+}
+
+message DescribeNamespaceRestoreResponse {
+    temporal.api.enums.v1.NamespaceRestoreState state = 1;
+    // Cluster that runs the restore job.
+    string host_cluster = 2;
+    google.protobuf.Timestamp start_time = 3;
+    // Unset while the restore is running.
+    google.protobuf.Timestamp close_time = 4;
+    // Run ID of the restore job.
+    string run_id = 5;
+    // Estimated when the refresh starts.
+    int64 total_execution_count = 6;
+    // Executions processed on every cluster.
+    int64 processed_execution_count = 7;
+    google.protobuf.Timestamp estimated_completion_time = 8;
 }
 
 message AddOrUpdateRemoteClusterRequest {

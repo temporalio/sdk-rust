@@ -136,6 +136,7 @@ message WorkflowExecutionExtendedInfo {
     // Information about the workflow execution pause operation.
     WorkflowExecutionPauseInfo pause_info = 8;
 
+    // Experimental.
     // Information about time skipping of the workflow execution.
     // If the execution has never enabled time skipping, it will be nil.
     temporal.api.common.v1.TimeSkippingInfo time_skipping_info = 9;
@@ -597,6 +598,7 @@ message WorkflowExecutionOptions {
     // If set, overrides the workflow's priority sent by the SDK.
     temporal.api.common.v1.Priority priority = 2;
 
+    // Experimental.
     // The time-skipping configuration for this workflow execution.
     // When `fast_forward` is set, time will be fast-forwarded to a future point relative
     // to the current workflow timestamp. Each call takes effect, even if

@@ -47,6 +47,23 @@ service OperatorService {
     rpc DeleteNamespace (DeleteNamespaceRequest) returns (DeleteNamespaceResponse) {
     }
 
+    // SoftDeleteNamespace moves a namespace to NAMESPACE_STATE_SOFT_DELETED on every cluster in its
+    // replication config. Executions stop making progress, but no data is removed. A running restore
+    // is marked failed. Idempotent.
+    rpc SoftDeleteNamespace (SoftDeleteNamespaceRequest) returns (SoftDeleteNamespaceResponse) {
+    }
+
+    // RestoreNamespace moves a soft-deleted namespace back to NAMESPACE_STATE_REGISTERED on every
+    // cluster in its replication config, then starts a job that refreshes every execution so they
+    // resume. Returns UNAVAILABLE until every cluster has the new state; retry until it succeeds.
+    // Idempotent.
+    rpc RestoreNamespace (RestoreNamespaceRequest) returns (RestoreNamespaceResponse) {
+    }
+
+    // DescribeNamespaceRestore reports the state and progress of the namespace's most recent restore.
+    rpc DescribeNamespaceRestore (DescribeNamespaceRestoreRequest) returns (DescribeNamespaceRestoreResponse) {
+    }
+
     // AddOrUpdateRemoteCluster adds or updates remote cluster.
     rpc AddOrUpdateRemoteCluster(AddOrUpdateRemoteClusterRequest) returns (AddOrUpdateRemoteClusterResponse) {
     }

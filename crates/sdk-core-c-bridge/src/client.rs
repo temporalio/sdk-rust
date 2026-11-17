@@ -1131,6 +1131,9 @@ async fn call_operator_service(
         "DeleteNexusEndpoint" => {
             rpc_call_on_trait!(client, call, OperatorService, delete_nexus_endpoint)
         }
+        "DescribeNamespaceRestore" => {
+            rpc_call_on_trait!(client, call, OperatorService, describe_namespace_restore)
+        }
         "GetNexusEndpoint" => rpc_call_on_trait!(client, call, OperatorService, get_nexus_endpoint),
         "ListClusters" => rpc_call_on_trait!(client, call, OperatorService, list_clusters),
         "ListNexusEndpoints" => {
@@ -1144,6 +1147,10 @@ async fn call_operator_service(
         }
         "RemoveSearchAttributes" => {
             rpc_call_on_trait!(client, call, OperatorService, remove_search_attributes)
+        }
+        "RestoreNamespace" => rpc_call_on_trait!(client, call, OperatorService, restore_namespace),
+        "SoftDeleteNamespace" => {
+            rpc_call_on_trait!(client, call, OperatorService, soft_delete_namespace)
         }
         "UpdateNexusEndpoint" => {
             rpc_call_on_trait!(client, call, OperatorService, update_nexus_endpoint)
