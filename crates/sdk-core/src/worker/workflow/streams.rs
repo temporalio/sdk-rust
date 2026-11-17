@@ -62,6 +62,8 @@ pub struct StreamRuntimes {
     /// The bytes of one read's Records that may wait for Workflow code, or `None` for
     /// [DEFAULT_READ_AHEAD_BYTES].
     read_ahead_bytes: Option<usize>,
+    /// The Records of one read in one activation, or `None` for [STREAM_PAGE_MAX_RECORDS].
+    read_page_records: Option<usize>,
 }
 
 impl StreamRuntimes {
@@ -70,6 +72,7 @@ impl StreamRuntimes {
         Self {
             runtimes: runtimes.into_iter().collect(),
             read_ahead_bytes: None,
+            read_page_records: None,
         }
     }
 
@@ -88,6 +91,27 @@ impl StreamRuntimes {
     /// The bound that [StreamRuntimes::with_read_ahead_bytes] set, if it set one.
     pub fn read_ahead_bytes(&self) -> Option<usize> {
         self.read_ahead_bytes
+    }
+
+    /// The runtimes with `records` as the most Records of one read in one activation. Core keeps
+    /// the Records over it and gives them in the next activation, with no wait. Unset is 256. A
+    /// value under 1 or over 1000 is refused when the Worker's config is built. A replay gives
+    /// each page as History has it, whatever this value is.
+    pub fn with_read_page_records(self, records: usize) -> Self {
+        Self {
+            read_page_records: Some(records),
+            ..self
+        }
+    }
+
+    /// The cap that [StreamRuntimes::with_read_page_records] set, if it set one.
+    pub fn read_page_records(&self) -> Option<usize> {
+        self.read_page_records
+    }
+
+    /// The Records of one read in one activation, with the default when the Worker set none.
+    pub(crate) fn page_cap(&self) -> usize {
+        self.read_page_records.unwrap_or(STREAM_PAGE_MAX_RECORDS)
     }
 
     /// The Worker's options of a read.
@@ -226,12 +250,15 @@ pub(crate) struct StreamTestHooks {
 /// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
 /// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
 pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
-/// The Records of one read in one activation. With no bound, a read of a long backlog would give
-/// Workflow code all of it in one page, which lang must handle in one activation. A count adds no
-/// wait, unlike a time gap, and means the same on any machine. Core keeps the Records over it and
-/// gives them in the next activation, which it issues with no wait. Replay gives the pages of
-/// History as they are, so the bound doesn't apply there.
+/// The Records of one read in one activation when the Worker sets no `read_page_records`. With no
+/// bound, a read of a long backlog would give Workflow code all of it in one page, which lang must
+/// handle in one activation. A count adds no wait, unlike a time gap, and means the same on any
+/// machine. Core keeps the Records over it and gives them in the next activation, which it issues
+/// with no wait. Replay gives the pages of History as they are, so the bound doesn't apply there.
 pub(crate) const STREAM_PAGE_MAX_RECORDS: usize = 256;
+/// The highest `read_page_records` that a Worker may set. A larger page is one activation that
+/// lang must handle in one go, which is what the cap bounds.
+pub(crate) const MAX_READ_PAGE_RECORDS: usize = 1000;
 /// The wait before the second try of a Store call that failed with `StorageUnavailable`. A short
 /// Store outage should not reach Workflow code, as the retry of a Local Activity keeps it away.
 pub(crate) const STORE_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(100);
@@ -803,7 +830,7 @@ impl StreamManager {
 
 /// Reads until the first stop. It sends each response with Records as one batch immediately, and
 /// looks at the Store again right after. Batches that come while an activation of the run is out
-/// join, up to [STREAM_PAGE_MAX_RECORDS] for one activation.
+/// join, up to the Worker's `read_page_records` for one activation.
 async fn read(
     runtime: Arc<StreamRuntime>,
     spec: ReadSpec,
