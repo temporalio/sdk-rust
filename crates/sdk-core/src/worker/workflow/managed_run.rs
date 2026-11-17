@@ -252,8 +252,8 @@ impl ManagedRun {
             waiting.hb_timeout_handle.abort();
             waiting.heartbeat_timeout_pending = false;
         }
-        if let Some(message) = stream_replay_error {
-            return Err(WFMachinesError::StreamReplay(message).into());
+        if let Some(error) = stream_replay_error {
+            return Err(error.into());
         }
 
         if was_legacy_query

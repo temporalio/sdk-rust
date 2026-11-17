@@ -4070,6 +4070,7 @@ impl Held {
         let hooks = StreamTestHooks {
             close_bound,
             shutdown_waits: Some(self.shutdown_waits.clone()),
+            ..Default::default()
         };
         start_configured(
             t,
@@ -5569,4 +5570,159 @@ async fn an_append_with_sequence_zero_is_not_retried() {
     worker.complete_execution(&result.run_id).await;
     worker.drain_pollers_and_shutdown().await;
     assert!(all_records(&runtime, "s").await.is_empty());
+}
+
+/// A replay whose Store fails once reads the Records on its next try, and gives them.
+#[tokio::test]
+async fn a_replay_retries_a_store_that_fails_once() {
+    let (runtime, flaky) = flaky_runtime().await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, _) = one_page(&all_records(&runtime, "s").await);
+    flaky.fail_reads.store(1, Ordering::Release);
+    let run = start(
+        replayed_read_history(&data),
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        1,
+        0,
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(&run.worker, &first, vec![read_cmd(1, "s").into()]).await;
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_eq!(texts(&reads(&replayed)[0].records), ["a", "b"]);
+    assert_eq!(flaky.fail_reads.load(Ordering::Acquire), 0);
+    complete(&run.worker, &replayed, vec![]).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    run.worker.complete_execution(&live.run_id).await;
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(run.failed.lock().is_empty());
+}
+
+/// A shorter bound of a replay's retry. A replay reads the Store on the Worker's own thread, whose
+/// clock a test can't pause.
+const SHORT_REPLAY_BOUND: Duration = Duration::from_millis(500);
+
+/// A replay whose Store stays down past the bound fails only its task, with
+/// `StreamReplayUnavailable`, also on a Worker that fails the Workflow for a `StreamReplayError`.
+#[tokio::test]
+async fn a_replay_whose_store_stays_down_fails_only_the_task() {
+    let (runtime, flaky) = flaky_runtime().await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, range) = one_page(&all_records(&runtime, "s").await);
+    flaky.fail_reads.store(usize::MAX, Ordering::Release);
+    let run = start_configured(
+        replayed_read_history(&data),
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        (1, 1, true),
+        None,
+        |wc| {
+            wc.workflow_failure_errors = [WorkflowErrorType::StreamReplay].into();
+            wc.stream_test_hooks = StreamTestHooks {
+                replay_retry_bound: Some(SHORT_REPLAY_BOUND),
+                ..Default::default()
+            };
+        },
+    );
+    let started = tokio::time::Instant::now();
+    tokio::select! {
+        _ = until("the failed task", || run.failed.lock().len() == 1) => {}
+        polled = run.worker.poll_workflow_activation() => {
+            panic!("The task should fail before any activation: {polled:?}")
+        }
+    }
+    assert!(
+        started.elapsed() >= SHORT_REPLAY_BOUND,
+        "{:?}",
+        started.elapsed()
+    );
+    // A try after each wait of 100, 200 and 200 ms, and one before them.
+    assert!(flaky.fail_reads.load(Ordering::Acquire) <= usize::MAX - 4);
+    run.worker.drain_pollers_and_shutdown().await;
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].0,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    assert!(
+        failed[0].1.starts_with(&format!(
+            "StreamReplayUnavailable: {range}: stream_storage_unavailable"
+        )),
+        "{}",
+        failed[0].1
+    );
+    assert!(
+        run.sent
+            .lock()
+            .iter()
+            .all(|sent| workflow_failure(sent).is_none()),
+        "the Workflow failed"
+    );
+}
+
+/// A replay Worker whose Store stays down evicts the run with `StreamReplayUnavailable` and ends
+/// the history, and doesn't fail the Workflow for it.
+#[tokio::test]
+async fn a_replay_worker_whose_store_stays_down_ends_the_history() {
+    let (runtime, flaky) = flaky_runtime().await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (data, range) = one_page(&all_records(&runtime, "s").await);
+    flaky.fail_reads.store(usize::MAX, Ordering::Release);
+    let sent = Arc::new(Mutex::new(vec![]));
+    let kept = sent.clone();
+    let mut client = crate::worker::client::mocks::mock_manual_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .returning(move |completion, _| {
+            kept.lock().push(completion);
+            async { Ok(Default::default()) }.boxed()
+        });
+    client
+        .expect_fail_workflow_task()
+        .returning(|_, _, _| async { Ok(Default::default()) }.boxed());
+    let mut cfg = test_worker_cfg()
+        .stream_runtimes(runtimes(&runtime))
+        .workflow_failure_errors([WorkflowErrorType::StreamReplay].into())
+        .build()
+        .unwrap();
+    cfg.stream_test_hooks = StreamTestHooks {
+        replay_retry_bound: Some(SHORT_REPLAY_BOUND),
+        ..Default::default()
+    };
+    let mut input = ReplayWorkerInput::new(
+        cfg,
+        futures_util::stream::iter([HistoryForReplay::from(replayed_read_history(&data))]),
+    );
+    input.client_override = Some(client);
+    let worker = crate::init_replay_worker(input).unwrap();
+    let evicted = worker.poll_workflow_activation().await.unwrap();
+    let Some(workflow_activation_job::Variant::RemoveFromCache(evict)) =
+        evicted.jobs.first().and_then(|job| job.variant.clone())
+    else {
+        panic!("Expected an eviction, got {:?}", evicted.jobs);
+    };
+    assert!(
+        evict.message.contains(&format!(
+            "StreamReplayUnavailable: {range}: stream_storage_unavailable"
+        )),
+        "{}",
+        evict.message
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(evicted.run_id))
+        .await
+        .unwrap();
+    let next = worker.poll_workflow_activation().await;
+    assert!(
+        next.is_err(),
+        "the replay Worker fed the history again: {next:?}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker.drain_pollers_and_shutdown()).await;
+    assert!(
+        sent.lock()
+            .iter()
+            .all(|sent| workflow_failure(sent).is_none())
+    );
 }
