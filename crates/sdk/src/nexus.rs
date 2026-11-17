@@ -52,9 +52,8 @@ use futures_util::{FutureExt, future::BoxFuture};
 use nexus_rpc::{HandlerError, HandlerErrorRetryBehavior, HandlerErrorType, OperationError};
 pub use nexus_rpc::{NexusOperation, NexusService};
 use serde::{Deserialize, Serialize};
-use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
 use std::{
-    any::Any, cell::RefCell, collections::HashMap, future::Future, io, marker::PhantomData,
+    any::Any, cell::RefCell, collections::HashMap, future::Future, marker::PhantomData,
     panic::AssertUnwindSafe, sync::Arc, time::SystemTime,
 };
 use temporalio_client::{
@@ -76,7 +75,8 @@ use temporalio_common::{
     protos::{
         coresdk::nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
         temporal::api::{
-            common::v1::{Callback, callback},
+            common::v1::{Callback, Link, callback, link},
+            enums::v1::EventType,
             failure::v1::{Failure, NexusHandlerFailureInfo, failure::FailureInfo},
             nexus::v1::{self as proto, request, response, start_operation_response},
         },
@@ -103,41 +103,6 @@ pub struct TemporalOperationToken {
 
 tokio::task_local! {
     static OUTBOUND_LINKS: RefCell<Vec<proto::Link>>;
-}
-
-// System.Text.Json escapes non-ASCII and HTML-sensitive characters even inside base64 tokens.
-// Matching it keeps operation identities byte-for-byte compatible with the .NET SDK.
-struct DotnetTokenFormatter;
-
-impl Formatter for DotnetTokenFormatter {
-    fn write_string_fragment<W: io::Write + ?Sized>(
-        &mut self,
-        writer: &mut W,
-        fragment: &str,
-    ) -> io::Result<()> {
-        for ch in fragment.chars() {
-            if ch.is_ascii() && !matches!(ch, '&' | '\'' | '+' | '<' | '>' | '`' | '\x7f') {
-                writer.write_all(&[ch as u8])?;
-            } else {
-                for unit in ch.encode_utf16(&mut [0; 2]) {
-                    write!(writer, "\\u{unit:04X}")?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn write_char_escape<W: io::Write + ?Sized>(
-        &mut self,
-        writer: &mut W,
-        escape: CharEscape,
-    ) -> io::Result<()> {
-        match escape {
-            CharEscape::Quote => writer.write_all(b"\\u0022"),
-            CharEscape::AsciiControl(byte) => write!(writer, "\\u{byte:04X}"),
-            escape => CompactFormatter.write_char_escape(writer, escape),
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -167,12 +132,8 @@ impl WorkflowOperationToken {
     }
 
     fn encode_token(&self) -> String {
-        let mut json = Vec::new();
-        self.serialize(&mut serde_json::Serializer::with_formatter(
-            &mut json,
-            DotnetTokenFormatter,
-        ))
-        .expect("operation token contains only JSON-compatible fields");
+        let json =
+            serde_json::to_vec(self).expect("operation token contains only JSON-compatible fields");
         general_purpose::URL_SAFE_NO_PAD.encode(json)
     }
 
@@ -256,10 +217,7 @@ impl TemporalNexusClient {
 
     /// Start a workflow that completes this Nexus operation when it completes.
     ///
-    /// The supplied task queue is passed through unchanged. Use the request ID for a stable
-    /// workflow ID so retried Nexus start requests do not start multiple workflows. The Nexus
-    /// request ID is also used as the workflow start RPC's idempotency key; other options,
-    /// including workflow ID reuse and conflict policies, are preserved.
+    /// The Nexus request ID is used as the workflow start RPC's idempotency key.
     ///
     /// The workflow ID identifies the operation, including cancellation. Do not reuse it for
     /// independent operations, since a delayed cancellation could target a later execution.
@@ -289,7 +247,6 @@ impl TemporalNexusClient {
             let mut header = self.request.callback_header.clone();
             // Completion can reach the caller before AsyncSuccess supplies the operation identity.
             header.insert("nexus-operation-token".to_owned(), token.clone());
-            header.insert("nexus-operation-id".to_owned(), token.clone());
             options.completion_callbacks.push(Callback {
                 variant: Some(callback::Variant::Nexus(callback::Nexus {
                     url: self.request.callback.clone(),
@@ -298,7 +255,7 @@ impl TemporalNexusClient {
                 links,
             });
         }
-        let handle = temporalio_client::__internal::start_nexus_workflow(
+        let response_link = temporalio_client::__internal::start_nexus_workflow(
             &self.client,
             workflow,
             input,
@@ -307,35 +264,60 @@ impl TemporalNexusClient {
         )
         .await
         .map_err(TemporalOperationError::from)?;
-        let info = handle.info();
-        let run_id = info.run_id.as_deref().ok_or_else(|| {
-            TemporalOperationError::handler("INTERNAL", "Workflow start returned no run ID", true)
-        })?;
-        let mut url = Url::parse("temporal:///").expect("valid Temporal link base");
-        url.path_segments_mut()
-            .expect("Temporal link supports path segments")
-            .extend([
-                "namespaces",
-                &info.namespace,
-                "workflows",
-                &info.workflow_id,
-                run_id,
-                "history",
-            ]);
-        url.query_pairs_mut()
-            .append_pair("eventID", "1")
-            .append_pair("eventType", "WorkflowExecutionStarted")
-            .append_pair("referenceType", "EventReference");
-        OUTBOUND_LINKS.with(|links| {
-            links.borrow_mut().push(proto::Link {
-                url: url.into(),
-                r#type: "temporal.api.common.v1.Link.WorkflowEvent".to_owned(),
+        if let Some(link) = workflow_event_link_to_nexus(response_link)? {
+            OUTBOUND_LINKS.with(|links| {
+                links.borrow_mut().push(link);
             });
-        });
+        }
         Ok(TemporalOperationResult::Async(TemporalOperationToken {
             token,
         }))
     }
+}
+
+fn workflow_event_link_to_nexus(
+    link: Option<Link>,
+) -> Result<Option<proto::Link>, TemporalOperationError> {
+    let Some(link::Variant::WorkflowEvent(event)) = link.and_then(|link| link.variant) else {
+        return Ok(None);
+    };
+    let mut url = Url::parse("temporal:///").expect("valid Temporal link base");
+    url.path_segments_mut()
+        .expect("Temporal link supports path segments")
+        .extend([
+            "namespaces",
+            &event.namespace,
+            "workflows",
+            &event.workflow_id,
+            &event.run_id,
+            "history",
+        ]);
+    if let Some(reference) = event.reference {
+        let (key, value, event_type, reference_type) = match reference {
+            link::workflow_event::Reference::EventRef(reference) => (
+                "eventID",
+                reference.event_id.to_string(),
+                reference.event_type,
+                "EventReference",
+            ),
+            link::workflow_event::Reference::RequestIdRef(reference) => (
+                "requestID",
+                reference.request_id,
+                reference.event_type,
+                "RequestIdReference",
+            ),
+        };
+        let event_type = EventType::try_from(event_type)
+            .map_err(|error| TemporalOperationError::handler("INTERNAL", error, true))?;
+        url.query_pairs_mut()
+            .append_pair(key, &value)
+            .append_pair("eventType", &format!("{event_type:?}"))
+            .append_pair("referenceType", reference_type);
+    }
+    Ok(Some(proto::Link {
+        url: url.into(),
+        r#type: "temporal.api.common.v1.Link.WorkflowEvent".to_owned(),
+    }))
 }
 
 /// Invalid Nexus service or operation registration.
@@ -1111,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_tokens_match_dotnet_serialization() {
+    fn operation_tokens_accept_cross_sdk_escaping() {
         for (namespace, workflow_id, expected) in [
             ("ns", "wid", "eyJucyI6Im5zIiwid2lkIjoid2lkIiwidCI6MX0"),
             (
@@ -1126,10 +1108,21 @@ mod tests {
             ),
         ] {
             let token = WorkflowOperationToken::new(namespace.to_owned(), workflow_id.to_owned());
-            assert_eq!(token.encode_token(), expected);
-            let decoded = WorkflowOperationToken::decode_token(expected).unwrap();
-            assert_eq!(decoded.namespace, namespace);
-            assert_eq!(decoded.workflow_id, workflow_id);
+            for encoded in [expected, &token.encode_token()] {
+                let decoded = WorkflowOperationToken::decode_token(encoded).unwrap();
+                assert_eq!(decoded.namespace, namespace);
+                assert_eq!(decoded.workflow_id, workflow_id);
+            }
+        }
+        for json in [
+            r#"{"t":1,"ns":"\u540d\u524d","wid":"quote\"<>&'`+\\\n\ud83d\ude00"}"#,
+            r#"{"t":1,"ns":"名前","wid":"quote\"\u003c\u003e\u0026'`+\\\n😀"}"#,
+            r#"{"t":1,"ns":"名前","wid":"quote\"<>&'`+\\\n😀"}"#,
+        ] {
+            let token = general_purpose::URL_SAFE_NO_PAD.encode(json);
+            let decoded = WorkflowOperationToken::decode_token(&token).unwrap();
+            assert_eq!(decoded.namespace, "名前");
+            assert_eq!(decoded.workflow_id, "quote\"<>&'`+\\\n😀");
         }
     }
 
@@ -1418,9 +1411,34 @@ mod tests {
         type Run = Self;
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn workflow_backed_start_links_and_cancellation() {
+    async fn workflow_backed_start_links_and_cancellation(
+        #[values("missing", "event", "request_id", "workflow")] reference: &str,
+    ) {
         for with_callback in [true, false] {
+            let response_link = (reference != "missing").then(|| Link {
+                variant: Some(link::Variant::WorkflowEvent(link::WorkflowEvent {
+                    namespace: "server-namespace".to_owned(),
+                    workflow_id: "server/workflow".to_owned(),
+                    run_id: "original-run".to_owned(),
+                    reference: match reference {
+                        "event" => Some(link::workflow_event::Reference::EventRef(
+                            link::workflow_event::EventReference {
+                                event_id: 42,
+                                event_type: EventType::WorkflowExecutionOptionsUpdated as i32,
+                            },
+                        )),
+                        "request_id" => Some(link::workflow_event::Reference::RequestIdRef(
+                            link::workflow_event::RequestIdReference {
+                                request_id: "server-request".to_owned(),
+                                event_type: EventType::WorkflowExecutionOptionsUpdated as i32,
+                            },
+                        )),
+                        _ => None,
+                    },
+                })),
+            });
             let inbound = proto::Link {
                 url: "temporal:///namespaces/test/workflows/caller/caller-run/history?eventID=7&eventType=NexusOperationScheduled".to_owned(),
                 r#type: "temporal.api.common.v1.Link.WorkflowEvent".to_owned(),
@@ -1459,10 +1477,12 @@ mod tests {
                                     )
                                     .encode_token();
                                     assert_eq!(callback.header["nexus-operation-token"], token);
-                                    assert_eq!(callback.header["nexus-operation-id"], token);
+                                    assert!(!callback.header.contains_key("nexus-operation-id"));
                                 }
                                 StartWorkflowExecutionResponse {
                                     run_id: "current-run".to_owned(),
+                                    first_execution_run_id: "first-run".to_owned(),
+                                    link: response_link.clone(),
                                     ..Default::default()
                                 }
                                 .encode_to_vec()
@@ -1558,10 +1578,27 @@ mod tests {
             else {
                 panic!("expected async success");
             };
-            assert_eq!(result.links.len(), 1);
+            let expected_url = match reference {
+                "missing" => None,
+                "event" => Some(
+                    "temporal:///namespaces/server-namespace/workflows/server%2Fworkflow/original-run/history?eventID=42&eventType=WorkflowExecutionOptionsUpdated&referenceType=EventReference",
+                ),
+                "request_id" => Some(
+                    "temporal:///namespaces/server-namespace/workflows/server%2Fworkflow/original-run/history?requestID=server-request&eventType=WorkflowExecutionOptionsUpdated&referenceType=RequestIdReference",
+                ),
+                _ => Some(
+                    "temporal:///namespaces/server-namespace/workflows/server%2Fworkflow/original-run/history",
+                ),
+            };
             assert_eq!(
-                result.links[0].url,
-                "temporal:///namespaces/test/workflows/backing%2Fid/current-run/history?eventID=1&eventType=WorkflowExecutionStarted&referenceType=EventReference"
+                result.links,
+                expected_url
+                    .into_iter()
+                    .map(|url| proto::Link {
+                        url: url.to_owned(),
+                        r#type: "temporal.api.common.v1.Link.WorkflowEvent".to_owned(),
+                    })
+                    .collect::<Vec<_>>(),
             );
             assert_eq!(
                 result.operation_token,

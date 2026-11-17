@@ -398,19 +398,16 @@ impl PaymentHandlers {
     #[temporal_operation]
     async fn charge(
         &self,
-        ctx: NexusContext,
+        _ctx: NexusContext,
         client: TemporalNexusClient,
         input: String,
     ) -> Result<TemporalOperationResult<String>, TemporalOperationError> {
+        let workflow_id = format!("charge-{input}");
         client
             .start_workflow(
                 ChargeWorkflow::run,
                 input,
-                WorkflowStartOptions::new(
-                    "payments",
-                    format!("charge-{}", ctx.info().request_id),
-                )
-                .build(),
+                WorkflowStartOptions::new("payments", workflow_id).build(),
             )
             .await
     }
@@ -423,21 +420,16 @@ let options = WorkerOptions::new("payments")
 ```
 
 Request metadata, including headers, request ID, deadline, and cancellation, is available on the
-`NexusInfo` returned by `ctx.info()`. The request-scoped client is supplied as the second handler
-parameter, after the context and before the input. Return `TemporalOperationResult::Sync(output)`
+`NexusInfo` returned by `ctx.info()`. Return `TemporalOperationResult::Sync(output)`
 for a synchronous result, or use `client.start_workflow`
-to attach the Nexus completion callback to a typed workflow. Supplied workflow options, including the
-task queue, are passed through unchanged; the helper uses the Nexus request ID for start idempotency.
-Workflow-backed operation tokens identify a workflow by namespace and workflow ID, so use a unique
-workflow ID for each independent operation. Nexus polling is enabled only when services are registered.
+to attach the Nexus completion callback to a typed workflow. Nexus polling is enabled only when
+services are registered.
 
 Return `nexus_rpc::OperationError::failed(...)` or `OperationError::canceled(...)` through
 `TemporalOperationError` for terminal operation outcomes. Both support `with_source` to preserve an
 application cause and its details. `nexus_rpc::HandlerError` retains its error type, optional cause,
 and retry override. Unexpected implementation errors are retryable handler failures; direct
-application failures retain their non-retryable override as `INTERNAL` handler failures. See the
-[failure-handling comparison](../../arch_docs/nexus_failure_handling.md) for RPC mappings and
-cross-SDK conventions.
+application failures retain their non-retryable override as `INTERNAL` handler failures.
 
 ## Activities in detail
 

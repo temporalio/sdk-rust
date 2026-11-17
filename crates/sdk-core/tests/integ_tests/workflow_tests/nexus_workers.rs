@@ -1,18 +1,19 @@
 use crate::{
-    common::{CoreWfStarter, WorkflowHandleExt},
-    integ_tests::mk_nexus_endpoint,
+    common::{get_integ_client, integ_namespace, rand_6_chars},
+    integ_tests::mk_nexus_endpoint_for_client,
 };
 use nexus_rpc::service;
 use std::time::Duration;
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
+    WorkflowTermination,
     nexus::{
         NexusContext, NexusOperationOptions, NexusServiceClientOptions, TemporalNexusClient,
         TemporalOperationError, TemporalOperationResult, temporal_nexus_service_handler,
     },
+    workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -169,37 +170,42 @@ impl PaymentCaller {
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_worker(#[values(Outcome::Sync, Outcome::Async, Outcome::Cancel)] outcome: Outcome) {
-    let mut starter = CoreWfStarter::new("nexus_worker");
-    starter.set_core_task_types(WorkerTaskTypes {
-        enable_workflows: true,
-        enable_local_activities: false,
-        enable_remote_activities: false,
-        enable_nexus: true,
-    });
-    starter
-        .sdk_config
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let client = get_integ_client(integ_namespace(), None).await;
+    let task_queue = format!("nexus-worker-{}", rand_6_chars());
+    let options = WorkerOptions::new(task_queue.clone())
         .register_workflow::<PaymentCaller>()
-        .unwrap();
-    starter
-        .sdk_config
+        .unwrap()
         .register_workflow::<ChargeWorkflow>()
-        .unwrap();
-    starter
-        .sdk_config
+        .unwrap()
         .register_nexus_service(PaymentHandlers {
-            task_queue: starter.get_task_queue().to_owned(),
+            task_queue: task_queue.clone(),
         })
-        .unwrap();
-    let endpoint = mk_nexus_endpoint(&mut starter).await;
-    let mut worker = starter.worker().await;
-    let caller = worker
-        .submit_workflow(
+        .unwrap()
+        .build();
+    let endpoint = mk_nexus_endpoint_for_client(&client, &task_queue).await;
+    let worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let caller = client
+        .start_workflow(
             PaymentCaller::run,
             (endpoint, outcome),
-            starter.workflow_options.clone(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue)
+                .execution_timeout(Duration::from_secs(60))
+                .build(),
         )
         .await
         .unwrap();
-    worker.run_until_done().await.unwrap();
-    caller.fetch_history_and_replay(&mut worker).await.unwrap();
+    worker
+        .run_until(async { caller.get_result(Default::default()).await.unwrap() })
+        .await
+        .unwrap();
+    let history = caller.fetch_history(Default::default());
+    let replayer = WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .register_workflow::<PaymentCaller>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    replayer.replay_workflow(history).await.unwrap();
 }
