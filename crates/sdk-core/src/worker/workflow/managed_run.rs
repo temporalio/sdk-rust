@@ -941,8 +941,10 @@ impl ManagedRun {
                     waiting.hb_timeout_handle.abort();
                 }
                 // A close runs after the server took this task, and its result needs another
-                // one, unless the Workflow ends here.
-                let closing = self.wfm.machines.has_pending_close_intents()
+                // one, unless the Workflow ends here. So do the Stream results and intents that
+                // the marker of this task had no room for.
+                let closing = (self.wfm.machines.has_pending_close_intents()
+                    || self.wfm.machines.has_carried_stream_results())
                     && !self.wfm.machines.workflow_is_finished();
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
@@ -967,7 +969,12 @@ impl ManagedRun {
                 if let Some(wola) = self.waiting_on_la.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
-                if completing_la_heartbeat || !data.query_responses.is_empty() {
+                // A full Stream marker completes the task now, as a heartbeat does, also while
+                // Local Activities or Stream writes run. They go on in the new task.
+                if completing_la_heartbeat
+                    || !data.query_responses.is_empty()
+                    || self.wfm.machines.stream_marker_full()
+                {
                     // Reporting a query while an LA is still running must request another WFT;
                     // otherwise the LA could resolve without a task on which to deliver its job.
                     let hb_timeout_handle = self.start_heartbeat_timeout(start_t, wft_timeout);
@@ -1030,6 +1037,16 @@ impl ManagedRun {
         self.wfm.notify_of_local_result(res)?;
         self.dispatch_stream_requests();
         if self.activation.is_none() {
+            // A result that the full Stream marker had no room for gives no activation. The task
+            // then completes now, as at a heartbeat, so that a new one takes the result.
+            if self.wft.is_some()
+                && !self.wfm.machines.has_pending_jobs()
+                && self.wfm.machines.has_carried_stream_results()
+                && let Some(waiting) = self.waiting_on_la.as_mut()
+            {
+                waiting.hb_timeout_handle.abort();
+                waiting.heartbeat_timeout_pending = true;
+            }
             self._check_more_activations()
         } else {
             Ok(None)
