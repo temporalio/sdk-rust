@@ -10,7 +10,7 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
     nexus::{
-        NexusOperationOptions, NexusServiceClientOptions, TemporalNexusClient,
+        NexusContext, NexusOperationOptions, NexusServiceClientOptions, TemporalNexusClient,
         TemporalOperationError, TemporalOperationResult, temporal_nexus_service_handler,
     },
 };
@@ -44,10 +44,11 @@ impl PaymentHandlers {
     #[temporal_operation]
     async fn quote(
         &self,
-        client: TemporalNexusClient,
+        ctx: NexusContext,
+        _client: TemporalNexusClient,
         input: ChargeInput,
     ) -> Result<TemporalOperationResult<ChargeOutput>, TemporalOperationError> {
-        assert!(!client.info().request_id.is_empty());
+        assert!(!ctx.info().request_id.is_empty());
         Ok(TemporalOperationResult::Sync(ChargeOutput {
             receipt: format!("quote-{}", input.amount),
         }))
@@ -56,6 +57,7 @@ impl PaymentHandlers {
     #[temporal_operation]
     async fn charge(
         &self,
+        ctx: NexusContext,
         client: TemporalNexusClient,
         input: ChargeInput,
     ) -> Result<TemporalOperationResult<ChargeOutput>, TemporalOperationError> {
@@ -65,7 +67,7 @@ impl PaymentHandlers {
                 input,
                 WorkflowStartOptions::new(
                     self.task_queue.clone(),
-                    format!("charge-{}", client.info().request_id),
+                    format!("charge-{}", ctx.info().request_id),
                 )
                 .build(),
             )

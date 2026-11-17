@@ -12,7 +12,7 @@ mod workflow_definitions;
 /// Implements typed Nexus service registration for an inherent handler impl.
 ///
 /// Requires `service = ServiceMarker` and at least one `#[temporal_operation]` async method.
-/// Methods take `&self`, a request-scoped `TemporalNexusClient`, and an input.
+/// Methods take `&self`, a request-scoped `NexusContext`, a `TemporalNexusClient`, and an input.
 #[proc_macro_attribute]
 pub fn temporal_nexus_service_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
     match nexus_handlers::expand(attr.into(), item.into()) {

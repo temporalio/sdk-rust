@@ -7,7 +7,7 @@
 //! use temporalio_sdk::{
 //!     WorkerOptions,
 //!     nexus::{
-//!         TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
+//!         NexusContext, TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
 //!         temporal_nexus_service_handler, temporal_operation,
 //!     },
 //! };
@@ -23,10 +23,11 @@
 //!     #[temporal_operation]
 //!     async fn quote(
 //!         &self,
-//!         client: TemporalNexusClient,
+//!         ctx: NexusContext,
+//!         _client: TemporalNexusClient,
 //!         input: String,
 //!     ) -> Result<TemporalOperationResult<String>, TemporalOperationError> {
-//!         let _request_id = &client.info().request_id;
+//!         let _request_id = &ctx.info().request_id;
 //!         Ok(TemporalOperationResult::Sync(input))
 //!     }
 //! }
@@ -207,11 +208,23 @@ impl WorkflowOperationToken {
     }
 }
 
+/// Context of the Nexus request currently being served.
+#[derive(Clone, Debug)]
+pub struct NexusContext {
+    info: NexusInfo,
+}
+
+impl NexusContext {
+    /// Returns information about the executing Nexus request.
+    pub fn info(&self) -> &NexusInfo {
+        &self.info
+    }
+}
+
 /// Request-scoped client for starting workflow-backed Nexus operations.
 #[derive(Clone, Debug)]
 pub struct TemporalNexusClient {
     client: Client,
-    info: NexusInfo,
     request: proto::StartOperationRequest,
 }
 
@@ -238,11 +251,6 @@ impl TemporalNexusClient {
     /// Configured Temporal client, including the worker's converters and codecs.
     pub fn client(&self) -> &Client {
         &self.client
-    }
-
-    /// Returns information about the executing Nexus request.
-    pub fn info(&self) -> &NexusInfo {
-        &self.info
     }
 
     /// Start a workflow that completes this Nexus operation when it completes.
@@ -294,7 +302,7 @@ impl TemporalNexusClient {
             workflow,
             input,
             options,
-            &self.info.request_id,
+            &self.request.request_id,
         )
             .await
             .map_err(|error| {
@@ -384,7 +392,7 @@ pub trait TemporalNexusServiceHandler: Send + Sync + 'static {
 /// trait Second { fn call(input: String) -> String; }
 /// # fn main() {
 /// let handler = NexusServiceHandler::new(First)
-///     .operation(Second::call, |_, input: String| async move {
+///     .operation(Second::call, |_, _, input: String| async move {
 ///         Ok(TemporalOperationResult::Sync(input))
 ///     });
 /// # }
@@ -395,7 +403,7 @@ pub trait TemporalNexusServiceHandler: Send + Sync + 'static {
 /// ```compile_fail
 /// use nexus_rpc::service;
 /// use temporalio_sdk::nexus::{
-///     temporal_nexus_service_handler, temporal_operation, TemporalNexusClient,
+///     temporal_nexus_service_handler, temporal_operation, NexusContext, TemporalNexusClient,
 ///     TemporalOperationError, TemporalOperationResult,
 /// };
 /// #[service]
@@ -404,7 +412,7 @@ pub trait TemporalNexusServiceHandler: Send + Sync + 'static {
 /// #[temporal_nexus_service_handler(service = PaymentService)]
 /// impl PaymentHandlers {
 ///     #[temporal_operation]
-///     async fn quote(&self, client: TemporalNexusClient, input: String)
+///     async fn quote(&self, ctx: NexusContext, client: TemporalNexusClient, input: String)
 ///         -> Result<TemporalOperationResult<u32>, TemporalOperationError>
 ///     {
 ///         Ok(TemporalOperationResult::Sync(42))
@@ -436,7 +444,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
         O: NexusOperation<Service = S>,
         O::Input: TemporalDeserializable,
         O::Output: TemporalSerializable + Sync,
-        F: Fn(TemporalNexusClient, O::Input) -> Fut + Send + Sync + 'static,
+        F: Fn(NexusContext, TemporalNexusClient, O::Input) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<TemporalOperationResult<O::Output>, TemporalOperationError>>
             + Send
             + 'static,
@@ -451,7 +459,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
         let handler = Arc::new(handler);
         self.operations.insert(
             name,
-            Arc::new(move |client, converter| {
+            Arc::new(move |context, client, converter| {
                 let handler = handler.clone();
                 async move {
                     let payload = client.request.payload.clone().unwrap_or_default();
@@ -461,7 +469,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
                         .map_err(|error| {
                             TemporalOperationError::handler("BAD_REQUEST", error, false)
                         })?;
-                    match handler(client, input).await? {
+                    match handler(context, client, input).await? {
                         TemporalOperationResult::Sync(output) => {
                             let payload = converter
                                 .to_payload(&serialization_context(), &output)
@@ -603,6 +611,7 @@ fn start_status(variant: start_operation_response::Variant) -> nexus_task_comple
 
 type OperationHandler = Arc<
     dyn Fn(
+            NexusContext,
             TemporalNexusClient,
             DataConverter,
         )
@@ -771,9 +780,9 @@ async fn dispatch(
                 .scope(
                     RefCell::new(Vec::new()),
                     handler(
+                        NexusContext { info: info.clone() },
                         TemporalNexusClient {
                             client,
-                            info: info.clone(),
                             request: start,
                         },
                         converter,
@@ -981,7 +990,7 @@ mod tests {
 
     fn service() -> NexusServiceHandler<Payments> {
         NexusServiceHandler::new(Payments)
-            .operation(Payments::quote, |_, input| async move {
+            .operation(Payments::quote, |_, _, input| async move {
                 Ok(TemporalOperationResult::Sync(input))
             })
             .unwrap()
@@ -1027,10 +1036,11 @@ mod tests {
         #[temporal_operation]
         async fn quote(
             &self,
+            ctx: NexusContext,
             client: TemporalNexusClient,
             input: String,
         ) -> Result<TemporalOperationResult<String>, TemporalOperationError> {
-            let info = client.info();
+            let info = ctx.info();
             assert_eq!(info.headers["intercepted"], "yes");
             assert_eq!(info.endpoint, "payments");
             assert_eq!(info.service, Payments::name());
@@ -1089,13 +1099,13 @@ mod tests {
         services
             .register(
                 NexusServiceHandler::new(Payments)
-                    .operation(Payments::quote, move |client, input: String| {
+                    .operation(Payments::quote, move |ctx, _, input: String| {
                         let barrier = barrier.clone();
                         async move {
                             for suffix in ["first", "second"] {
                                 OUTBOUND_LINKS.with(|links| {
                                     links.borrow_mut().push(proto::Link {
-                                        url: format!("{}/{suffix}", client.info().request_id),
+                                        url: format!("{}/{suffix}", ctx.info().request_id),
                                         r#type: "test".to_owned(),
                                     });
                                 });
@@ -1182,7 +1192,7 @@ mod tests {
         ));
         assert!(services.is_empty());
         assert!(matches!(
-            service().operation(Payments::quote, |_, input| async move {
+            service().operation(Payments::quote, |_, _, input| async move {
                 Ok(TemporalOperationResult::Sync(input))
             }),
             Err(NexusRegistrationError::DuplicateOperation { .. }),
@@ -1304,7 +1314,7 @@ mod tests {
             services
                 .register(
                     NexusServiceHandler::new(Payments)
-                        .operation(Payments::quote, |client, input| async move {
+                        .operation(Payments::quote, |_, client, input| async move {
                             client
                                 .start_workflow(
                                     BackingWorkflow,

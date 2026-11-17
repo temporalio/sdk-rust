@@ -85,10 +85,10 @@ pub(crate) fn expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenS
             }
         }
         let arguments = inputs.collect::<Vec<_>>();
-        if arguments.len() != 2 {
+        if arguments.len() != 3 {
             return Err(syn::Error::new_spanned(
                 signature,
-                "expected client and input after &self",
+                "expected context, client, and input after &self",
             ));
         }
         for argument in &arguments {
@@ -107,9 +107,9 @@ pub(crate) fn expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenS
                 let handler = ::std::sync::Arc::clone(&self);
                 service_handler = service_handler.operation(
                     #service::#name,
-                    move |client, input| {
+                    move |context, client, input| {
                         let handler = ::std::sync::Arc::clone(&handler);
-                        async move { handler.#name(client, input).await }
+                        async move { handler.#name(context, client, input).await }
                     },
                 )?;
             }
@@ -178,11 +178,11 @@ mod tests {
                 #[cfg_attr(feature = "disable", cfg(any()))]
                 #[allow(clippy::unused_async)]
                 #[temporal_operation]
-                async fn charge(&self, client: TemporalNexusClient, input: ChargeInput)
+                async fn charge(&self, ctx: NexusContext, client: TemporalNexusClient, input: ChargeInput)
                     -> HandlerResult { make_result(input) }
 
                 #[temporal_operation]
-                async fn refund(&self, client: TemporalNexusClient, input: RefundInput)
+                async fn refund(&self, ctx: NexusContext, client: TemporalNexusClient, input: RefundInput)
                     -> HandlerResult { make_result(input) }
             }
         };
@@ -231,25 +231,36 @@ mod tests {
     fn rejects_invalid_operation_signatures() {
         for method in [
             quote!(
-                fn charge(&self, client: Client, input: Input) {}
+                fn charge(&self, ctx: NexusContext, client: Client, input: Input) {}
             ),
             quote!(
-                async fn charge(&mut self, client: Client, input: Input) {}
+                async fn charge(&mut self, ctx: NexusContext, client: Client, input: Input) {}
             ),
             quote!(
-                async fn charge<T>(&self, client: Client, input: T) {}
+                async fn charge<T>(&self, ctx: NexusContext, client: Client, input: T) {}
             ),
             quote!(
-                async unsafe fn charge(&self, client: Client, input: Input) {}
+                async unsafe fn charge(&self, ctx: NexusContext, client: Client, input: Input) {}
             ),
             quote!(
-                async extern "C" fn charge(&self, client: Client, input: Input) {}
+                async extern "C" fn charge(&self, ctx: NexusContext, client: Client, input: Input) {
+                }
             ),
             quote!(
                 async fn charge(&self, input: Input) {}
             ),
             quote!(
-                async fn charge(&self, client: Client, context: RequestContext, input: Input) {}
+                async fn charge(&self, ctx: NexusContext, input: Input) {}
+            ),
+            quote!(
+                async fn charge(
+                    &self,
+                    ctx: NexusContext,
+                    client: Client,
+                    extra: Extra,
+                    input: Input,
+                ) {
+                }
             ),
         ] {
             let item = quote! {
@@ -270,14 +281,14 @@ mod tests {
             quote! {
                 impl Handlers {
                     #[temporal_operation(name = "charge")]
-                    async fn charge(&self, client: Client, input: Input) {}
+                    async fn charge(&self, ctx: NexusContext, client: Client, input: Input) {}
                 }
             },
             quote! {
                 impl Handlers {
                     #[temporal_operation]
                     #[other::temporal_operation]
-                    async fn charge(&self, client: Client, input: Input) {}
+                    async fn charge(&self, ctx: NexusContext, client: Client, input: Input) {}
                 }
             },
         ] {
