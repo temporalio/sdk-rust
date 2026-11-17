@@ -182,6 +182,71 @@ fn is_resolved(act: &WorkflowActivation) {
     });
 }
 
+#[rstest]
+#[tokio::test]
+async fn missing_start_failure_preserves_resolution_kind(
+    #[values(Outcome::Canceled, Outcome::TimedOut)] outcome: Outcome,
+    #[values(false, true)] replay: bool,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled_event_id = add_scheduled(&mut t);
+    match outcome {
+        Outcome::Canceled => t.add(NexusOperationCanceledEventAttributes {
+            scheduled_event_id,
+            ..Default::default()
+        }),
+        Outcome::TimedOut => t.add(NexusOperationTimedOutEventAttributes {
+            scheduled_event_id,
+            ..Default::default()
+        }),
+        _ => unreachable!(),
+    };
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+    let core = build_fake_worker("fake_wf_id", t, response_batches(2, replay));
+    let assert_resolution = |act: &WorkflowActivation| {
+        assert_only_job(act, |job| {
+            let workflow_activation_job::Variant::ResolveNexusOperationStart(start) = job else {
+                panic!("expected start resolution, got {job:?}");
+            };
+            assert_eq!(start.seq, SEQ);
+            let Some(resolve_nexus_operation_start::Status::Failed(failure)) = &start.status else {
+                panic!("expected start failure, got {start:?}");
+            };
+            match outcome {
+                Outcome::Canceled => assert!(matches!(
+                    failure.failure_info,
+                    Some(FailureInfo::CanceledFailureInfo(_))
+                )),
+                Outcome::TimedOut => assert!(matches!(
+                    failure.failure_info,
+                    Some(FailureInfo::TimeoutFailureInfo(_))
+                )),
+                _ => unreachable!(),
+            }
+        });
+    };
+    poll_and_reply(
+        &core,
+        NonSticky,
+        &[
+            gen_assert_and_reply(
+                &is_initialize,
+                vec![
+                    schedule_cmd(NexusOperationCancellationType::WaitCancellationCompleted).into(),
+                ],
+            ),
+            gen_assert_and_reply(
+                &assert_resolution,
+                vec![CompleteWorkflowExecution { result: None }.into()],
+            ),
+        ],
+    )
+    .await;
+}
+
 // Lang must learn the outcome of a Nexus operation exactly once. Cancellation types that resolve
 // lang when cancellation is requested (or, for WaitCancellationRequested, when the request is
 // delivered) leave the operation running on the server, so its eventual outcome still lands in

@@ -326,19 +326,59 @@ if ctx.patched("my-patch-id") {
 
 ### Nexus Operations
 
-The SDK supports starting Nexus operations from a workflow:
+Enable the `experimental` feature to call Nexus services from workflows with typed input and output.
+Service definitions use the [Nexus Rust SDK](https://crates.io/crates/nexus-rpc).
+Add it as a dependency:
 
-```rust
-let started = ctx.start_nexus_operation(NexusOperationOptions {
-    endpoint: "my-endpoint".to_string(),
-    service: "my-service".to_string(),
-    operation: "my-operation".to_string(),
-    input: Some(payload),
-    ..Default::default()
-}).await?;
+```toml
+nexus-rpc = "0.1.0"
 ```
 
-Defining Nexus handlers will be added later.
+```rust
+use nexus_rpc::service;
+use temporalio_sdk::nexus::{
+    NexusOperationOptions, NexusServiceClientOptions,
+};
+
+#[service(name = "payments")]
+pub trait PaymentService {
+    #[operation(name = "charge")]
+    fn charge(input: String) -> String;
+}
+
+let payments = ctx.nexus_client(
+    PaymentService,
+    NexusServiceClientOptions::new("payments-endpoint").build(),
+);
+
+let receipt: String = payments
+    .execute(PaymentService::charge, input, NexusOperationOptions::default())
+    .await?;
+
+let handle = payments
+    .start(PaymentService::charge, another_input, NexusOperationOptions::default())
+    .await?;
+handle.cancel();
+let receipt = handle.result().await?;
+```
+
+The `nexus_client` call returns a `NexusServiceClient` bound to the service and endpoint.
+The `#[service]` macro generates the `PaymentService::charge` value passed to `execute` or `start`.
+It identifies the operation and its service, input, and output types, so mismatched calls are rejected
+at compile time. `start` waits for the operation to be acknowledged; the handle exposes
+`operation_token()` (`None` for synchronous operations),
+`cancel()`, and a typed `result()`. Cancellation can race with completion. Options include timeouts,
+cancellation behavior, and a cancellation token; absent a token, workflow cancellation is inherited.
+Nexus request headers can be set by workflow interceptors, not by the typed call options.
+
+Calls use the workflow's payload and failure converters, with payload codecs applied at the worker
+boundary. Service and operation wire names are recorded in history, so changing them in existing
+workflow code requires the same replay-safe versioning as other command changes.
+`NexusOperationError::Failed` retains a `NexusOperationFailureError`; use `operation_failure()` to
+inspect its metadata and normalized reason, and `as_cancelled()` / `as_timeout()` to classify it.
+`NexusOperationError::Serialization` reports input or result conversion errors.
+The endpoint must already exist in the server's endpoint registry. Hosting Nexus handlers is not
+included yet.
 
 ## Activities in detail
 

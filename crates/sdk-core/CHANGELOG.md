@@ -37,6 +37,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* Nexus operations cancelled or timed out before starting retain their cancellation or timeout
+  failure type even when the corresponding history event omits its failure.
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
   times out no longer fails workflow tasks with a nondeterminism error.
 * Cancelling a Nexus operation with `ABANDON` or `TRY_CANCEL` before it starts now resolves it with
