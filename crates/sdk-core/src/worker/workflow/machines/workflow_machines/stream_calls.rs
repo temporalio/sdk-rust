@@ -6,15 +6,15 @@ use crate::{
     worker::workflow::{
         OutgoingJob, WFMachinesError, fatal, nondeterminism,
         streams::{
-            AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_RECORD_BYTES, ReadFlow,
-            ReadSpec, STREAM_PAGE_MAX_RECORDS, StreamCallResult, StreamRequest, StreamResolution,
-            input_over_limit, next_call_id, store_metrics,
+            AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_ENTRY_BYTES,
+            MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, STREAM_PAGE_MAX_RECORDS, StreamCallResult,
+            StreamRequest, StreamResolution, input_over_limit, next_call_id, store_metrics,
         },
     },
 };
 use prost::Message;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -34,7 +34,10 @@ use temporalio_common::protos::{
         stream::v1::{Producer, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind},
     },
 };
-use temporalio_streams::digest::records_digest;
+use temporalio_streams::{
+    digest::{DIGEST_LEN, records_digest},
+    ids::MAX_OFFSET_BYTES,
+};
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
@@ -63,6 +66,9 @@ enum Intent {
     Sealed(WorkflowTaskEpoch),
     /// History has the intent, from the completion that the server took or from a replay.
     Recorded(Option<WorkflowTaskEpoch>),
+    /// Workflow code asked for the close, and this task's marker had no room for its intent. A
+    /// later task records it.
+    Deferred,
 }
 
 struct Close {
@@ -188,6 +194,168 @@ fn fit_in_marker(
     })
 }
 
+/// The tag and the length of a field of bytes or of a message of less than 2 MiB.
+const FIELD_BYTES: usize = 4;
+/// A field of a varint of 32 bits, with its tag.
+const VARINT_BYTES: usize = 6;
+/// A field of a varint of 64 bits, with its tag.
+const VARINT64_BYTES: usize = 11;
+/// A read entry with no page and no end: its seq, Stream, count, digest, the headers of its
+/// offsets and of its two lists of pages, and a `last_offset` at its limit. The two other offsets
+/// count at their own size.
+const READ_ENTRY_BYTES: usize = FIELD_BYTES
+    + 3 * VARINT_BYTES
+    + 3 * FIELD_BYTES
+    + MAX_OFFSET_BYTES
+    + FIELD_BYTES
+    + DIGEST_LEN
+    + 2 * FIELD_BYTES;
+/// One page of a read: its count and its activation, in the two packed lists.
+const PAGE_BYTES: usize = 2 * (VARINT_BYTES - 1);
+/// The end of a read with no failure, apart from its `last_offset`.
+const END_BYTES: usize = 2 * FIELD_BYTES + 3 * VARINT_BYTES;
+/// An append entry with no failure, apart from its offsets.
+const APPEND_ENTRY_BYTES: usize = FIELD_BYTES + 3 * VARINT_BYTES + 2 * FIELD_BYTES;
+/// The entry of a close's result with no failure.
+const CLOSE_RESULT_BYTES: usize = FIELD_BYTES + 4 * VARINT_BYTES;
+/// The entry of a close's intent, with the epoch of its task. A negative 32-bit number takes the
+/// ten bytes of a 64-bit one.
+const CLOSE_INTENT_BYTES: usize =
+    FIELD_BYTES + 2 * VARINT_BYTES + 2 * FIELD_BYTES + 4 * VARINT64_BYTES;
+
+fn failure_bytes(failure: Option<&Failure>) -> usize {
+    failure.map_or(0, |failure| FIELD_BYTES + failure.encoded_len())
+}
+
+/// What this task's marker holds apart from Records, as an estimate that is never below its
+/// encoded size. A result counts when it becomes a job, before Workflow code gets it, so that a
+/// result that doesn't fit can wait for the next task.
+#[derive(Default)]
+struct EntryBudget {
+    bytes: usize,
+    /// The Streams of the marker's table.
+    streams: HashSet<(String, String)>,
+    /// The reads that have an entry in the marker.
+    reads: HashSet<u32>,
+}
+
+impl EntryBudget {
+    /// Adds `bytes` of an entry of `stream`, and its Stream if the table lacks it. Returns false,
+    /// and adds nothing, when the marker would pass [MAX_MARKER_ENTRY_BYTES]. An empty marker
+    /// takes any entry, since no single one comes near the bound.
+    fn add(&mut self, bytes: usize, stream: &StreamRef) -> bool {
+        let key = (stream.store.clone(), stream.id.clone());
+        let table = if self.streams.contains(&key) {
+            0
+        } else {
+            FIELD_BYTES + stream.encoded_len()
+        };
+        if self.bytes > 0 && self.bytes + bytes + table > MAX_MARKER_ENTRY_BYTES {
+            return false;
+        }
+        self.bytes += bytes + table;
+        self.streams.insert(key);
+        true
+    }
+
+    /// Adds a page of `read`. `merges` is true when the page joins the read's pending job, which
+    /// is one page of the marker already.
+    fn add_page(&mut self, read: &Read, page: &ResolveStreamRead, merges: bool) -> bool {
+        let new_entry = !self.reads.contains(&page.seq);
+        let mut bytes = 0;
+        if new_entry {
+            // The entry's `after_offset` is where Workflow code is when it gets this page.
+            bytes += READ_ENTRY_BYTES + read.from_offset.len() + read.last_offset.len();
+        }
+        if !merges && !page.records.is_empty() {
+            bytes += PAGE_BYTES;
+        }
+        if let Some(end) = &page.end {
+            bytes += END_BYTES + end.last_offset.len() + failure_bytes(end.failure.as_ref());
+        }
+        if !self.add(bytes, &read.stream) {
+            return false;
+        }
+        self.reads.insert(page.seq);
+        true
+    }
+}
+
+/// Fits a live page of `read` in the Records bound and the entry bound of the task's marker, and in
+/// the page cap of the next activation, when the read's pending job holds `pending` Records.
+/// Returns the job, or `None` when the page waits for a later activation or task.
+fn fit_page(
+    read: &mut Read,
+    page: ResolveStreamRead,
+    pending: usize,
+    record_bytes: &mut usize,
+    budget: &mut EntryBudget,
+) -> Option<ResolveStreamRead> {
+    let page = if read.records_in_history {
+        fit_in_marker(read, page, record_bytes)?
+    } else {
+        page
+    };
+    let page = fit_in_activation(read, page, pending)?;
+    fit_entry(read, page, pending > 0, budget)
+}
+
+/// Fits a page that becomes a job in the entry bound of the task's marker, or keeps it for the
+/// next task. `merges` is true when the page joins the read's pending job.
+fn fit_entry(
+    read: &mut Read,
+    page: ResolveStreamRead,
+    merges: bool,
+    budget: &mut EntryBudget,
+) -> Option<ResolveStreamRead> {
+    if !budget.add_page(read, &page, merges) {
+        carry_front(read, page);
+        return None;
+    }
+    if page.end.is_some() {
+        read.open = false;
+    }
+    Some(page)
+}
+
+/// The estimate of the marker entry of the result of an append or a close.
+fn result_bytes(job: &StreamJob) -> usize {
+    match job {
+        StreamJob::Append(result) => {
+            let (offsets, failure) = match &result.status {
+                Some(resolve_stream_append::Status::Appended(appended)) => (
+                    appended.first_offset.len() + appended.last_offset.len(),
+                    None,
+                ),
+                Some(resolve_stream_append::Status::Failed(failure)) => (0, Some(failure)),
+                None => (0, None),
+            };
+            APPEND_ENTRY_BYTES + offsets + failure_bytes(failure)
+        }
+        StreamJob::Close(result) => CLOSE_RESULT_BYTES + failure_bytes(result.failed.as_ref()),
+        // A page counts by its read, with [EntryBudget::add_page].
+        StreamJob::Read(_) => 0,
+    }
+}
+
+/// Keeps `page` for the next task, in front of the Records that wait already for a later
+/// activation or task. Only the last of them can have the end.
+fn carry_front(read: &mut Read, page: ResolveStreamRead) {
+    let ResolveStreamRead {
+        seq,
+        mut records,
+        mut end,
+    } = page;
+    for later in [read.over_cap.take(), read.carried.take()]
+        .into_iter()
+        .flatten()
+    {
+        records.extend(later.records);
+        end = later.end.or(end);
+    }
+    read.carried = Some(ResolveStreamRead { seq, records, end });
+}
+
 impl Read {
     /// The read to run from where Workflow code is, with what is left of its caps.
     fn spec(&self) -> ReadSpec {
@@ -273,6 +441,11 @@ pub(super) struct StreamCalls {
     /// The bytes of Records that this task's marker holds for reads with their Records in
     /// History, counted when a page becomes a job.
     marker_record_bytes: usize,
+    /// What this task's marker holds apart from Records.
+    entry_budget: EntryBudget,
+    /// The results of appends and closes past this task's entry bound, in the order they came.
+    /// The next task takes them.
+    carried_results: Vec<StreamJob>,
 }
 
 impl StreamCalls {
@@ -364,6 +537,13 @@ impl StreamCalls {
             return vec![];
         }
         self.live = true;
+        // The intents that replay left without a record go in the marker of this live task.
+        for close in self.closes.values_mut() {
+            if matches!(close.intent, Intent::Pending) {
+                close.intent = Intent::Deferred;
+            }
+        }
+        self.admit_deferred_intents();
         let mut stores = vec![];
         let mut reads: Vec<_> = self
             .reads
@@ -409,6 +589,10 @@ impl StreamCalls {
         }
         let refusal = input_over_limit(&stream, &[]);
         let refused = refusal.is_some();
+        // A replay takes the intents of History, so only a live task counts them.
+        let deferred = !refused
+            && self.live
+            && (self.has_deferred_intents() || !self.entry_budget.add(CLOSE_INTENT_BYTES, &stream));
         self.closes.insert(
             seq,
             Close {
@@ -418,6 +602,8 @@ impl StreamCalls {
                 // A refused close has no intent for a task to record, and never runs.
                 intent: if refused {
                     Intent::Recorded(None)
+                } else if deferred {
+                    Intent::Deferred
                 } else {
                     Intent::Pending
                 },
@@ -465,6 +651,32 @@ impl StreamCalls {
             }
         }
         std::mem::take(&mut self.requests)
+    }
+
+    fn has_deferred_intents(&self) -> bool {
+        self.closes
+            .values()
+            .any(|close| matches!(close.intent, Intent::Deferred))
+    }
+
+    /// Gives the deferred intents room in this task's marker, in seq order, while they fit.
+    fn admit_deferred_intents(&mut self) {
+        let mut deferred: Vec<_> = self
+            .closes
+            .iter()
+            .filter(|(_, close)| matches!(close.intent, Intent::Deferred))
+            .map(|(seq, _)| *seq)
+            .collect();
+        deferred.sort();
+        for seq in deferred {
+            let Some(close) = self.closes.get_mut(&seq) else {
+                continue;
+            };
+            if !self.entry_budget.add(CLOSE_INTENT_BYTES, &close.stream) {
+                return;
+            }
+            close.intent = Intent::Pending;
+        }
     }
 
     /// Drops the intents that History doesn't have, when their task fails.
@@ -636,14 +848,18 @@ impl StreamCalls {
                 if read.call_id != call_id || !read.open {
                     return None;
                 }
-                let mut page = ResolveStreamRead { seq, records, end };
-                if read.records_in_history {
-                    page = fit_in_marker(read, page, &mut self.marker_record_bytes)?;
+                let page = ResolveStreamRead { seq, records, end };
+                if read.carried.is_some() {
+                    carry_front(read, page);
+                    return None;
                 }
-                let page = fit_in_activation(read, page, pending(seq))?;
-                if page.end.is_some() {
-                    read.open = false;
-                }
+                let page = fit_page(
+                    read,
+                    page,
+                    pending(seq),
+                    &mut self.marker_record_bytes,
+                    &mut self.entry_budget,
+                )?;
                 Some(StreamJob::Read(page))
             }
             StreamCallResult::Append(status) => {
@@ -652,12 +868,14 @@ impl StreamCalls {
                     return None;
                 }
                 append.resolved = true;
-                let key = (append.stream.store.clone(), append.stream.id.clone());
+                let stream = append.stream.clone();
+                let key = (stream.store.clone(), stream.id.clone());
                 self.unqueue(&key, Queued::Append(seq));
-                Some(StreamJob::Append(ResolveStreamAppend {
+                let job = ResolveStreamAppend {
                     seq,
                     status: Some(status),
-                }))
+                };
+                self.fit_result(StreamJob::Append(job), &stream)
             }
             StreamCallResult::Close(failed) => {
                 let close = self.closes.get_mut(&seq)?;
@@ -665,9 +883,13 @@ impl StreamCalls {
                     return None;
                 }
                 close.resolved = true;
-                let key = (close.stream.store.clone(), close.stream.id.clone());
+                let stream = close.stream.clone();
+                let key = (stream.store.clone(), stream.id.clone());
                 self.unqueue(&key, Queued::Close(seq));
-                Some(StreamJob::Close(ResolveStreamClose { seq, failed }))
+                self.fit_result(
+                    StreamJob::Close(ResolveStreamClose { seq, failed }),
+                    &stream,
+                )
             }
         }
     }
@@ -1009,16 +1231,54 @@ impl StreamCalls {
             let Some(page) = read.carried.take() else {
                 continue;
             };
-            if let Some(page) = fit_in_marker(read, page, &mut self.marker_record_bytes)
-                && let Some(page) = fit_in_activation(read, page, pending(seq))
-            {
-                if page.end.is_some() {
-                    read.open = false;
-                }
+            if let Some(page) = fit_page(
+                read,
+                page,
+                pending(seq),
+                &mut self.marker_record_bytes,
+                &mut self.entry_budget,
+            ) {
                 jobs.push(StreamJob::Read(page));
             }
         }
+        // The results go in the order they came, so the first that doesn't fit keeps the rest.
+        for job in std::mem::take(&mut self.carried_results) {
+            match self.result_stream(&job) {
+                Some(stream) => {
+                    if let Some(job) = self.fit_result(job, &stream) {
+                        jobs.push(job);
+                    }
+                }
+                None => self.carried_results.push(job),
+            }
+        }
         jobs
+    }
+
+    /// The Stream of the call of an append or a close result.
+    fn result_stream(&self, job: &StreamJob) -> Option<StreamRef> {
+        match job {
+            StreamJob::Append(result) => self.appends.get(&result.seq).map(|a| a.stream.clone()),
+            StreamJob::Close(result) => self.closes.get(&result.seq).map(|c| c.stream.clone()),
+            StreamJob::Read(_) => None,
+        }
+    }
+
+    /// Gives the result of an append or a close as a job, or keeps it for the next task when the
+    /// entry bound has no room for it, or when an earlier result waits already.
+    fn fit_result(&mut self, job: StreamJob, stream: &StreamRef) -> Option<StreamJob> {
+        if !self.carried_results.is_empty() || !self.entry_budget.add(result_bytes(&job), stream) {
+            self.carried_results.push(job);
+            return None;
+        }
+        Some(job)
+    }
+
+    /// True if results or intents wait for a later task, which the task must then force.
+    pub(super) fn has_carried(&self) -> bool {
+        !self.carried_results.is_empty()
+            || self.reads.values().any(|read| read.carried.is_some())
+            || self.has_deferred_intents()
     }
 
     /// The Records that reads gave past the page cap, as jobs of the next activation. Called once
@@ -1040,21 +1300,19 @@ impl StreamCalls {
             let Some(page) = read.over_cap.take() else {
                 continue;
             };
-            if let Some(page) = fit_in_activation(read, page, 0) {
-                if page.end.is_some() {
-                    read.open = false;
-                }
+            if let Some(page) = fit_in_activation(read, page, 0)
+                && let Some(page) = fit_entry(read, page, false, &mut self.entry_budget)
+            {
                 jobs.push(StreamJob::Read(page));
             }
         }
         jobs
     }
 
-    /// True once the Records of this task's marker reached their bound, so that the task
-    /// completes and a new one takes the rest.
+    /// True once the Records or the entries of this task's marker reached their bound, so that the
+    /// task completes and a new one takes the rest.
     pub(super) fn marker_full(&self) -> bool {
-        self.marker_record_bytes >= MAX_MARKER_RECORD_BYTES
-            || self.reads.values().any(|read| read.carried.is_some())
+        self.marker_record_bytes >= MAX_MARKER_RECORD_BYTES || self.has_carried()
     }
 
     /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
@@ -1071,6 +1329,14 @@ impl StreamCalls {
             append.resolved = true;
             append.spec = None;
             self.requests.push(StreamRequest::Cancel(append.call_id));
+        }
+        self.carried_results.clear();
+        // The task that ends the Workflow is the last one, so it records every intent, also past
+        // the entry bound.
+        for close in self.closes.values_mut() {
+            if matches!(close.intent, Intent::Deferred) {
+                close.intent = Intent::Pending;
+            }
         }
         // A close stays. History has its intent, or the completion with the terminal command
         // carries it, and the Stream must close after it.
@@ -1252,6 +1518,14 @@ impl StreamCalls {
         epoch: Option<WorkflowTaskEpoch>,
     ) -> Option<StreamMarkerData> {
         self.marker_record_bytes = 0;
+        self.entry_budget = EntryBudget::default();
+        let marker = self.seal_marker(epoch);
+        // The intents that didn't fit come first in the next task's marker.
+        self.admit_deferred_intents();
+        marker
+    }
+
+    fn seal_marker(&mut self, epoch: Option<WorkflowTaskEpoch>) -> Option<StreamMarkerData> {
         if !self.has_marker_entries() {
             return None;
         }
@@ -1364,5 +1638,130 @@ fn read_entry(read: &Read, entry: ReadEntryBuilder, stream_index: u32) -> Stream
         page_counts: entry.page_counts,
         page_activations,
         end: entry.end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::workflow::streams::{
+        MAX_FAILURE_MESSAGE_BYTES, MAX_STORE_NAME_BYTES, failure,
+    };
+    use prost_types::Timestamp;
+    use temporalio_common::protos::coresdk::common::StreamReadStop;
+    use temporalio_streams::{Reason, StreamError, ids::MAX_STREAM_ID_BYTES};
+
+    /// The size of `entry` as a field of the marker.
+    fn field(entry: &impl Message) -> usize {
+        FIELD_BYTES + entry.encoded_len()
+    }
+
+    /// The largest entry of each kind, with every input at its limit, is at most its estimate and
+    /// far under the entry bound, so no single entry can pass the bound alone.
+    #[test]
+    fn the_largest_entries_are_far_under_the_entry_bound() {
+        let far_under = MAX_MARKER_ENTRY_BYTES / 16;
+        let offset = vec![0xff; MAX_OFFSET_BYTES];
+        let wordy = StreamError::new(Reason::StorageUnavailable, "\u{20ac}".repeat(100_000));
+        let failure = failure(&wordy);
+        assert!(failure.message.len() <= MAX_FAILURE_MESSAGE_BYTES);
+
+        let stream = StreamRef {
+            id: "x".repeat(MAX_STREAM_ID_BYTES),
+            store: "m".repeat(MAX_STORE_NAME_BYTES),
+        };
+        let mut budget = EntryBudget::default();
+        assert!(budget.add(0, &stream));
+        assert!(field(&stream) <= budget.bytes && budget.bytes < far_under);
+
+        let read = StreamReadEntry {
+            seq: u32::MAX,
+            stream_index: u32::MAX,
+            from_offset: offset.clone(),
+            after_offset: offset.clone(),
+            last_offset: offset.clone(),
+            count: u32::MAX,
+            digest: vec![0xff; DIGEST_LEN],
+            records: vec![],
+            page_counts: vec![u32::MAX],
+            page_activations: vec![u32::MAX],
+            end: Some(StreamReadEnded {
+                last_offset: offset.clone(),
+                stop: StreamReadStop::Timeout as i32,
+                done: true,
+                failure: Some(failure.clone()),
+                activation: u32::MAX,
+            }),
+        };
+        let read_estimate = READ_ENTRY_BYTES
+            + 2 * MAX_OFFSET_BYTES
+            + PAGE_BYTES
+            + END_BYTES
+            + MAX_OFFSET_BYTES
+            + failure_bytes(Some(&failure));
+        assert!(
+            field(&read) <= read_estimate,
+            "{} > {read_estimate}",
+            field(&read)
+        );
+        assert!(read_estimate < far_under);
+
+        let appended = StreamAppendEntry {
+            seq: u32::MAX,
+            stream_index: u32::MAX,
+            first_offset: offset.clone(),
+            last_offset: offset.clone(),
+            failure: None,
+            activation: u32::MAX,
+        };
+        let appended_job = StreamJob::Append(ResolveStreamAppend {
+            seq: u32::MAX,
+            status: Some(resolve_stream_append::Status::Appended(StreamAppended {
+                first_offset: offset.clone(),
+                last_offset: offset.clone(),
+            })),
+        });
+        assert!(field(&appended) <= result_bytes(&appended_job));
+        let failed = StreamAppendEntry {
+            first_offset: vec![],
+            last_offset: vec![],
+            failure: Some(failure.clone()),
+            ..appended
+        };
+        let failed_job = StreamJob::Append(ResolveStreamAppend {
+            seq: u32::MAX,
+            status: Some(resolve_stream_append::Status::Failed(failure.clone())),
+        });
+        assert!(field(&failed) <= result_bytes(&failed_job));
+        assert!(result_bytes(&failed_job) < far_under);
+
+        let close = StreamCloseEntry {
+            seq: u32::MAX,
+            stream_index: u32::MAX,
+            intent_epoch: None,
+            resolved: true,
+            failure: Some(failure.clone()),
+            activation: u32::MAX,
+        };
+        let close_job = StreamJob::Close(ResolveStreamClose {
+            seq: u32::MAX,
+            failed: Some(failure),
+        });
+        assert!(field(&close) <= result_bytes(&close_job));
+        assert!(result_bytes(&close_job) < far_under);
+        let intent = StreamCloseEntry {
+            seq: u32::MAX,
+            stream_index: u32::MAX,
+            intent_epoch: Some(WorkflowTaskEpoch {
+                started_event_id: i64::MIN,
+                attempt: i32::MIN,
+                started_time: Some(Timestamp {
+                    seconds: i64::MIN,
+                    nanos: i32::MIN,
+                }),
+            }),
+            ..Default::default()
+        };
+        assert!(field(&intent) <= CLOSE_INTENT_BYTES);
     }
 }
