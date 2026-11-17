@@ -6,7 +6,9 @@ use crate::{
         client::WorkerClient,
         workflow::{
             CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, UnstoredWftFailInfo,
-            history_update::HistoryPaginator, streams::WorkerStreams,
+            WFMachinesError,
+            history_update::HistoryPaginator,
+            streams::{WorkerStreams, is_stream_replay_unavailable},
         },
     },
 };
@@ -151,16 +153,25 @@ impl WFTExtractor {
                                 Ok(()) => WFTExtractorOutput::FetchResult(*pwft, rc),
                                 // A replay Worker fails the run instead, so that lang sees the
                                 // eviction and the replay of this history ends. So does a Worker
-                                // that fails the Workflow for this error, which needs the run.
+                                // that fails the Workflow for this error, which needs the run. A
+                                // Store that stayed unavailable never fails the Workflow, since
+                                // the Records may still be there.
                                 Err(err)
                                     if streams.as_ref().is_some_and(|streams| {
                                         !streams.worker().calls_stores()
-                                            || streams
-                                                .worker()
-                                                .fails_workflow(&pwft.work.workflow_type)
+                                            || (!is_stream_replay_unavailable(&err)
+                                                && streams
+                                                    .worker()
+                                                    .fails_workflow(&pwft.work.workflow_type))
                                     }) =>
                                 {
-                                    pwft.work.stream_replay_error = Some(err.message().to_string());
+                                    let message = err.message().to_string();
+                                    pwft.work.stream_replay_error =
+                                        Some(if is_stream_replay_unavailable(&err) {
+                                            WFMachinesError::StreamReplayUnavailable(message)
+                                        } else {
+                                            WFMachinesError::StreamReplay(message)
+                                        });
                                     WFTExtractorOutput::FetchResult(*pwft, rc)
                                 }
                                 Err(err) => WFTExtractorOutput::FailedFetch {
