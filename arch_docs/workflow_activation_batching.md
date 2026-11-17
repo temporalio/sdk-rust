@@ -19,8 +19,9 @@ different workflow runs concurrently because completions may need history pagina
 
 Execute each activation on the same workflow instance, in order, using its own clock, replay state,
 flags, and workflow metadata. Complete runnable work, microtasks, condition checks, failure checks,
-and completion processing at each boundary. An activation with no jobs still advances workflow
-execution. Preserve activation timeouts and deadlock detection separately for each activation.
+and completion processing at each boundary. Core handles tasks with no jobs internally; they do
+not occupy activation indices in a batch. Preserve activation timeouts and deadlock detection
+separately for each activation.
 Queries and cache removal retain their existing semantics and isolation.
 
 Return one batch completion containing a nonempty contiguous prefix of
@@ -52,7 +53,7 @@ activation-count limit or requiring pagination to finish. A batch can contain th
 including initialization, or an available suffix. Only completed replay tasks with the necessary
 lookahead are included; live work remains separate.
 
-The projection includes signals, empty tasks, timer firings, workflow cancellation, patch
+The projection skips jobless tasks and includes signals, timer firings, workflow cancellation, patch
 notifications, and resolutions whose command state Core already knows. Timer sequence numbers
 come from the recorded timer IDs. Other stateful events are projected using private copies of
 their existing machines; Core stops before events whose language sequence mapping or intervening
@@ -70,5 +71,5 @@ and update dependencies, unsupported events, or missing lookahead end accumulati
 batch size only: the batch protocol is always used whether chunking is enabled or disabled and
 regardless of the `disable_workflow_task_chunking` Cargo feature.
 
-Batching adds no history flags, markers, or recording changes. The separate chunking transition
-continues to control history boundaries as described in [workflow task chunking](workflow_task_chunking.md).
+Batching adds no history flags, markers, or recording changes. The mode chosen at workflow start
+controls history boundaries as described in [workflow task chunking](workflow_task_chunking.md).

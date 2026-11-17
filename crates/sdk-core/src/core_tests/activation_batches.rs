@@ -43,10 +43,8 @@ fn history(task_count: usize, unchunked: bool) -> TestHistoryBuilder {
     if unchunked {
         history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
     }
-    for index in 0..task_count {
-        if index % 2 == 0 {
-            history.add_we_signaled("tick", vec![]);
-        }
+    for _ in 0..task_count {
+        history.add_we_signaled("tick", vec![]);
         history.add_full_wf_task();
     }
     history.add_timer_fired(timer, "1".to_owned());
@@ -177,6 +175,58 @@ async fn batches_apply_unrecorded_commands_at_each_boundary(#[case] task_count: 
     }
     assert_eq!(replayed, task_count);
     assert_eq!(batches, 2);
+    finish(core, run_id).await;
+}
+
+#[tokio::test]
+async fn batches_skip_jobless_tasks() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    let timer = history.add_timer_started("1".to_owned());
+    history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+    for _ in 0..2 {
+        history.add_we_signaled("tick", vec![]);
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+    }
+    history.add_timer_fired(timer, "1".to_owned());
+    history.add_workflow_task_scheduled_and_started();
+    let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [6]));
+    mocks.make_wft_stream_interminable();
+    let core = mock_worker(mocks);
+    let run_id = initialize(&core).await;
+    let batch = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(batch.activations.len(), 2);
+    for activation in &batch.activations {
+        assert!(activation.is_replaying);
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [job] if matches!(job.variant, Some(Variant::SignalWorkflow(_)))
+        );
+    }
+    assert!(batch.activations[0].history_length < batch.activations[1].history_length);
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: (0..2)
+            .map(|index| indexed(index, WorkflowActivationCompletion::empty(&run_id)))
+            .collect(),
+    })
+    .await
+    .unwrap();
+    let batch = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(batch.activations.len(), 1);
+    assert!(!batch.activations[0].is_replaying);
+    assert_matches!(
+        batch.activations[0].jobs[0].variant,
+        Some(Variant::FireTimer(_))
+    );
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![indexed(0, WorkflowActivationCompletion::empty(&run_id))],
+    })
+    .await
+    .unwrap();
     finish(core, run_id).await;
 }
 
@@ -420,6 +470,7 @@ async fn known_activity_resolution_and_workflow_cancellation_are_batched() {
     history.add_full_wf_task();
     history.add_cancel_requested();
     history.add_full_wf_task();
+    history.add_we_signaled("finish", vec![]);
     history.add_workflow_task_scheduled_and_started();
     let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [5]));
     mocks.make_wft_stream_interminable();
@@ -594,7 +645,9 @@ async fn unknown_activity_sequence_requires_an_early_batch_return() {
     let started = history.add_activity_task_started(activity);
     history.add_activity_task_completed(activity, started, Default::default());
     history.add_full_wf_task();
+    history.add_we_signaled("after", vec![]);
     history.add_full_wf_task();
+    history.add_we_signaled("finish", vec![]);
     history.add_workflow_task_scheduled_and_started();
     let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [5]));
     mocks.make_wft_stream_interminable();
@@ -658,7 +711,9 @@ async fn patch_lookahead_is_included_before_early_return() {
     history.add_we_signaled("patch", vec![]);
     history.add_full_wf_task();
     history.add_has_change_marker("patch-id", false);
+    history.add_we_signaled("after", vec![]);
     history.add_full_wf_task();
+    history.add_we_signaled("finish", vec![]);
     history.add_workflow_task_scheduled_and_started();
     let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [4]));
     mocks.make_wft_stream_interminable();

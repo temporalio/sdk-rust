@@ -719,7 +719,7 @@ impl WorkflowMachines {
         first: &WorkflowActivation,
     ) -> Vec<WorkflowActivation> {
         if self.outstanding_local_activity_count() != 0
-            || self.has_pending_jobs()
+            || self.activation_needed()
             || !self.protocol_msgs.is_empty()
             || !self.commands.is_empty()
             || !self.current_wf_task_commands.is_empty()

@@ -92,22 +92,17 @@ impl HistoryUpdate {
         let mut rest = &self.events[self
             .events
             .partition_point(|e| e.event_id <= i64::from(first.history_length))..];
-        // The completion immediately after initialization may establish the unchunked boundaries.
-        // Legacy chunked work must still be constructed by the existing chunker.
-        if !self.chunking_disabled && !rest.first().is_some_and(disables_chunking) {
+        if !self.chunking_disabled {
             return vec![];
         }
         let mut previous = first.clone();
         let mut activations = vec![];
-        loop {
-            let NextWFTSeqEndIndex::Complete(end) = find_end_index_of_next_wft_seq(
-                rest,
-                i64::from(previous.history_length),
-                self.has_last_wft || self.ends_at_known_boundary(),
-                true,
-            ) else {
-                break;
-            };
+        while let NextWFTSeqEndIndex::Complete(end) = find_end_index_of_next_wft_seq(
+            rest,
+            i64::from(previous.history_length),
+            self.has_last_wft || self.ends_at_known_boundary(),
+            true,
+        ) {
             let events = &rest[..=end];
             let Some(started) = events.last() else { break };
             let Some(Attributes::WorkflowTaskStartedEventAttributes(attrs)) = &started.attributes
@@ -195,6 +190,17 @@ impl HistoryUpdate {
                         .into()
                 })
             }));
+            // Patch-only work waits for another job in the authoritative machines too.
+            if !jobs.is_empty()
+                && jobs.iter().all(|job: &WorkflowActivationJob| {
+                    matches!(
+                        job.variant,
+                        Some(workflow_activation_job::Variant::NotifyHasPatch(_))
+                    )
+                })
+            {
+                break;
+            }
             // Replay reads completion metadata ahead of executing the corresponding activation.
             flags.add_from_complete(completed);
             if let Some(version) = completed_deployment_version(completed) {
@@ -219,7 +225,9 @@ impl HistoryUpdate {
             };
             prepare_to_ship_activation(&mut next);
             previous = next.clone();
-            activations.push(next);
+            if !next.jobs.is_empty() {
+                activations.push(next);
+            }
             rest = lookahead;
         }
         activations

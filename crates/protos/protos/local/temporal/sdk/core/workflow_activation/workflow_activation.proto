@@ -119,7 +119,7 @@ message WorkflowActivation {
 // Execute activations sequentially on the same workflow instance. Apply each activation's own
 // timestamp, replay state, flags and metadata, and finish its jobs, runnable workflow work,
 // microtasks, conditions, failure checks and completion processing before advancing. Never merge
-// activation boundaries or skip an activation with no jobs. Preserve per-activation timeouts and
+// activation boundaries. Core does not include jobless tasks in a batch. Preserve per-activation timeouts and
 // deadlock checks; healthy progress across a batch is not one long activation.
 //
 // Return one WorkflowActivationBatchCompletion containing indexed results for the executed

@@ -2170,8 +2170,9 @@ fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure
 mod tests {
     use super::*;
     use crate::{
-        abstractions::tests::fixed_size_permit_dealer, replay::TestHistoryBuilder,
-        test_help::{hist_to_poll_resp, MockWorkerInputs, MocksHolder, mock_worker},
+        abstractions::tests::fixed_size_permit_dealer,
+        replay::TestHistoryBuilder,
+        test_help::{MockWorkerInputs, MocksHolder, hist_to_poll_resp, mock_worker},
         worker::client::mocks::mock_worker_client,
     };
     use itertools::Itertools;

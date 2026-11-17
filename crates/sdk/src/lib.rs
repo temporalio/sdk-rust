@@ -161,7 +161,7 @@ use temporalio_common::{
             ActivityTaskCompletion,
             activity_result::{self, ActivityExecutionResult, activity_execution_result},
             activity_task::{ActivityTask, activity_task},
-            common::{ExternalStorageMetrics, NamespacedWorkflowExecution},
+            common::NamespacedWorkflowExecution,
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
             workflow_commands::{
                 WorkflowCommand, signal_external_workflow_execution, workflow_command,
@@ -826,9 +826,6 @@ struct CommonWorker {
 struct WorkflowHalf {
     /// Maps run id to cached workflow state
     workflows: RefCell<HashMap<String, WorkflowData>>,
-    /// Retrieval metrics for each run's current activation, sent with its completion. Not part of
-    /// `workflows` because a run's first activation is retrieved before the run has an entry there.
-    download_metrics: RefCell<HashMap<String, ExternalStorageMetrics>>,
     workflow_definitions: WorkflowDefinitions,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
@@ -1220,7 +1217,6 @@ impl Worker {
             },
             workflow_half: WorkflowHalf {
                 workflows: Default::default(),
-                download_metrics: Default::default(),
                 workflow_definitions: workflows,
                 workflow_removed_from_map: Default::default(),
                 detect_nondeterministic_futures: false,
