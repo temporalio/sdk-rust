@@ -59,8 +59,13 @@ relevant information.
   A read gives Workflow code what it has as soon as no activation of the run is out, and one page
   holds at most 256 Records by default. Core gives the Records over it in the next activation,
   with no wait. `StreamRuntimes::with_read_page_records` sets that cap, from 1 to 1000. Another
-  value fails the build of the `WorkerConfig`.
-  Replay gives each page as History has it, also one over the cap.
+  value fails the build of the `WorkerConfig`. `StreamRuntimes::with_read_min_gap` sets an opt-in
+  least time between two batches of one read from the Store, with no gap by default. A gap over
+  1 s fails the build of the `WorkerConfig`. With a gap, a read gives its first batch
+  immediately, and the Records that come in the gap after a batch come together in the next one,
+  still at most the cap in one page. The end of a read
+  waits at most one gap too. Records over the cap come in the next activation with no gap.
+  Replay gives each page as History has it, also one over the cap, and with no gap.
   Core refuses a read, an append or a close whose Stream id or Store name has more than 4096 bytes,
   or a read whose `from_offset` has more than 1024 bytes, which is
   `temporalio_streams::ids::MAX_OFFSET_BYTES`. Workflow code gets `stream_invalid` in the next
