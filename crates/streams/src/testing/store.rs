@@ -370,9 +370,9 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
     }
 }
 
-/// With no last-write TTL, an open Stream's meta and log never expire, and the meta has no `exp`.
-/// Its close gives both the Retention, and the meta the Tombstone after it.
-async fn an_open_stream_with_no_last_write_ttl_never_expires_until_the_close() {
+/// With no Producer idle TTL, an open Stream's meta and log never expire, and the meta has no
+/// `exp`. Its close gives both the Retention, and the meta the Tombstone after it.
+async fn an_open_stream_with_no_producer_idle_ttl_never_expires_until_the_close() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
         append(&target, &client(), 1, &["a"]).await.unwrap();
@@ -414,7 +414,7 @@ async fn an_open_stream_keeps_its_records_past_its_retention() {
         assert_eq!(state.trimmed, 0);
         assert!(state.retained_from() <= old.offsets.unwrap().0);
         assert_eq!(records_of(&entries), ["old", "new"]);
-        // A Store with a last-write TTL gives the log that TTL, and one with none gives no TTL.
+        // A Store with a Producer idle TTL gives the log that TTL, and one with none gives no TTL.
         let (ttl, _) = target.ttls().await;
         assert!(ttl == -1 || ttl > retention.as_millis() as i64, "{ttl}");
     }
@@ -783,7 +783,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_close_stops_appends_but_not_a_resend),
     case!(a_newer_format_refuses_every_write),
     case!(an_expired_stream_refuses_writes_and_its_create),
-    case!(an_open_stream_with_no_last_write_ttl_never_expires_until_the_close),
+    case!(an_open_stream_with_no_producer_idle_ttl_never_expires_until_the_close),
     case!(an_open_stream_keeps_its_records_past_its_retention),
     case!(offsets_go_on_after_the_log_is_gone),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),

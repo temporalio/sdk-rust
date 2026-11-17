@@ -221,9 +221,9 @@ impl StreamRuntime {
 pub struct MemoryStreamOptions {
     /// The Retention of each Stream. `None` is [DEFAULT_RETENTION].
     pub retention: Option<Duration>,
-    /// How long an open Stream stays after its last write. `None` keeps an open Stream until its
-    /// close.
-    pub last_write_ttl: Option<Duration>,
+    /// How long an open Stream stays after the last write of any Producer. `None` keeps an open
+    /// Stream until its close.
+    pub producer_idle_ttl: Option<Duration>,
 }
 
 /// The Stream runtime on the memory Store, for tests. It serves the same calls with the same
@@ -243,7 +243,7 @@ impl MemoryStreamRuntime {
         let positive = |value: Option<Duration>| value.filter(|value| !value.is_zero());
         let store = Arc::new(MemoryStore::new(
             positive(options.retention).unwrap_or(DEFAULT_RETENTION),
-            positive(options.last_write_ttl),
+            positive(options.producer_idle_ttl),
         ));
         StreamRuntime::new(store_name, store, meter)
     }

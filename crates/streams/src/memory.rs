@@ -46,7 +46,7 @@ struct Keys {
 pub struct MemoryStore {
     prefix: String,
     retention: Duration,
-    last_write_ttl: Option<Duration>,
+    producer_idle_ttl: Option<Duration>,
     streams: Mutex<HashMap<String, Keys>>,
     appended: Notify,
 }
@@ -55,7 +55,7 @@ impl std::fmt::Debug for MemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryStore")
             .field("retention", &self.retention)
-            .field("last_write_ttl", &self.last_write_ttl)
+            .field("producer_idle_ttl", &self.producer_idle_ttl)
             .finish_non_exhaustive()
     }
 }
@@ -216,11 +216,11 @@ impl Keys {
         Ok(())
     }
 
-    fn refresh(&mut self, now: i64, last_write_ttl: Option<i64>, tombstone: i64) {
-        // An open Stream keeps the last-write TTL after its last write, and with none it stays
-        // until its close. A closed one keeps the Retention.
+    fn refresh(&mut self, now: i64, producer_idle_ttl: Option<i64>, tombstone: i64) {
+        // An open Stream keeps the Producer idle TTL after the last write of any Producer, and with
+        // none it stays until its close. A closed one keeps the Retention.
         let ttl = if self.get("closed").is_none() {
-            last_write_ttl
+            producer_idle_ttl
         } else {
             Some(self.number("ret"))
         };
@@ -301,11 +301,11 @@ impl Keys {
 
 impl MemoryStore {
     /// An empty Store.
-    pub fn new(retention: Duration, last_write_ttl: Option<Duration>) -> Self {
+    pub fn new(retention: Duration, producer_idle_ttl: Option<Duration>) -> Self {
         Self {
             prefix: crate::ids::DEFAULT_KEY_PREFIX.to_string(),
             retention,
-            last_write_ttl,
+            producer_idle_ttl,
             streams: Mutex::default(),
             appended: Notify::new(),
         }
@@ -425,7 +425,8 @@ impl Store for MemoryStore {
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = millis(retention.unwrap_or(self.retention));
         let request_id = create.request_id;
-        let (last_write_ttl, tombstone) = (self.last_write_ttl.map(millis), millis(TOMBSTONE));
+        let (producer_idle_ttl, tombstone) =
+            (self.producer_idle_ttl.map(millis), millis(TOMBSTONE));
         let created = self.with(stream_id, |keys, now| {
             if keys.get("ret").is_none() {
                 keys.set("v", FORMAT_VERSION.to_string());
@@ -433,7 +434,7 @@ impl Store for MemoryStore {
                 if !request_id.is_empty() {
                     keys.set("rid", request_id);
                 }
-                keys.refresh(now, last_write_ttl, tombstone);
+                keys.refresh(now, producer_idle_ttl, tombstone);
                 return Ok((CreateOutcome::Created, retention));
             }
             keys.check_live(now)?;
@@ -461,7 +462,8 @@ impl Store for MemoryStore {
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(producer.kind.as_ref());
-        let (last_write_ttl, tombstone) = (self.last_write_ttl.map(millis), millis(TOMBSTONE));
+        let (producer_idle_ttl, tombstone) =
+            (self.producer_idle_ttl.map(millis), millis(TOMBSTONE));
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let appended = self.with(stream_id, |keys, now| {
             // The format version comes first, since a newer format can change the Producer field.
@@ -549,7 +551,7 @@ impl Store for MemoryStore {
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
-            keys.refresh(now, last_write_ttl, tombstone);
+            keys.refresh(now, producer_idle_ttl, tombstone);
             Ok((false, first, last))
         });
         let (resend, first, last) = appended?;
