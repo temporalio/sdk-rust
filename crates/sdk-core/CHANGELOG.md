@@ -65,7 +65,11 @@ relevant information.
   `temporalio_streams::ids::MAX_OFFSET_BYTES`. Workflow code gets `stream_invalid` in the next
   activation, also for a close. The refused call reaches no Store and no marker, and a replay
   refuses it again. A Store answer with a longer offset fails its call with
-  `stream_storage_corrupt`.
+  `stream_storage_corrupt`. The message of a Stream failure that Workflow code gets, and that the
+  marker records, is cut at 4096 bytes on a character boundary, with `...` at the end. The rest of
+  one task's marker apart from its Records holds at most 256 KiB. Past it, the task completes with
+  a new one forced, as at a heartbeat, and the results and close intents that didn't fit come in
+  the new task.
   A read with no `idle_timeout` ends after 1 minute with no Record. A graceful shutdown completes a
   task that only reads hold open, and a cached run that gets another Worker's events is evicted.
   That completion forces a new task, with none inline and no sticky queue, so that another Worker

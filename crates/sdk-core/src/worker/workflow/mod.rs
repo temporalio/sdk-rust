@@ -21,7 +21,8 @@ pub(crate) use streams::STORE_RETRY_BOUND;
 pub use streams::StreamRuntimes;
 #[cfg(test)]
 pub(crate) use streams::{
-    MAX_MARKER_RECORD_BYTES, MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
+    MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES,
+    MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
 };
 
 use crate::{

@@ -247,6 +247,22 @@ pub(crate) const STORE_REPLAY_RETRY_BOUND: Duration = Duration::from_secs(5);
 /// Records in History. A larger marker could pass the server's payload limit, and the task would
 /// then fail for good. The first Record of a task always comes, also when it is larger.
 pub(crate) const MAX_MARKER_RECORD_BYTES: usize = 1024 * 1024;
+/// The bytes of one Workflow Task's Stream marker that aren't Records: the entries of reads,
+/// appends and closes, and the table of Streams. A long task with many small results would
+/// otherwise make a marker with no limit. Past the bound, the task completes with a new one
+/// forced, as at a heartbeat, and the results that didn't fit go to the new task.
+///
+/// Core counts an estimate that is never below the encoded size. No single entry comes near the
+/// bound, since each input is bounded. The largest is a read entry with one page, 8402 bytes:
+/// four offsets of [MAX_OFFSET_BYTES] and an end with a failure of 4228 bytes, whose message has
+/// at most [MAX_FAILURE_MESSAGE_BYTES]. Each further page adds at most 10 bytes, and the pages
+/// past the bound go to the next task. A Stream of the table has at most 8202 bytes, an id and a
+/// Store name of 4096 bytes each. An append entry has at most 4249 bytes, and a close entry 4251.
+/// The test `the_largest_entries_are_far_under_the_entry_bound` checks each against its estimate.
+pub(crate) const MAX_MARKER_ENTRY_BYTES: usize = 256 * 1024;
+/// The bytes of the message of a Stream failure that Workflow code gets and the marker records. A
+/// Store can give an error text of any size, and one failure must not fill a marker.
+pub(crate) const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
 /// The idle timeout of a read that sets none. A quiet read holds its Workflow Task open, and each
 /// heartbeat adds three events to History, so a read with no bound would grow History for good.
 /// The server also ends a chain of heartbeat tasks after 30 minutes. One constant in Core gives
@@ -1161,7 +1177,7 @@ fn proto_duration(duration: Duration) -> prost_types::Duration {
 /// details hold the `StreamErrorDetails` that lang reads the reason from.
 pub(crate) fn failure(error: &StreamError) -> Failure {
     Failure {
-        message: error.to_string(),
+        message: cut_message(error.to_string()),
         failure_info: Some(FailureInfo::ApplicationFailureInfo(
             ApplicationFailureInfo {
                 r#type: error.reason.token().to_string(),
@@ -1184,6 +1200,20 @@ pub(crate) fn failure(error: &StreamError) -> Failure {
         )),
         ..Default::default()
     }
+}
+
+/// `text` cut at [MAX_FAILURE_MESSAGE_BYTES] on a character boundary, with `...` at the end of a
+/// cut one. Core cuts it where it builds the failure, so that lang and the marker get the same
+/// text, and a replay gives the text of the marker.
+fn cut_message(text: String) -> String {
+    if text.len() <= MAX_FAILURE_MESSAGE_BYTES {
+        return text;
+    }
+    let mut end = MAX_FAILURE_MESSAGE_BYTES - "...".len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
 }
 
 /// The marker detail that holds the encoded [StreamMarkerData].
