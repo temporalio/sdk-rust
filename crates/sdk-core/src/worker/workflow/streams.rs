@@ -187,7 +187,7 @@ impl WorkerStreams {
         if let Some(bound) = self.hooks.replay_retry_bound {
             return bound;
         }
-        STORE_RETRY_BOUND
+        STORE_REPLAY_RETRY_BOUND
     }
 
     fn close_bound(&self) -> Duration {
@@ -238,7 +238,7 @@ pub(crate) struct StreamTestHooks {
     pub(crate) close_bound: Option<Duration>,
     /// Told each time a graceful shutdown waits for a close in flight.
     pub(crate) shutdown_waits: Option<Arc<Notify>>,
-    /// A shorter bound in place of [STORE_RETRY_BOUND] for a replay's reads. They run on the
+    /// A shorter bound in place of [STORE_REPLAY_RETRY_BOUND] for a replay's reads. They run on the
     /// Worker's own thread, whose clock a test can't pause.
     pub(crate) replay_retry_bound: Option<Duration>,
 }
@@ -255,6 +255,9 @@ pub(crate) const STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// How long after its first failure a call stops trying and gives Workflow code the error. A
 /// longer outage is one that Workflow code should see and handle.
 pub(crate) const STORE_RETRY_BOUND: Duration = Duration::from_secs(30);
+/// The same bound for a replay's read of the Store. It is shorter than the default Workflow Task
+/// timeout, so the task fails with its cause and not with a timeout.
+pub(crate) const STORE_REPLAY_RETRY_BOUND: Duration = Duration::from_secs(5);
 /// The bytes of Records that one Workflow Task may put into its marker, for reads with their
 /// Records in History. A larger marker could pass the server's payload limit, and the task would
 /// then fail for good. The first Record of a task always comes, also when it is larger.
@@ -1312,7 +1315,7 @@ async fn read_range(
     entry: &StreamReadEntry,
 ) -> Result<Vec<StreamRecord>, tonic::Status> {
     let runtime = streams.and_then(|streams| streams.worker.get(&stream.store));
-    let retry = StoreRetry::with_bound(streams.map_or(STORE_RETRY_BOUND, |streams| {
+    let retry = StoreRetry::with_bound(streams.map_or(STORE_REPLAY_RETRY_BOUND, |streams| {
         streams.worker.replay_retry_bound()
     }));
     let Some(metrics) = streams.and_then(|streams| streams.replay_metrics(&stream.store)) else {
