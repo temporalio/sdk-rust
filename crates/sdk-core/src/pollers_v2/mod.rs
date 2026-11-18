@@ -1,7 +1,10 @@
 #![allow(unused)]
 
+pub(crate) mod req_resp;
+
 use std::{
     future,
+    num::NonZero,
     ops::DerefMut,
     pin::Pin,
     task::{Context, Poll},
@@ -10,8 +13,9 @@ use std::{
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use futures::{
-    FutureExt, Stream, TryFutureExt,
+    FutureExt, Stream, StreamExt, TryFutureExt,
     future::{BoxFuture, LocalBoxFuture},
+    stream::FuturesUnordered,
 };
 use itertools::Either;
 use pin_project::pin_project;
@@ -48,7 +52,7 @@ pub(crate) trait Poller {
     fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>>;
 
     /// Wraps this poller in a pinned box with a [`Send`] bound.
-    fn boxed<'a>(self) -> Pin<Box<dyn Poller<Item = Self::Item> + Send + 'a>>
+    fn boxed<'a>(self) -> BoxedPoller<'a, Self::Item>
     where
         Self: Sized + Send + 'a,
     {
@@ -56,7 +60,7 @@ pub(crate) trait Poller {
     }
 
     /// Wraps this poller in a pinned box without a [`Send`] bound.
-    fn boxed_local<'a>(self) -> Pin<Box<dyn Poller<Item = Self::Item> + 'a>>
+    fn boxed_local<'a>(self) -> BoxedLocalPoller<'a, Self::Item>
     where
         Self: Sized + 'a,
     {
@@ -84,11 +88,11 @@ pub(crate) trait Poller {
     }
 
     /// Maps values using the provided asynchronous function. See also [`Self::map`].
-    fn then<F, Fut, R>(self, f: F) -> Then<Self, F, Fut, R>
+    fn then<F, Fut>(self, f: F) -> Then<Self, F, Fut>
     where
         Self: Sized,
         F: FnMut(Self::Item) -> Fut,
-        Fut: Future<Output = R>,
+        Fut: Future,
     {
         Then {
             inner: self,
@@ -104,6 +108,52 @@ pub(crate) trait Poller {
         F: FnMut(&Self::Item) -> bool,
     {
         Filter { inner: self, f }
+    }
+
+    /// Filters and maps values at the same time using the provided function.
+    fn filter_map<F, R>(self, f: F) -> FilterMap<Self, F, R>
+    where
+        Self: Sized,
+        F: FnMut(Self::Item) -> Option<R>,
+    {
+        FilterMap { inner: self, f }
+    }
+
+    /// Calls the provided function for every value returned by this poller.
+    fn inspect<F>(self, f: F) -> Inspect<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(&Self::Item),
+    {
+        Inspect { inner: self, f }
+    }
+
+    /// Awaits provided future before shutting down. Even if the future returns an error, full
+    /// shutdown is performed (except if the future panics).
+    fn on_shutdown<Fut>(self, fut: Fut) -> OnShutdown<Self, Fut>
+    where
+        Self: Sized,
+        Fut: Future<Output = anyhow::Result<()>> + Send,
+    {
+        OnShutdown {
+            inner: self,
+            fut: Some(fut),
+        }
+    }
+
+    /// Buffers multiple futures from this poller and awaits them at the same time, returning values
+    /// in the order of completion of the futures. The number of buffered futures never exceeds
+    /// specified maximum.
+    fn buffer_unordered(self, max: usize) -> BufferUnordered<Self>
+    where
+        Self: Sized,
+        Self::Item: Future,
+    {
+        BufferUnordered {
+            inner: self,
+            in_progress_queue: FuturesUnordered::new(),
+            max,
+        }
     }
 
     /// Wraps the poller in [`Either::Left`]. Can be used together with [`Self::right_poller`] to
@@ -175,6 +225,9 @@ where
     }
 }
 
+pub(crate) type BoxedPoller<'a, T> = Pin<Box<dyn Poller<Item = T> + Send + 'a>>;
+pub(crate) type BoxedLocalPoller<'a, T> = Pin<Box<dyn Poller<Item = T> + 'a>>;
+
 #[pin_project]
 pub(crate) struct PendingWhen<P, F>
 where
@@ -242,26 +295,26 @@ where
 }
 
 #[pin_project]
-pub(crate) struct Then<P, F, Fut, R>
+pub(crate) struct Then<P, F, Fut>
 where
     P: Poller,
     F: FnMut(P::Item) -> Fut,
-    Fut: Future<Output = R>,
+    Fut: Future,
 {
     #[pin]
     inner: P,
     f: F,
     #[pin]
-    fut: Option<Fut>,
+    fut: Option<F::Output>,
 }
 
-impl<P, F, Fut, R> Poller for Then<P, F, Fut, R>
+impl<P, F, Fut> Poller for Then<P, F, Fut>
 where
     P: Poller,
     F: FnMut(P::Item) -> Fut,
-    Fut: Future<Output = R>,
+    Fut: Future,
 {
-    type Item = R;
+    type Item = Fut::Output;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollerResult<Self::Item> {
         let mut this = self.project();
@@ -332,6 +385,77 @@ where
     }
 }
 
+#[pin_project]
+pub(crate) struct FilterMap<P, F, R>
+where
+    P: Poller,
+    F: FnMut(P::Item) -> Option<R>,
+{
+    #[pin]
+    inner: P,
+    f: F,
+}
+
+impl<P, F, R> Poller for FilterMap<P, F, R>
+where
+    P: Poller,
+    F: FnMut(P::Item) -> Option<R>,
+{
+    type Item = R;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollerResult<Self::Item> {
+        let mut this = self.project();
+        loop {
+            return match this.inner.as_mut().poll_next(cx) {
+                PollerResult::Ready(v) => match (this.f)(v) {
+                    Some(v) => PollerResult::Ready(v),
+                    None => continue,
+                },
+                PollerResult::Pending => PollerResult::Pending,
+                PollerResult::Drained => PollerResult::Drained,
+            };
+        }
+    }
+
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.project().inner.shutdown()
+    }
+}
+
+#[pin_project]
+pub(crate) struct Inspect<P, F>
+where
+    P: Poller,
+    F: FnMut(&P::Item),
+{
+    #[pin]
+    inner: P,
+    f: F,
+}
+
+impl<P, F> Poller for Inspect<P, F>
+where
+    P: Poller,
+    F: FnMut(&P::Item),
+{
+    type Item = P::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollerResult<Self::Item> {
+        let mut this = self.project();
+        loop {
+            let result = this.inner.as_mut().poll_next(cx);
+            if let PollerResult::Ready(v) = &result {
+                (this.f)(v);
+            }
+            return result;
+        }
+    }
+
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.project().inner.shutdown()
+    }
+}
+
 impl<P1, P2> Poller for Either<P1, P2>
 where
     P1: Poller,
@@ -351,6 +475,87 @@ where
             Either::Left(p) => p.shutdown(),
             Either::Right(p) => p.shutdown(),
         }
+    }
+}
+
+#[pin_project]
+pub(crate) struct OnShutdown<P, Fut>
+where
+    P: Poller,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    #[pin]
+    inner: P,
+    fut: Option<Fut>,
+}
+
+impl<P, Fut> Poller for OnShutdown<P, Fut>
+where
+    P: Poller,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    type Item = P::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollerResult<Self::Item> {
+        self.project().inner.poll_next(cx)
+    }
+
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+        let mut this = self.project();
+        let fut = this.fut.take();
+        let shutdown_fut = this.inner.shutdown();
+        async move {
+            let fut = fut.ok_or_else(|| anyhow!("poller shutdown called twice"))?;
+            let (fut_result, shutdown_result) = join!(fut, shutdown_fut);
+            fut_result.and(shutdown_result)
+        }
+        .boxed()
+    }
+}
+
+#[pin_project]
+pub(crate) struct BufferUnordered<P>
+where
+    P: Poller,
+    P::Item: Future,
+{
+    #[pin]
+    inner: P,
+    #[pin]
+    in_progress_queue: FuturesUnordered<P::Item>,
+    max: usize,
+}
+
+impl<P> Poller for BufferUnordered<P>
+where
+    P: Poller,
+    P::Item: Future,
+{
+    type Item = <P::Item as Future>::Output;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> PollerResult<Self::Item> {
+        let max = self.max;
+        let mut this = self.project();
+        let mut drained = false;
+        while this.in_progress_queue.len() < max {
+            match this.inner.as_mut().poll_next(cx) {
+                PollerResult::Ready(fut) => this.in_progress_queue.push(fut),
+                PollerResult::Pending => break,
+                PollerResult::Drained => {
+                    drained = true;
+                    break;
+                }
+            }
+        }
+        match this.in_progress_queue.poll_next(cx) {
+            Poll::Ready(Some(v)) => PollerResult::Ready(v),
+            Poll::Ready(None) if drained => PollerResult::Drained,
+            Poll::Ready(None) | Poll::Pending => PollerResult::Pending,
+        }
+    }
+
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.project().inner.shutdown()
     }
 }
 
@@ -409,11 +614,14 @@ where
     }
 }
 
+/// Returned by [`from_unbounded_receiver`].
+pub(crate) type FromUnboundedReceiver<T> = FromStream<UnboundedReceiverStream<T>>;
+
 /// Creates [`Poller`] from [`mpsc::UnboundedReceiver`]. The poller is drained when the channel is
 /// closed and empty.
 pub(crate) fn from_unbounded_receiver<T>(
     receiver: mpsc::UnboundedReceiver<T>,
-) -> FromStream<UnboundedReceiverStream<T>> {
+) -> FromUnboundedReceiver<T> {
     from_stream(UnboundedReceiverStream::new(receiver))
 }
 
@@ -550,9 +758,7 @@ where
         let shutdown2 = this.poller2.shutdown();
         async move {
             let (result1, result2) = join!(shutdown1, shutdown2);
-            result1?;
-            result2?;
-            Ok(())
+            result1.and(result2)
         }
         .boxed()
     }
@@ -594,14 +800,15 @@ mod tests {
         }};
     }
 
-    struct ScriptedPoller {
-        steps: VecDeque<PollerResult<i32>>,
+    #[pin_project]
+    struct ScriptedPoller<T> {
+        steps: VecDeque<PollerResult<T>>,
         polls: Arc<AtomicUsize>,
         shut_down: Arc<AtomicBool>,
     }
 
-    impl ScriptedPoller {
-        fn new(steps: impl IntoIterator<Item = PollerResult<i32>>) -> Self {
+    impl<T> ScriptedPoller<T> {
+        fn new(steps: impl IntoIterator<Item = PollerResult<T>>) -> Self {
             Self {
                 steps: steps.into_iter().collect(),
                 polls: Arc::new(AtomicUsize::new(0)),
@@ -610,17 +817,24 @@ mod tests {
         }
     }
 
-    impl Poller for ScriptedPoller {
-        type Item = i32;
+    impl<T> Poller for ScriptedPoller<T> {
+        type Item = T;
 
-        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> PollerResult<i32> {
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> PollerResult<Self::Item> {
             assert!(!self.shut_down.load(Ordering::SeqCst));
             self.polls.fetch_add(1, Ordering::SeqCst);
-            self.steps.pop_front().unwrap_or(PollerResult::Drained)
+            self.project()
+                .steps
+                .pop_front()
+                .unwrap_or(PollerResult::Drained)
         }
 
         fn shutdown(mut self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
-            assert_polls! { self; PollerResult::Drained; }
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(matches!(
+                self.as_mut().poll_next(&mut cx),
+                PollerResult::Drained
+            ));
             let shut_down = self.shut_down.clone();
             async move {
                 shut_down.store(true, Ordering::SeqCst);
@@ -689,6 +903,63 @@ mod tests {
     }
 
     #[test]
+    fn filter_map_only_transforms_ready_values() {
+        let calls = Cell::new(0);
+        let mut poller = pin!(
+            ScriptedPoller::new([
+                PollerResult::Pending,
+                PollerResult::Ready(1),
+                PollerResult::Pending,
+                PollerResult::Ready(-2),
+                PollerResult::Drained,
+                PollerResult::Ready(-3),
+                PollerResult::Ready(-4),
+                PollerResult::Pending,
+                PollerResult::Ready(-5),
+                PollerResult::Ready(6),
+                PollerResult::Ready(-7),
+            ])
+            .filter_map(|v| {
+                calls.set(calls.get() + 1);
+                (v > 0).then(|| v.to_string())
+            })
+        );
+
+        assert_polls! { poller;
+            PollerResult::Pending + assert_eq!(calls.get(), 0);
+            PollerResult::Ready("1".to_string()) + assert_eq!(calls.get(), 1);
+            PollerResult::Pending + assert_eq!(calls.get(), 1);
+            PollerResult::Drained + assert_eq!(calls.get(), 2);
+            PollerResult::Pending + assert_eq!(calls.get(), 4);
+            PollerResult::Ready("6".to_string()) + assert_eq!(calls.get(), 6);
+            PollerResult::Drained + assert_eq!(calls.get(), 7);
+        }
+    }
+
+    #[test]
+    fn inspect_only_called_for_ready_values() {
+        let calls = Cell::new(0);
+        let mut poller = pin!(
+            ScriptedPoller::new([
+                PollerResult::Pending,
+                PollerResult::Ready(3),
+                PollerResult::Drained,
+                PollerResult::Ready(5),
+            ])
+            .inspect(|v| {
+                calls.set(calls.get() + 1);
+            })
+        );
+
+        assert_polls! { poller;
+            PollerResult::Pending + assert_eq!(calls.get(), 0);
+            PollerResult::Ready(3) + assert_eq!(calls.get(), 1);
+            PollerResult::Drained + assert_eq!(calls.get(), 1);
+            PollerResult::Ready(5) + assert_eq!(calls.get(), 2);
+        }
+    }
+
+    #[test]
     fn pending_when_only_calls_predicate_when_drained() {
         let calls = Cell::new(0);
         let mut poller = pin!(
@@ -750,8 +1021,8 @@ mod tests {
                 Poll::Ready(v * 10)
             })
         }));
-        let mut cx = Context::from_waker(noop_waker_ref());
 
+        let mut cx = Context::from_waker(noop_waker_ref());
         assert_eq!(poller.as_mut().poll_next(&mut cx), PollerResult::Pending);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         for _ in 0..2 {
@@ -927,10 +1198,12 @@ mod tests {
     #[rstest::rstest]
     #[tokio::test]
     async fn shutdown_propagates_through_adapters(#[values(false, true)] biased: bool) {
-        let source1 = ScriptedPoller::new([PollerResult::Ready(1)]);
-        let source2 = ScriptedPoller::new([]);
+        let source1 = ScriptedPoller::new([PollerResult::Ready(async { 1 })]);
+        let source2 = ScriptedPoller::<future::Ready<i32>>::new([]);
         let shut_down1 = source1.shut_down.clone();
         let shut_down2 = source2.shut_down.clone();
+        let (shutdown_tx1, shutdown_rx1) = oneshot::channel();
+        let (shutdown_tx2, shutdown_rx2) = oneshot::channel();
 
         // exercising every adapter method
         let poller1 = source1
@@ -939,10 +1212,22 @@ mod tests {
             .pending_when(|| false)
             .map(|x| x)
             .then(async |x| x)
-            .filter(|_| true);
+            .filter(|_| true)
+            .inspect(|_| ())
+            .on_shutdown(async move {
+                shutdown_tx1.send(());
+                Ok(())
+            })
+            .buffer_unordered(1);
 
         // exercising every adapter method in reverse order (except boxing due to Send bound)
         let poller2 = source2
+            .buffer_unordered(1)
+            .on_shutdown(async move {
+                shutdown_tx2.send(());
+                Ok(())
+            })
+            .inspect(|_| ())
             .filter(|_| true)
             .then(async |x| x)
             .map(|x| x)
@@ -970,5 +1255,7 @@ mod tests {
         shutdown_fut.await;
         assert!(shut_down1.load(Ordering::SeqCst));
         assert!(shut_down2.load(Ordering::SeqCst));
+        shutdown_rx1.now_or_never().unwrap().unwrap();
+        shutdown_rx2.now_or_never().unwrap().unwrap();
     }
 }

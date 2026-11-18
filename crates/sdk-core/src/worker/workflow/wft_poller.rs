@@ -91,6 +91,87 @@ pub(crate) fn make_wft_poller(
     new_wft_poller(wf_task_poll_buffer, metrics.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_wft_poller_v2(
+    config: &WorkerConfig,
+    sticky_queue_name: &Option<String>,
+    client: &Arc<dyn WorkerClient>,
+    metrics: &MetricsContext,
+    shutdown_token: &CancellationToken,
+    wft_slots: &MeteredPermitDealer<WorkflowSlotKind>,
+    heartbeat_state: PollerHeartbeatState,
+    sticky_heartbeat_state: PollerHeartbeatState,
+    capabilities: Arc<NamespaceCapabilities>,
+) -> impl crate::pollers_v2::Poller<
+    Item = Result<
+        (
+            ValidPollWFTQResponse,
+            OwnedMeteredSemPermit<WorkflowSlotKind>,
+        ),
+        tonic::Status,
+    >,
+> + Sized
++ 'static {
+    use crate::pollers_v2::Poller;
+
+    let wft_metrics = metrics.with_new_attrs([workflow_poller()]);
+    let effective_behavior = crate::worker::resolve_effective_behavior(
+        config.workflow_task_poller_behavior,
+        &capabilities,
+    );
+    let wft_poller_shared = if sticky_queue_name.is_some() {
+        // Balance on the limit `acquire_owned` actually enforces (min of slot supplier and cache
+        // size). Using only the slot supplier lets a small cache starve the non-sticky poller.
+        let balance_limit = [wft_slots.available_permits(), wft_slots.max_permits()]
+            .into_iter()
+            .flatten()
+            .min();
+        Some(Arc::new(StickyPollerShared::new(balance_limit)))
+    } else {
+        None
+    };
+    let wf_task_poll_buffer = LongPollBuffer::new_workflow_task(
+        client.clone(),
+        config.task_queue.clone(),
+        None,
+        sticky_poller_behavior(effective_behavior, config, false),
+        wft_slots.clone(),
+        shutdown_token.child_token(),
+        Some(move |np| {
+            wft_metrics.record_num_pollers(np);
+        }),
+        WorkflowTaskOptions {
+            wft_poller_shared: wft_poller_shared.clone(),
+        },
+        heartbeat_state,
+        capabilities.clone(),
+    )
+    .to_v2();
+    let sticky_queue_poller = sticky_queue_name.as_ref().map(|sqn| {
+        let sticky_metrics = metrics.with_new_attrs([workflow_sticky_poller()]);
+        LongPollBuffer::new_workflow_task(
+            client.clone(),
+            config.task_queue.clone(),
+            Some(sqn.clone()),
+            sticky_poller_behavior(effective_behavior, config, true),
+            wft_slots.clone().into_sticky(),
+            shutdown_token.child_token(),
+            Some(move |np| {
+                sticky_metrics.record_num_pollers(np);
+            }),
+            WorkflowTaskOptions { wft_poller_shared },
+            sticky_heartbeat_state,
+            capabilities,
+        )
+        .to_v2()
+    });
+    let wf_task_poll_buffer = match sticky_queue_poller {
+        Some(sp) => crate::pollers_v2::select(wf_task_poll_buffer, sp).left_poller(),
+        None => wf_task_poll_buffer.right_poller(),
+    };
+    new_wft_poller_v2(wf_task_poll_buffer, metrics.clone())
+}
+
 fn new_wft_poller(
     poller: BoxedWFPoller,
     metrics: MetricsContext,
@@ -139,6 +220,54 @@ fn new_wft_poller(
                     None
                 }
             };
+        }
+    })
+}
+
+fn new_wft_poller_v2(
+    poller: impl crate::pollers_v2::Poller<
+        Item = Result<
+            (
+                PollWorkflowTaskQueueResponse,
+                OwnedMeteredSemPermit<WorkflowSlotKind>,
+            ),
+            tonic::Status,
+        >,
+    >,
+    metrics: MetricsContext,
+) -> impl crate::pollers_v2::Poller<
+    Item = Result<
+        (
+            ValidPollWFTQResponse,
+            OwnedMeteredSemPermit<WorkflowSlotKind>,
+        ),
+        tonic::Status,
+    >,
+> {
+    poller.filter_map(move |x| match x {
+        Ok((wft, permit)) => {
+            if wft == PollWorkflowTaskQueueResponse::default() {
+                // We get the default proto in the event that the long poll times out.
+                debug!("Poll wft timeout");
+                metrics.wf_tq_poll_empty();
+                return None;
+            }
+            if let Some(dur) = wft.sched_to_start() {
+                metrics.wf_task_sched_to_start_latency(dur);
+            }
+            let work = match validate_wft(wft) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(error=?e, "Server returned an unparseable workflow task");
+                    return None;
+                }
+            };
+            metrics.wf_tq_poll_ok();
+            Some(Ok((work, permit)))
+        }
+        Err(e) => {
+            warn!(error=?e, "Error while polling for workflow tasks");
+            Some(Err(e))
         }
     })
 }

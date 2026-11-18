@@ -80,6 +80,21 @@ impl WFStream {
         Self::build_internal(all_inputs, basics, local_activity_request_sink)
     }
 
+    pub(super) fn build_v2(
+        basics: WorkflowBasics,
+        wft_poller: impl crate::pollers_v2::Poller<Item = Result<WFTExtractorOutput, tonic::Status>>
+        + Send
+        + 'static,
+        local_poller: impl crate::pollers_v2::Poller<Item = LocalInput> + Send + 'static,
+        local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+    ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
+        let all_inputs = crate::pollers_v2::select_biased(
+            local_poller.map(Into::into),
+            wft_poller.map(|t| ExternalPollerInputs::from(t).into()),
+        );
+        Self::build_internal_v2(all_inputs, basics, local_activity_request_sink)
+    }
+
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
@@ -234,6 +249,167 @@ impl WFStream {
             })
             // Stop the stream once we have shut down
             .take_while(|o| future::ready(!matches!(o, Err(PollError::ShutDown))))
+    }
+
+    fn build_internal_v2(
+        all_inputs: impl crate::pollers_v2::Poller<Item = WFStreamInput> + Send + 'static,
+        basics: WorkflowBasics,
+        local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+    ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
+        let mut state = WFStream {
+            buffered_polls_need_cache_slot: Default::default(),
+            runs: RunCache::new(
+                basics.worker_config.clone(),
+                (basics.sdk_name.clone(), basics.sdk_version.clone()),
+                basics.server_capabilities,
+                local_activity_request_sink,
+                basics.metrics.clone(),
+            ),
+            shutdown_token: basics.shutdown_token,
+            metrics: basics.metrics,
+            runs_needing_fetching: Default::default(),
+            history_fetch_refcounter: Arc::new(HistfetchRC {}),
+        };
+        let mut poller = all_inputs
+            .map(move |action: WFStreamInput| {
+                let span = span!(Level::DEBUG, "new_stream_input", action=?action);
+                let _span_g = span.enter();
+
+                let mut activations = vec![];
+                let mut actions = vec![];
+                let maybe_act = match action {
+                    WFStreamInput::NewWft(pwft) => {
+                        debug!(run_id=%pwft.work.execution.run_id, "New WFT");
+                        state.instantiate_or_update(*pwft)
+                    }
+                    WFStreamInput::Local(local_input) => {
+                        let _span_g = local_input.span.enter();
+                        if let Some(rid) = local_input.input.run_id()
+                            && let Some(rh) = state.runs.get_mut(rid)
+                        {
+                            rh.record_span_fields(&local_input.span);
+                        }
+                        match local_input.input {
+                            LocalInputs::Completion(completion) => {
+                                activations.extend(state.process_completion(
+                                    NewOrFetchedComplete::New(Box::new(completion)),
+                                ));
+                                None // completions can return more than one activation
+                            }
+                            LocalInputs::FetchedPageCompletion { paginator, update } => {
+                                activations.extend(state.process_completion(
+                                    NewOrFetchedComplete::Fetched(update, Box::new(paginator)),
+                                ));
+                                None // completions can return more than one activation
+                            }
+                            LocalInputs::PostActivation(report) => {
+                                state.process_post_activation(*report)
+                            }
+                            LocalInputs::LocalResolution(res) => state.local_resolution(res),
+                            LocalInputs::HeartbeatTimeout(hbt) => {
+                                state.process_heartbeat_timeout(hbt)
+                            }
+                            LocalInputs::LocalActivityCancelProcessed(run_id) => state
+                                .runs
+                                .get_mut(&run_id)
+                                .and_then(|rh| rh.check_more_activations()),
+                            LocalInputs::RequestEviction(evict) => {
+                                state.request_eviction(evict).into_run_update_resp()
+                            }
+                            LocalInputs::GetStateInfo(gsi) => {
+                                let _ = gsi.response_tx.send(WorkflowStateInfo {
+                                    cached_workflows: state.runs.len(),
+                                    outstanding_wft: state.outstanding_wfts(),
+                                });
+                                None
+                            }
+                            LocalInputs::BumpStream => {
+                                // Ensures pending workflow activation polls resolve for
+                                // scenarios like during shutdown
+                                None
+                            }
+                        }
+                    }
+                    WFStreamInput::FailedFetch {
+                        run_id,
+                        err,
+                        auto_reply_fail,
+                    } => {
+                        let message = format!("Fetching history failed: {err:?}");
+                        if !state.runs.has_run(&run_id)
+                            && let Some(info) = auto_reply_fail.clone()
+                        {
+                            actions.push(WorkflowStreamAction::FailUnstoredWft {
+                                run_id,
+                                report: Box::new(FailedActivationWFTReport::new(
+                                    info.task_token,
+                                    info.workflow_id,
+                                    info.attempt,
+                                    WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                    ApiFailure::application_failure(message, true).into(),
+                                    WftFailureKind::Task,
+                                    &state
+                                        .metrics
+                                        .with_new_attrs([workflow_type(info.workflow_type)]),
+                                )),
+                            });
+                            None
+                        } else {
+                            state
+                                .request_eviction(RequestEvictMsg {
+                                    run_id,
+                                    message,
+                                    reason: EvictionReason::PaginationOrHistoryFetch,
+                                    auto_reply_fail,
+                                })
+                                .into_run_update_resp()
+                        }
+                    }
+                    WFStreamInput::PollerDead => {
+                        debug!("WFT poller died, beginning shutdown");
+                        state.shutdown_token.cancel();
+                        None
+                    }
+                    WFStreamInput::PollerError(e) => {
+                        return Err(PollError::TonicError(e));
+                    }
+                };
+
+                activations.extend(maybe_act);
+                activations.extend(state.reconcile_buffered());
+                actions.extend(
+                    activations
+                        .into_iter()
+                        .map(WorkflowStreamAction::Activation),
+                );
+
+                if state.shutdown_done() {
+                    info!("Workflow shutdown is done");
+                    return Err(PollError::ShutDown);
+                }
+
+                Ok(WFStreamOutput {
+                    actions: actions.into(),
+                    fetch_histories: std::mem::take(&mut state.runs_needing_fetching),
+                })
+            })
+            .inspect(|o| {
+                if let Some(e) = o.as_ref().err()
+                    && !matches!(e, PollError::ShutDown)
+                {
+                    error!(
+                        "Workflow processing encountered fatal error and must shut down {:?}",
+                        e
+                    );
+                }
+            })
+            .boxed_local();
+
+        stream::poll_fn(move |cx| match poller.as_mut().poll_next(cx) {
+            crate::pollers_v2::PollerResult::Ready(x) => std::task::Poll::Ready(Some(x)),
+            crate::pollers_v2::PollerResult::Pending => std::task::Poll::Pending,
+            crate::pollers_v2::PollerResult::Drained => std::task::Poll::Ready(None),
+        })
     }
 
     /// Instantiate or update run machines with a new WFT
