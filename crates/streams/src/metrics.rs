@@ -4,7 +4,6 @@ use temporalio_common::telemetry::metrics::{
     Counter, MetricAttributes, MetricParameters, TemporalMeter, UpDownCounter,
 };
 
-#[derive(Clone)]
 pub(crate) struct Metrics {
     attributes: MetricAttributes,
     fenced: Counter,

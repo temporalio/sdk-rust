@@ -25,16 +25,20 @@ pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 /// with a Stream Store, and that client's Workers share it. A Store has no namespaces, so the
 /// runtime ignores a request's `namespace`. The SDK sets it, and only the server reads it.
 ///
-/// The runtime checks each request before the Store sees it, and each answer after it. The checks
-/// are the same for every Store.
+/// The runtime checks each request before the Store sees it, and the answer to a create, an append,
+/// a read or a describe after it. The checks are the same for every Store.
 ///
 /// - A Stream id and a Producer id are opaque text of 1 to 4096 bytes. The caller builds both.
 /// - A Workflow Producer appends and closes with its Workflow Task as the epoch, so that a Store
 ///   can refuse a write of an older task.
-/// - A batch has at most 1000 Records and 4 MiB, and a Record at most 1536 KiB.
-/// - A read gives at most 1000 Records and waits at most 60 s. A page over the caps of its request
-///   is cut.
-/// - An answer with a bad offset fails with [Reason::StorageCorrupt].
+/// - A batch has at most 1000 Records and 4 MiB, and a Record at most 1536 KiB. The sizes are of
+///   the stored form, in which each Record has its Producer.
+/// - A read gives at most 1000 Records, and the runtime asks the Store to wait at most 60 s. A page
+///   over the caps of its request is cut.
+/// - The offsets of a page rise, start after the read's `from_offset`, and end at or before its
+///   `last_offset`.
+/// - An answer that breaks these rules, a create with no ref, or a describe with no status fails
+///   with [Reason::StorageCorrupt].
 pub struct StreamRuntime {
     store: Arc<dyn StreamStore>,
     metrics: Metrics,
@@ -54,12 +58,12 @@ fn check_conflict_policy(value: i32) -> StreamResult<()> {
         .map_err(|_| StreamError::invalid(format!("The conflict policy {value} is unknown")))
 }
 
-fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
+/// Refuses a request with no Stream ref, or with an empty or too long Stream id.
+fn check_stream_ref(stream_ref: Option<&StreamRef>) -> StreamResult<()> {
     let id = stream_ref
         .map(|stream_ref| stream_ref.id.as_str())
         .unwrap_or_default();
-    check_stream_id(id)?;
-    Ok(id)
+    check_stream_id(id)
 }
 
 /// Refuses a create answer with no ref, or with the ref of another Stream.
@@ -109,7 +113,7 @@ fn check_close_producer(producer: Option<&Producer>) -> StreamResult<()> {
 
 /// Checks an append before the Store sees it, and gives its Producer.
 fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
-    stream_id(request.r#ref.as_ref())?;
+    check_stream_ref(request.r#ref.as_ref())?;
     let producer = request
         .producer
         .as_ref()
@@ -322,8 +326,13 @@ impl StreamRuntime {
         &self,
         request: CreateStreamRequest,
     ) -> StreamResult<CreateStreamResponse> {
-        let id = stream_id(request.stream_ref.as_ref())?.to_string();
+        check_stream_ref(request.stream_ref.as_ref())?;
         check_conflict_policy(request.id_conflict_policy)?;
+        let id = request
+            .stream_ref
+            .as_ref()
+            .map(|stream_ref| stream_ref.id.clone())
+            .unwrap_or_default();
         let created = self.store.create_stream(request).await?;
         check_created(&created, &id)?;
         Ok(created)
@@ -350,7 +359,7 @@ impl StreamRuntime {
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
-        stream_id(request.r#ref.as_ref())?;
+        check_stream_ref(request.r#ref.as_ref())?;
         read_page(self.store.as_ref(), &self.metrics, request).await
     }
 
@@ -359,7 +368,7 @@ impl StreamRuntime {
         &self,
         request: CloseStreamRequest,
     ) -> StreamResult<CloseStreamResponse> {
-        stream_id(request.r#ref.as_ref())?;
+        check_stream_ref(request.r#ref.as_ref())?;
         check_close_producer(request.producer.as_ref())?;
         let closed = self.store.close_stream(request).await;
         self.count_fenced(&closed);
@@ -371,7 +380,7 @@ impl StreamRuntime {
         &self,
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse> {
-        stream_id(request.r#ref.as_ref())?;
+        check_stream_ref(request.r#ref.as_ref())?;
         let described = self.store.describe_stream(request).await?;
         check_described(&described)?;
         Ok(described)
@@ -719,6 +728,10 @@ mod tests {
                 .await
                 .unwrap_err(),
             runtime
+                .read_records(ReadRecordsRequest::default())
+                .await
+                .unwrap_err(),
+            runtime
                 .describe_stream(DescribeStreamRequest::default())
                 .await
                 .unwrap_err(),
@@ -1002,7 +1015,7 @@ mod tests {
         let empty = "The Store gave an empty page with a last_offset that is lower than the \
                      from_offset of the read";
         let cases = [
-            // The Records are not after the offset of the read, and the cursor is empty.
+            // A read after `m` that gets Records below it and an empty `last_offset`.
             ("m", page(&["b", "a", "a"], "", false), first.to_string()),
             ("a", page(&["a"], "a", false), first.to_string()),
             ("b", page(&["a", "c"], "c", false), first.to_string()),
@@ -1089,6 +1102,72 @@ mod tests {
                 error.message,
                 format!("The Store gave an offset of {too_long} bytes, more than 1024")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_last_offset_of_a_read_is_corrupt() {
+        // The Record is fine and `last_offset` is above it, so only the bound can refuse the page.
+        let page = |last_offset: usize| ReadRecordsResponse {
+            records: vec![stored(b"a", 1)],
+            last_offset: vec![0xff; last_offset],
+            done: true,
+        };
+        read_after("", page(MAX_OFFSET_BYTES)).await.unwrap();
+        let error = read_after("", page(MAX_OFFSET_BYTES + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, Reason::StorageCorrupt);
+        assert_eq!(
+            error.message,
+            "The Store gave a last offset of 1025 bytes, more than 1024"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_goes_to_the_store_and_its_answer_passes() {
+        let (store, runtime) = runtime();
+        let appended = runtime
+            .append_records(AppendRecordsRequest {
+                records: vec![],
+                ..append_as(workflow(Some(epoch())))
+            })
+            .await
+            .unwrap();
+        assert_eq!(appended, AppendRecordsResponse::default());
+        let sent = store.appends.lock().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_max_records_of_a_read_is_1000_or_less_and_zero_or_less_is_1000() {
+        let (store, runtime) = runtime();
+        // The Store gives 1001 Records, one more than the highest cap.
+        *store.page.lock() = ReadRecordsResponse {
+            records: (1u16..=1001).map(|n| stored(&n.to_be_bytes(), 1)).collect(),
+            last_offset: 1001u16.to_be_bytes().to_vec(),
+            done: true,
+        };
+        for (asked, sent, kept) in [
+            (0, 1000, 1000),
+            (1, 1, 1),
+            (1000, 1000, 1000),
+            (1001, 1000, 1000),
+            (-1, 1000, 1000),
+        ] {
+            let page = runtime
+                .read_records(ReadRecordsRequest {
+                    max_records: asked,
+                    ..read()
+                })
+                .await
+                .unwrap();
+            assert_eq!(store.reads.lock().last().unwrap().max_records, sent);
+            assert_eq!(page.records.len(), kept, "max_records {asked}");
+            // The page is cut, so it is not done and it ends at its last Record.
+            assert!(!page.done);
+            assert_eq!(page.last_offset, (kept as u16).to_be_bytes().to_vec());
         }
     }
 }

@@ -39,7 +39,6 @@ impl Json {
         match self {
             Json::Str(text) => quote_json(out, text),
             Json::Int(value) => out.push_str(&value.to_string()),
-            Json::Arr(items) if items.is_empty() => out.push_str("[]"),
             Json::Obj(fields) if fields.is_empty() => out.push_str("{}"),
             Json::Arr(items) => {
                 out.push_str("[\n");
@@ -77,22 +76,10 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
-/// Escapes as the readers of the file need, and leaves non-ASCII text as it is.
+/// Quotes a string. Every string of the file is a key, a kind or hex, so none needs an escape.
 fn quote_json(out: &mut String, text: &str) {
     out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
+    out.push_str(text);
     out.push('"');
 }
 

@@ -355,7 +355,10 @@ mod tests {
     fn a_local_activity_epoch_needs_its_workflow_task() {
         let mut local = local_activity();
         local_epoch(&mut local).task = None;
-        assert!(refused(&local).contains("Workflow Task"));
+        assert_eq!(
+            refused(&local),
+            "The Producer has no Workflow Task that dispatched it"
+        );
     }
 
     #[test]
@@ -366,7 +369,10 @@ mod tests {
             .as_mut()
             .unwrap()
             .started_event_id = 0;
-        assert!(refused(&local).contains("Workflow Task"));
+        assert_eq!(
+            refused(&local),
+            "The Workflow Task of the epoch has no started event id"
+        );
     }
 
     #[test]

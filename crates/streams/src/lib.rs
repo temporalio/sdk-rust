@@ -1,7 +1,7 @@
 #![warn(missing_docs)]
 
-//! Experimental. The Stream runtime that Core and the Temporal SDK bridges link. It answers the
-//! five operations of the Stream service on a Stream Store, and it has no Store of its own.
+//! Experimental. The Stream runtime for Core and the Temporal SDK bridges. It answers the five
+//! operations of the Stream service on a Stream Store, and it has no Store of its own.
 //!
 //! A [StreamStore] answers each operation whole. The Store applies the rules of the service
 //! itself. A lang bridge implements the trait for a Store that is written in that language. The
@@ -10,8 +10,8 @@
 //!
 //! [StreamRuntime::new] builds the runtime on one Store. It has one typed method for each
 //! operation. [StreamRuntime::call] is the byte form of the same methods. The runtime checks each
-//! request before the Store sees it, and each answer after it. The checks are the same for every
-//! Store.
+//! request before the Store sees it, and the answer to a create, an append, a read or a describe
+//! after it. The checks are the same for every Store.
 
 mod dispatch;
 pub mod epoch;

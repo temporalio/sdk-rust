@@ -24,7 +24,7 @@ pub enum Reason {
     SequenceTooLow,
     /// The batch has the `sequence` of the last one of its epoch, and other content.
     SeqDivergent,
-    /// The Stream's owner doesn't allow this Producer to close it.
+    /// The caller may not create or close this Stream.
     NotOwner,
     /// A newer format version wrote the Stream.
     FormatTooNew,
@@ -88,7 +88,7 @@ impl Reason {
         }
     }
 
-    /// The status code of the reason, as in the proposal's Appendix A.
+    /// The status code of the reason, as the comments of [StreamErrorReason] give it.
     pub fn code(self) -> Code {
         match self {
             Reason::NotFound | Reason::Expired => Code::NotFound,
@@ -155,7 +155,7 @@ impl TryFrom<i32> for Reason {
 pub struct StreamError {
     /// Why the call failed.
     pub reason: Reason,
-    /// What happened, for a log or the facade error.
+    /// What happened, for a log or for the text of the error that lang raises.
     pub message: String,
 }
 

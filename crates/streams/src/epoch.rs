@@ -85,9 +85,11 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
     key
 }
 
-/// The key of an epoch. It is the [task_of] key, then the attempt's scheduled seconds and nanos
-/// and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't have is zero, and a Producer
-/// with no case is all zeros.
+/// The key of an epoch. It is the [task_key] of the task that [task_of] gives, then the attempt's
+/// scheduled seconds and nanos and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't
+/// have is zero, and a Producer with no case is all zeros. A Producer with no epoch, such as a
+/// client, gives the zero key. The runtime refuses a Workflow Producer with no epoch before a Store
+/// sees it.
 pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
     let (scheduled, attempt) = match kind {
         Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
@@ -194,8 +196,8 @@ mod tests {
             })
         };
         let ascending = [
-            // A later started time, a higher attempt, and a later Workflow Task. Each beats the
-            // fields after it.
+            // A later Workflow Task beats a higher attempt, and a higher attempt beats a later
+            // started time.
             vec![
                 workflow(task(8, 1, 0)),
                 workflow(task(8, 1, 100)),

@@ -10,9 +10,10 @@ use crate::{
 };
 use std::time::Duration;
 
-/// The longest wait of one read for new Records.
+/// The longest wait that the runtime asks of a Store for one read. The runtime sets no timer of its
+/// own, so a Store that never answers holds the read.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
-/// The maximum number of Records in one read.
+/// The most Records in one page of a read.
 pub const MAX_RECORDS: usize = 1000;
 
 /// A Stream Store. It answers each operation of the Stream service whole: `create_stream`,
@@ -25,8 +26,8 @@ pub const MAX_RECORDS: usize = 1000;
 /// - An offset is opaque bytes, at most [MAX_OFFSET_BYTES](crate::ids::MAX_OFFSET_BYTES), and the
 ///   offsets of one Stream compare in order.
 /// - A failed call gives a [StreamError](crate::StreamError) with its reason.
-///   [StorageUnavailable](crate::Reason::StorageUnavailable) is the one reason that a Worker tries
-///   again.
+///   [StorageUnavailable](crate::Reason::StorageUnavailable) is the one reason that says a later
+///   try can work.
 ///
 /// A lang bridge implements the trait for a Store that is written in that language. The Stores that
 /// Temporal provides, and the shared rules that a Store in Rust builds on, are in
