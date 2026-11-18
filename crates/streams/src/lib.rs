@@ -3,6 +3,7 @@
 //! Experimental. What every Store of a Temporal Stream shares: the error of a failed call, the
 //! order of a Producer's epochs, and the stored form of a Record.
 
+pub mod epoch;
 mod error;
 
 pub use error::{Reason, StreamError, StreamResult};

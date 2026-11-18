@@ -4602,6 +4602,8 @@ name = "temporalio-streams"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "prost-wkt-types",
+ "serde_json",
  "temporalio-common",
  "thiserror 2.0.21",
  "tonic",

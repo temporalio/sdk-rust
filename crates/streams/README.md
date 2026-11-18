@@ -9,6 +9,13 @@ A failed call gives a `StreamError` with a `Reason`. `StreamError::code` gives i
 `StreamError::details` its encoded `StreamErrorDetails`, so every SDK raises the same error for
 the same failure.
 
+## The order of epochs
+
+`epoch::epoch_key` gives the epoch of a Producer as 40 bytes that compare in order. A Store fences
+by this order, so every Store refuses the same writes. `testdata/epochs.json` has the shared
+vectors. `examples/gen_vectors.rs` writes them from a second implementation that shares no code
+with the crate. Run it with `cargo run -p temporalio-streams --example gen_vectors`.
+
 ## Protos
 
 The crate defines no protos. `temporalio-protos` generates them, and `temporalio_streams::proto`
