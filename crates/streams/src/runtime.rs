@@ -10,7 +10,7 @@ use crate::{
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRef,
         StreamStatus, producer::Kind,
     },
-    record::{check_bounds, check_records},
+    record::{BatchLimits, check_records},
 };
 use prost::Message;
 use std::{sync::Arc, time::Duration};
@@ -20,10 +20,10 @@ use temporalio_common::telemetry::metrics::TemporalMeter;
 /// exactly up to this value.
 pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 
-/// The Stream runtime on one Store. It has one typed method for each operation, and
-/// [StreamRuntime::call] is the byte form of the same methods. A bridge builds one for each client
-/// with a Stream Store, and that client's Workers share it. A Store has no namespaces, so the
-/// runtime ignores a request's `namespace`. The SDK sets it, and only the server reads it.
+/// The Stream runtime on one Store. It has one typed method for each operation. A bridge builds one
+/// for each client with a Stream Store, and that client's Workers share it. A Store has no
+/// namespaces, so the runtime ignores a request's `namespace`. The SDK sets it, and only the server
+/// reads it.
 ///
 /// The runtime checks each request before the Store sees it, and the answer to a create, an append,
 /// a read or a describe after it. The checks are the same for every Store.
@@ -31,8 +31,9 @@ pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 /// - A Stream id and a Producer id are opaque text of 1 to 4096 bytes. The caller builds both.
 /// - A Workflow Producer appends and closes with its Workflow Task as the epoch, so that a Store
 ///   can refuse a write of an older task.
-/// - A batch has at most 1000 Records and 4 MiB, and a Record at most 1536 KiB. The sizes are of
-///   the stored form, in which each Record has its Producer.
+/// - A batch is within the limits of its Store. They are at most 1000 Records and 4 MiB for a
+///   batch, and 1536 KiB for a Record. The sizes are of the stored form, in which each Record has
+///   its Producer.
 /// - A read gives at most 1000 Records, and the runtime asks the Store to wait at most 60 s. A page
 ///   over the caps of its request is cut.
 /// - The offsets of a page rise, start after the read's `from_offset`, and end at or before its
@@ -41,6 +42,7 @@ pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 ///   with [Reason::StorageCorrupt].
 pub struct StreamRuntime {
     store: Arc<dyn StreamStore>,
+    limits: BatchLimits,
     metrics: Metrics,
 }
 
@@ -316,6 +318,7 @@ impl StreamRuntime {
     pub fn new(store: Arc<dyn StreamStore>, meter: Option<TemporalMeter>) -> Arc<Self> {
         let meter = meter.unwrap_or_else(TemporalMeter::no_op);
         Arc::new(Self {
+            limits: store.limits(),
             store,
             metrics: Metrics::new(&meter),
         })
@@ -345,8 +348,8 @@ impl StreamRuntime {
         request: AppendRecordsRequest,
     ) -> StreamResult<AppendRecordsResponse> {
         let producer = append_producer(&request)?;
-        // The same bounds hold for every Store, so a batch over them fails here too.
-        check_bounds(producer, &request.records)?;
+        // A batch over the limits of the Store fails here, so the Store never sees it.
+        self.limits.check(producer, &request.records)?;
         let appended = append_batch(self.store.as_ref(), request).await;
         self.count_fenced(&appended);
         appended
@@ -393,7 +396,7 @@ mod tests {
     use crate::{
         proto::{AppendRecord, ClientProducer, StreamRecord, WorkflowProducer, WorkflowTaskEpoch},
         record::MAX_BATCH_RECORDS,
-        test_store::{Scripted, runtime},
+        test_store::{Scripted, runtime, runtime_with_limits},
     };
     use std::{
         error::Error,
@@ -1169,5 +1172,27 @@ mod tests {
             assert!(!page.done);
             assert_eq!(page.last_offset, (kept as u16).to_be_bytes().to_vec());
         }
+    }
+
+    #[tokio::test]
+    async fn a_batch_over_the_limits_of_its_store_fails_before_the_store() {
+        let limits = BatchLimits::default().with_max_batch_records(2).unwrap();
+        let (store, runtime) = runtime_with_limits(limits);
+        let error = runtime
+            .append_records(append(1, vec![record(); 3]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, Reason::TooLarge);
+        assert_eq!(error.message, "The batch has 3 Records, more than 2");
+        assert!(store.appends.lock().is_empty());
+        *store.appended.lock() = AppendRecordsResponse {
+            first_offset: b"a".to_vec(),
+            last_offset: b"b".to_vec(),
+        };
+        runtime
+            .append_records(append(1, vec![record(); 2]))
+            .await
+            .unwrap();
+        assert_eq!(store.appends.lock().len(), 1);
     }
 }

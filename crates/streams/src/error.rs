@@ -36,7 +36,7 @@ pub enum Reason {
     Invalid,
     /// The Store failed or did not answer. A retry can succeed.
     StorageUnavailable,
-    /// The runtime or the Store does not support what the call asks for.
+    /// The Store does not support what the call asks for.
     Unsupported,
     /// A create that doesn't use an existing Stream asks for the id of a Stream that exists.
     AlreadyExists,

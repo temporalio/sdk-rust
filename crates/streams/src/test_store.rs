@@ -7,6 +7,7 @@ use crate::{
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         ReadRecordsRequest, ReadRecordsResponse,
     },
+    record::BatchLimits,
 };
 use parking_lot::Mutex;
 use std::sync::{
@@ -30,6 +31,7 @@ pub(crate) struct Scripted {
     pub(crate) hold_reads: AtomicBool,
     pub(crate) entered: Notify,
     pub(crate) release: Notify,
+    pub(crate) limits: BatchLimits,
 }
 
 impl Scripted {
@@ -84,11 +86,24 @@ impl StreamStore for Scripted {
     ) -> StreamResult<DescribeStreamResponse> {
         self.answer(self.described.lock().clone())
     }
+
+    fn limits(&self) -> BatchLimits {
+        self.limits
+    }
 }
 
 /// A runtime on a new [Scripted] Store, and the Store.
 pub(crate) fn runtime() -> (Arc<Scripted>, Arc<StreamRuntime>) {
-    let store = Arc::new(Scripted::default());
+    runtime_with_limits(BatchLimits::default())
+}
+
+/// A runtime on a new [Scripted] Store that gives `limits`, and the Store. The runtime reads the
+/// limits when it is built, so a test sets them here.
+pub(crate) fn runtime_with_limits(limits: BatchLimits) -> (Arc<Scripted>, Arc<StreamRuntime>) {
+    let store = Arc::new(Scripted {
+        limits,
+        ..Default::default()
+    });
     let runtime = StreamRuntime::new(store.clone(), None);
     (store, runtime)
 }

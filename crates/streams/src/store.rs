@@ -7,6 +7,7 @@ use crate::{
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         ReadRecordsRequest, ReadRecordsResponse,
     },
+    record::BatchLimits,
 };
 use std::time::Duration;
 
@@ -57,4 +58,11 @@ pub trait StreamStore: Send + Sync + 'static {
         &self,
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse>;
+
+    /// The limits of one batch on this Store. The runtime reads them once, when it is built, and
+    /// refuses a batch over them before the Store sees it. The default is the largest batch that
+    /// any Store may take.
+    fn limits(&self) -> BatchLimits {
+        BatchLimits::default()
+    }
 }

@@ -9,12 +9,10 @@
 //! [temporal-community/sdk-streams](https://github.com/temporal-community/sdk-streams).
 //!
 //! [StreamRuntime::new] builds the runtime on one Store. It has one typed method for each
-//! operation. [StreamRuntime::call] is the byte form of the same methods. The runtime checks each
-//! request before the Store sees it, and the answer to a create, an append, a read or a describe
-//! after it. The checks are the same for every Store.
+//! operation. The runtime checks each request before the Store sees it, and the answer to a create,
+//! an append, a read or a describe after it. The checks are the same for every Store.
 
 pub mod digest;
-mod dispatch;
 pub mod epoch;
 mod error;
 pub mod ids;
