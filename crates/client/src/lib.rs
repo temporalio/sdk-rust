@@ -37,6 +37,30 @@ pub mod worker;
 mod workflow_handle;
 mod workflow_status;
 
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod __internal {
+    use crate::{Client, WorkflowClientTrait, WorkflowStartOptions, errors::WorkflowStartError};
+    use temporalio_common::{HasWorkflowDefinition, protos::temporal::api::common::v1::Link};
+
+    pub async fn start_nexus_workflow<W>(
+        client: &Client,
+        workflow: W,
+        input: W::Input,
+        options: WorkflowStartOptions,
+        request_id: &str,
+    ) -> Result<Option<Link>, WorkflowStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+    {
+        client
+            .start_workflow_with_request_id(workflow, input, options, Some(request_id.to_owned()))
+            .await
+            .map(|(_, link)| link)
+    }
+}
+
 pub use crate::{proxy::HttpConnectProxyOptions, request_extensions::PayloadErrorLimits};
 pub use activity::*;
 pub use async_activity_handle::{
@@ -145,7 +169,9 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{ActivityType, Memo as ProtoMemo, Payloads, WorkflowType},
+            common::v1::{
+                ActivityType, Link as ProtoLink, Memo as ProtoMemo, Payloads, WorkflowType,
+            },
             enums::v1::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
@@ -1416,6 +1442,25 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
     where
         Self: Sized,
         W: HasWorkflowDefinition,
+        W::Input: Send,
+    {
+        async {
+            self.start_workflow_with_request_id(workflow, input, options, None)
+                .await
+                .map(|(handle, _)| handle)
+        }
+    }
+
+    fn start_workflow_with_request_id<W>(
+        &self,
+        workflow: W,
+        input: W::Input,
+        options: WorkflowStartOptions,
+        request_id: Option<String>,
+    ) -> impl Future<Output = Result<(WorkflowHandle<Self, W>, Option<ProtoLink>), WorkflowStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
         W::Input: Send;
 
     /// Start a workflow and atomically send it a signal.
@@ -1815,6 +1860,15 @@ fn build_start_workflow_request(
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
     let request_eager_execution = options.enable_eager_workflow_start;
+    let on_conflict_options = (options.id_conflict_policy == WorkflowIdConflictPolicy::UseExisting
+        && (!options.completion_callbacks.is_empty() || !options.links.is_empty()))
+    .then_some(
+        temporalio_common::protos::temporal::api::workflow::v1::OnConflictOptions {
+            attach_request_id: true,
+            attach_completion_callbacks: !options.completion_callbacks.is_empty(),
+            attach_links: !options.links.is_empty(),
+        },
+    );
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
@@ -1849,6 +1903,7 @@ fn build_start_workflow_request(
         retry_policy: options.retry_policy.map(Into::into),
         links: options.links,
         completion_callbacks: options.completion_callbacks,
+        on_conflict_options,
         priority: Some(options.priority.into()),
         versioning_override: options.versioning_override.map(Into::into),
         memo,
@@ -1862,12 +1917,13 @@ impl<T> WorkflowClientTrait for T
 where
     T: WorkflowService + NamespacedClient + Clone + Send + Sync + 'static,
 {
-    async fn start_workflow<W>(
+    async fn start_workflow_with_request_id<W>(
         &self,
         workflow: W,
         input: W::Input,
         options: WorkflowStartOptions,
-    ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
+        request_id: Option<String>,
+    ) -> Result<(WorkflowHandle<Self, W>, Option<ProtoLink>), WorkflowStartError>
     where
         W: HasWorkflowDefinition,
         W::Input: Send,
@@ -1912,6 +1968,10 @@ where
                             user_metadata,
                             options,
                         );
+                        // Nexus task redeliveries must reuse the caller's idempotency key.
+                        if let Some(request_id) = request_id {
+                            request.request_id = request_id;
+                        }
                         let target = StoreTarget::workflow(
                             &request.namespace,
                             &request.workflow_id,
@@ -1924,14 +1984,15 @@ where
                         store_external_payloads(&mut request, &data_converter, &client.namespace(), Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
-                        let run_id = client
+                        let response = client
                             .start_workflow_execution(request)
                             .await
                             .map_err(WorkflowStartError::from_status)?
-                            .into_inner()
-                            .run_id;
+                            .into_inner();
 
-                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                        let mut output = StartWorkflowOutput::new(workflow_id, response.run_id);
+                        output.link = response.link;
+                        Ok(output)
                     })
                 }
             }),
@@ -1940,16 +2001,20 @@ where
         let StartWorkflowOutput {
             workflow_id,
             run_id,
+            link,
         } = interceptor_output;
 
-        Ok(WorkflowHandle::new(
-            self.clone(),
-            WorkflowExecutionInfo {
-                namespace,
-                workflow_id,
-                run_id: Some(run_id.clone()),
-                first_execution_run_id: Some(run_id),
-            },
+        Ok((
+            WorkflowHandle::new(
+                self.clone(),
+                WorkflowExecutionInfo {
+                    namespace,
+                    workflow_id,
+                    run_id: Some(run_id.clone()),
+                    first_execution_run_id: Some(run_id),
+                },
+            ),
+            link,
         ))
     }
 
@@ -2083,6 +2148,7 @@ where
         let StartWorkflowOutput {
             workflow_id,
             run_id,
+            ..
         } = interceptor_output;
 
         Ok(WorkflowHandle::new(
