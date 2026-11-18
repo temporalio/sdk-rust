@@ -740,7 +740,7 @@ impl WorkflowMachines {
         if !all_query {
             let activation = self.local_activity_data.current_activation_index();
             self.stream_calls.note_delivered(
-                &jobs,
+                jobs.iter().map(|job| &job.variant),
                 u32::try_from(activation).unwrap_or(u32::MAX),
                 &self.metrics,
             );

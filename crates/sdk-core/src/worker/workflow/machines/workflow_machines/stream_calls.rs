@@ -1,16 +1,10 @@
 //! The Stream calls of a run, and the marker that records what Workflow code got in one Workflow
 //! Task. A call has no command or event of its own, so it needs no state machine.
 
-use crate::{
-    telemetry::metrics::MetricsContext,
-    worker::workflow::{
-        OutgoingJob, WFMachinesError, fatal, nondeterminism,
-        streams::{
-            AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_ENTRY_BYTES,
-            MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
-            StreamResolution, input_over_limit, next_call_id, store_metrics,
-        },
-    },
+use crate::worker::workflow::streams::{
+    AppendSpec, CallError, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_ENTRY_BYTES,
+    MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, StreamCallResult, StreamMetrics, StreamRequest,
+    StreamResolution, input_over_limit, next_call_id, store_metrics,
 };
 use prost::Message;
 use std::{
@@ -39,7 +33,19 @@ use temporalio_streams::{
     ids::MAX_OFFSET_BYTES,
 };
 
-type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
+type Result<T, E = CallError> = std::result::Result<T, E>;
+
+macro_rules! nondeterminism {
+    ($($arg:tt)*) => {{
+        CallError::Nondeterminism(format!($($arg)*))
+    }};
+}
+
+macro_rules! fatal {
+    ($($arg:tt)*) => {{
+        CallError::Fatal(format!($($arg)*))
+    }};
+}
 
 /// What a result does to the activations of the run.
 pub(super) enum StreamJob {
@@ -918,7 +924,7 @@ impl StreamCalls {
             // A run that was cached when its history came, and left the cache before it replayed
             // it, gets markers with no Records read. Giving no Records would be a wrong replay.
             if entry.count > 0 && entry.records.is_empty() {
-                return Err(WFMachinesError::Stream(format!(
+                return Err(CallError::Stream(format!(
                     "StreamReplayError: Stream `{}` in Store `{}`: the Records of the marker of \
                      read {seq} were not read",
                     stream.id, stream.store
@@ -1403,14 +1409,14 @@ impl StreamCalls {
 
     /// Notes the Stream jobs of an activation, which Workflow code gets at `activation` in the
     /// Workflow Task. The marker of the task records them. `metrics` are the run's.
-    pub(super) fn note_delivered(
+    pub(super) fn note_delivered<'a>(
         &mut self,
-        jobs: &[OutgoingJob],
+        variants: impl IntoIterator<Item = &'a workflow_activation_job::Variant>,
         activation: u32,
-        metrics: &MetricsContext,
+        metrics: &dyn StreamMetrics,
     ) {
-        for job in jobs {
-            match &job.variant {
+        for variant in variants {
+            match variant {
                 workflow_activation_job::Variant::ResolveStreamRead(page) => {
                     self.note_page(page, activation, metrics);
                 }
@@ -1455,7 +1461,12 @@ impl StreamCalls {
         }
     }
 
-    fn note_page(&mut self, page: &ResolveStreamRead, activation: u32, metrics: &MetricsContext) {
+    fn note_page(
+        &mut self,
+        page: &ResolveStreamRead,
+        activation: u32,
+        metrics: &dyn StreamMetrics,
+    ) {
         let Some(read) = self.reads.get_mut(&page.seq).filter(|read| !read.refused) else {
             return;
         };

@@ -7,6 +7,7 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
+mod stream_adapters;
 mod streams;
 mod wft_extraction;
 pub(crate) mod wft_poller;
@@ -49,6 +50,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
+            stream_adapters::{LocalSink, worker_streams},
             streams::{STREAM_REPLAY_ERROR_TYPE, StreamManager, WorkerStreams},
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
@@ -207,11 +209,11 @@ impl Workflows {
         // Stream calls run on it, so that Store work never holds up the workflow processing thread.
         // The Worker's Stream state carries its metrics, which a replay's reads of the Store count
         // in, and its choice for a replay that can't read its Records.
-        let streams = Arc::new(WorkerStreams::new(&basics.worker_config, &basics.metrics));
+        let streams = Arc::new(worker_streams(&basics.worker_config, &basics.metrics));
         let stream_manager = Arc::new(StreamManager::new(
             streams.clone(),
             tokio::runtime::Handle::current(),
-            local_tx.clone(),
+            Arc::new(LocalSink(local_tx.clone())),
             basics.shutdown_token.clone(),
         ));
         let shutdown_tok = basics.shutdown_token.clone();
@@ -2238,7 +2240,7 @@ mod tests {
         let (paginator, work) = HistoryPaginator::from_poll(
             validate_wft(response).unwrap(),
             Arc::new(mock_worker_client()),
-            Arc::new(WorkerStreams::new(
+            Arc::new(worker_streams(
                 &Arc::new(crate::test_help::test_worker_cfg().build().unwrap()),
                 &crate::telemetry::metrics::MetricsContext::no_op(),
             )),

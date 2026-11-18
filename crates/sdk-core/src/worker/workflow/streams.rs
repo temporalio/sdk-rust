@@ -1,14 +1,6 @@
 //! Direct calls to Streams. Core reads and appends a Stream on the Worker's Stream runtimes, in
 //! tasks on the Worker's runtime, and gives each result to the run as a [LocalResolution].
 
-use crate::{
-    WorkerConfig, WorkflowErrorType,
-    telemetry::metrics::{MetricsContext, stream_store, workflow_type},
-    worker::workflow::{
-        LocalResolution, LocalResolutionMsg,
-        workflow_stream::{LocalInput, LocalInputs},
-    },
-};
 use futures_util::{
     StreamExt, TryStreamExt,
     future::{AbortHandle, AbortRegistration, Abortable},
@@ -17,6 +9,7 @@ use parking_lot::Mutex;
 use prost::Message;
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -46,13 +39,75 @@ use temporalio_streams::{
         StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
     },
 };
-use tokio::{
-    runtime::Handle,
-    sync::{Notify, mpsc::UnboundedSender},
-    time::Instant,
-};
+use tokio::{runtime::Handle, sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, warn};
+
+/// The errors that the Stream calls of a run give to the machines.
+#[derive(Debug)]
+pub(crate) enum CallError {
+    /// Workflow code and History disagree.
+    Nondeterminism(String),
+    /// A command or a marker entry that no valid run gives.
+    Fatal(String),
+    /// A call that the Worker can't serve. The text is the whole message.
+    Stream(String),
+}
+
+/// The metrics that the Stream calls count, which Core implements with its own.
+pub(crate) trait StreamMetrics: Send + Sync + 'static {
+    /// False for a meter that counts nothing, so that a call site builds no attributes for it.
+    fn has_meter(&self) -> bool;
+    /// The metrics with the attribute of the Store `store` added.
+    fn with_store(&self, store: &str) -> Arc<dyn StreamMetrics>;
+    /// The metrics with the attributes of the Workflow type and of the Store added.
+    fn with_workflow_and_store(&self, workflow_type: &str, store: &str) -> Arc<dyn StreamMetrics>;
+    /// A read started.
+    fn stream_read_started(&self);
+    /// A read ended with a failure.
+    fn stream_read_failed(&self);
+    /// Workflow code got `records` Records of a read.
+    fn stream_read_records(&self, records: u64);
+    /// An append started.
+    fn stream_append_started(&self);
+    /// An append ended with a failure.
+    fn stream_append_failed(&self);
+    /// The time an append took.
+    fn stream_append_latency(&self, dur: Duration);
+    /// A close started.
+    fn stream_close_started(&self);
+    /// A close ended with a failure.
+    fn stream_close_failed(&self);
+    /// The time a close took.
+    fn stream_close_latency(&self, dur: Duration);
+    /// A graceful shutdown gave up a close that the Store didn't answer.
+    fn stream_close_abandoned(&self);
+    /// A replay started to read the Records of a marker entry.
+    fn stream_replay_read_started(&self);
+    /// A replay could not read or check the Records of a marker entry.
+    fn stream_replay_read_failed(&self);
+    /// The time a replay's read of a marker entry took.
+    fn stream_replay_read_latency(&self, dur: Duration);
+}
+
+/// What the Stream manager gives to the Worker's runs.
+#[derive(Debug)]
+pub(crate) enum RunInput {
+    /// The Workflow Task of the run with this id reached its heartbeat time.
+    HeartbeatTimeout(String),
+    /// Wakes the pending polls for activations, with no new result.
+    Bump,
+    /// A result of a call of the run with this id.
+    Resolution(String, StreamResolution),
+}
+
+/// Where the Stream manager sends what it gives to the Worker's runs.
+pub(crate) trait RunSink: Send + Sync + 'static {
+    /// Sends `input`, which the receiver handles under `span`.
+    fn send(&self, input: RunInput, span: Span);
+    /// Resolves once nothing receives the inputs, which is when the Worker is gone.
+    fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
 
 /// The Stream runtimes of a Worker, by the name of the Store that each serves, and the Worker's
 /// options of a read. A Workflow call on a Stream uses the runtime of its `StreamRef.store`.
@@ -156,7 +211,7 @@ impl StreamRuntimes {
 }
 
 /// Says for a Workflow type whether a replay that can't read its Records fails the Workflow.
-type FailsWorkflow = Box<dyn Fn(&str) -> bool + Send + Sync>;
+pub(crate) type FailsWorkflow = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What the Worker builds from its config for its Stream calls. A run and each history page share
 /// it.
@@ -168,28 +223,34 @@ pub(crate) struct WorkerStreams {
     /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
     /// with no meter, so that it builds no attributes for a read.
     #[debug(skip)]
-    metrics: Option<MetricsContext>,
+    metrics: Option<Arc<dyn StreamMetrics>>,
     /// True for a Workflow type that the Worker fails, and not only its task, when a replay can't
     /// read its Records.
     #[debug(skip)]
     fails_workflow: FailsWorkflow,
-    #[cfg(test)]
     hooks: StreamTestHooks,
 }
 
 impl WorkerStreams {
-    pub(crate) fn new(config: &Arc<WorkerConfig>, metrics: &MetricsContext) -> Self {
-        let failure_config = config.clone();
+    pub(crate) fn new(
+        runtimes: StreamRuntimes,
+        calls_stores: bool,
+        metrics: Option<Arc<dyn StreamMetrics>>,
+        fails_workflow: FailsWorkflow,
+    ) -> Self {
         Self {
-            runtimes: config.stream_runtimes.clone(),
-            calls_stores: !config.replays_only,
-            metrics: metrics.has_meter().then(|| metrics.clone()),
-            fails_workflow: Box::new(move |workflow_type| {
-                failure_config.should_fail_workflow(workflow_type, &WorkflowErrorType::StreamReplay)
-            }),
-            #[cfg(test)]
-            hooks: config.stream_test_hooks.clone(),
+            runtimes,
+            calls_stores,
+            metrics,
+            fails_workflow,
+            hooks: StreamTestHooks::default(),
         }
+    }
+
+    /// The Stream state with `hooks` in place of the default ones.
+    #[cfg(test)]
+    pub(crate) fn with_test_hooks(self, hooks: StreamTestHooks) -> Self {
+        Self { hooks, ..self }
     }
 
     /// The runtime of the Store `store`, if the Worker has one.
@@ -209,7 +270,6 @@ impl WorkerStreams {
 
     /// How long a replay's read of the Store tries again after its first `StorageUnavailable`.
     fn replay_retry_bound(&self) -> Duration {
-        #[cfg(test)]
         if let Some(bound) = self.hooks.replay_retry_bound {
             return bound;
         }
@@ -217,7 +277,6 @@ impl WorkerStreams {
     }
 
     fn close_bound(&self) -> Duration {
-        #[cfg(test)]
         if let Some(bound) = self.hooks.close_bound {
             return bound;
         }
@@ -246,18 +305,16 @@ impl RunStreams {
     }
 
     /// The metrics of a replay's read of `store`, or `None` with no meter.
-    fn replay_metrics(&self, store: &str) -> Option<MetricsContext> {
+    fn replay_metrics(&self, store: &str) -> Option<Arc<dyn StreamMetrics>> {
         let metrics = self.worker.metrics.as_ref()?;
-        let run = self
-            .workflow_type
-            .iter()
-            .map(|ty| workflow_type(ty.clone()));
-        Some(metrics.with_new_attrs(run.chain([stream_store(store)])))
+        Some(match &self.workflow_type {
+            Some(ty) => metrics.with_workflow_and_store(ty, store),
+            None => metrics.with_store(store),
+        })
     }
 }
 
 /// What lets a test see and shorten the wait of a graceful shutdown for a close.
-#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StreamTestHooks {
     /// A shorter bound in place of [CLOSE_SHUTDOWN_BOUND].
@@ -412,9 +469,11 @@ pub(crate) fn next_call_id() -> u64 {
 
 /// The metrics of a run's call to `store`, or `None` for a Worker with no meter, so that such a
 /// Worker builds no attributes for a call.
-pub(crate) fn store_metrics(run: &MetricsContext, store: &str) -> Option<MetricsContext> {
-    run.has_meter()
-        .then(|| run.with_new_attrs([stream_store(store)]))
+pub(crate) fn store_metrics(
+    run: &dyn StreamMetrics,
+    store: &str,
+) -> Option<Arc<dyn StreamMetrics>> {
+    run.has_meter().then(|| run.with_store(store))
 }
 
 /// The Records that a read gave to the run and that no activation took yet.
@@ -560,7 +619,7 @@ pub(crate) enum StreamCallResult {
 pub(crate) struct StreamManager {
     streams: Arc<WorkerStreams>,
     handle: Handle,
-    local_tx: UnboundedSender<LocalInput>,
+    local_tx: Arc<dyn RunSink>,
     /// The run and the abort handle of each running call, by its call id, and whether the call
     /// outlives its run.
     tasks: Arc<Mutex<HashMap<u64, Task>>>,
@@ -592,7 +651,7 @@ impl StreamManager {
     pub(crate) fn new(
         streams: Arc<WorkerStreams>,
         handle: Handle,
-        local_tx: UnboundedSender<LocalInput>,
+        local_tx: Arc<dyn RunSink>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -608,7 +667,6 @@ impl StreamManager {
     /// True while a close waits for the Store, so that a graceful shutdown isn't done.
     pub(crate) fn has_closes_in_flight(&self) -> bool {
         let in_flight = self.closes_in_flight.load(Ordering::Acquire) > 0;
-        #[cfg(test)]
         if in_flight && let Some(waits) = &self.streams.hooks.shutdown_waits {
             waits.notify_one();
         }
@@ -622,7 +680,7 @@ impl StreamManager {
         run_id: &str,
         epoch: Option<WorkflowTaskEpoch>,
         requests: Vec<StreamRequest>,
-        metrics: &MetricsContext,
+        metrics: &dyn StreamMetrics,
     ) {
         for request in requests {
             match request {
@@ -723,10 +781,7 @@ impl StreamManager {
         self.handle.spawn(Abortable::new(
             async move {
                 sleep.await;
-                let _ = local_tx.send(LocalInput {
-                    input: LocalInputs::HeartbeatTimeout(run_id),
-                    span,
-                });
+                local_tx.send(RunInput::HeartbeatTimeout(run_id), span);
             },
             abort_reg,
         ));
@@ -738,7 +793,7 @@ impl StreamManager {
         &self,
         stream: StreamRef,
         call: impl Future<Output = ()> + Send + 'static,
-        metrics: Option<MetricsContext>,
+        metrics: Option<Arc<dyn StreamMetrics>>,
     ) -> impl Future<Output = ()> + Send + 'static {
         let shutdown = self.shutdown.clone();
         let bound = self.streams.close_bound();
@@ -763,10 +818,7 @@ impl StreamManager {
                     if let Some(metrics) = metrics {
                         metrics.stream_close_abandoned();
                     }
-                    let _ = local_tx.send(LocalInput {
-                        input: LocalInputs::BumpStream,
-                        span: Span::current(),
-                    });
+                    local_tx.send(RunInput::Bump, Span::current());
                 }
             }
         }
@@ -808,17 +860,17 @@ impl StreamManager {
         let local_tx = self.local_tx.clone();
         let run_id = run_id.to_string();
         move |result| {
-            let _ = local_tx.send(LocalInput {
-                input: LocalInputs::LocalResolution(LocalResolutionMsg {
-                    run_id: run_id.clone(),
-                    res: LocalResolution::Stream(StreamResolution {
+            local_tx.send(
+                RunInput::Resolution(
+                    run_id.clone(),
+                    StreamResolution {
                         call_id,
                         seq,
                         result,
-                    }),
-                }),
-                span: Span::current(),
-            });
+                    },
+                ),
+                Span::current(),
+            );
         }
     }
 
@@ -864,7 +916,7 @@ async fn read(
     runtime: Arc<StreamRuntime>,
     spec: ReadSpec,
     sink: impl Fn(StreamCallResult),
-    metrics: Option<MetricsContext>,
+    metrics: Option<Arc<dyn StreamMetrics>>,
     options: ReadOptions,
 ) {
     let deadline = spec.deadline.map(|deadline| {
@@ -1054,13 +1106,13 @@ fn page_bytes_cap(bytes_left: Option<u64>, flow: &ReadFlow, read_ahead_bytes: us
 
 /// The metrics of an append or a close, and when Core started it.
 struct CallTimer {
-    metrics: MetricsContext,
+    metrics: Arc<dyn StreamMetrics>,
     started: Instant,
 }
 
 impl CallTimer {
     /// `None` for a Worker with no meter, which then reads no clock for a call.
-    fn start(run: &MetricsContext, store: &str) -> Option<Self> {
+    fn start(run: &dyn StreamMetrics, store: &str) -> Option<Self> {
         store_metrics(run, store).map(|metrics| Self {
             metrics,
             started: Instant::now(),
