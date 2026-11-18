@@ -1,4 +1,5 @@
-//! The stored Records of a batch, and the bounds that measure them.
+//! The stored Records of a batch, and the bounds that measure them. The runtime runs the check of a
+//! batch's Records and these bounds before a Store sees a request.
 
 use crate::{
     Reason, StreamError, StreamResult,
@@ -25,7 +26,7 @@ pub fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
 }
 
 /// Refuses a batch with a Record that has no body, before the Store.
-pub fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
+pub(crate) fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
     match records.iter().position(|record| record.body.is_none()) {
         Some(at) => Err(StreamError::invalid(format!(
             "Record {at} of the batch has no body"

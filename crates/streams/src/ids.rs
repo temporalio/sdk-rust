@@ -1,5 +1,6 @@
-//! The checks of Stream ids and Producers. A caller builds both kinds of id, so the crate treats
-//! each as opaque text.
+//! The limits of Stream ids, Producer ids and offsets, and the checks of ids and Producers. A
+//! caller builds both kinds of id, so the crate treats each as opaque text. The checks are private.
+//! The runtime runs them before a Store sees a request, and they are right only as that set.
 
 use crate::{
     StreamError, StreamResult,
@@ -23,7 +24,7 @@ pub const MAX_OFFSET_BYTES: usize = 1024;
 pub const MAX_PRODUCER_ID_BYTES: usize = 4096;
 
 /// Refuses an empty or too long Stream id.
-pub fn check_stream_id(id: &str) -> StreamResult<()> {
+pub(crate) fn check_stream_id(id: &str) -> StreamResult<()> {
     if id.is_empty() {
         return Err(StreamError::invalid("The Stream id is empty"));
     }
@@ -41,7 +42,7 @@ pub fn check_stream_id(id: &str) -> StreamResult<()> {
 /// keeps the fence of a Producer by kind and id, and an epoch has no run. So the id of a run-based
 /// kind must hold its run id. A caller that uses one id in two runs gets `FENCED` in the second run
 /// when that run's epoch is lower.
-pub fn check_producer(producer: &Producer) -> StreamResult<()> {
+pub(crate) fn check_producer(producer: &Producer) -> StreamResult<()> {
     if producer.id.is_empty() {
         return Err(StreamError::invalid("The Producer id is empty"));
     }
@@ -83,7 +84,7 @@ fn check_task(task: &WorkflowTaskEpoch) -> StreamResult<()> {
 /// Workflow Task as the epoch, for an append as for a close, and the epoch must order. A
 /// Workflow Task's started time stays optional, since Core leaves it empty when the server gave the
 /// task none.
-pub fn check_required(producer: &Producer) -> StreamResult<()> {
+pub(crate) fn check_required(producer: &Producer) -> StreamResult<()> {
     match producer.kind.as_ref() {
         Some(Kind::Workflow(workflow)) => {
             if workflow.run_id.is_empty() {
