@@ -2,8 +2,7 @@
 //!
 //! An epoch key has fixed-width big-endian fields in the order of comparison, so a Store orders
 //! two epochs of one Producer by comparing their keys as bytes. Keys of different Producers don't
-//! compare. Implementations in other languages can check their keys against
-//! `testdata/epochs.json`.
+//! compare.
 
 use crate::{
     StreamError, StreamResult,
@@ -128,7 +127,7 @@ pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
 mod tests {
     use super::*;
     use crate::proto::{
-        ActivityEpoch, ActivityProducer, LocalActivityEpoch, LocalActivityProducer,
+        ActivityEpoch, ActivityProducer, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
         WorkflowProducer,
     };
 
@@ -225,6 +224,47 @@ mod tests {
                     pair[1]
                 );
             }
+        }
+    }
+
+    // A Store persists the key as its fence, so its bytes must never change.
+    #[test]
+    fn the_bytes_of_a_key_never_change() {
+        let task = WorkflowTaskEpoch {
+            started_event_id: 8,
+            attempt: 2,
+            started_time: at(1_760_000_000, 5),
+        };
+        let workflow = Kind::Workflow(WorkflowProducer {
+            run_id: "r".to_string(),
+            epoch: Some(task),
+        });
+        let local = local_activity(WorkflowTaskEpoch { attempt: 1, ..task }, 3);
+        let activity = Kind::WorkflowActivity(activity(1_760_000_001, 999_999_999, 2));
+        let client = Kind::Client(ClientProducer {});
+        let zero = "0".repeat(80);
+        let cases = [
+            (
+                Some(workflow),
+                "0000000000000008000000020000000068e778000000000500000000000000000000000000000000",
+            ),
+            (
+                Some(local),
+                "0000000000000008000000010000000068e778000000000500000000000000000000000000000003",
+            ),
+            (
+                Some(activity),
+                "0000000000000000000000000000000000000000000000000000000068e778013b9ac9ff00000002",
+            ),
+            (Some(client), zero.as_str()),
+            (None, zero.as_str()),
+        ];
+        for (kind, key) in cases {
+            let hex: String = epoch_key(kind.as_ref())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(hex, key, "{kind:?}");
         }
     }
 }

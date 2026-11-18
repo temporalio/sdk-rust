@@ -21,10 +21,5 @@ tonic = { workspace = true }
 path = "../common"
 version = "~1.2.0"
 default-features = false
-
-[dev-dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { workspace = true }
-
 [lints]
 workspace = true
