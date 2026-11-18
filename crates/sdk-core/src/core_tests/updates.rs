@@ -440,9 +440,9 @@ const ACCEPTED_UPDATE_ID: &str = "upd-accept";
 
 type CapturedCompletion = (Vec<Command>, WorkflowTaskCompletedMetadata);
 
-/// Builds the tasks Temporal Server 1.32.2 handed out in sdk-rust#1797 for a workflow started with
-/// a start delay. The first task is speculative and carries an update the worker rejects; the
-/// server drops that completion without a `WorkflowTaskCompleted` event or a
+/// Builds the tasks the server hands out for a workflow started with a start delay that receives
+/// updates during the delay. The first task is speculative and carries an update the worker
+/// rejects; the server drops that completion without a `WorkflowTaskCompleted` event or a
 /// `reset_history_event_id`. The next task follows the dropped one's schedule-to-start timeout and
 /// carries an update the worker accepts. Returns the persisted history alongside both tasks.
 fn discarded_first_task_rejection_tasks() -> (TestHistoryBuilder, [PollWorkflowTaskQueueResponse; 2])
@@ -748,9 +748,12 @@ async fn patch_after_discarded_first_task_rejection_replays() {
     );
 }
 
-/// Mirrors how the Python SDK (1.36.0) decides whether to use a default-enabled lang flag on each
-/// activation, returning whether the flag is used and whether it must be reported to Core.
-fn python_default_lang_flag(act: &WorkflowActivation, flag: u32) -> (bool, bool) {
+/// Decides whether a lang SDK uses a default-enabled lang flag on an activation, returning whether
+/// the flag is used and whether it must be reported to Core. A flag listed in
+/// `available_internal_flags` is used whether or not the activation is replaying, and needs no
+/// report since history already has it. A flag missing from that list is used and reported only
+/// when not replaying, because history that never recorded it must keep the old behavior.
+fn default_enabled_lang_flag(act: &WorkflowActivation, flag: u32) -> (bool, bool) {
     if act.available_internal_flags.contains(&flag) {
         (true, false)
     } else if act.is_replaying {
@@ -761,19 +764,18 @@ fn python_default_lang_flag(act: &WorkflowActivation, flag: u32) -> (bool, bool)
 }
 
 /// Lang flags sent with a dropped first-task rejection are not in history either. A lang SDK that
-/// only reports flags missing from `available_internal_flags`, as the Python SDK does, must see the
-/// same flag availability when the next persisted task replays from scratch as it saw live, or it
-/// picks different behavior on replay. This checks flag availability and selection, not lang's
-/// resulting commands.
+/// does not report flags already listed in `available_internal_flags` must still make the same
+/// flag-dependent choice when the next persisted task replays from scratch as it made live, even
+/// though the flag may be listed on replay but not live. This checks flag availability and
+/// selection, not lang's resulting commands.
 #[tokio::test]
 async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay() {
-    // Python's PROCESS_WORKFLOW_ACTIVATION_JOBS_AS_SINGLE_BATCH, which is enabled by default
     let lang_flag = 2;
     let (persisted, tasks) = discarded_first_task_rejection_tasks();
     let (core, completions) = cached_worker_capturing_completions(&persisted, tasks);
 
     let act = core.poll_workflow_activation().await.unwrap();
-    let (_, report) = python_default_lang_flag(&act, lang_flag);
+    let (_, report) = default_enabled_lang_flag(&act, lang_flag);
     let mut completion = WorkflowActivationCompletion::from_cmd(act.run_id, reject_update());
     if report {
         completion.add_internal_flags(lang_flag);
@@ -789,7 +791,7 @@ async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay
         }]
     );
     let live_available = act.available_internal_flags.clone();
-    let (live_uses_flag, report) = python_default_lang_flag(&act, lang_flag);
+    let (live_uses_flag, report) = default_enabled_lang_flag(&act, lang_flag);
     let mut completion = WorkflowActivationCompletion::from_cmds(act.run_id, accept_update(None));
     if report {
         completion.add_internal_flags(lang_flag);
@@ -808,7 +810,7 @@ async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay
     let mut replay_choice = None;
     let outcome = replay_persisted_update_completion(persisted, &update_completion, "", |act| {
         replay_choice = Some((
-            python_default_lang_flag(act, lang_flag).0,
+            default_enabled_lang_flag(act, lang_flag).0,
             act.available_internal_flags.clone(),
         ));
         accept_update(None)
