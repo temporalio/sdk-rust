@@ -129,8 +129,11 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu
-      # A swap limit equal to the memory limit gives the container no swap. With swap, the kernel
-      # can move the buffer of the memory test out of memory, and the test then reads too little.
+      # The memory test reads anonymous memory in RAM, and swapped-out pages are not part of it.
+      # The page cache of the test binary can fill the container up to its memory limit. When the
+      # test then allocates its buffer, the kernel reclaims memory, and with swap it can swap out
+      # a part of the buffer. Then the test reads too little. A swap limit equal to the memory
+      # limit gives the container no swap, so the buffer stays in RAM.
       options: --cpus=1 --memory=512m --memory-swap=512m
     env:
       CGROUP_TESTS_ENABLED: true
