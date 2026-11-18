@@ -1,5 +1,4 @@
 mod local_acts;
-mod stream_calls;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
@@ -14,10 +13,7 @@ use super::{
     stream_marker_state_machine::{is_stream_marker, stream_marker, stream_marker_data},
     timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
-    workflow_machines::{
-        local_acts::LocalActivityData,
-        stream_calls::{StreamCalls, StreamJob},
-    },
+    workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
 use crate::{
@@ -85,6 +81,7 @@ use temporalio_common::{
     },
     worker::WorkerDeploymentVersion,
 };
+use temporalio_streams::workflow::{StreamCalls, StreamJob};
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 

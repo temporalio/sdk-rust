@@ -4603,6 +4603,8 @@ name = "temporalio-streams"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "derive_more",
+ "futures-util",
  "parking_lot",
  "prost",
  "prost-wkt-types",
@@ -4610,7 +4612,9 @@ dependencies = [
  "temporalio-common",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

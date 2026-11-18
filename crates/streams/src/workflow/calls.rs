@@ -1,10 +1,17 @@
 //! The Stream calls of a run, and the marker that records what Workflow code got in one Workflow
 //! Task. A call has no command or event of its own, so it needs no state machine.
 
-use crate::worker::workflow::streams::{
-    AppendSpec, CallError, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_ENTRY_BYTES,
-    MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, StreamCallResult, StreamMetrics, StreamRequest,
-    StreamResolution, input_over_limit, next_call_id, store_metrics,
+use super::{
+    CallError, StreamMetrics,
+    manager::{
+        AppendSpec, CloseSpec, DEFAULT_IDLE_TIMEOUT, MAX_MARKER_ENTRY_BYTES,
+        MAX_MARKER_RECORD_BYTES, ReadFlow, ReadSpec, StreamCallResult, StreamRequest,
+        StreamResolution, input_over_limit, next_call_id, store_metrics,
+    },
+};
+use crate::{
+    digest::{DIGEST_LEN, records_digest},
+    ids::MAX_OFFSET_BYTES,
 };
 use prost::Message;
 use std::{
@@ -28,10 +35,6 @@ use temporalio_common::protos::{
         stream::v1::{Producer, StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind},
     },
 };
-use temporalio_streams::{
-    digest::{DIGEST_LEN, records_digest},
-    ids::MAX_OFFSET_BYTES,
-};
 
 type Result<T, E = CallError> = std::result::Result<T, E>;
 
@@ -48,10 +51,12 @@ macro_rules! fatal {
 }
 
 /// What a result does to the activations of the run.
-pub(super) enum StreamJob {
+pub enum StreamJob {
     /// Records of a read, and its end if it ended. They join the read's pending job, if it has one.
     Read(ResolveStreamRead),
+    /// The result of an append.
     Append(ResolveStreamAppend),
+    /// The result of a close.
     Close(ResolveStreamClose),
 }
 
@@ -424,8 +429,9 @@ struct ReadEntryBuilder {
     end: Option<StreamReadEnded>,
 }
 
+/// The Stream calls of one run.
 #[derive(Default)]
-pub(super) struct StreamCalls {
+pub struct StreamCalls {
     reads: HashMap<u32, Read>,
     appends: HashMap<u32, Append>,
     closes: HashMap<u32, Close>,
@@ -459,7 +465,8 @@ pub(super) struct StreamCalls {
 }
 
 impl StreamCalls {
-    pub(super) fn new(calls_stores: bool, page_cap: usize) -> Self {
+    /// The calls of a new run, which has started none.
+    pub fn new(calls_stores: bool, page_cap: usize) -> Self {
         Self {
             calls_stores,
             page_cap,
@@ -468,7 +475,7 @@ impl StreamCalls {
     }
 
     /// Starts a read. Returns the job of its refusal, for a read with an input over its limit.
-    pub(super) fn start_read(
+    pub fn start_read(
         &mut self,
         attrs: StartStreamRead,
         workflow_time: Option<SystemTime>,
@@ -537,13 +544,13 @@ impl StreamCalls {
     }
 
     /// True once replay ended, so that the Worker runs new calls.
-    pub(super) fn is_live(&self) -> bool {
+    pub fn is_live(&self) -> bool {
         self.live
     }
 
     /// Runs the calls that replay left open, from where Workflow code is. Returns the Stores that
     /// they use, so that the caller can check that the Worker has their runtimes.
-    pub(super) fn go_live(&mut self) -> Vec<String> {
+    pub fn go_live(&mut self) -> Vec<String> {
         if self.live || !self.calls_stores {
             return vec![];
         }
@@ -582,7 +589,7 @@ impl StreamCalls {
 
     /// Records a close, which the Worker runs only after History has this task. Returns the job of
     /// its refusal, for a close with an input over its limit.
-    pub(super) fn close(&mut self, attrs: CloseStream) -> Result<Option<StreamJob>> {
+    pub fn close(&mut self, attrs: CloseStream) -> Result<Option<StreamJob>> {
         let seq = attrs.seq;
         let stream = attrs
             .stream
@@ -634,7 +641,7 @@ impl StreamCalls {
 
     /// True if Workflow code asked for a close that no completion carries. The task completes
     /// at once then, so that the Stream closes as soon as History has the intent.
-    pub(super) fn has_pending_intents(&self) -> bool {
+    pub fn has_pending_intents(&self) -> bool {
         self.closes
             .values()
             .any(|close| matches!(close.intent, Intent::Pending))
@@ -643,7 +650,7 @@ impl StreamCalls {
     /// The server took the completion that carries the sealed intents, so History has them. Each
     /// close waits in its Stream's queue, in front of every append of a later task. Returns the
     /// closes that run at once. A replay Worker runs none.
-    pub(super) fn intents_taken(&mut self) -> Vec<StreamRequest> {
+    pub fn intents_taken(&mut self) -> Vec<StreamRequest> {
         let mut sealed: Vec<_> = self
             .closes
             .iter()
@@ -691,7 +698,7 @@ impl StreamCalls {
     }
 
     /// Drops the intents that History doesn't have, when their task fails.
-    pub(super) fn drop_intents(&mut self) {
+    pub fn drop_intents(&mut self) {
         self.closes
             .retain(|_, close| matches!(close.intent, Intent::Recorded(_)));
     }
@@ -744,7 +751,7 @@ impl StreamCalls {
     }
 
     /// Stops a read. Returns true if it was still open, so that its pending Records are dropped.
-    pub(super) fn close_read(&mut self, seq: u32) -> Result<bool> {
+    pub fn close_read(&mut self, seq: u32) -> Result<bool> {
         let read = self
             .reads
             .get_mut(&seq)
@@ -763,7 +770,7 @@ impl StreamCalls {
 
     /// Starts an append. Returns the job of its refusal, for an append with an input over its
     /// limit.
-    pub(super) fn append(&mut self, attrs: AppendToStream) -> Result<Option<StreamJob>> {
+    pub fn append(&mut self, attrs: AppendToStream) -> Result<Option<StreamJob>> {
         let seq = attrs.seq;
         let stream = attrs
             .stream
@@ -843,7 +850,7 @@ impl StreamCalls {
     /// Applies a result. Returns the job it makes, or `None` when its call is gone, stopped or
     /// from an older dispatch, or when its Records wait for a later activation. `pending` gives
     /// the Records in the pending job of a read.
-    pub(super) fn resolve(
+    pub fn resolve(
         &mut self,
         resolution: StreamResolution,
         pending: impl FnOnce(u32) -> usize,
@@ -907,7 +914,7 @@ impl StreamCalls {
     }
 
     /// Holds the results of a marker of history, each for its activation in the Workflow Task.
-    pub(super) fn insert_peeked(&mut self, data: StreamMarkerData) -> Result<()> {
+    pub fn insert_peeked(&mut self, data: StreamMarkerData) -> Result<()> {
         let streams = data.streams;
         let stream_of = |kind: &str, seq: u32, index: u32| {
             streams.get(index as usize).cloned().ok_or_else(|| {
@@ -1040,7 +1047,7 @@ impl StreamCalls {
     /// Takes the held results that Workflow code gets in activation `current`, or that it gets
     /// late, of calls that it started. With `include_held`, it takes those of later activations
     /// too, for a replay that made fewer activations than its first run.
-    pub(super) fn take_held(&mut self, current: u32, include_held: bool) -> Result<Vec<StreamJob>> {
+    pub fn take_held(&mut self, current: u32, include_held: bool) -> Result<Vec<StreamJob>> {
         let mut jobs = vec![];
         let mut at = 0;
         while at < self.held.len() {
@@ -1196,7 +1203,7 @@ impl StreamCalls {
 
     /// Fails when history has results of a marker that Workflow code never got. A replayed
     /// marker event comes after every activation of its Workflow Task.
-    pub(super) fn check_marker_consumed(&self) -> Result<()> {
+    pub fn check_marker_consumed(&self) -> Result<()> {
         match self.held.first() {
             Some(held) => Err(nondeterminism!(
                 "History has a Stream result of {} {} that Workflow code never got",
@@ -1212,13 +1219,13 @@ impl StreamCalls {
     }
 
     /// True if history has results that wait for their activation.
-    pub(super) fn has_held(&self) -> bool {
+    pub fn has_held(&self) -> bool {
         !self.held.is_empty()
     }
 
     /// Clears what Workflow code got in the last Workflow Task, when the next one begins. A
     /// replayed task has no marker to write, and a live one wrote its marker already.
-    pub(super) fn wft_applied(&mut self) {
+    pub fn wft_applied(&mut self) {
         self.marker_reads.clear();
         self.marker_appends.clear();
         self.marker_closes.clear();
@@ -1227,7 +1234,7 @@ impl StreamCalls {
     /// The pages that reads gave past the marker bound of the last task, as jobs of this task.
     /// They count against this task's bound too, and against the page cap. `pending` gives the
     /// Records in the pending job of a read.
-    pub(super) fn release_carried(&mut self, pending: impl Fn(u32) -> usize) -> Vec<StreamJob> {
+    pub fn release_carried(&mut self, pending: impl Fn(u32) -> usize) -> Vec<StreamJob> {
         let mut seqs: Vec<_> = self
             .reads
             .iter()
@@ -1288,7 +1295,7 @@ impl StreamCalls {
     }
 
     /// True if results or intents wait for a later task, which the task must then force.
-    pub(super) fn has_carried(&self) -> bool {
+    pub fn has_carried(&self) -> bool {
         !self.carried_results.is_empty()
             || self.reads.values().any(|read| read.carried.is_some())
             || self.has_deferred_intents()
@@ -1297,7 +1304,7 @@ impl StreamCalls {
     /// The Records that reads gave past the page cap, as jobs of the next activation. Called once
     /// an activation took the pending jobs, so that the next one comes with no wait, also when the
     /// Store has nothing new.
-    pub(super) fn release_over_cap(&mut self) -> Vec<StreamJob> {
+    pub fn release_over_cap(&mut self) -> Vec<StreamJob> {
         let mut seqs: Vec<_> = self
             .reads
             .iter()
@@ -1324,14 +1331,14 @@ impl StreamCalls {
 
     /// True once the Records or the entries of this task's marker reached their bound, so that the
     /// task completes and a new one takes the rest.
-    pub(super) fn marker_full(&self) -> bool {
+    pub fn marker_full(&self) -> bool {
         self.marker_record_bytes >= MAX_MARKER_RECORD_BYTES || self.has_carried()
     }
 
     /// Stops every call. A terminal command does it, as does a failed Workflow Task, whose
     /// results must not reach Workflow code. It keeps the results that history holds, so that a
     /// replayed marker event still finds one that Workflow code never got.
-    pub(super) fn stop_all(&mut self) {
+    pub fn stop_all(&mut self) {
         for read in self.reads.values_mut().filter(|read| read.open) {
             read.open = false;
             read.carried = None;
@@ -1368,25 +1375,27 @@ impl StreamCalls {
 
     /// Drops the results that history holds. A failed Workflow Task evicts the run, and a forced
     /// failure of the Workflow must not meet them.
-    pub(super) fn drop_held(&mut self) {
+    pub fn drop_held(&mut self) {
         self.held.clear();
     }
 
-    pub(super) fn drain_requests(&mut self) -> Vec<StreamRequest> {
+    /// Takes the calls that the Worker must start or stop.
+    pub fn drain_requests(&mut self) -> Vec<StreamRequest> {
         std::mem::take(&mut self.requests)
     }
 
     /// True if Workflow code ever started a Stream call in this run.
-    pub(super) fn has_calls(&self) -> bool {
+    pub fn has_calls(&self) -> bool {
         !self.reads.is_empty() || !self.appends.is_empty() || !self.closes.is_empty()
     }
 
-    pub(super) fn has_requests(&self) -> bool {
+    /// True if there are calls that the Worker must start or stop.
+    pub fn has_requests(&self) -> bool {
         !self.requests.is_empty()
     }
 
     /// The reads that the Worker runs. A replayed read that waits for history holds no task.
-    pub(super) fn open_reads(&self) -> usize {
+    pub fn open_reads(&self) -> usize {
         self.reads
             .values()
             .filter(|read| read.open && read.dispatched)
@@ -1395,7 +1404,7 @@ impl StreamCalls {
 
     /// The writes that have no result: appends, and closes that wait in a queue or run, once
     /// replay ended. A close holds a Workflow Task after the one of its intent, as an append does.
-    pub(super) fn open_writes(&self) -> usize {
+    pub fn open_writes(&self) -> usize {
         if !self.live {
             return 0;
         }
@@ -1409,7 +1418,7 @@ impl StreamCalls {
 
     /// Notes the Stream jobs of an activation, which Workflow code gets at `activation` in the
     /// Workflow Task. The marker of the task records them. `metrics` are the run's.
-    pub(super) fn note_delivered<'a>(
+    pub fn note_delivered<'a>(
         &mut self,
         variants: impl IntoIterator<Item = &'a workflow_activation_job::Variant>,
         activation: u32,
@@ -1521,7 +1530,7 @@ impl StreamCalls {
     }
 
     /// True if Workflow code got a Stream result in this Workflow Task, or asked for a close.
-    pub(super) fn has_marker_entries(&self) -> bool {
+    pub fn has_marker_entries(&self) -> bool {
         !self.marker_reads.is_empty()
             || !self.marker_appends.is_empty()
             || !self.marker_closes.is_empty()
@@ -1531,10 +1540,7 @@ impl StreamCalls {
     /// The marker of this Workflow Task, if Workflow code got a Stream result in it or asked for a
     /// close. `epoch` is the task, which a close of the task closes with. It clears the entries,
     /// since the next task records its own.
-    pub(super) fn take_marker(
-        &mut self,
-        epoch: Option<WorkflowTaskEpoch>,
-    ) -> Option<StreamMarkerData> {
+    pub fn take_marker(&mut self, epoch: Option<WorkflowTaskEpoch>) -> Option<StreamMarkerData> {
         self.marker_record_bytes = 0;
         self.entry_budget = EntryBudget::default();
         let marker = self.seal_marker(epoch);
@@ -1662,12 +1668,13 @@ fn read_entry(read: &Read, entry: ReadEntryBuilder, stream_index: u32) -> Stream
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::workflow::streams::{
-        MAX_FAILURE_MESSAGE_BYTES, MAX_STORE_NAME_BYTES, failure,
+    use crate::{
+        Reason, StreamError,
+        ids::MAX_STREAM_ID_BYTES,
+        workflow::manager::{MAX_FAILURE_MESSAGE_BYTES, MAX_STORE_NAME_BYTES, failure},
     };
     use prost_types::Timestamp;
     use temporalio_common::protos::coresdk::common::StreamReadStop;
-    use temporalio_streams::{Reason, StreamError, ids::MAX_STREAM_ID_BYTES};
 
     /// The size of `entry` as a field of the marker.
     fn field(entry: &impl Message) -> usize {

@@ -7,7 +7,6 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
-mod stream_adapters;
 mod streams;
 mod wft_extraction;
 pub(crate) mod wft_poller;
@@ -50,8 +49,9 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
-            stream_adapters::{LocalSink, worker_streams},
-            streams::{STREAM_REPLAY_ERROR_TYPE, StreamManager, WorkerStreams},
+            streams::{
+                LocalSink, STREAM_REPLAY_ERROR_TYPE, StreamManager, WorkerStreams, worker_streams,
+            },
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
