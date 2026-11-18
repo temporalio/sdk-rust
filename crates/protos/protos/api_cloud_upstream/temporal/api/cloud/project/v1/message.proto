@@ -1,0 +1,50 @@
+// Projects are an upcoming feature and may not be enabled for your account.
+// Contact Temporal support to request access.
+
+syntax = "proto3";
+
+package temporal.api.cloud.project.v1;
+
+option go_package = "go.temporal.io/api/cloud/project/v1;project";
+option java_package = "io.temporal.api.cloud.project.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Cloud::Project::V1";
+option csharp_namespace = "Temporalio.Api.Cloud.Project.V1";
+
+import "temporal/api/cloud/resource/v1/message.proto";
+import "google/protobuf/timestamp.proto";
+
+message ProjectSpec {
+  // The display name of the project.
+  string display_name = 1;
+  // A description of the project.
+  string description = 2;
+  // The lifecycle configuration for the project.
+  LifecycleSpec lifecycle = 3;
+}
+
+message LifecycleSpec {
+  // If true, the project cannot be deleted.
+  bool enable_delete_protection = 1;
+}
+
+message Project {
+  // The id of the user
+  string id = 1;
+  // The project specification
+  ProjectSpec spec = 2;
+  // The current version of the project specification
+  // The next update operation will have to include this version
+  string resource_version = 3;
+  // The current state of the project.
+  // For any failed state, reach out to Temporal Cloud support for remediation.
+  temporal.api.cloud.resource.v1.ResourceState state = 4;
+  // The id of the async operation that is creating/updating/deleting the project, if any
+  string async_operation_id = 5;
+  // The date and time when the project was created
+  google.protobuf.Timestamp created_time = 6;
+  // The date and time when the project was last modified
+  // Will not be set if the project has never been modified
+  google.protobuf.Timestamp last_modified_time = 7;
+}

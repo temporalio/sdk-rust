@@ -1,7 +1,19 @@
 use super::*;
-use crate::workflow_context::{NexusUnblockData, StartedNexusOperation};
+use crate::{
+    nexus::NexusOperationError,
+    workflow_context::{NexusUnblockData, StartedNexusOperation},
+};
+use temporalio_common_wasm::data_converters::{
+    NexusOperationDecodeHint, SerializationContextData, WorkflowSerializationContext,
+};
 
-pub(crate) type NexusStartResult = Result<StartedNexusOperation, Failure>;
+pub(crate) type NexusStartResult = Result<StartedNexusOperation, NexusOperationError>;
+
+impl From<NexusOperationError> for WorkflowTermination {
+    fn from(value: NexusOperationError) -> Self {
+        Self::Failed(value.into())
+    }
+}
 
 impl Unblockable for NexusStartResult {
     type OtherDat = NexusUnblockData;
@@ -30,7 +42,14 @@ impl Unblockable for NexusStartResult {
                         base_ctx,
                     })
                 }
-                resolve_nexus_operation_start::Status::Failed(f) => Err(f),
+                resolve_nexus_operation_start::Status::Failed(failure) => Err(base_ctx
+                    .data_converter()
+                    .to_error(
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                        failure,
+                        NexusOperationDecodeHint::Failed,
+                    )
+                    .unwrap_or_else(NexusOperationError::Serialization)),
             },
             _ => panic!("Invalid unblock event for nexus operation"),
         }

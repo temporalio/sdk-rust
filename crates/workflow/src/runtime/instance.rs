@@ -1315,6 +1315,149 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "experimental")]
+    mod nexus_tests {
+        use super::*;
+        use crate::nexus::{NexusOperationOptions, NexusServiceClientOptions};
+        use nexus_rpc::service;
+        use temporalio_common_wasm::protos::{
+            coresdk::{
+                nexus::{NexusOperationResult, nexus_operation_result},
+                workflow_activation::{
+                    ResolveNexusOperation, ResolveNexusOperationStart,
+                    resolve_nexus_operation_start,
+                },
+            },
+            temporal::api::failure::v1::{CanceledFailureInfo, failure::FailureInfo},
+        };
+
+        #[service]
+        trait Payments {
+            #[operation]
+            fn charge(input: String) -> String;
+        }
+
+        #[workflow]
+        #[derive(Default)]
+        struct CancelledNexusWorkflow;
+
+        #[workflow_methods]
+        impl CancelledNexusWorkflow {
+            #[run]
+            async fn run(ctx: &mut WorkflowContext<Self>) -> crate::WorkflowResult<String> {
+                Ok(ctx
+                    .nexus_client(Payments, NexusServiceClientOptions::new("payments").build())
+                    .execute(
+                        Payments::charge,
+                        String::new(),
+                        NexusOperationOptions::default(),
+                    )
+                    .await?)
+            }
+        }
+
+        #[rstest::rstest]
+        fn propagated_nexus_cancellation_completes_workflow_as_cancelled(
+            #[values(false, true)] started: bool,
+        ) {
+            let base_ctx = BaseWorkflowContext::from_raw(
+                WorkflowInit {
+                    namespace: "default".to_string(),
+                    task_queue: "task-queue".to_string(),
+                    run_id: "run-id".to_string(),
+                    initialize_workflow: InitializeWorkflow {
+                        workflow_type: CancelledNexusWorkflow::name().to_string(),
+                        ..Default::default()
+                    },
+                },
+                DataConverter::default(),
+                Rc::new(NoopHost),
+                None,
+                Vec::new(),
+            );
+            let mut instance = GuestWorkflowInstance::<CancelledNexusWorkflow>::new_with_workflow(
+                CancelledNexusWorkflow,
+                base_ctx,
+                None,
+            );
+            assert!(matches!(
+                instance
+                    .poll_routine(MAIN_ROUTINE_ID, Waker::noop())
+                    .unwrap()
+                    .completion,
+                Some(RoutineCompletion::Main(MainRoutineCompletion::Blocked))
+            ));
+            if started {
+                instance
+                    .activate(
+                        WorkflowActivation {
+                            jobs: vec![
+                                ActivationVariant::ResolveNexusOperationStart(
+                                    ResolveNexusOperationStart {
+                                        seq: 1,
+                                        status: Some(
+                                            resolve_nexus_operation_start::Status::OperationToken(
+                                                "token".to_string(),
+                                            ),
+                                        ),
+                                    },
+                                )
+                                .into(),
+                            ],
+                            ..Default::default()
+                        },
+                        Waker::noop(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    instance
+                        .poll_routine(MAIN_ROUTINE_ID, Waker::noop())
+                        .unwrap()
+                        .completion,
+                    Some(RoutineCompletion::Main(MainRoutineCompletion::Blocked))
+                ));
+            }
+            let resolution = if started {
+                ActivationVariant::ResolveNexusOperation(ResolveNexusOperation {
+                    seq: 1,
+                    result: Some(NexusOperationResult {
+                        status: Some(nexus_operation_result::Status::Cancelled(Failure::default())),
+                    }),
+                })
+            } else {
+                ActivationVariant::ResolveNexusOperationStart(ResolveNexusOperationStart {
+                    seq: 1,
+                    status: Some(resolve_nexus_operation_start::Status::Failed(Failure {
+                        failure_info: Some(FailureInfo::CanceledFailureInfo(
+                            CanceledFailureInfo::default(),
+                        )),
+                        ..Default::default()
+                    })),
+                })
+            };
+            instance
+                .activate(
+                    WorkflowActivation {
+                        jobs: vec![
+                            ActivationVariant::CancelWorkflow(Default::default()).into(),
+                            resolution.into(),
+                        ],
+                        ..Default::default()
+                    },
+                    Waker::noop(),
+                )
+                .unwrap();
+            assert!(matches!(
+                instance
+                    .poll_routine(MAIN_ROUTINE_ID, Waker::noop())
+                    .unwrap()
+                    .completion,
+                Some(RoutineCompletion::Main(MainRoutineCompletion::Terminal(outcome)))
+                    if matches!(*outcome, TerminalOutcome::Cancelled(_))
+            ));
+        }
+    }
+
     impl WorkflowHost for NoopHost {
         fn set_current_details(&self, _details: String) {}
 

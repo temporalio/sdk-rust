@@ -304,6 +304,7 @@ impl ScheduledEventRecorded {
             ca.failure.unwrap_or_else(|| Failure {
                 message: "Nexus operation was cancelled but failure field was not populated"
                     .to_owned(),
+                failure_info: Some(FailureInfo::CanceledFailureInfo(Default::default())),
                 ..Default::default()
             }),
         )])
@@ -316,6 +317,7 @@ impl ScheduledEventRecorded {
         NexusOperationMachineTransition::commands([NexusOperationCommand::FailBeforeStart(
             toa.failure.unwrap_or_else(|| Failure {
                 message: "Nexus operation timed out but failure field was not populated".to_owned(),
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(Default::default())),
                 ..Default::default()
             }),
         )])

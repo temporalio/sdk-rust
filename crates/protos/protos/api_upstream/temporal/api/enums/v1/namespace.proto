@@ -14,6 +14,17 @@ enum NamespaceState {
     NAMESPACE_STATE_REGISTERED = 1;
     NAMESPACE_STATE_DEPRECATED = 2;
     NAMESPACE_STATE_DELETED = 3;
+    // Set by OperatorService.SoftDeleteNamespace. Executions make no progress, but no data is
+    // removed until the namespace is restored or deleted.
+    NAMESPACE_STATE_SOFT_DELETED = 4;
+}
+
+// State of a restore started by OperatorService.RestoreNamespace.
+enum NamespaceRestoreState {
+    NAMESPACE_RESTORE_STATE_UNSPECIFIED = 0;
+    NAMESPACE_RESTORE_STATE_RUNNING = 1;
+    NAMESPACE_RESTORE_STATE_COMPLETED = 2;
+    NAMESPACE_RESTORE_STATE_FAILED = 3;
 }
 
 enum ArchivalState {

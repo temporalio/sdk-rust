@@ -465,6 +465,10 @@ pub enum OutgoingWorkflowError {
     /// A workflow failure sourced from requesting cancellation of an external workflow.
     #[error(transparent)]
     CancelExternalWorkflow(#[from] Box<CancelExternalWorkflowError>),
+    /// A workflow failure sourced from a Nexus operation.
+    #[cfg(feature = "experimental")]
+    #[error(transparent)]
+    NexusOperation(#[from] Box<NexusOperationError>),
 }
 
 impl OutgoingWorkflowError {
@@ -479,6 +483,8 @@ impl OutgoingWorkflowError {
             Self::ChildWorkflowStart(err) => err.as_cancelled(),
             Self::WorkflowSignal(err) => err.as_cancelled(),
             Self::CancelExternalWorkflow(err) => err.as_cancelled(),
+            #[cfg(feature = "experimental")]
+            Self::NexusOperation(err) => err.as_cancelled(),
         }
     }
 }
@@ -540,6 +546,16 @@ impl From<CancelExternalWorkflowError> for OutgoingWorkflowError {
     }
 }
 
+#[cfg(feature = "experimental")]
+impl From<NexusOperationError> for OutgoingWorkflowError {
+    fn from(value: NexusOperationError) -> Self {
+        match value {
+            NexusOperationError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::NexusOperation(Box::new(other)),
+        }
+    }
+}
+
 /// A normalized incoming Temporal failure decoded from a protobuf [`Failure`].
 #[derive(Debug)]
 #[non_exhaustive]
@@ -561,7 +577,7 @@ pub enum IncomingError {
     /// A decoded child-workflow failure wrapper.
     ChildWorkflowExecution(ChildWorkflowFailureError),
     /// A decoded nexus operation failure wrapper.
-    NexusOperationExecution(IncomingNexusOperationExecutionError),
+    NexusOperationExecution(NexusOperationFailureError),
     /// A decoded nexus handler failure wrapper.
     NexusHandler(IncomingNexusHandlerError),
 }
@@ -992,10 +1008,103 @@ impl ChildWorkflowFailureError {
 }
 
 impl_incoming_failure_wrapper!(ChildWorkflowFailureError);
-incoming_failure_wrapper!(
-    IncomingNexusOperationExecutionError,
-    "A normalized nexus operation failure wrapper."
-);
+
+/// A Nexus operation failure retaining its original proto and normalized reason.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", .failure.message)]
+pub struct NexusOperationFailureError {
+    failure: Failure,
+    #[source]
+    cause: Option<Box<IncomingError>>,
+}
+
+/// Compatibility alias for [`NexusOperationFailureError`].
+#[deprecated(note = "Use NexusOperationFailureError instead.")]
+pub type IncomingNexusOperationExecutionError = NexusOperationFailureError;
+
+impl NexusOperationFailureError {
+    pub(crate) fn new(failure: Failure, cause: Option<IncomingError>) -> Self {
+        Self {
+            failure,
+            cause: cause.map(Box::new),
+        }
+    }
+
+    /// Returns the original failure proto, which may omit the Nexus wrapper.
+    pub fn failure(&self) -> &Failure {
+        &self.failure
+    }
+
+    /// Returns the normalized operation failure reason, if any.
+    ///
+    /// When the incoming failure has no Nexus wrapper, its entire normalized error is the reason.
+    pub fn cause(&self) -> Option<&IncomingError> {
+        self.cause.as_deref()
+    }
+
+    /// Returns the normalized operation failure reason, if any.
+    pub fn reason(&self) -> Option<&IncomingError> {
+        self.cause()
+    }
+
+    /// Returns the immediate cancellation cause, if present.
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.cause().and_then(IncomingError::as_cancelled)
+    }
+
+    /// Returns the immediate timeout cause, if present.
+    pub fn as_timeout(&self) -> Option<&TimeoutError> {
+        self.cause().and_then(IncomingError::as_timeout)
+    }
+
+    /// Consumes this error and returns the original failure proto.
+    pub fn into_failure(self) -> Failure {
+        self.failure
+    }
+
+    /// Consumes this wrapper and returns the retained proto failure and normalized reason.
+    pub fn into_parts(self) -> (Failure, Option<IncomingError>) {
+        (self.failure, self.cause.map(|cause| *cause))
+    }
+
+    /// Returns the Nexus endpoint from the retained operation wrapper, if present.
+    pub fn endpoint(&self) -> Option<&str> {
+        self.operation_info().map(|info| info.endpoint.as_str())
+    }
+
+    /// Returns the Nexus service from the retained operation wrapper, if present.
+    pub fn service(&self) -> Option<&str> {
+        self.operation_info().map(|info| info.service.as_str())
+    }
+
+    /// Returns the operation name from the retained operation wrapper, if present.
+    pub fn operation(&self) -> Option<&str> {
+        self.operation_info().map(|info| info.operation.as_str())
+    }
+
+    /// Returns the operation token from the retained operation wrapper, if present.
+    pub fn operation_token(&self) -> Option<&str> {
+        self.operation_info()
+            .map(|info| info.operation_token.as_str())
+    }
+
+    /// Returns the scheduled event ID from the retained operation wrapper, if present.
+    pub fn scheduled_event_id(&self) -> Option<i64> {
+        self.operation_info().map(|info| info.scheduled_event_id)
+    }
+
+    fn operation_info(
+        &self,
+    ) -> Option<&crate::protos::temporal::api::failure::v1::NexusOperationFailureInfo> {
+        match self.failure().failure_info.as_ref()? {
+            crate::protos::temporal::api::failure::v1::failure::FailureInfo::NexusOperationExecutionFailureInfo(info) => {
+                Some(info)
+            }
+            _ => None,
+        }
+    }
+}
+
 incoming_failure_wrapper!(
     IncomingNexusHandlerError,
     "A normalized nexus handler failure wrapper."
@@ -1060,6 +1169,42 @@ impl ActivityExecutionError {
             ActivityExecutionError::Cancelled(err) => Some(err),
             ActivityExecutionError::Serialization(_) => None,
         }
+    }
+}
+
+/// Error returned when executing a Nexus operation fails.
+#[cfg(feature = "experimental")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NexusOperationError {
+    /// The Nexus operation returned a failure, including cancellation or timeout.
+    #[error("Nexus operation failed: {0}")]
+    Failed(#[source] Box<NexusOperationFailureError>),
+    /// Failed to serialize input or deserialize the operation result payload.
+    #[error("Payload conversion failed: {0}")]
+    Serialization(#[from] PayloadConversionError),
+}
+
+#[cfg(feature = "experimental")]
+impl NexusOperationError {
+    /// Returns the operation failure, if the error came from an operation resolution.
+    pub fn operation_failure(&self) -> Option<&NexusOperationFailureError> {
+        match self {
+            Self::Failed(err) => Some(err),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// If the operation failed with cancellation, returns the associated [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.operation_failure()
+            .and_then(NexusOperationFailureError::as_cancelled)
+    }
+
+    /// If the operation failed with a timeout, returns the associated [`TimeoutError`].
+    pub fn as_timeout(&self) -> Option<&TimeoutError> {
+        self.operation_failure()
+            .and_then(NexusOperationFailureError::as_timeout)
     }
 }
 

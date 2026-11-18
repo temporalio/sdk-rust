@@ -1891,6 +1891,24 @@ proxier! {
             r.extensions_mut().insert(labels);
         }
     );
+    (soft_delete_namespace, SoftDeleteNamespaceRequest, SoftDeleteNamespaceResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (restore_namespace, RestoreNamespaceRequest, RestoreNamespaceResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (describe_namespace_restore, DescribeNamespaceRestoreRequest, DescribeNamespaceRestoreResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
     (add_or_update_remote_cluster, AddOrUpdateRemoteClusterRequest, AddOrUpdateRemoteClusterResponse);
     (remove_remote_cluster, RemoveRemoteClusterRequest, RemoveRemoteClusterResponse);
     (list_clusters, ListClustersRequest, ListClustersResponse);
@@ -1994,6 +2012,25 @@ proxier! {
     (get_user_namespace_assignments, cloudreq::GetUserNamespaceAssignmentsRequest, cloudreq::GetUserNamespaceAssignmentsResponse);
     (get_service_account_namespace_assignments, cloudreq::GetServiceAccountNamespaceAssignmentsRequest, cloudreq::GetServiceAccountNamespaceAssignmentsResponse);
     (get_user_group_namespace_assignments, cloudreq::GetUserGroupNamespaceAssignmentsRequest, cloudreq::GetUserGroupNamespaceAssignmentsResponse);
+    (move_nexus_endpoint_to_project, cloudreq::MoveNexusEndpointToProjectRequest, cloudreq::MoveNexusEndpointToProjectResponse);
+    (create_caller_rate_limit, cloudreq::CreateCallerRateLimitRequest, cloudreq::CreateCallerRateLimitResponse);
+    (get_caller_rate_limit, cloudreq::GetCallerRateLimitRequest, cloudreq::GetCallerRateLimitResponse);
+    (get_caller_rate_limits, cloudreq::GetCallerRateLimitsRequest, cloudreq::GetCallerRateLimitsResponse);
+    (update_caller_rate_limit, cloudreq::UpdateCallerRateLimitRequest, cloudreq::UpdateCallerRateLimitResponse);
+    (delete_caller_rate_limit, cloudreq::DeleteCallerRateLimitRequest, cloudreq::DeleteCallerRateLimitResponse);
+    (get_projects, cloudreq::GetProjectsRequest, cloudreq::GetProjectsResponse);
+    (get_project, cloudreq::GetProjectRequest, cloudreq::GetProjectResponse);
+    (create_project, cloudreq::CreateProjectRequest, cloudreq::CreateProjectResponse);
+    (update_project, cloudreq::UpdateProjectRequest, cloudreq::UpdateProjectResponse);
+    (move_namespace_to_project, cloudreq::MoveNamespaceToProjectRequest, cloudreq::MoveNamespaceToProjectResponse);
+    (delete_project, cloudreq::DeleteProjectRequest, cloudreq::DeleteProjectResponse);
+    (set_user_project_access, cloudreq::SetUserProjectAccessRequest, cloudreq::SetUserProjectAccessResponse);
+    (set_user_group_project_access, cloudreq::SetUserGroupProjectAccessRequest, cloudreq::SetUserGroupProjectAccessResponse);
+    (set_service_account_project_access, cloudreq::SetServiceAccountProjectAccessRequest, cloudreq::SetServiceAccountProjectAccessResponse);
+    (get_user_project_assignments, cloudreq::GetUserProjectAssignmentsRequest, cloudreq::GetUserProjectAssignmentsResponse);
+    (get_service_account_project_assignments, cloudreq::GetServiceAccountProjectAssignmentsRequest, cloudreq::GetServiceAccountProjectAssignmentsResponse);
+    (get_user_group_project_assignments, cloudreq::GetUserGroupProjectAssignmentsRequest, cloudreq::GetUserGroupProjectAssignmentsResponse);
+    (get_project_scoped_service_accounts, cloudreq::GetProjectScopedServiceAccountsRequest, cloudreq::GetProjectScopedServiceAccountsResponse);
 }
 
 proxier! {

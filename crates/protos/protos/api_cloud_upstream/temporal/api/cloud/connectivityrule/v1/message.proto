@@ -32,6 +32,9 @@ message ConnectivityRule {
 
   // The date and time when the connectivity rule was created.
   google.protobuf.Timestamp created_time = 7;
+
+  // The ID of the project this connectivity rule belongs to.
+  string project_id = 8;
 }
 
 // The connectivity rule specification passed in on create/update operations.
@@ -53,16 +56,26 @@ message PublicConnectivityRule {
 
 // A private connectivity rule allows connections from a specific private vpc only.
 message PrivateConnectivityRule {
-  // Connection id provided to enforce the private connectivity. This is required both by AWS and GCP.
+  // Connection id provided by user to enforce the private connectivity.
+  // For AWS: VPC endpoint ID (e.g. "vpce-0123456789abcdef0").
+  // For GCP: PSC connection ID (numeric string).
+  // For Azure: not set by the customer; populated internally with the PPv2 LinkID
+  // returned by the infra plane during Private Endpoint connection approval.
   string connection_id = 1;
 
-  // For GCP private connectivity service, GCP needs both GCP project id and the Private Service Connect Connection IDs
-  // AWS only needs the connection_id
+  // For GCP private connectivity service, GCP needs both GCP project id and the Private Service Connect Connection IDs.
+  // AWS only needs the connection_id.
   string gcp_project_id = 2;
 
   // The region of the connectivity rule. This should align with the namespace.
-  // Example: "aws-us-west-2"
+  // Example: "aws-us-west-2", "gcp-us-central1", "azure-eastus"
   string region = 3;
 
   reserved 4;
+
+  // azure_pe_resource_id is the ARM resource ID of the customer's Azure Private Endpoint.
+  // Required for Azure private connectivity rules.
+  // Example: "/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/privateEndpoints/{name}"
+  // temporal:versioning:min_version=v0.18.0
+  string azure_pe_resource_id = 5;
 }

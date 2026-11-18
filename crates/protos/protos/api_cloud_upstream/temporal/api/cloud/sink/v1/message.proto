@@ -40,6 +40,26 @@ message GCSSpec {
     string region = 4;
 }
 
+message AzureBlobSpec {
+    // The customer's Azure tenant ID where the storage account exists and where Temporal's app registration is consented/granted access.
+    string tenant_id = 1;
+
+    // The name of the destination Azure storage account where Temporal will send data.
+    string storage_account = 2;
+
+    // The name of the destination Azure Blob container where Temporal will send data.
+    string container_name = 3;
+
+    // The region where the Azure storage account is located.
+    string region = 4;
+
+    // The Azure subscription ID that contains the storage account.
+    string subscription_id = 5;
+
+    // The Azure resource group that contains the storage account.
+    string resource_group = 6;
+}
+
 message KinesisSpec {
     // The role Temporal Cloud assumes when writing records to Kinesis
     string role_name = 1;
