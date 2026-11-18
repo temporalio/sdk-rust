@@ -11,10 +11,10 @@ use crate::{
 };
 use std::time::Duration;
 
-/// The longest wait that the runtime asks a Store for in one read. The runtime has no timer of its
-/// own, so a Store that never answers holds the read.
+/// The cap on the `wait` of a read request. A longer wait is cut to it. The runtime has no timer
+/// of its own, so a Store that never answers holds the read.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
-/// The most Records in one page of a read.
+/// The cap on the `max_records` of a read request, and the page size when the request sets none.
 pub const MAX_RECORDS: usize = 1000;
 
 /// A Stream Store. It runs each operation of the Stream service with the service's messages, and
