@@ -1,7 +1,6 @@
 #![warn(missing_docs)]
 
-//! Experimental. What every Store of a Temporal Stream shares: the error of a failed call, the
-//! order of a Producer's epochs, and the stored form of a Record.
+//! Experimental. Contains shared definitions for Temporal Stream Store implementations.
 
 pub mod epoch;
 mod error;
@@ -9,8 +8,7 @@ pub mod record;
 
 pub use error::{Reason, StreamError, StreamResult};
 
-/// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
-/// needs no conversion between the crates.
+/// The Stream protos, re-exported from `temporalio-common` so that its values need no conversion.
 pub mod proto {
     pub use temporalio_common::protos::temporal::api::{
         enums::v1::{StreamErrorReason, StreamIdConflictPolicy, StreamStatus},

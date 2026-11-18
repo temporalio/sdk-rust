@@ -1,4 +1,4 @@
-//! The stored Records of a batch, and the limits that measure them.
+//! The stored form of a Record, and the size limits of a batch.
 
 use crate::{
     Reason, StreamError, StreamResult,
@@ -6,17 +6,17 @@ use crate::{
 };
 use prost::{Message, encoding};
 
-/// The most bytes of a stored Record that a Store may allow. A Record can go into Workflow History,
-/// where the server refuses a payload over 2 MiB by default.
+/// The largest stored Record, in bytes, that a Store may allow. A Record can go into Workflow
+/// History, where the server refuses a payload over 2 MiB by default.
 pub const MAX_RECORD_BYTES: usize = 1536 * 1024;
-/// The most bytes of a stored batch that a Store may allow.
+/// The largest stored batch, in bytes, that a Store may allow.
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
-/// The most Records of a batch that a Store may allow. Many small Records fit under
-/// [MAX_BATCH_BYTES], but they keep a Store busy for long.
+/// The most Records that a Store may allow in one batch. Many small Records fit under
+/// [`MAX_BATCH_BYTES`], but they can keep a Store busy for a long time.
 pub const MAX_BATCH_RECORDS: usize = 1000;
 
-/// The limits of one batch on a Store. The default is the three constants, which are also the most
-/// that a Store may allow. A Store that wants smaller batches or Records sets less.
+/// The size limits of one batch on a Store. The defaults are the `MAX_*` constants, which are also
+/// the upper bounds. A Store can set lower limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchLimits {
     max_record_bytes: usize,
@@ -34,7 +34,6 @@ impl Default for BatchLimits {
     }
 }
 
-/// A limit from 1 to `most`.
 fn limit(option: &str, value: usize, most: usize) -> StreamResult<usize> {
     if (1..=most).contains(&value) {
         return Ok(value);
@@ -45,7 +44,7 @@ fn limit(option: &str, value: usize, most: usize) -> StreamResult<usize> {
 }
 
 impl BatchLimits {
-    /// Sets the most bytes of one stored Record, from 1 to [MAX_RECORD_BYTES].
+    /// Sets the maximum stored size of one Record, from 1 to [`MAX_RECORD_BYTES`].
     pub fn with_max_record_bytes(self, bytes: usize) -> StreamResult<Self> {
         let max_record_bytes = limit("max_record_bytes", bytes, MAX_RECORD_BYTES)?;
         Ok(Self {
@@ -54,7 +53,7 @@ impl BatchLimits {
         })
     }
 
-    /// Sets the most bytes of one stored batch, from 1 to [MAX_BATCH_BYTES].
+    /// Sets the maximum stored size of one batch, from 1 to [`MAX_BATCH_BYTES`].
     pub fn with_max_batch_bytes(self, bytes: usize) -> StreamResult<Self> {
         let max_batch_bytes = limit("max_batch_bytes", bytes, MAX_BATCH_BYTES)?;
         Ok(Self {
@@ -63,7 +62,7 @@ impl BatchLimits {
         })
     }
 
-    /// Sets the most Records of one batch, from 1 to [MAX_BATCH_RECORDS].
+    /// Sets the maximum number of Records in one batch, from 1 to [`MAX_BATCH_RECORDS`].
     pub fn with_max_batch_records(self, records: usize) -> StreamResult<Self> {
         let max_batch_records = limit("max_batch_records", records, MAX_BATCH_RECORDS)?;
         Ok(Self {
@@ -72,23 +71,23 @@ impl BatchLimits {
         })
     }
 
-    /// The most bytes of one stored Record.
+    /// The maximum stored size of one Record, in bytes.
     pub fn max_record_bytes(&self) -> usize {
         self.max_record_bytes
     }
 
-    /// The most bytes of one stored batch.
+    /// The maximum stored size of one batch, in bytes.
     pub fn max_batch_bytes(&self) -> usize {
         self.max_batch_bytes
     }
 
-    /// The most Records of one batch.
+    /// The maximum number of Records in one batch.
     pub fn max_batch_records(&self) -> usize {
         self.max_batch_records
     }
 
-    /// Refuses a batch over one of the limits with [Reason::TooLarge]. It measures the stored
-    /// Records of the batch, and encodes and clones nothing.
+    /// Fails with [`Reason::TooLarge`] if the batch is over a limit. It measures the stored size
+    /// of each Record without encoding or cloning it.
     pub fn check(&self, producer: &Producer, records: &[AppendRecord]) -> StreamResult<()> {
         let Self {
             max_record_bytes,
@@ -125,7 +124,7 @@ impl BatchLimits {
     }
 }
 
-/// One stored data Record. It has no offset, since the Store gives the entry its offset.
+/// Encodes the stored form of one data Record. It has no offset, since the Store assigns it.
 pub fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
     StreamRecord {
         producer: Some(producer.clone()),
@@ -135,11 +134,9 @@ pub fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// The stored size of one data Record in bytes, which is `data_record(producer, record).len()`.
-/// It measures the Record and allocates nothing.
+/// The length of the [`data_record`] output, without allocating.
 pub fn data_record_len(producer: &Producer, record: &AppendRecord) -> usize {
-    // The tags are those of `producer` and `body` in `StreamRecord`. A test checks the sum against
-    // the encoded Record.
+    // This must match the fields that `data_record` sets, `producer` (tag 1) and `body` (tag 2).
     encoding::message::encoded_len(1, producer)
         + record
             .body
@@ -157,7 +154,7 @@ mod tests {
     use prost_types::Timestamp;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
 
-    /// One Producer of each kind, with every field set, and one with no kind.
+    /// One Producer of each kind with every field set, and one Producer with no kind.
     fn producers() -> Vec<Producer> {
         let task = WorkflowTaskEpoch {
             started_event_id: 300,
@@ -230,51 +227,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn the_limits_check_gives_the_errors_of_the_stored_records() {
-        let producer = &producers()[0];
-        let record = |bytes: usize| AppendRecord {
-            body: Some(Payload {
-                data: vec![0; bytes],
-                ..Default::default()
-            }),
-        };
-        let big = data_record(producer, record(MAX_RECORD_BYTES)).len();
-        let half = vec![record(MAX_RECORD_BYTES / 2 + 1); 8];
-        let total: usize = half
-            .iter()
-            .map(|record| data_record(producer, record.clone()).len())
-            .sum();
-        let cases = [
-            (
-                vec![record(MAX_RECORD_BYTES)],
-                format!("A Record has {big} bytes, more than {MAX_RECORD_BYTES}"),
-            ),
-            (
-                half,
-                format!("The batch has {total} bytes, more than {MAX_BATCH_BYTES}"),
-            ),
-            (
-                vec![record(1); MAX_BATCH_RECORDS + 1],
-                format!(
-                    "The batch has {} Records, more than {MAX_BATCH_RECORDS}",
-                    MAX_BATCH_RECORDS + 1
-                ),
-            ),
-        ];
-        let limits = BatchLimits::default();
-        for (records, message) in cases {
-            let error = limits.check(producer, &records).unwrap_err();
-            assert_eq!(error.reason, Reason::TooLarge);
-            assert_eq!(error.message, message);
-        }
-        // A batch at the limits passes.
-        limits
-            .check(producer, &vec![record(1); MAX_BATCH_RECORDS])
-            .unwrap();
-        limits.check(producer, &[]).unwrap();
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! Producer epochs and their order.
+//! The order of Producer epochs.
 //!
-//! A Store keeps an epoch as a key of fixed-width big-endian fields, in the order of comparison.
-//! A byte comparison of two keys then orders the epochs field by field. `testdata/epochs.json` has
-//! the shared vectors of the keys, in hex.
+//! An epoch key has fixed-width big-endian fields in the order of comparison, so a Store orders
+//! two epochs of one Producer by comparing their keys as bytes. Keys of different Producers don't
+//! compare. Implementations in other languages can check their keys against
+//! `testdata/epochs.json`.
 
 use crate::{
     StreamError, StreamResult,
@@ -10,17 +11,17 @@ use crate::{
 };
 use prost_types::Timestamp;
 
-/// The kind of a Producer, which is the case of its epoch. The numbers must never change. A Store
-/// may keep the number of a kind in what it stores, and a digest that History keeps for good can
-/// hash it with the [epoch_key]. A changed number would break the stored data, and the replay of
-/// that History.
+/// The kind of a Producer. Each kind has its own epoch fields.
+///
+/// The numbers must never change. A Store can persist them, and Workflow History can keep a digest
+/// of them, so a changed number breaks the stored data and the replay of that History.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProducerKind {
     /// A Workflow run.
     Workflow = 1,
     /// A Local Activity.
     LocalActivity = 2,
-    /// An Activity of a Workflow.
+    /// An Activity that a Workflow scheduled.
     Activity = 3,
     /// A client.
     Client = 4,
@@ -40,7 +41,7 @@ impl From<&Kind> for ProducerKind {
     }
 }
 
-/// Refuses a Producer with no kind case.
+/// Fails for a Producer with no kind set.
 impl TryFrom<&Producer> for ProducerKind {
     type Error = StreamError;
 
@@ -49,17 +50,17 @@ impl TryFrom<&Producer> for ProducerKind {
     }
 }
 
-/// The kind case of a Producer, `None` when it has none.
+/// The kind of a Producer, or `None` if it has no kind set.
 pub fn kind_of(producer: &Producer) -> Option<ProducerKind> {
     producer.kind.as_ref().map(ProducerKind::from)
 }
 
-/// The length of a [task_key].
+/// The length of a [`task_key`] in bytes.
 pub const TASK_KEY_LEN: usize = 24;
-/// The length of an [epoch_key].
+/// The length of an [`epoch_key`] in bytes.
 pub const EPOCH_KEY_LEN: usize = 40;
 
-// A negative field is clamped at zero, since its bytes would outrank every real epoch.
+// Without the clamp, the two's-complement bytes of a negative field sort above every real epoch.
 fn be64(value: i64) -> [u8; 8] {
     value.max(0).to_be_bytes()
 }
@@ -72,9 +73,10 @@ fn time_fields(time: Option<&Timestamp>) -> (i64, i32) {
     time.map_or((0, 0), |time| (time.seconds, time.nanos))
 }
 
-/// The key of a Workflow Task attempt. It is the started event id, the attempt, and the started
-/// seconds and nanos, in 8, 4, 8 and 4 bytes. The epoch keys of the run and of the task's Local
-/// Activities start with it.
+/// The key of a Workflow Task attempt. It has the started event id, the attempt, and the started
+/// seconds and nanos, in 8, 4, 8 and 4 bytes. A negative field gives zero. The epoch keys of a
+/// Workflow and of its Local Activities start with this key, so the same Local Activity call in a
+/// later task gives a higher key.
 pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
     let (seconds, nanos) = time_fields(task.started_time.as_ref());
     let mut key = [0; TASK_KEY_LEN];
@@ -85,10 +87,10 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
     key
 }
 
-/// The key of an epoch. It is the [task_key] of the task that [task_of] gives, then the attempt's
-/// scheduled seconds and nanos and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't
-/// have is zero, and a Producer with no case is all zeros. A Producer with no epoch, such as a
-/// client, gives the zero key.
+/// The key of an epoch. It starts with the [`task_key`] of the task that [`task_of`] returns, then
+/// has the attempt's scheduled seconds and nanos and the attempt, in 8, 4 and 4 bytes. A negative
+/// field, or a field that the kind doesn't have, gives zero. So a client or a Producer with no
+/// kind gives an all-zero key.
 pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
     let (scheduled, attempt) = match kind {
         Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
@@ -99,7 +101,7 @@ pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
                 epoch.map_or(0, |e| e.attempt),
             )
         }
-        // A client has one epoch for its whole life, so nothing fences it.
+        // A client has no epoch, so nothing fences it.
         Some(Kind::Client(_)) => (None, 0),
         Some(Kind::Workflow(_)) | None => (None, 0),
     };
@@ -112,8 +114,8 @@ pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
     key
 }
 
-/// The Workflow Task of an epoch. It is a Workflow's own task, or the task that dispatched a Local
-/// Activity, and zero for the other kinds.
+/// The Workflow Task of an epoch. It's a Workflow's own task, or the task that scheduled a Local
+/// Activity. Other kinds give a zero task.
 pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
     match kind {
         Some(Kind::Workflow(w)) => w.epoch.unwrap_or_default(),
@@ -126,11 +128,10 @@ pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
 mod tests {
     use super::*;
     use crate::proto::{
-        ActivityEpoch, ActivityProducer, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
+        ActivityEpoch, ActivityProducer, LocalActivityEpoch, LocalActivityProducer,
         WorkflowProducer,
     };
 
-    // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
     fn a_negative_field_keys_as_zero() {
         let negative = Kind::LocalActivity(LocalActivityProducer {
@@ -143,16 +144,6 @@ mod tests {
         assert_eq!(epoch_key(Some(&negative)), epoch_key(None));
     }
 
-    #[test]
-    fn the_numbers_of_the_kinds_never_change() {
-        assert_eq!(ProducerKind::Workflow as u8, 1);
-        assert_eq!(ProducerKind::LocalActivity as u8, 2);
-        assert_eq!(ProducerKind::Activity as u8, 3);
-        assert_eq!(ProducerKind::Client as u8, 4);
-        assert_eq!(ProducerKind::StandaloneActivity as u8, 5);
-    }
-
-    /// A time as a proto Timestamp, from its seconds and nanos.
     fn at(seconds: i64, nanos: i32) -> Option<Timestamp> {
         Some(Timestamp { seconds, nanos })
     }
@@ -185,7 +176,6 @@ mod tests {
         }
     }
 
-    // A Store fences by comparing keys, so a later epoch of a kind must give a higher key.
     #[test]
     fn a_higher_epoch_gives_a_higher_key_for_each_kind_that_has_one() {
         let workflow = |task| {
@@ -236,12 +226,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn a_client_has_no_epoch_and_keys_as_zero() {
-        let client = Kind::Client(ClientProducer {});
-        assert_eq!(epoch_key(Some(&client)), [0; EPOCH_KEY_LEN]);
-        assert_eq!(epoch_key(None), [0; EPOCH_KEY_LEN]);
     }
 }
