@@ -5,9 +5,12 @@
 
 pub mod epoch;
 mod error;
+pub mod ids;
 pub mod record;
+mod store;
 
 pub use error::{Reason, StreamError, StreamResult};
+pub use store::{MAX_RECORDS, MAX_WAIT, StreamStore};
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.
