@@ -4601,6 +4601,7 @@ dependencies = [
 name = "temporalio-streams"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "prost",
  "prost-wkt-types",
  "temporalio-common",

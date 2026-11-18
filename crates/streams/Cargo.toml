@@ -12,6 +12,7 @@ keywords = ["temporal", "workflow", "streams"]
 categories = ["development-tools"]
 
 [dependencies]
+async-trait = "0.1"
 prost = { workspace = true }
 prost-types = { workspace = true }
 thiserror = { workspace = true }

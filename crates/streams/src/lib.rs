@@ -4,9 +4,12 @@
 
 pub mod epoch;
 mod error;
+pub mod ids;
 pub mod record;
+mod store;
 
 pub use error::{Reason, StreamError, StreamResult};
+pub use store::{MAX_RECORDS, MAX_WAIT, StreamStore};
 
 /// The Stream protos, re-exported from `temporalio-common` so that its values need no conversion.
 pub mod proto {
