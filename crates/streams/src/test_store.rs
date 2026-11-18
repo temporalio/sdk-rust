@@ -1,4 +1,4 @@
-//! The Store that the unit tests of the crate share.
+//! A scripted Store for the crate's unit tests.
 
 use crate::{
     StreamError, StreamResult, StreamRuntime, StreamStore,
@@ -16,7 +16,7 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
-/// A Store that keeps the requests it got and gives the answers that a test set.
+/// A Store that records its requests and returns the answers that a test sets.
 #[derive(Default)]
 pub(crate) struct Scripted {
     pub(crate) reads: Mutex<Vec<ReadRecordsRequest>>,
@@ -24,10 +24,10 @@ pub(crate) struct Scripted {
     pub(crate) page: Mutex<ReadRecordsResponse>,
     pub(crate) appended: Mutex<AppendRecordsResponse>,
     pub(crate) described: Mutex<DescribeStreamResponse>,
-    /// The answer of a create. It is the request's ref, as created, when it is `None`.
+    /// The answer to a create. `None` answers with the request's ref, as created.
     pub(crate) created: Mutex<Option<CreateStreamResponse>>,
     pub(crate) error: Mutex<Option<StreamError>>,
-    /// A read tells `entered`, and then waits for `release` if `hold_reads` is set.
+    /// A read notifies `entered`, then waits for `release` if `hold_reads` is set.
     pub(crate) hold_reads: AtomicBool,
     pub(crate) entered: Notify,
     pub(crate) release: Notify,
@@ -92,12 +92,12 @@ impl StreamStore for Scripted {
     }
 }
 
-/// A runtime on a new [Scripted] Store, and the Store.
+/// A runtime on a new [`Scripted`] Store, and the Store.
 pub(crate) fn runtime() -> (Arc<Scripted>, Arc<StreamRuntime>) {
     runtime_with_limits(BatchLimits::default())
 }
 
-/// A runtime on a new [Scripted] Store that gives `limits`, and the Store. The runtime reads the
+/// A runtime on a new [`Scripted`] Store that gives `limits`, and the Store. The runtime reads the
 /// limits when it is built, so a test sets them here.
 pub(crate) fn runtime_with_limits(limits: BatchLimits) -> (Arc<Scripted>, Arc<StreamRuntime>) {
     let store = Arc::new(Scripted {

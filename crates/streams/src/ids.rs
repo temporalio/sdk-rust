@@ -1,6 +1,5 @@
-//! The limits of Stream ids, Producer ids and offsets, and the checks of ids and Producers. A
-//! caller builds both kinds of id, so the crate treats each as opaque text. The checks are private.
-//! The runtime runs them before a Store sees a request, and they are right only as that set.
+//! The size limits of Stream ids, Producer ids and offsets, and the checks that the runtime runs on
+//! ids and Producers. Callers build both kinds of id, so the crate treats them as opaque text.
 
 use crate::{
     StreamError, StreamResult,
@@ -11,16 +10,14 @@ use crate::{
 /// The longest Stream id, in bytes.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
 
-/// The longest offset, in bytes, that a caller may give or a Store may give back. An offset is
-/// opaque to a caller, and a Worker records the offsets of its calls in History, so an offset of
-/// any size could make a History event of any size.
+/// The longest offset, in bytes, that a caller or a Store may give. A Worker records offsets in
+/// History, so an offset with no bound could make a History event with no bound.
 pub const MAX_OFFSET_BYTES: usize = 1024;
 
-/// The longest Producer id, in bytes. A caller builds the id from names that Temporal limits to
-/// 1000 characters, so an id with two of them still fits. A Store keeps the id of each Producer for
-/// as long as the Stream lives. Each Record of a batch holds its Producer, so the size check counts
-/// the Producer once for each Record against
-/// [MAX_BATCH_BYTES](crate::record::MAX_BATCH_BYTES).
+/// The longest Producer id, in bytes. Callers build ids from names that Temporal limits to 1000
+/// characters, so an id with two of them fits. A Store keeps each Producer id for the life of the
+/// Stream. Each stored Record has its Producer, so the id counts once for each Record against
+/// [`MAX_BATCH_BYTES`](crate::record::MAX_BATCH_BYTES).
 pub const MAX_PRODUCER_ID_BYTES: usize = 4096;
 
 /// Refuses an empty or too long Stream id.
@@ -37,11 +34,9 @@ pub(crate) fn check_stream_id(id: &str) -> StreamResult<()> {
     Ok(())
 }
 
-/// Refuses a Producer with no id, an id over [MAX_PRODUCER_ID_BYTES], or no kind. The id is opaque
-/// text, so the Store requires no shape of it. It identifies one Producer in one Stream. A Store
-/// keeps the fence of a Producer by kind and id, and an epoch has no run. So the id of a run-based
-/// kind must hold its run id. A caller that uses one id in two runs gets `FENCED` in the second run
-/// when that run's epoch is lower.
+/// Refuses a Producer with no id, an id over [`MAX_PRODUCER_ID_BYTES`], or no kind. A Store fences
+/// by kind and id, and an epoch doesn't include the run. So the id of a run-based kind must include
+/// its run id, or a later run gets `Fenced` when its epoch is lower.
 pub(crate) fn check_producer(producer: &Producer) -> StreamResult<()> {
     if producer.id.is_empty() {
         return Err(StreamError::invalid("The Producer id is empty"));
@@ -80,10 +75,8 @@ fn check_task(task: &WorkflowTaskEpoch) -> StreamResult<()> {
     at_least_one(task.attempt, "Workflow Task")
 }
 
-/// Refuses a Producer that lacks a field the API requires. A Workflow Producer writes with its
-/// Workflow Task as the epoch, for an append as for a close, and the epoch must order. A
-/// Workflow Task's started time stays optional, since Core leaves it empty when the server gave the
-/// task none.
+/// Refuses a Producer that lacks a field the API requires. A Workflow Task's started time is
+/// optional, since Core leaves it empty when the server gives the task none.
 pub(crate) fn check_required(producer: &Producer) -> StreamResult<()> {
     match producer.kind.as_ref() {
         Some(Kind::Workflow(workflow)) => {
@@ -262,12 +255,12 @@ mod tests {
 
     #[test]
     fn a_producer_with_its_required_fields_passes() {
-        // A standalone Activity has no run.
         let workflow = workflow_with(WorkflowTaskEpoch {
             started_event_id: 3,
             attempt: 1,
             started_time: None,
         });
+        // A standalone Activity has no run.
         let mut standalone = activity();
         let Some(Kind::WorkflowActivity(kind)) = standalone.kind.take() else {
             unreachable!()
@@ -293,7 +286,6 @@ mod tests {
         assert!(refused(&workflow).contains("Workflow Task as its epoch"));
     }
 
-    /// A Workflow Producer with `epoch`.
     fn workflow_with(epoch: WorkflowTaskEpoch) -> Producer {
         Producer {
             id: "wf:r".to_string(),
@@ -302,16 +294,6 @@ mod tests {
                 epoch: Some(epoch),
             })),
         }
-    }
-
-    #[test]
-    fn a_workflow_epoch_passes_with_its_required_fields() {
-        let epoch = WorkflowTaskEpoch {
-            started_event_id: 3,
-            attempt: 1,
-            started_time: None,
-        };
-        check_required(&workflow_with(epoch)).unwrap();
     }
 
     #[test]

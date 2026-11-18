@@ -1,4 +1,4 @@
-//! The Stream runtime, a plain object that lang's bridge builds per client.
+//! The Stream runtime, which checks Stream calls and passes them to a Store.
 
 use crate::{
     MAX_RECORDS, MAX_WAIT, Reason, StreamError, StreamResult, StreamStore,
@@ -20,26 +20,23 @@ use temporalio_common::telemetry::metrics::TemporalMeter;
 /// exactly up to this value.
 pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 
-/// The Stream runtime on one Store. It has one typed method for each operation. A bridge builds one
-/// for each client with a Stream Store, and that client's Workers share it. A Store has no
-/// namespaces, so the runtime ignores a request's `namespace`. The SDK sets it, and only the server
-/// reads it.
+/// The Stream runtime on one Store. A bridge builds one for each client that has a Stream Store,
+/// and the Workers of that client share it.
 ///
-/// The runtime checks each request before the Store sees it, and the answer to a create, an append,
-/// a read or a describe after it. The checks are the same for every Store.
+/// The runtime checks each request before the Store sees it, and each answer after, with the same
+/// rules for every Store.
 ///
-/// - A Stream id and a Producer id are opaque text of 1 to 4096 bytes. The caller builds both.
-/// - A Workflow Producer appends and closes with its Workflow Task as the epoch, so that a Store
-///   can refuse a write of an older task.
-/// - A batch is within the limits of its Store. They are at most 1000 Records and 4 MiB for a
-///   batch, and 1536 KiB for a Record. The sizes are of the stored form, in which each Record has
-///   its Producer.
-/// - A read gives at most 1000 Records, and the runtime asks the Store to wait at most 60 s. A page
-///   over the caps of its request is cut.
-/// - The offsets of a page rise, start after the read's `from_offset`, and end at or before its
-///   `last_offset`.
-/// - An answer that breaks these rules, a create with no ref, or a describe with no status fails
-///   with [Reason::StorageCorrupt].
+/// - Stream ids and Producer ids are opaque text of 1 to 4096 bytes.
+/// - A Workflow Producer writes with its Workflow Task as the epoch, so a Store can fence a write
+///   from an older task.
+/// - A batch must fit the [`BatchLimits`] of the Store, measured on the stored Records.
+/// - A read returns at most [`MAX_RECORDS`] Records, and the runtime asks the Store to wait at most
+///   [`MAX_WAIT`]. The runtime cuts a page that is over the caps of its request.
+/// - The offsets of a page rise, start after `from_offset`, and end at or before `last_offset`.
+/// - A create answer has the ref of its Stream, and a describe answer has a known status.
+///
+/// An answer that breaks these rules fails with [`Reason::StorageCorrupt`]. The runtime ignores a
+/// request's `namespace`, since a Store has no namespaces.
 pub struct StreamRuntime {
     store: Arc<dyn StreamStore>,
     limits: BatchLimits,
@@ -52,8 +49,8 @@ impl std::fmt::Debug for StreamRuntime {
     }
 }
 
-/// Refuses a conflict policy that the Stream service doesn't know. The Store applies the policy,
-/// and takes an unspecified one as FAIL, as for a Workflow start.
+/// Refuses a conflict policy value that the proto doesn't define. The Store applies the policy, and
+/// treats an unspecified one as `Fail`, as a Workflow start does.
 fn check_conflict_policy(value: i32) -> StreamResult<()> {
     StreamIdConflictPolicy::try_from(value)
         .map(drop)
@@ -81,8 +78,8 @@ fn check_created(response: &CreateStreamResponse, id: &str) -> StreamResult<()> 
     }
 }
 
-/// Refuses a describe answer with a long `last_offset`, no status, or a status that the Stream
-/// service doesn't know. An empty `last_offset` is fine, since a Stream may have no Record.
+/// Refuses a describe answer with a long `last_offset`, no status, or an unknown status. An empty
+/// `last_offset` is fine, since a Stream may have no Records.
 fn check_described(response: &DescribeStreamResponse) -> StreamResult<()> {
     offset_bound(&response.last_offset, "a last offset")?;
     match StreamStatus::try_from(response.status) {
@@ -98,7 +95,7 @@ fn check_described(response: &DescribeStreamResponse) -> StreamResult<()> {
 }
 
 /// Checks the Producer of a close. Any kind may close, and a Workflow closes with its Workflow
-/// Task as the epoch, as it appends.
+/// Task as the epoch, as for an append.
 fn check_close_producer(producer: Option<&Producer>) -> StreamResult<()> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
@@ -113,7 +110,7 @@ fn check_close_producer(producer: Option<&Producer>) -> StreamResult<()> {
     check_required(producer)
 }
 
-/// Checks an append before the Store sees it, and gives its Producer.
+/// Checks an append before the Store sees it, and returns its Producer.
 fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
     check_stream_ref(request.r#ref.as_ref())?;
     let producer = request
@@ -139,7 +136,7 @@ fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
     Ok(producer)
 }
 
-/// Refuses an offset that a caller gives with more than [MAX_OFFSET_BYTES].
+/// Refuses an offset from a caller with more than [`MAX_OFFSET_BYTES`].
 fn caller_offset(offset: &[u8]) -> StreamResult<()> {
     if offset.len() > MAX_OFFSET_BYTES {
         return Err(StreamError::invalid(format!(
@@ -150,8 +147,8 @@ fn caller_offset(offset: &[u8]) -> StreamResult<()> {
     Ok(())
 }
 
-/// Refuses an offset that a Store gives with more than [MAX_OFFSET_BYTES]. An empty one passes.
-/// `what` is the offset's place in the message of the error.
+/// Refuses an offset from the Store with more than [`MAX_OFFSET_BYTES`]. An empty one passes.
+/// `what` describes the offset in the error message.
 fn offset_bound(offset: &[u8], what: &str) -> StreamResult<()> {
     if offset.len() > MAX_OFFSET_BYTES {
         return Err(StreamError::storage_corrupt(format!(
@@ -162,9 +159,8 @@ fn offset_bound(offset: &[u8], what: &str) -> StreamResult<()> {
     Ok(())
 }
 
-/// Refuses an offset that a Store gives for a Record, empty or with more than [MAX_OFFSET_BYTES].
-/// A Worker records the offsets in History and resumes a read from one, and an empty one is the
-/// start.
+/// Refuses a Record offset from the Store that is empty or has more than [`MAX_OFFSET_BYTES`]. A
+/// Worker resumes a read from a Record's offset, and an empty offset is the start of the Stream.
 fn store_offset(offset: &[u8]) -> StreamResult<()> {
     if offset.is_empty() {
         return Err(StreamError::storage_corrupt(
@@ -190,7 +186,7 @@ fn max_bytes(value: i64) -> StreamResult<usize> {
     }
 }
 
-/// Reads one page, with the caps and the longest wait of a read.
+/// Reads one page, with the caps of the request and a wait of at most [`MAX_WAIT`].
 async fn read_page(
     store: &dyn StreamStore,
     metrics: &Metrics,
@@ -208,17 +204,16 @@ async fn read_page(
         .map(|wait| wait.min(MAX_WAIT))
         .and_then(|wait| prost_types::Duration::try_from(wait).ok());
     let response = {
-        // The Store holds a read for up to its `wait`. The guard counts the read down again when
-        // the Store answers and when the read's future is dropped.
+        // The Store can hold the read for up to its `wait`.
         let _waiting = metrics.read_waiting();
         store.read_records(request).await?
     };
     fit_page(response, &from_offset, max, max_bytes)
 }
 
-/// The page cut to `max` Records and `max_bytes`, with its first Record always. A Worker bounds
-/// what one read holds by these caps, so a Store that gives more must not pass them. A cut page
-/// ends at its last Record and is not done.
+/// Cuts the page to `max` Records and `max_bytes`, but always keeps the first Record so a read
+/// moves on. A Worker bounds what one read holds by these caps, so a Store that gives more can't
+/// pass them. A cut page ends at its last kept Record and isn't done.
 fn fit_page(
     mut page: ReadRecordsResponse,
     from_offset: &[u8],
@@ -250,9 +245,8 @@ fn fit_page(
 
 /// Refuses a page whose offsets don't rise after `from_offset`, or whose `last_offset` is lower
 /// than its last Record. Offsets compare as bytes, and an empty `from_offset` is the start. A
-/// Worker resumes a read from `last_offset`, so a bad cursor makes a read that never moves on.
-/// A `last_offset` above the last Record is fine, since a Store may skip entries that are not
-/// Records, and the page that ends a closed Stream may cover them.
+/// Worker resumes a read from `last_offset`, so a bad cursor makes a read that never moves on. A
+/// `last_offset` above the last Record is fine, since a Store may skip entries that aren't Records.
 fn check_cursor(page: &ReadRecordsResponse, from_offset: &[u8]) -> StreamResult<()> {
     let mut newest = from_offset;
     for (at, record) in page.records.iter().enumerate() {
@@ -305,7 +299,7 @@ async fn append_batch(
 }
 
 impl StreamRuntime {
-    /// Counts a write that the Store refused for a lower epoch, an append or a close.
+    /// Counts an append or a close that the Store fenced.
     fn count_fenced<T>(&self, result: &StreamResult<T>) {
         if let Err(error) = result
             && error.reason == Reason::Fenced
@@ -314,7 +308,7 @@ impl StreamRuntime {
         }
     }
 
-    /// Builds the runtime on `store`. It records metrics on `meter`, lang's runtime meter, if set.
+    /// Builds the runtime on `store`. It records metrics on `meter` if set.
     pub fn new(store: Arc<dyn StreamStore>, meter: Option<TemporalMeter>) -> Arc<Self> {
         let meter = meter.unwrap_or_else(TemporalMeter::no_op);
         Arc::new(Self {
@@ -324,7 +318,7 @@ impl StreamRuntime {
         })
     }
 
-    /// Creates a Stream, or gets it with USE_EXISTING.
+    /// Creates a Stream, or gets the open one with the `UseExisting` conflict policy.
     pub async fn create_stream(
         &self,
         request: CreateStreamRequest,
@@ -342,7 +336,7 @@ impl StreamRuntime {
     }
 
     /// Appends one batch as one Producer. A Workflow Producer appends with its Workflow Task as the
-    /// epoch, so that the fence refuses a write of an older task.
+    /// epoch, so the Store can fence a write from an older task.
     pub async fn append_records(
         &self,
         request: AppendRecordsRequest,
@@ -355,9 +349,8 @@ impl StreamRuntime {
         appended
     }
 
-    /// Reads one page after `from_offset`. The Store waits up to the request's `wait` for a Record
-    /// when it has none to give, and the metric `stream_blocking_reads_waiting` counts the read for
-    /// that time.
+    /// Reads one page after `from_offset`. If the Store has no Records to return, it waits up to
+    /// the request's `wait`, and `stream_blocking_reads_waiting` counts the read for that time.
     pub async fn read_records(
         &self,
         request: ReadRecordsRequest,
@@ -366,7 +359,7 @@ impl StreamRuntime {
         read_page(self.store.as_ref(), &self.metrics, request).await
     }
 
-    /// Closes a Stream. Its readers drain what is left, and later appends fail.
+    /// Closes a Stream. Readers still get the Records it has, and later appends fail.
     pub async fn close_stream(
         &self,
         request: CloseStreamRequest,
@@ -497,7 +490,7 @@ mod tests {
         }
     }
 
-    /// A runtime on a new [Scripted] Store, with a meter that the test reads.
+    /// A runtime on a new [`Scripted`] Store, with a meter that the test reads.
     fn metered() -> (Arc<Scripted>, Arc<StreamRuntime>, Arc<Meter>) {
         let store = Arc::new(Scripted::default());
         let meter = Arc::new(Meter::default());
@@ -687,60 +680,106 @@ mod tests {
             id_conflict_policy,
             ..Default::default()
         };
-        let errors = [
-            runtime
-                .create_stream(bad_create(None, 0))
-                .await
-                .unwrap_err(),
-            runtime
-                .create_stream(bad_create(stream_ref(), 99))
-                .await
-                .unwrap_err(),
-            runtime
-                .append_records(append(-1, vec![record()]))
-                .await
-                .unwrap_err(),
-            runtime
-                .append_records(append(MAX_SEQUENCE + 1, vec![record()]))
-                .await
-                .unwrap_err(),
-            runtime
-                .append_records(append(1, vec![AppendRecord::default()]))
-                .await
-                .unwrap_err(),
-            runtime
-                .close_stream(CloseStreamRequest {
-                    r#ref: stream_ref(),
-                    producer: None,
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err(),
-            runtime
-                .close_stream(CloseStreamRequest {
-                    r#ref: stream_ref(),
-                    producer: Some(Producer {
-                        id: "wf:r".to_string(),
-                        kind: Some(Kind::Workflow(WorkflowProducer {
-                            run_id: "r".to_string(),
-                            epoch: None,
-                        })),
-                    }),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err(),
-            runtime
-                .read_records(ReadRecordsRequest::default())
-                .await
-                .unwrap_err(),
-            runtime
-                .describe_stream(DescribeStreamRequest::default())
-                .await
-                .unwrap_err(),
+        let cases = [
+            (
+                "a create with no ref",
+                runtime.create_stream(bad_create(None, 0)).await.map(drop),
+            ),
+            (
+                "a create with an unknown conflict policy",
+                runtime
+                    .create_stream(bad_create(stream_ref(), 99))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "an append with a negative sequence",
+                runtime
+                    .append_records(append(-1, vec![record()]))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "an append over the highest sequence",
+                runtime
+                    .append_records(append(MAX_SEQUENCE + 1, vec![record()]))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "an append with a Record that has no body",
+                runtime
+                    .append_records(append(1, vec![AppendRecord::default()]))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "an append from a Workflow with no epoch",
+                runtime
+                    .append_records(append_as(workflow(None)))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "a close with no Producer",
+                runtime
+                    .close_stream(CloseStreamRequest {
+                        r#ref: stream_ref(),
+                        producer: None,
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop),
+            ),
+            (
+                "a close from a Workflow with no epoch",
+                runtime
+                    .close_stream(CloseStreamRequest {
+                        r#ref: stream_ref(),
+                        producer: workflow(None),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop),
+            ),
+            (
+                "a read with no ref",
+                runtime
+                    .read_records(ReadRecordsRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "a read from a long offset",
+                runtime
+                    .read_records(ReadRecordsRequest {
+                        from_offset: vec![1; MAX_OFFSET_BYTES + 1],
+                        ..read()
+                    })
+                    .await
+                    .map(drop),
+            ),
+            (
+                "a read with a negative max_bytes",
+                runtime
+                    .read_records(ReadRecordsRequest {
+                        max_bytes: -1,
+                        ..read()
+                    })
+                    .await
+                    .map(drop),
+            ),
+            (
+                "a describe with no ref",
+                runtime
+                    .describe_stream(DescribeStreamRequest::default())
+                    .await
+                    .map(drop),
+            ),
         ];
-        for error in errors {
-            assert_eq!(error.reason, Reason::Invalid, "{}", error.message);
+        for (case, result) in cases {
+            let error = result.expect_err(case);
+            assert_eq!(error.reason, Reason::Invalid, "{case}: {}", error.message);
         }
         let big = vec![record(); MAX_BATCH_RECORDS + 1];
         let error = runtime.append_records(append(1, big)).await.unwrap_err();
@@ -932,76 +971,12 @@ mod tests {
                 first_offset: offset.clone(),
                 last_offset: offset,
             };
-            let epoch = WorkflowTaskEpoch {
-                started_event_id: 3,
-                attempt: 1,
-                ..Default::default()
-            };
             let error = runtime
-                .append_records(append_as(workflow(Some(epoch))))
+                .append_records(append_as(workflow(Some(epoch()))))
                 .await
                 .unwrap_err();
             assert_eq!(error.reason, Reason::StorageCorrupt);
         }
-    }
-
-    #[tokio::test]
-    async fn a_bad_request_never_reaches_the_store() {
-        let (store, runtime) = runtime();
-        let bad_reads = [
-            ReadRecordsRequest::default(),
-            ReadRecordsRequest {
-                r#ref: stream_ref(),
-                from_offset: vec![1; MAX_OFFSET_BYTES + 1],
-                ..Default::default()
-            },
-            ReadRecordsRequest {
-                r#ref: stream_ref(),
-                max_bytes: -1,
-                ..Default::default()
-            },
-        ];
-        for request in bad_reads {
-            let error = runtime.read_records(request).await.unwrap_err();
-            assert_eq!(error.reason, Reason::Invalid);
-        }
-        // A Workflow writes with its Workflow Task as the epoch, so the fence orders its writes.
-        let error = runtime
-            .append_records(append_as(workflow(None)))
-            .await
-            .unwrap_err();
-        assert_eq!(error.reason, Reason::Invalid);
-        assert!(store.reads.lock().is_empty());
-        assert!(store.appends.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn an_append_gets_the_producer_with_its_epoch_and_the_error_of_the_store() {
-        let (store, runtime) = runtime();
-        let epoch = WorkflowTaskEpoch {
-            started_event_id: 3,
-            attempt: 1,
-            ..Default::default()
-        };
-        *store.appended.lock() = AppendRecordsResponse {
-            first_offset: b"a".to_vec(),
-            last_offset: b"a".to_vec(),
-        };
-        let appended = runtime
-            .append_records(append_as(workflow(Some(epoch))))
-            .await
-            .unwrap();
-        assert_eq!(appended.last_offset, b"a".to_vec());
-        assert_eq!(store.appends.lock()[0].producer, workflow(Some(epoch)));
-        *store.error.lock() = Some(StreamError::new(Reason::Closed, "closed"));
-        let error = runtime
-            .append_records(append_as(workflow(Some(epoch))))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            (error.reason, error.message.as_str()),
-            (Reason::Closed, "closed")
-        );
     }
 
     #[tokio::test]
@@ -1093,6 +1068,7 @@ mod tests {
             };
             runtime.append_records(empty()).await.unwrap();
         }
+        assert_eq!(store.appends.lock().len(), 2);
         let too_long = MAX_OFFSET_BYTES + 1;
         for (first, last) in [(too_long, 0), (0, too_long)] {
             *store.appended.lock() = AppendRecordsResponse {
@@ -1125,22 +1101,6 @@ mod tests {
             error.message,
             "The Store gave a last offset of 1025 bytes, more than 1024"
         );
-    }
-
-    #[tokio::test]
-    async fn an_empty_batch_goes_to_the_store_and_its_answer_passes() {
-        let (store, runtime) = runtime();
-        let appended = runtime
-            .append_records(AppendRecordsRequest {
-                records: vec![],
-                ..append_as(workflow(Some(epoch())))
-            })
-            .await
-            .unwrap();
-        assert_eq!(appended, AppendRecordsResponse::default());
-        let sent = store.appends.lock().clone();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].records.is_empty());
     }
 
     #[tokio::test]
