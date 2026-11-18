@@ -1,0 +1,25 @@
+[package]
+name = "temporalio-streams"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license-file = { workspace = true }
+description = "The experimental Stream runtime of the Temporal SDKs"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporalio/sdk-rust"
+keywords = ["temporal", "workflow", "streams"]
+categories = ["development-tools"]
+
+[dependencies]
+prost = { workspace = true }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+
+[dependencies.temporalio-common]
+path = "../common"
+version = "~1.2.0"
+default-features = false
+
+[lints]
+workspace = true

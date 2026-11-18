@@ -4598,6 +4598,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "temporalio-streams"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "temporalio-common",
+ "thiserror 2.0.21",
+ "tonic",
+]
+
+[[package]]
 name = "temporalio-workflow"
 version = "1.2.0"
 dependencies = [
