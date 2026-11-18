@@ -41,6 +41,9 @@ relevant information.
   for new workflows only. The mode is recorded on the first successful task completion and defaults to off.
   Core handles tasks with no activation jobs internally, without polling workflow routines; see
   [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
+* [lang-internal] Added the experimental `temporalio-streams` crate. It has what every Store of a
+  Temporal Stream shares: the Stream error, the order of a Producer's epochs, and the stored form
+  of a Record. Core's worker has no Stream code.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
