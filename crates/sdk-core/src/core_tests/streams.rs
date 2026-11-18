@@ -1,6 +1,7 @@
-//! Direct reads and appends of a Stream, on the memory Store. A test drives the Worker with a mock
+//! Direct reads and appends of a Stream, on a test Store. A test drives the Worker with a mock
 //! history, and adds Records to the Store between its polls.
 
+use super::stream_store::TestStreamStore;
 use crate::{
     StreamRuntimes, Worker, WorkerConfig, WorkflowErrorType,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
@@ -57,18 +58,15 @@ use temporalio_common::protos::{
 };
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_streams::{
-    MemoryStreamOptions, MemoryStreamRuntime, Reason, StreamError, StreamResult, StreamRuntime,
+    Reason, StreamError, StreamResult, StreamRuntime, StreamStore,
     digest::records_digest,
     ids::{MAX_OFFSET_BYTES, MAX_STREAM_ID_BYTES},
-    memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, ClientProducer, CloseStreamRequest,
-        CreateStreamRequest, DescribeStreamRequest, Producer, ReadRecordsRequest, StreamRecord,
-        StreamRef, StreamStatus, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
-    },
-    store::{
-        Appended, Batch, Capabilities, Closed, Create, Created, DEFAULT_RETENTION, Entry, Store,
-        StreamState,
+        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
+        CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
+        DescribeStreamRequest, DescribeStreamResponse, Producer, ReadRecordsRequest,
+        ReadRecordsResponse, StreamRecord, StreamRef, StreamStatus, WorkflowProducer,
+        WorkflowTaskEpoch, producer::Kind,
     },
 };
 use tokio::sync::{Notify, Semaphore};
@@ -76,7 +74,7 @@ use tokio::sync::{Notify, Semaphore};
 const STORE: &str = "mem";
 
 fn runtime() -> Arc<StreamRuntime> {
-    MemoryStreamRuntime::new(STORE, MemoryStreamOptions::default(), None)
+    StreamRuntime::new(Arc::new(TestStreamStore::default()), None)
 }
 
 fn stream(id: &str) -> StreamRef {
@@ -1474,11 +1472,8 @@ fn one_page(records: &[StreamRecord]) -> (StreamMarkerData, String) {
 /// The Records that a marker counts are gone after the Retention of their closed Stream.
 #[tokio::test]
 async fn replay_fails_when_records_are_gone() {
-    let options = MemoryStreamOptions {
-        retention: Some(Duration::from_millis(100)),
-        ..Default::default()
-    };
-    let runtime = MemoryStreamRuntime::new(STORE, options, None);
+    let store = TestStreamStore::with_retention(Duration::from_millis(100));
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     put(&runtime, "s", &["a", "b"]).await;
     let (data, range) = one_page(&all_records(&runtime, "s").await);
@@ -2209,12 +2204,12 @@ fn timer_cmd(seq: u32) -> workflow_command::Variant {
 async fn a_read_with_no_idle_timeout_ends_after_a_minute() {
     let waits = Arc::new(AtomicUsize::new(0));
     let store = WatchedStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         gave: Default::default(),
         waits: waits.clone(),
         closes: Default::default(),
     };
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     // The heartbeats come at 40 s and 80 s, so the minute ends between them.
     let mut t = TestHistoryBuilder::default();
@@ -2364,12 +2359,12 @@ async fn idle_time_skips_a_paused_read() {
     let gave = Arc::new(Mutex::new(vec![]));
     let waits = Arc::new(AtomicUsize::new(0));
     let store = WatchedStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         gave: gave.clone(),
         waits: waits.clone(),
         closes: Default::default(),
     };
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
@@ -2743,11 +2738,8 @@ async fn a_replay_worker_with_no_runtime_ends_the_history() {
 /// `StreamReplayError`, and ends the history.
 #[tokio::test]
 async fn a_replay_worker_whose_records_are_gone_ends_the_history() {
-    let options = MemoryStreamOptions {
-        retention: Some(Duration::from_millis(100)),
-        ..Default::default()
-    };
-    let runtime = MemoryStreamRuntime::new(STORE, options, None);
+    let store = TestStreamStore::with_retention(Duration::from_millis(100));
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     put(&runtime, "s", &["a", "b"]).await;
     let (data, range) = one_page(&all_records(&runtime, "s").await);
@@ -2882,14 +2874,14 @@ fn close_cmd(seq: u32, id: &str, run_id: &str) -> CloseStream {
 }
 
 fn stream_is_closed(runtime: &StreamRuntime, id: &str) -> bool {
-    // The memory Store answers at once, so this works also inside a mock's sync closure.
+    // The test Store answers immediately, so this works also inside a mock's sync closure.
     let described = runtime
         .describe_stream(DescribeStreamRequest {
             r#ref: Some(stream(id)),
             ..Default::default()
         })
         .now_or_never()
-        .expect("the memory Store answers at once")
+        .expect("the test Store answers immediately")
         .unwrap();
     described.status == StreamStatus::Closed as i32
 }
@@ -3317,12 +3309,12 @@ fn close_history(intent: StreamCloseEntry, result: Option<StreamCloseEntry>) -> 
 async fn a_new_worker_sends_a_recorded_close() {
     let closes = Arc::new(Mutex::new(vec![]));
     let store = WatchedStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         gave: Default::default(),
         waits: Default::default(),
         closes: closes.clone(),
     };
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     let t = close_history(intent_entry(1), None);
     let run_id = t.get_orig_run_id().to_string();
@@ -3908,7 +3900,7 @@ async fn replayed_calls_count_nothing() {
 async fn stream_metrics_have_the_store_of_the_call() {
     let mem = runtime();
     create(&mem, "s").await;
-    let other = MemoryStreamRuntime::new("other", MemoryStreamOptions::default(), None);
+    let other = StreamRuntime::new(Arc::new(TestStreamStore::default()), None);
     let in_other = StreamRef {
         id: "s".to_string(),
         store: "other".to_string(),
@@ -3962,10 +3954,10 @@ async fn stream_metrics_have_the_store_of_the_call() {
     }
 }
 
-/// A memory Store that holds each close, and each append if `appends` is set, until the test
+/// A test Store that holds each close, and each append if `appends` is set, until the test
 /// lets it go.
 struct HeldCloseStore {
-    inner: MemoryStore,
+    inner: TestStreamStore,
     /// Told when a held call reaches the Store.
     held: Arc<Notify>,
     /// One permit lets one held call go.
@@ -3985,43 +3977,38 @@ impl HeldCloseStore {
 }
 
 #[async_trait::async_trait]
-impl Store for HeldCloseStore {
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+impl StreamStore for HeldCloseStore {
+    async fn create_stream(
+        &self,
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        self.inner.create_stream(request).await
     }
 
-    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
-        self.inner.create(stream_ref, create).await
-    }
-
-    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+    async fn append_records(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
         if self.appends {
             self.hold().await;
         }
-        self.inner.append(stream_ref, batch).await
+        self.inner.append_records(request).await
     }
 
-    async fn read(
-        &self,
-        stream_ref: &StreamRef,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        self.inner.read(stream_ref, from, count).await
+    async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
+        self.inner.read_records(request).await
     }
 
-    async fn wait_after(
-        &self,
-        stream_ref: &StreamRef,
-        after: i64,
-        deadline: tokio::time::Instant,
-    ) -> StreamResult<bool> {
-        self.inner.wait_after(stream_ref, after, deadline).await
-    }
-
-    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+    async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
         self.hold().await;
-        self.inner.close(stream_ref, producer).await
+        self.inner.close_stream(request).await
+    }
+
+    async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        self.inner.describe_stream(request).await
     }
 }
 
@@ -4044,12 +4031,12 @@ impl Held {
         let held = Arc::new(Notify::new());
         let release = Arc::new(Semaphore::new(0));
         let store = HeldCloseStore {
-            inner: MemoryStore::new(DEFAULT_RETENTION, None),
+            inner: TestStreamStore::default(),
             held: held.clone(),
             release: release.clone(),
             appends,
         };
-        let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+        let runtime = StreamRuntime::new(Arc::new(store), None);
         create(&runtime, "s").await;
         Self {
             runtime,
@@ -4181,59 +4168,54 @@ async fn a_shutdown_gives_up_a_close_past_its_bound() {
 /// memory.
 const SMALL_READ_AHEAD: usize = 4 << 10;
 
-/// A memory Store that counts the entries that its reads gave.
+/// A test Store that counts the Records that its reads gave.
 struct CountedStore {
-    inner: MemoryStore,
+    inner: TestStreamStore,
     served: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
-impl Store for CountedStore {
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
-        self.inner.create(stream_ref, create).await
-    }
-
-    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
-        self.inner.append(stream_ref, batch).await
-    }
-
-    async fn read(
+impl StreamStore for CountedStore {
+    async fn create_stream(
         &self,
-        stream_ref: &StreamRef,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        let read = self.inner.read(stream_ref, from, count).await?;
-        self.served.fetch_add(read.1.len(), Ordering::AcqRel);
-        Ok(read)
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        self.inner.create_stream(request).await
     }
 
-    async fn wait_after(
+    async fn append_records(
         &self,
-        stream_ref: &StreamRef,
-        after: i64,
-        deadline: tokio::time::Instant,
-    ) -> StreamResult<bool> {
-        self.inner.wait_after(stream_ref, after, deadline).await
+        request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
+        self.inner.append_records(request).await
     }
 
-    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
-        self.inner.close(stream_ref, producer).await
+    async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
+        let page = self.inner.read_records(request).await?;
+        self.served.fetch_add(page.records.len(), Ordering::AcqRel);
+        Ok(page)
+    }
+
+    async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
+        self.inner.close_stream(request).await
+    }
+
+    async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        self.inner.describe_stream(request).await
     }
 }
 
-/// A runtime on a [CountedStore], and the count of the entries that its reads gave.
+/// A runtime on a [CountedStore], and the count of the Records that its reads gave.
 fn counted_runtime() -> (Arc<StreamRuntime>, Arc<AtomicUsize>) {
     let served = Arc::new(AtomicUsize::new(0));
     let store = CountedStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         served: served.clone(),
     };
-    (StreamRuntime::new(STORE, Arc::new(store), None), served)
+    (StreamRuntime::new(Arc::new(store), None), served)
 }
 
 /// A read with a small `read_ahead_bytes` stops asking the Store while that many bytes of its
@@ -4376,59 +4358,60 @@ async fn all_appends(worker: &Worker, count: usize) -> (AppendResults, WorkflowA
     }
 }
 
-/// A memory Store that keeps when each of its reads gave Records, and counts the long polls that
-/// wait on it.
+/// A test Store that keeps when each of its reads gave Records, and counts the reads that ask it to
+/// wait.
 struct WatchedStore {
-    inner: MemoryStore,
+    inner: TestStreamStore,
     /// The clock time and the count of each read that gave Records.
     gave: Arc<Mutex<Vec<(tokio::time::Instant, usize)>>>,
+    /// The reads that reached the Store with a wait. Such a read waits when it finds no Record.
     waits: Arc<AtomicUsize>,
     /// The Producer of each close.
     closes: Arc<Mutex<Vec<Producer>>>,
 }
 
 #[async_trait::async_trait]
-impl Store for WatchedStore {
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
-        self.inner.create(stream_ref, create).await
-    }
-
-    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
-        self.inner.append(stream_ref, batch).await
-    }
-
-    async fn read(
+impl StreamStore for WatchedStore {
+    async fn create_stream(
         &self,
-        stream_ref: &StreamRef,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        let read = self.inner.read(stream_ref, from, count).await?;
-        if !read.1.is_empty() {
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        self.inner.create_stream(request).await
+    }
+
+    async fn append_records(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
+        self.inner.append_records(request).await
+    }
+
+    async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
+        if request
+            .wait
+            .is_some_and(|wait| wait.seconds > 0 || wait.nanos > 0)
+        {
+            self.waits.fetch_add(1, Ordering::AcqRel);
+        }
+        let page = self.inner.read_records(request).await?;
+        if !page.records.is_empty() {
             self.gave
                 .lock()
-                .push((tokio::time::Instant::now(), read.1.len()));
+                .push((tokio::time::Instant::now(), page.records.len()));
         }
-        Ok(read)
+        Ok(page)
     }
 
-    async fn wait_after(
+    async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
+        self.closes.lock().extend(request.producer.clone());
+        self.inner.close_stream(request).await
+    }
+
+    async fn describe_stream(
         &self,
-        stream_ref: &StreamRef,
-        after: i64,
-        deadline: tokio::time::Instant,
-    ) -> StreamResult<bool> {
-        self.waits.fetch_add(1, Ordering::AcqRel);
-        self.inner.wait_after(stream_ref, after, deadline).await
-    }
-
-    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
-        self.closes.lock().push(producer.clone());
-        self.inner.close(stream_ref, producer).await
+        request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        self.inner.describe_stream(request).await
     }
 }
 
@@ -4452,12 +4435,12 @@ impl Watching {
         let gave = Arc::new(Mutex::new(vec![]));
         let waits = Arc::new(AtomicUsize::new(0));
         let store = WatchedStore {
-            inner: MemoryStore::new(DEFAULT_RETENTION, None),
+            inner: TestStreamStore::default(),
             gave: gave.clone(),
             waits: waits.clone(),
             closes: Default::default(),
         };
-        let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+        let runtime = StreamRuntime::new(Arc::new(store), None);
         create(&runtime, "s").await;
         create(&runtime, "t").await;
         let mut t = TestHistoryBuilder::default();
@@ -4966,12 +4949,12 @@ type Watched = (
 async fn watched_with_a() -> Watched {
     let gave = Arc::new(Mutex::new(vec![]));
     let store = WatchedStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         gave: gave.clone(),
         waits: Arc::new(AtomicUsize::new(0)),
         closes: Default::default(),
     };
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     put(&runtime, "s", &["a"]).await;
     gave.lock().clear();
@@ -5172,12 +5155,12 @@ async fn a_shutdown_ends_a_task_that_only_a_read_holds() {
 async fn a_shutdown_ends_when_its_forced_task_comes_back_to_it(#[case] new_read: bool) {
     let waits = Arc::new(AtomicUsize::new(0));
     let store = WatchedStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         gave: Default::default(),
         waits: waits.clone(),
         closes: Default::default(),
     };
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     let mut reader = TestHistoryBuilder::default();
     reader.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
@@ -5674,54 +5657,52 @@ impl Flaky {
     }
 }
 
-/// A memory Store whose next reads or appends fail with `StorageUnavailable`.
+/// A test Store whose next reads or appends fail with `StorageUnavailable`.
 struct FlakyStore {
-    inner: MemoryStore,
+    inner: TestStreamStore,
     flaky: Arc<Flaky>,
 }
 
 #[async_trait::async_trait]
-impl Store for FlakyStore {
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+impl StreamStore for FlakyStore {
+    async fn create_stream(
+        &self,
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        self.inner.create_stream(request).await
     }
 
-    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
-        self.inner.create(stream_ref, create).await
-    }
-
-    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+    async fn append_records(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
         self.flaky.appends.fetch_add(1, Ordering::AcqRel);
         if self.flaky.lose_answers.load(Ordering::Acquire) {
-            let appended = self.inner.append(stream_ref, batch).await?;
+            let appended = self.inner.append_records(request).await?;
             Flaky::fails(&self.flaky.fail_appends)?;
             return Ok(appended);
         }
         Flaky::fails(&self.flaky.fail_appends)?;
-        self.inner.append(stream_ref, batch).await
+        self.inner.append_records(request).await
     }
 
-    async fn read(
-        &self,
-        stream_ref: &StreamRef,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+    async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
         Flaky::fails(&self.flaky.fail_reads)?;
-        self.inner.read(stream_ref, from, count).await
+        let page = self.inner.read_records(request).await?;
+        // An outage that began while the read waited fails it when its wait ends.
+        Flaky::fails(&self.flaky.fail_reads)?;
+        Ok(page)
     }
 
-    async fn wait_after(
+    async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
+        self.inner.close_stream(request).await
+    }
+
+    async fn describe_stream(
         &self,
-        stream_ref: &StreamRef,
-        after: i64,
-        deadline: tokio::time::Instant,
-    ) -> StreamResult<bool> {
-        self.inner.wait_after(stream_ref, after, deadline).await
-    }
-
-    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
-        self.inner.close(stream_ref, producer).await
+        request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        self.inner.describe_stream(request).await
     }
 }
 
@@ -5729,10 +5710,10 @@ impl Store for FlakyStore {
 async fn flaky_runtime() -> (Arc<StreamRuntime>, Arc<Flaky>) {
     let flaky = Arc::new(Flaky::default());
     let store = FlakyStore {
-        inner: MemoryStore::new(DEFAULT_RETENTION, None),
+        inner: TestStreamStore::default(),
         flaky: flaky.clone(),
     };
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     (runtime, flaky)
 }
@@ -6154,7 +6135,7 @@ fn assert_refused(failure: Option<&Failure>, what: &str, limit: usize) {
     );
 }
 
-/// Runs a Workflow on the memory Store that issues `commands` in its first activation and ends in
+/// Runs a Workflow on a test Store that issues `commands` in its first activation and ends in
 /// the next. Returns that activation, the completion of the task and the counts of Store calls.
 async fn refused_calls(
     commands: impl FnOnce(&str) -> Vec<workflow_command::Variant>,
@@ -6399,19 +6380,21 @@ async fn many_appends_keep_each_marker_under_the_entry_bound() {
 }
 
 /// A Store that fails each append with a long message.
-struct WordyStore(MemoryStore);
+struct WordyStore(TestStreamStore);
 
 #[async_trait::async_trait]
-impl Store for WordyStore {
-    fn capabilities(&self) -> Capabilities {
-        self.0.capabilities()
+impl StreamStore for WordyStore {
+    async fn create_stream(
+        &self,
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        self.0.create_stream(request).await
     }
 
-    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
-        self.0.create(stream_ref, create).await
-    }
-
-    async fn append(&self, _: &StreamRef, _: &Batch<'_>) -> StreamResult<Appended> {
+    async fn append_records(
+        &self,
+        _request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
         // A sign of three bytes, so that the cut must find a character boundary.
         Err(StreamError::new(
             Reason::Fenced,
@@ -6419,26 +6402,19 @@ impl Store for WordyStore {
         ))
     }
 
-    async fn read(
-        &self,
-        stream_ref: &StreamRef,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        self.0.read(stream_ref, from, count).await
+    async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
+        self.0.read_records(request).await
     }
 
-    async fn wait_after(
-        &self,
-        stream_ref: &StreamRef,
-        after: i64,
-        deadline: tokio::time::Instant,
-    ) -> StreamResult<bool> {
-        self.0.wait_after(stream_ref, after, deadline).await
+    async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
+        self.0.close_stream(request).await
     }
 
-    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
-        self.0.close(stream_ref, producer).await
+    async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        self.0.describe_stream(request).await
     }
 }
 
@@ -6446,8 +6422,8 @@ impl Store for WordyStore {
 /// with its reason, and the marker records the same small entry.
 #[tokio::test]
 async fn a_long_store_failure_message_is_cut() {
-    let store = WordyStore(MemoryStore::new(DEFAULT_RETENTION, None));
-    let runtime = StreamRuntime::new(STORE, Arc::new(store), None);
+    let store = WordyStore(TestStreamStore::default());
+    let runtime = StreamRuntime::new(Arc::new(store), None);
     create(&runtime, "s").await;
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
