@@ -10,8 +10,10 @@ use crate::{
 };
 use prost_types::Timestamp;
 
-/// The kind of a Producer, which is the case of its epoch. A Store may keep the number of a kind in
-/// what it stores, so each kind keeps its number.
+/// The kind of a Producer, which is the case of its epoch. The numbers must never change. A Store
+/// may keep the number of a kind in what it stores, and a digest that History keeps for good can
+/// hash it with the [epoch_key]. A changed number would break the stored data, and the replay of
+/// that History.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProducerKind {
     /// A Workflow run.
@@ -122,7 +124,10 @@ pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{LocalActivityEpoch, LocalActivityProducer};
+    use crate::proto::{
+        ActivityEpoch, ActivityProducer, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
+        WorkflowProducer,
+    };
 
     // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
@@ -135,5 +140,107 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(epoch_key(Some(&negative)), epoch_key(None));
+    }
+
+    #[test]
+    fn the_numbers_of_the_kinds_never_change() {
+        assert_eq!(ProducerKind::Workflow as u8, 1);
+        assert_eq!(ProducerKind::LocalActivity as u8, 2);
+        assert_eq!(ProducerKind::Activity as u8, 3);
+        assert_eq!(ProducerKind::Client as u8, 4);
+        assert_eq!(ProducerKind::StandaloneActivity as u8, 5);
+    }
+
+    /// A time as a proto Timestamp, from its seconds and nanos.
+    fn at(seconds: i64, nanos: i32) -> Option<Timestamp> {
+        Some(Timestamp { seconds, nanos })
+    }
+
+    fn task(started_event_id: i64, attempt: i32, seconds: i64) -> WorkflowTaskEpoch {
+        WorkflowTaskEpoch {
+            started_event_id,
+            attempt,
+            started_time: at(seconds, 0),
+        }
+    }
+
+    fn local_activity(task: WorkflowTaskEpoch, attempt: i32) -> Kind {
+        Kind::LocalActivity(LocalActivityProducer {
+            run_id: "r".to_string(),
+            epoch: Some(LocalActivityEpoch {
+                task: Some(task),
+                attempt,
+            }),
+        })
+    }
+
+    fn activity(seconds: i64, nanos: i32, attempt: i32) -> ActivityProducer {
+        ActivityProducer {
+            run_id: "r".to_string(),
+            epoch: Some(ActivityEpoch {
+                attempt_scheduled_time: at(seconds, nanos),
+                attempt,
+            }),
+        }
+    }
+
+    // A Store fences by comparing keys, so a later epoch of a kind must give a higher key.
+    #[test]
+    fn a_higher_epoch_gives_a_higher_key_for_each_kind_that_has_one() {
+        let workflow = |task| {
+            Kind::Workflow(WorkflowProducer {
+                run_id: "r".to_string(),
+                epoch: Some(task),
+            })
+        };
+        let ascending = [
+            // A later started time, a higher attempt, and a later Workflow Task. Each beats the
+            // fields after it.
+            vec![
+                workflow(task(8, 1, 0)),
+                workflow(task(8, 1, 100)),
+                workflow(task(8, 2, 0)),
+                workflow(task(8, 2, 200)),
+                workflow(task(9, 1, 0)),
+            ],
+            // The Workflow Task of a Local Activity comes before its own attempt.
+            vec![
+                local_activity(task(8, 1, 0), 1),
+                local_activity(task(8, 1, 0), 2),
+                local_activity(task(8, 1, 100), 1),
+                local_activity(task(8, 2, 0), 1),
+                local_activity(task(9, 1, 0), 1),
+            ],
+            // A later scheduled time beats a higher attempt.
+            vec![
+                Kind::WorkflowActivity(activity(100, 0, 1)),
+                Kind::WorkflowActivity(activity(100, 0, 2)),
+                Kind::WorkflowActivity(activity(100, 5, 1)),
+                Kind::WorkflowActivity(activity(101, 0, 1)),
+            ],
+            vec![
+                Kind::StandaloneActivity(activity(100, 0, 1)),
+                Kind::StandaloneActivity(activity(100, 0, 2)),
+                Kind::StandaloneActivity(activity(100, 5, 1)),
+                Kind::StandaloneActivity(activity(101, 0, 1)),
+            ],
+        ];
+        for kinds in ascending {
+            for pair in kinds.windows(2) {
+                assert!(
+                    epoch_key(Some(&pair[0])) < epoch_key(Some(&pair[1])),
+                    "{:?} must key lower than {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_has_no_epoch_and_keys_as_zero() {
+        let client = Kind::Client(ClientProducer {});
+        assert_eq!(epoch_key(Some(&client)), [0; EPOCH_KEY_LEN]);
+        assert_eq!(epoch_key(None), [0; EPOCH_KEY_LEN]);
     }
 }
