@@ -29,7 +29,7 @@ impl Metrics {
             attributes: meter.get_default_attributes().clone(),
             fenced: meter.counter(parameters(
                 "stream_fenced",
-                "Batches that the Store refused for a lower epoch",
+                "Appends and closes that the Store refused for a lower epoch",
                 "",
             )),
             blocking_reads_waiting: meter.up_down_counter(parameters(

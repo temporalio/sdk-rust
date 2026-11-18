@@ -134,6 +134,15 @@ fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
 }
 
 impl StreamRuntime {
+    /// Counts a write that the Store refused for a lower epoch, an append or a close.
+    fn count_fenced<T>(&self, result: &StreamResult<T>) {
+        if let Err(error) = result
+            && error.reason == Reason::Fenced
+        {
+            self.metrics.fenced();
+        }
+    }
+
     /// Builds the runtime on `store`. It records metrics on `meter`, lang's runtime meter, if set.
     pub fn new(store: Arc<dyn StreamStore>, meter: Option<TemporalMeter>) -> Arc<Self> {
         let meter = meter.unwrap_or_else(TemporalMeter::no_op);
@@ -165,11 +174,7 @@ impl StreamRuntime {
         // The same bounds hold for every Store, so a batch over them fails here too.
         check_bounds(producer, &request.records)?;
         let appended = store::append(self.store.as_ref(), request).await;
-        if let Err(error) = &appended
-            && error.reason == Reason::Fenced
-        {
-            self.metrics.fenced();
-        }
+        self.count_fenced(&appended);
         appended
     }
 
@@ -191,7 +196,9 @@ impl StreamRuntime {
     ) -> StreamResult<CloseStreamResponse> {
         stream_id(request.r#ref.as_ref())?;
         check_close_producer(request.producer.as_ref())?;
-        self.store.close_stream(request).await
+        let closed = self.store.close_stream(request).await;
+        self.count_fenced(&closed);
+        closed
     }
 
     /// Gets the status and the newest offset of a Stream.
@@ -392,13 +399,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_fenced_append_counts_as_fenced() {
+    async fn only_a_fenced_append_or_close_counts_as_fenced() {
         let (store, runtime, meter) = metered();
+        let close = || CloseStreamRequest {
+            r#ref: stream_ref(),
+            producer: client(),
+            ..Default::default()
+        };
         *store.error.lock() = Some(StreamError::new(Reason::Closed, "closed"));
         runtime
             .append_records(append(1, vec![record()]))
             .await
             .unwrap_err();
+        runtime.close_stream(close()).await.unwrap_err();
         assert_eq!(meter.fenced.load(Ordering::SeqCst), 0);
         *store.error.lock() = Some(StreamError::new(Reason::Fenced, "fenced"));
         let error = runtime
@@ -407,6 +420,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.reason, Reason::Fenced);
         assert_eq!(meter.fenced.load(Ordering::SeqCst), 1);
+        let error = runtime.close_stream(close()).await.unwrap_err();
+        assert_eq!(error.reason, Reason::Fenced);
+        assert_eq!(meter.fenced.load(Ordering::SeqCst), 2);
+        // A close that the runtime refuses before the Store is not a fenced close.
+        let bad = CloseStreamRequest {
+            producer: None,
+            ..close()
+        };
+        runtime.close_stream(bad).await.unwrap_err();
+        assert_eq!(meter.fenced.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

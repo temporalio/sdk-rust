@@ -109,6 +109,46 @@ impl Reason {
     }
 }
 
+/// The reason of a failure that lang gives as the proto enum. The unspecified value is an error.
+impl TryFrom<StreamErrorReason> for Reason {
+    type Error = StreamError;
+
+    fn try_from(reason: StreamErrorReason) -> StreamResult<Self> {
+        Ok(match reason {
+            StreamErrorReason::Unspecified => {
+                return Err(StreamError::invalid("The error reason is unspecified"));
+            }
+            StreamErrorReason::NotFound => Reason::NotFound,
+            StreamErrorReason::Expired => Reason::Expired,
+            StreamErrorReason::Closed => Reason::Closed,
+            StreamErrorReason::Fenced => Reason::Fenced,
+            StreamErrorReason::SequenceTooLow => Reason::SequenceTooLow,
+            StreamErrorReason::SeqDivergent => Reason::SeqDivergent,
+            StreamErrorReason::NotOwner => Reason::NotOwner,
+            StreamErrorReason::FormatTooNew => Reason::FormatTooNew,
+            StreamErrorReason::OffsetTooHigh => Reason::OffsetTooHigh,
+            StreamErrorReason::TooLarge => Reason::TooLarge,
+            StreamErrorReason::Invalid => Reason::Invalid,
+            StreamErrorReason::StorageUnavailable => Reason::StorageUnavailable,
+            StreamErrorReason::Unsupported => Reason::Unsupported,
+            StreamErrorReason::AlreadyExists => Reason::AlreadyExists,
+            StreamErrorReason::StorageCorrupt => Reason::StorageCorrupt,
+        })
+    }
+}
+
+/// The reason of a failure from the number of its proto value. The unspecified value and a value
+/// that the enum doesn't have are errors.
+impl TryFrom<i32> for Reason {
+    type Error = StreamError;
+
+    fn try_from(value: i32) -> StreamResult<Self> {
+        StreamErrorReason::try_from(value)
+            .map_err(|_| StreamError::invalid(format!("The error reason {value} is unknown")))?
+            .try_into()
+    }
+}
+
 /// A failed Stream call.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{}: {message}", reason.token())]
@@ -168,5 +208,146 @@ mod tests {
         assert_eq!(error.code(), Code::FailedPrecondition);
         let details = StreamErrorDetails::decode(error.details().as_slice()).unwrap();
         assert_eq!(details.reason(), StreamErrorReason::FormatTooNew);
+    }
+
+    #[test]
+    fn every_reason_has_its_proto_value_status_code_and_token() {
+        use StreamErrorReason as Proto;
+        let table = [
+            (
+                Reason::NotFound,
+                Proto::NotFound,
+                1,
+                Code::NotFound,
+                "stream_not_found",
+            ),
+            (
+                Reason::Expired,
+                Proto::Expired,
+                2,
+                Code::NotFound,
+                "stream_expired",
+            ),
+            (
+                Reason::Closed,
+                Proto::Closed,
+                3,
+                Code::FailedPrecondition,
+                "stream_closed",
+            ),
+            (
+                Reason::Fenced,
+                Proto::Fenced,
+                4,
+                Code::FailedPrecondition,
+                "stream_fenced",
+            ),
+            (
+                Reason::SequenceTooLow,
+                Proto::SequenceTooLow,
+                5,
+                Code::FailedPrecondition,
+                "stream_sequence_too_low",
+            ),
+            (
+                Reason::SeqDivergent,
+                Proto::SeqDivergent,
+                6,
+                Code::FailedPrecondition,
+                "seq_divergent",
+            ),
+            (
+                Reason::NotOwner,
+                Proto::NotOwner,
+                7,
+                Code::FailedPrecondition,
+                "stream_not_owner",
+            ),
+            (
+                Reason::FormatTooNew,
+                Proto::FormatTooNew,
+                8,
+                Code::FailedPrecondition,
+                "stream_format_too_new",
+            ),
+            (
+                Reason::OffsetTooHigh,
+                Proto::OffsetTooHigh,
+                9,
+                Code::OutOfRange,
+                "stream_offset_too_high",
+            ),
+            (
+                Reason::TooLarge,
+                Proto::TooLarge,
+                10,
+                Code::InvalidArgument,
+                "stream_too_large",
+            ),
+            (
+                Reason::Invalid,
+                Proto::Invalid,
+                11,
+                Code::InvalidArgument,
+                "stream_invalid",
+            ),
+            (
+                Reason::StorageUnavailable,
+                Proto::StorageUnavailable,
+                12,
+                Code::Unavailable,
+                "stream_storage_unavailable",
+            ),
+            (
+                Reason::Unsupported,
+                Proto::Unsupported,
+                13,
+                Code::Unimplemented,
+                "stream_unsupported",
+            ),
+            (
+                Reason::AlreadyExists,
+                Proto::AlreadyExists,
+                14,
+                Code::AlreadyExists,
+                "stream_already_exists",
+            ),
+            (
+                Reason::StorageCorrupt,
+                Proto::StorageCorrupt,
+                15,
+                Code::DataLoss,
+                "stream_storage_corrupt",
+            ),
+        ];
+        // The table has a row for each value of the proto enum, except the unspecified one.
+        let known = (0..100).filter(|n| Proto::try_from(*n).is_ok()).count();
+        assert_eq!(table.len(), known - 1);
+        for (reason, proto, number, code, token) in table {
+            assert_eq!(reason.proto(), proto);
+            assert_eq!(proto as i32, number);
+            assert_eq!(reason.code(), code);
+            assert_eq!(reason.token(), token);
+            assert_eq!(Reason::try_from(proto).unwrap(), reason);
+            assert_eq!(Reason::try_from(number).unwrap(), reason);
+            let error = StreamError::new(reason, "x");
+            let details = StreamErrorDetails::decode(error.details().as_slice()).unwrap();
+            assert_eq!(Reason::try_from(details.reason).unwrap(), reason);
+        }
+    }
+
+    #[test]
+    fn an_unspecified_or_unknown_reason_is_invalid() {
+        for (value, message) in [
+            (0, "The error reason is unspecified"),
+            (16, "The error reason 16 is unknown"),
+            (-1, "The error reason -1 is unknown"),
+        ] {
+            let error = Reason::try_from(value).unwrap_err();
+            assert_eq!(error.reason, Reason::Invalid);
+            assert_eq!(error.message, message);
+        }
+        let error = Reason::try_from(StreamErrorReason::Unspecified).unwrap_err();
+        assert_eq!(error.message, "The error reason is unspecified");
     }
 }
