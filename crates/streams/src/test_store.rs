@@ -1,8 +1,7 @@
 //! The Store that the unit tests of the crate share.
 
 use crate::{
-    StreamError, StreamResult, StreamRuntime,
-    operations::OperationStore,
+    StreamError, StreamResult, StreamRuntime, StreamStore,
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
@@ -41,7 +40,7 @@ impl Scripted {
 }
 
 #[async_trait::async_trait]
-impl OperationStore for Scripted {
+impl StreamStore for Scripted {
     async fn create_stream(
         &self,
         request: CreateStreamRequest,
@@ -87,6 +86,6 @@ impl OperationStore for Scripted {
 /// A runtime on a new [Scripted] Store, and the Store.
 pub(crate) fn runtime() -> (Arc<Scripted>, Arc<StreamRuntime>) {
     let store = Arc::new(Scripted::default());
-    let runtime = StreamRuntime::with_operations(store.clone(), None);
+    let runtime = StreamRuntime::new(store.clone(), None);
     (store, runtime)
 }

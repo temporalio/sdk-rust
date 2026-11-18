@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
-description = "The experimental Stream runtime that Temporal SDK bridges link"
+description = "The experimental Stream runtime of the Temporal SDKs"
 homepage = "https://temporal.io/"
 repository = "https://github.com/temporalio/sdk-rust"
 keywords = ["temporal", "workflow", "streams"]

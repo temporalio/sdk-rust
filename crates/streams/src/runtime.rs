@@ -1,10 +1,9 @@
 //! The Stream runtime, a plain object that lang's bridge builds per client.
 
 use crate::{
-    Reason, StreamError, StreamResult,
+    Reason, StreamError, StreamResult, StreamStore,
     ids::{check_producer, check_required, check_stream_id},
     metrics::Metrics,
-    operations::{self, OperationStore},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
@@ -12,6 +11,7 @@ use crate::{
         producer::Kind,
     },
     record::{check_records, data_records},
+    store,
 };
 use std::sync::Arc;
 use temporalio_common::telemetry::metrics::TemporalMeter;
@@ -20,13 +20,23 @@ use temporalio_common::telemetry::metrics::TemporalMeter;
 /// exactly up to this value.
 pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 
-/// The Stream runtime on one Store. It serves the five Stream service operations. A Store has no
-/// namespaces, so the runtime ignores a request's `namespace`. The SDK sets it, and only the
-/// server reads it.
+/// The Stream runtime on one Store. It has one typed method for each operation, and
+/// [StreamRuntime::call] is the byte form of the same methods. A bridge builds one for each client
+/// with a Stream Store, and that client's Workers share it. A Store has no namespaces, so the
+/// runtime ignores a request's `namespace`. The SDK sets it, and only the server reads it.
 ///
-/// A bridge builds one for each client with a Stream Store, and that client's Workers share it.
+/// The runtime checks each request before the Store sees it, and each answer after it. The checks
+/// are the same for every Store.
+///
+/// - A Stream id and a Producer id are opaque text of 1 to 4096 bytes. The caller builds both.
+/// - A Workflow Producer appends and closes with its Workflow Task as the epoch, so that a Store
+///   can refuse a write of an older task.
+/// - A batch has at most 1000 Records and 4 MiB, and a Record at most 1536 KiB.
+/// - A read gives at most 1000 Records and waits at most 60 s. A page over the caps of its request
+///   is cut.
+/// - An answer with a bad offset fails with [Reason::StorageCorrupt].
 pub struct StreamRuntime {
-    store: Arc<dyn OperationStore>,
+    store: Arc<dyn StreamStore>,
     metrics: Metrics,
 }
 
@@ -95,16 +105,8 @@ fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
 }
 
 impl StreamRuntime {
-    /// Builds a runtime on a Store that answers whole operations, such as one that a user of a
-    /// lang SDK wrote in that language. The runtime checks each request before the Store sees it,
-    /// and each answer after it, with the same bounds on ids, Producers, Records and offsets for
-    /// every Store. It caps each page by the request's `max_records` and `max_bytes`, and fails an
-    /// answer with a bad offset with [Reason::StorageCorrupt]. The runtime records metrics on
-    /// `meter`, lang's runtime meter, if set.
-    pub fn with_operations(
-        store: Arc<dyn OperationStore>,
-        meter: Option<TemporalMeter>,
-    ) -> Arc<Self> {
+    /// Builds the runtime on `store`. It records metrics on `meter`, lang's runtime meter, if set.
+    pub fn new(store: Arc<dyn StreamStore>, meter: Option<TemporalMeter>) -> Arc<Self> {
         let meter = meter.unwrap_or_else(TemporalMeter::no_op);
         Arc::new(Self {
             store,
@@ -131,7 +133,7 @@ impl StreamRuntime {
         let producer = append_producer(&request)?;
         // The same bounds hold for every Store, so a batch over them fails here too.
         data_records(producer, request.records.clone())?;
-        let appended = operations::append(self.store.as_ref(), request).await;
+        let appended = store::append(self.store.as_ref(), request).await;
         if let Err(error) = &appended
             && error.reason == Reason::Fenced
         {
@@ -148,7 +150,7 @@ impl StreamRuntime {
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
         stream_id(request.r#ref.as_ref())?;
-        operations::read(self.store.as_ref(), &self.metrics, request).await
+        store::read(self.store.as_ref(), &self.metrics, request).await
     }
 
     /// Closes a Stream. Its readers drain what is left, and later appends fail.
@@ -287,7 +289,7 @@ mod tests {
             NewAttributes::default(),
             TaskQueueLabelStrategy::UseNormal,
         );
-        let runtime = StreamRuntime::with_operations(store.clone(), Some(temporal_meter));
+        let runtime = StreamRuntime::new(store.clone(), Some(temporal_meter));
         (store, runtime, meter)
     }
 

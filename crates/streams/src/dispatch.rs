@@ -11,8 +11,8 @@ fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
 impl StreamRuntime {
     /// Runs one of the five Stream service operations on an encoded request, by its name, and
     /// returns the encoded response. The names are `CreateStream`, `AppendRecords`, `CloseStream`,
-    /// `ReadRecords` and `DescribeStream`. The bridge raises an error with [StreamError::code] and
-    /// [StreamError::details].
+    /// `ReadRecords` and `DescribeStream`. Any other name fails with [Reason::Unsupported]. The
+    /// bridge raises an error with [StreamError::code] and [StreamError::details].
     pub async fn call(&self, operation: &str, request: &[u8]) -> StreamResult<Vec<u8>> {
         let response = match operation {
             "CreateStream" => self.create_stream(decode(request)?).await?.encode_to_vec(),

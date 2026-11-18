@@ -1,46 +1,51 @@
 # temporalio-streams
 
-Experimental. The Stream runtime that the Temporal SDKs link into their bridges. It answers the five
-operations of the Stream service on a Store. A bridge builds the runtime per client, as a plain
-object, and calls `StreamRuntime::call` with an operation name and the encoded request. The call
-gives back the encoded response. Core has no Stream code.
+Experimental. The Stream runtime that Core and the Temporal SDK bridges link. It answers the five
+operations of the Stream service on a Stream Store, and it has no Store of its own.
 
-## Protos and shared vectors
+## The Store
 
-The crate defines no protos. `temporalio-protos` generates them, and `temporalio_streams::proto`
-re-exports them, so a value needs no conversion between the crates.
+A `StreamStore` answers each operation whole: `create_stream`, `append_records`, `read_records`,
+`close_stream` and `describe_stream`. It takes and gives the messages of the Stream service. The
+Store applies the rules of the service itself.
 
-- `temporal/api/stream/v1/message.proto`, `temporal/api/streamservice/v1/request_response.proto`
-  and `temporal/api/enums/v1/stream.proto` are the Stream protos of the API. They are in
-  `crates/protos/protos/api_upstream`.
-- `testdata/*.json` are the shared vectors. They cover the Store keys of a Stream id, the meta
-  field of a Producer, offsets, epoch keys and the batch digest of a dedupe entry.
-  `examples/gen_vectors.rs` writes them from a second implementation, and the crate's tests read
-  each file. Run it with `cargo run -p temporalio-streams --example gen_vectors`. It shares no
-  code with the crate. Each Store reads `fields.json` through the shared Store suite.
-  `digests.json` is the golden of the crate's batch digest.
+- An append fences a lower epoch of its Producer, and writes a batch that comes again with the
+  same Producer, epoch and sequence once.
+- A read waits up to its `wait` for a Record when it has none to give, and a close wakes it.
+- An offset is opaque bytes, at most 1024, and the offsets of one Stream compare in order.
+- A failed call gives a `StreamError` with its reason. `StorageUnavailable` is the one reason
+  that a Worker tries again.
 
-A Stream id and a Producer id are opaque text. The caller builds both. The runtime refuses an
-empty id of either kind, and one over 4096 bytes. A Producer id names one Producer in one Stream.
-A Store keeps the fence of a Producer by kind and id, and an epoch has no run. So the id of a
-run-based kind must hold its run id. A caller that uses one id in two runs gets `FENCED` in the
-second run when that run's epoch is lower. A Workflow Producer appends with its Workflow Task as
-the epoch, so a write of an older task gets `FENCED`. It closes a Stream with an epoch too, since a
-close with none would pass the fence.
+A lang bridge implements the trait for a Store that is written in that language. The Stores that
+Temporal provides, and the shared rules that a Store in Rust builds on, are in
+[temporal-community/sdk-streams](https://github.com/temporal-community/sdk-streams).
 
 ## The runtime
 
-`StreamRuntime` serves the Stream service on one Store, with one typed method for each operation.
+`StreamRuntime::new` builds the runtime on one Store. It has one typed method for each operation.
 `StreamRuntime::call` is the byte form of the same methods. It takes `CreateStream`,
-`AppendRecords`, `CloseStream`, `ReadRecords` or `DescribeStream`, and any other name fails with
-`Reason::Unsupported`. A Store crate builds the runtime with `StreamRuntime::new`, the name that
-lang registered the Store under, and its Store. A `store::LazyStore` connects its inner Store on
-the first call that needs it. So a bridge can build the runtime with no async runtime.
-`MemoryStreamRuntime::new` builds it on the memory Store, from a `MemoryStreamOptions`.
+`AppendRecords`, `CloseStream`, `ReadRecords` or `DescribeStream` with the encoded request and
+gives the encoded response. Any other name fails with `Reason::Unsupported`.
 
-## Stores and the shared suites
+The runtime checks each request before the Store sees it, and each answer after it. The checks
+are the same for every Store.
 
-The memory Store is for tests. It keeps the key layout of the Redis Store and applies the same rules
-in the same order. The `test-support` feature exports the shared suites in `testing`. A Store crate
-implements `testing::TestStore` for its Store and runs each suite with `testing::run`, so that
-every Store keeps one set of rules. This crate runs them on the memory Store in its unit tests.
+- A Stream id and a Producer id are opaque text of 1 to 4096 bytes. The caller builds both.
+- A Workflow Producer appends and closes with its Workflow Task as the epoch, so that a Store can
+  refuse a write of an older task.
+- A batch has at most 1000 Records and 4 MiB, and a Record at most 1536 KiB.
+- A read gives at most 1000 Records and waits at most 60 s. A page over the caps of its request is
+  cut.
+- An answer with a bad offset fails with `Reason::StorageCorrupt`.
+
+## The order of epochs
+
+`epoch::epoch_key` gives the epoch of a Producer as 40 bytes that compare in order. A Store fences
+by this order, so every Store refuses the same writes. `testdata/epochs.json` has the shared
+vectors. `examples/gen_vectors.rs` writes them from a second implementation that shares no code
+with the crate. Run it with `cargo run -p temporalio-streams --example gen_vectors`.
+
+## Protos
+
+The crate defines no protos. `temporalio-protos` generates them, and `temporalio_streams::proto`
+re-exports them, so a value needs no conversion between the crates.

@@ -37,10 +37,10 @@ pub fn check_stream_id(id: &str) -> StreamResult<()> {
 }
 
 /// Refuses a Producer with no id, an id over [MAX_PRODUCER_ID_BYTES], or no kind. The id is opaque
-/// text, so the Store requires no shape of it. It names one Producer in one Stream. A Store keeps
-/// the fence of a Producer by kind and id, and an epoch has no run. So the id of a run-based kind
-/// must hold its run id. A caller that uses one id in two runs gets `FENCED` in the second run when
-/// that run's epoch is lower.
+/// text, so the Store requires no shape of it. It identifies one Producer in one Stream. A Store
+/// keeps the fence of a Producer by kind and id, and an epoch has no run. So the id of a run-based
+/// kind must hold its run id. A caller that uses one id in two runs gets `FENCED` in the second run
+/// when that run's epoch is lower.
 pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     if producer.id.is_empty() {
         return Err(StreamError::invalid("The Producer id is empty"));

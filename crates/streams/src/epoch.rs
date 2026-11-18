@@ -10,8 +10,8 @@ use crate::{
 };
 use prost_types::Timestamp;
 
-/// The kind of a Producer, which is the case of its epoch. The stored field names and keys hold
-/// its number, so each kind keeps its number.
+/// The kind of a Producer, which is the case of its epoch. A Store may keep the number of a kind in
+/// what it stores, so each kind keeps its number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProducerKind {
     /// A Workflow run.

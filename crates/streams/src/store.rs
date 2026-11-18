@@ -1,5 +1,4 @@
-//! The Store of the Stream runtime, which answers whole Stream operations. It keeps its own log and
-//! offsets, and it applies the rules of the Stream service itself.
+//! The Store of the Stream runtime.
 
 use crate::{
     StreamError, StreamResult,
@@ -19,17 +18,24 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
 pub const MAX_RECORDS: usize = 1000;
 
-/// The five operations of the Stream service, each answered whole. A runtime that
-/// [crate::StreamRuntime::with_operations] builds checks each request before the call, and each
-/// answer after it.
+/// A Stream Store. It answers each operation of the Stream service whole: `create_stream`,
+/// `append_records`, `read_records`, `close_stream` and `describe_stream`. It takes and gives the
+/// messages of the Stream service. The Store applies the rules of the service itself.
 ///
-/// The Store applies the rules of the Stream service itself. An append fences a lower epoch of its
-/// Producer and takes a resend of the same Producer, epoch and `sequence` once. A read waits up to
-/// its `wait` for a Record when it has none to give, and a close wakes it. An offset is opaque bytes
-/// that compare in order. A failed call gives a [StreamError] with its reason. A Store that can't
-/// reach its storage gives [crate::Reason::StorageUnavailable], which a Worker tries again.
+/// - An append fences a lower epoch of its Producer, and writes a batch that comes again with the
+///   same Producer, epoch and sequence once.
+/// - A read waits up to its `wait` for a Record when it has none to give, and a close wakes it.
+/// - An offset is opaque bytes, at most [MAX_OFFSET_BYTES], and the offsets of one Stream compare
+///   in order.
+/// - A failed call gives a [StreamError] with its reason.
+///   [StorageUnavailable](crate::Reason::StorageUnavailable) is the one reason that a Worker tries
+///   again.
+///
+/// A lang bridge implements the trait for a Store that is written in that language. The Stores that
+/// Temporal provides, and the shared rules that a Store in Rust builds on, are in
+/// [temporal-community/sdk-streams](https://github.com/temporal-community/sdk-streams).
 #[async_trait::async_trait]
-pub trait OperationStore: Send + Sync + 'static {
+pub trait StreamStore: Send + Sync + 'static {
     /// Creates a Stream, or gets the open one when the conflict policy allows it.
     async fn create_stream(
         &self,
@@ -101,7 +107,7 @@ fn max_bytes(value: i64) -> StreamResult<usize> {
 
 /// Reads one page, with the caps and the longest wait of a read.
 pub(crate) async fn read(
-    store: &dyn OperationStore,
+    store: &dyn StreamStore,
     metrics: &Metrics,
     mut request: ReadRecordsRequest,
 ) -> StreamResult<ReadRecordsResponse> {
@@ -161,7 +167,7 @@ fn fit_page(
 
 /// Appends a batch that the runtime checked, and checks the offsets of the answer.
 pub(crate) async fn append(
-    store: &dyn OperationStore,
+    store: &dyn StreamStore,
     request: AppendRecordsRequest,
 ) -> StreamResult<AppendRecordsResponse> {
     let empty = request.records.is_empty();

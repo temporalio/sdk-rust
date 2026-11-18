@@ -1,6 +1,6 @@
 //! Writes the golden vectors of the epoch keys to `testdata/epochs.json`.
 //!
-//! This is a second implementation of the key layout. It calls none of the crate's own code, so
+//! This is a second implementation of the epoch key. It calls none of the crate's own code, so
 //! the crate's test checks `epoch_key` against values it did not compute. Run it from any
 //! directory:
 //!
