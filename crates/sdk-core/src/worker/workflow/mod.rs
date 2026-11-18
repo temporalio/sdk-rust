@@ -1535,7 +1535,7 @@ impl LocalResolution {
 #[error("Lang provided workflow command with empty variant")]
 struct EmptyWorkflowCommandErr;
 
-/// [DrivenWorkflow]s respond with these when called, to indicate what they want to do next.
+/// The language SDK responds with these commands to indicate what the workflow wants to do next.
 /// EX: Create a new timer, complete the workflow, etc.
 #[derive(Debug, derive_more::From, derive_more::Display)]
 #[display("{}", variant)]

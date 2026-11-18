@@ -112,12 +112,13 @@ where
                 let _ = hlock.allow_stream.next().await;
 
                 if let Some(history) = hlock.next().await {
-                    let hist_info = HistoryInfo::new_from_history(&history.hist, None).unwrap();
-                    let mut resp = hist_info.as_poll_wft_response();
-                    resp.workflow_execution = Some(WorkflowExecution {
+                    let hist_info = HistoryInfo::from_owned_history(history.hist).unwrap();
+                    let execution = WorkflowExecution {
                         workflow_id: history.workflow_id,
                         run_id: hist_info.orig_run_id().to_string(),
-                    });
+                    };
+                    let mut resp = hist_info.into_poll_wft_response();
+                    resp.workflow_execution = Some(execution);
                     Ok(resp)
                 } else {
                     if let Some(wc) = hlock.worker_closer.get() {
