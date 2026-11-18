@@ -11,8 +11,8 @@ fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
 impl StreamRuntime {
     /// Runs one of the five Stream service operations on an encoded request, by its name, and
     /// returns the encoded response. The names are `CreateStream`, `AppendRecords`, `CloseStream`,
-    /// `ReadRecords` and `DescribeStream`. The bridge raises an error with [StreamError::code] and
-    /// [StreamError::details].
+    /// `ReadRecords` and `DescribeStream`. Any other name fails with [Reason::Unsupported]. The
+    /// bridge raises an error with [StreamError::code] and [StreamError::details].
     pub async fn call(&self, operation: &str, request: &[u8]) -> StreamResult<Vec<u8>> {
         let response = match operation {
             "CreateStream" => self.create_stream(decode(request)?).await?.encode_to_vec(),
@@ -38,15 +38,14 @@ impl StreamRuntime {
 mod tests {
     use super::*;
     use crate::{
-        MemoryStreamOptions, MemoryStreamRuntime,
         proto::{
             AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
             CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
             DescribeStreamRequest, DescribeStreamResponse, Producer, ReadRecordsRequest,
-            ReadRecordsResponse, StreamRef, StreamStatus, producer::Kind,
+            ReadRecordsResponse, StreamRecord, StreamRef, StreamStatus, producer::Kind,
         },
+        test_store::runtime,
     };
-    use std::sync::Arc;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
     use tonic::Code;
 
@@ -58,14 +57,10 @@ mod tests {
         "DescribeStream",
     ];
 
-    fn runtime() -> Arc<StreamRuntime> {
-        MemoryStreamRuntime::new("b", MemoryStreamOptions::default(), None)
-    }
-
     fn stream_ref() -> Option<StreamRef> {
         Some(StreamRef {
             id: "s".to_string(),
-            ..Default::default()
+            store: "b".to_string(),
         })
     }
 
@@ -106,7 +101,7 @@ mod tests {
     // checks the names that a bridge calls.
     #[tokio::test]
     async fn bad_bytes_are_invalid_and_an_unknown_operation_is_unsupported() {
-        let runtime = runtime();
+        let (_, runtime) = runtime();
         for operation in OPERATIONS {
             let error = runtime.call(operation, &[0xff]).await.unwrap_err();
             assert_eq!(error.reason, Reason::Invalid, "{operation}");
@@ -124,7 +119,24 @@ mod tests {
 
     #[tokio::test]
     async fn each_stream_operation_round_trips_its_bytes() {
-        let runtime = runtime();
+        let (store, runtime) = runtime();
+        *store.appended.lock() = AppendRecordsResponse {
+            first_offset: b"a".to_vec(),
+            last_offset: b"a".to_vec(),
+        };
+        *store.page.lock() = ReadRecordsResponse {
+            records: vec![StreamRecord {
+                body: Some(Payload::default()),
+                offset: b"a".to_vec(),
+                ..Default::default()
+            }],
+            last_offset: b"a".to_vec(),
+            done: false,
+        };
+        *store.described.lock() = DescribeStreamResponse {
+            status: StreamStatus::Closed as i32,
+            ..Default::default()
+        };
         assert_eq!(create(&runtime).await.r#ref.unwrap().store, "b");
         let appended: AppendRecordsResponse = call(
             &runtime,

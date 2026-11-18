@@ -4,6 +4,7 @@ mod local_activity_workflow_task;
 mod queries;
 mod query_eviction;
 mod replay_flag;
+mod stream_store;
 mod streams;
 mod updates;
 mod workers;

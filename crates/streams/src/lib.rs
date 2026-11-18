@@ -1,30 +1,33 @@
 #![warn(missing_docs)]
 
-//! The Stream runtime of Temporal SDKs. It is experimental.
+//! Experimental. The Stream runtime for Core and the Temporal SDK bridges. It answers the five
+//! operations of the Stream service on a Stream Store, and it has no Store of its own.
 //!
-//! The crate serves the five operations of the Stream service on a Stream Store. A lang bridge
-//! builds the runtime and calls it with an operation name and the encoded request. A Store is a
-//! [store::Store] of log calls, or an [operations::OperationStore] that answers whole operations.
+//! A [StreamStore] answers each operation whole. The Store applies the rules of the service
+//! itself. A lang bridge implements the trait for a Store that is written in that language. The
+//! Stores that Temporal provides, and the shared rules that a Store in Rust builds on, are in
+//! [temporal-community/sdk-streams](https://github.com/temporal-community/sdk-streams).
+//!
+//! [StreamRuntime::new] builds the runtime on one Store. It has one typed method for each
+//! operation. [StreamRuntime::call] is the byte form of the same methods. The runtime checks each
+//! request before the Store sees it, and the answer to a create, an append, a read or a describe
+//! after it. The checks are the same for every Store.
 
 pub mod digest;
 mod dispatch;
 pub mod epoch;
 mod error;
 pub mod ids;
-pub mod memory;
 mod metrics;
-pub mod offset;
-pub mod operations;
-mod read;
-mod record;
+pub mod record;
 mod runtime;
-pub mod store;
-#[cfg(any(test, feature = "test-support"))]
-pub mod testing;
+mod store;
+#[cfg(test)]
+mod test_store;
 
 pub use error::{Reason, StreamError, StreamResult};
-pub use read::MAX_WAIT;
-pub use runtime::{MemoryStreamOptions, MemoryStreamRuntime, StreamRuntime};
+pub use runtime::{MAX_SEQUENCE, StreamRuntime};
+pub use store::{MAX_RECORDS, MAX_WAIT, StreamStore};
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.
