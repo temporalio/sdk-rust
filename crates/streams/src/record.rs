@@ -1,4 +1,5 @@
-//! The stored form of a Record, and the size limits of a batch.
+//! The stored form of a Record, and the size limits of a batch. The runtime checks each batch
+//! against these limits before the Store sees it.
 
 use crate::{
     Reason, StreamError, StreamResult,
@@ -134,6 +135,16 @@ pub fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// Fails if a Record of the batch has no body.
+pub(crate) fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
+    match records.iter().position(|record| record.body.is_none()) {
+        Some(at) => Err(StreamError::invalid(format!(
+            "Record {at} of the batch has no body"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The length of the [`data_record`] output, without allocating.
 pub fn data_record_len(producer: &Producer, record: &AppendRecord) -> usize {
     // This must match the fields that `data_record` sets, `producer` (tag 1) and `body` (tag 2).
@@ -153,6 +164,17 @@ mod tests {
     };
     use prost_types::Timestamp;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
+
+    #[test]
+    fn a_record_with_no_body_is_invalid() {
+        let body = AppendRecord {
+            body: Some(Payload::default()),
+        };
+        check_records(std::slice::from_ref(&body)).unwrap();
+        let error = check_records(&[body, AppendRecord::default()]).unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
+        assert!(error.message.contains("Record 1"), "{}", error.message);
+    }
 
     /// One Producer of each kind with every field set, and one Producer with no kind.
     fn producers() -> Vec<Producer> {

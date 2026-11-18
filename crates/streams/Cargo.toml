@@ -22,5 +22,10 @@ tonic = { workspace = true }
 path = "../common"
 version = "~1.2.0"
 default-features = false
+
+[dev-dependencies]
+parking_lot = "0.12"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync"] }
+
 [lints]
 workspace = true

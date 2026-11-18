@@ -41,8 +41,9 @@ relevant information.
   for new workflows only. The mode is recorded on the first successful task completion and defaults to off.
   Core handles tasks with no activation jobs internally, without polling workflow routines; see
   [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
-* [lang-internal] Added the experimental `temporalio-streams` crate with shared definitions for
-  Temporal Stream Store implementations. Core's worker doesn't use it.
+* [lang-internal] Added the experimental `temporalio-streams` crate. `StreamRuntime` checks each
+  Stream call and passes it to a `StreamStore`, which a bridge implements for a Store in its own
+  language. Core's worker doesn't use it.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or

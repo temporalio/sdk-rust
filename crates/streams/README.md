@@ -5,4 +5,4 @@
 
 Part of [Temporal](https://temporal.io)'s [Rust SDK](https://github.com/temporalio/sdk-rust).
 
-Shared definitions for Temporal Stream Store implementations.
+The Stream runtime, and shared definitions for Temporal Stream Store implementations.

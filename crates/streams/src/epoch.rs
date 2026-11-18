@@ -89,7 +89,8 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
 /// The key of an epoch. It starts with the [`task_key`] of the task that [`task_of`] returns, then
 /// has the attempt's scheduled seconds and nanos and the attempt, in 8, 4 and 4 bytes. A negative
 /// field, or a field that the kind doesn't have, gives zero. So a client or a Producer with no
-/// kind gives an all-zero key.
+/// kind gives an all-zero key. The runtime refuses a Workflow Producer with no epoch before a
+/// Store sees it.
 pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
     let (scheduled, attempt) = match kind {
         Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
