@@ -72,21 +72,28 @@ fn caller_offset(offset: &[u8]) -> StreamResult<()> {
     Ok(())
 }
 
-/// Refuses an offset that a Store gives, empty or with more than [MAX_OFFSET_BYTES]. A Worker
-/// records the offsets in History and resumes a read from one, and an empty one is the start.
+/// Refuses an offset that a Store gives with more than [MAX_OFFSET_BYTES]. An empty one passes.
+/// `what` is the offset's place in the message of the error.
+pub(crate) fn offset_bound(offset: &[u8], what: &str) -> StreamResult<()> {
+    if offset.len() > MAX_OFFSET_BYTES {
+        return Err(StreamError::storage_corrupt(format!(
+            "The Store gave {what} of {} bytes, more than {MAX_OFFSET_BYTES}",
+            offset.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses an offset that a Store gives for a Record, empty or with more than [MAX_OFFSET_BYTES].
+/// A Worker records the offsets in History and resumes a read from one, and an empty one is the
+/// start.
 fn store_offset(offset: &[u8]) -> StreamResult<()> {
     if offset.is_empty() {
         return Err(StreamError::storage_corrupt(
             "The Store gave a Record with no offset",
         ));
     }
-    if offset.len() > MAX_OFFSET_BYTES {
-        return Err(StreamError::storage_corrupt(format!(
-            "The Store gave an offset of {} bytes, more than {MAX_OFFSET_BYTES}",
-            offset.len()
-        )));
-    }
-    Ok(())
+    offset_bound(offset, "an offset")
 }
 
 /// A proto Duration as a `Duration`, `None` when it is unset, zero or negative.
@@ -112,6 +119,7 @@ pub(crate) async fn read(
     mut request: ReadRecordsRequest,
 ) -> StreamResult<ReadRecordsResponse> {
     caller_offset(&request.from_offset)?;
+    let from_offset = request.from_offset.clone();
     let max_bytes = max_bytes(request.max_bytes)?;
     let max = match request.max_records {
         n if n <= 0 => MAX_RECORDS,
@@ -127,7 +135,7 @@ pub(crate) async fn read(
         let _waiting = metrics.read_waiting();
         store.read_records(request).await?
     };
-    fit_page(response, max, max_bytes)
+    fit_page(response, &from_offset, max, max_bytes)
 }
 
 /// The page cut to `max` Records and `max_bytes`, with its first Record always. A Worker bounds
@@ -135,18 +143,15 @@ pub(crate) async fn read(
 /// ends at its last Record and is not done.
 fn fit_page(
     mut page: ReadRecordsResponse,
+    from_offset: &[u8],
     max: usize,
     max_bytes: usize,
 ) -> StreamResult<ReadRecordsResponse> {
     for record in &page.records {
         store_offset(&record.offset)?;
     }
-    if page.last_offset.len() > MAX_OFFSET_BYTES {
-        return Err(StreamError::storage_corrupt(format!(
-            "The Store gave a last offset of {} bytes, more than {MAX_OFFSET_BYTES}",
-            page.last_offset.len()
-        )));
-    }
+    offset_bound(&page.last_offset, "a last offset")?;
+    check_cursor(&page, from_offset)?;
     let mut bytes = 0;
     let mut keep = 0;
     for record in &page.records {
@@ -165,6 +170,39 @@ fn fit_page(
     Ok(page)
 }
 
+/// Refuses a page whose offsets don't rise after `from_offset`, or whose `last_offset` is lower
+/// than its last Record. Offsets compare as bytes, and an empty `from_offset` is the start. A
+/// Worker resumes a read from `last_offset`, so a bad cursor makes a read that never moves on.
+/// A `last_offset` above the last Record is fine, since a Store may skip entries that are not
+/// Records, and the page that ends a closed Stream may cover them.
+fn check_cursor(page: &ReadRecordsResponse, from_offset: &[u8]) -> StreamResult<()> {
+    let mut newest = from_offset;
+    for (at, record) in page.records.iter().enumerate() {
+        if record.offset.as_slice() <= newest {
+            return Err(StreamError::storage_corrupt(if at == 0 {
+                "The Store gave a first Record with an offset that is not higher than the \
+                 from_offset of the read"
+                    .to_string()
+            } else {
+                format!(
+                    "The Store gave Record {at} with an offset that is not higher than the one \
+                     before it"
+                )
+            }));
+        }
+        newest = &record.offset;
+    }
+    if page.last_offset.as_slice() < newest {
+        return Err(StreamError::storage_corrupt(if page.records.is_empty() {
+            "The Store gave an empty page with a last_offset that is lower than the from_offset \
+             of the read"
+        } else {
+            "The Store gave a last_offset that is lower than the offset of the last Record"
+        }));
+    }
+    Ok(())
+}
+
 /// Appends a batch that the runtime checked, and checks the offsets of the answer.
 pub(crate) async fn append(
     store: &dyn StreamStore,
@@ -172,9 +210,18 @@ pub(crate) async fn append(
 ) -> StreamResult<AppendRecordsResponse> {
     let empty = request.records.is_empty();
     let response = store.append_records(request).await?;
-    if !empty {
+    if empty {
+        // A Store may give empty offsets for an empty batch, but not long ones.
+        offset_bound(&response.first_offset, "an offset")?;
+        offset_bound(&response.last_offset, "an offset")?;
+    } else {
         store_offset(&response.first_offset)?;
         store_offset(&response.last_offset)?;
+        if response.first_offset > response.last_offset {
+            return Err(StreamError::storage_corrupt(
+                "The Store gave a first offset that is higher than the last offset of the batch",
+            ));
+        }
     }
     Ok(response)
 }
@@ -243,6 +290,42 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn epoch() -> WorkflowTaskEpoch {
+        WorkflowTaskEpoch {
+            started_event_id: 3,
+            attempt: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A page of Records with these offsets, as a Store gives it.
+    fn page(offsets: &[&str], last_offset: &str, done: bool) -> ReadRecordsResponse {
+        ReadRecordsResponse {
+            records: offsets
+                .iter()
+                .map(|offset| record(offset.as_bytes(), 1))
+                .collect(),
+            last_offset: last_offset.as_bytes().to_vec(),
+            done,
+        }
+    }
+
+    /// What the runtime gives for a read after `from_offset` when the Store answers `answer`.
+    async fn read_after(
+        from_offset: &str,
+        answer: ReadRecordsResponse,
+    ) -> StreamResult<ReadRecordsResponse> {
+        let (store, runtime) = runtime();
+        *store.page.lock() = answer;
+        runtime
+            .read_records(ReadRecordsRequest {
+                r#ref: stream_ref(),
+                from_offset: from_offset.as_bytes().to_vec(),
+                ..Default::default()
+            })
+            .await
     }
 
     #[tokio::test]
@@ -386,5 +469,109 @@ mod tests {
             (error.reason, error.message.as_str()),
             (Reason::Closed, "closed")
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_with_a_bad_cursor_is_corrupt() {
+        let first = "The Store gave a first Record with an offset that is not higher than the \
+                     from_offset of the read";
+        let record_at = |at| {
+            format!(
+                "The Store gave Record {at} with an offset that is not higher than the one \
+                 before it"
+            )
+        };
+        let last = "The Store gave a last_offset that is lower than the offset of the last Record";
+        let empty = "The Store gave an empty page with a last_offset that is lower than the \
+                     from_offset of the read";
+        let cases = [
+            // The Records are not after the offset of the read, and the cursor is empty.
+            ("m", page(&["b", "a", "a"], "", false), first.to_string()),
+            ("a", page(&["a"], "a", false), first.to_string()),
+            ("b", page(&["a", "c"], "c", false), first.to_string()),
+            ("", page(&["b", "a"], "b", false), record_at(1)),
+            ("", page(&["a", "a"], "a", false), record_at(1)),
+            ("", page(&["a", "b", "b"], "b", false), record_at(2)),
+            ("a", page(&["b"], "", false), last.to_string()),
+            ("", page(&["b", "c"], "b", true), last.to_string()),
+            ("m", page(&[], "", false), empty.to_string()),
+            ("m", page(&[], "a", true), empty.to_string()),
+        ];
+        for (from_offset, answer, message) in cases {
+            let error = read_after(from_offset, answer.clone()).await.unwrap_err();
+            assert_eq!(error.reason, Reason::StorageCorrupt, "{answer:?}");
+            assert_eq!(error.message, message, "after {from_offset:?}, {answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_with_a_good_cursor_passes_as_it_is() {
+        let cases = [
+            ("", page(&["a", "b", "c"], "c", false)),
+            ("a", page(&["b", "c"], "c", false)),
+            // A Store may skip entries that are not Records, so the page that ends a closed Stream
+            // may cover them. Its `last_offset` is then above its last Record.
+            ("a", page(&["b"], "z", true)),
+            ("", page(&[], "", false)),
+            ("m", page(&[], "m", false)),
+            ("m", page(&[], "z", true)),
+        ];
+        for (from_offset, answer) in cases {
+            let page = read_after(from_offset, answer.clone()).await.unwrap();
+            assert_eq!(page, answer, "after {from_offset:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_append_answer_with_a_first_offset_above_the_last_is_corrupt() {
+        let (store, runtime) = runtime();
+        for (first, last, good) in [("a", "a", true), ("a", "c", true), ("c", "a", false)] {
+            *store.appended.lock() = AppendRecordsResponse {
+                first_offset: first.as_bytes().to_vec(),
+                last_offset: last.as_bytes().to_vec(),
+            };
+            let result = runtime
+                .append_records(append(workflow(Some(epoch()))))
+                .await;
+            if good {
+                assert_eq!(result.unwrap().last_offset, last.as_bytes().to_vec());
+                continue;
+            }
+            let error = result.unwrap_err();
+            assert_eq!(error.reason, Reason::StorageCorrupt);
+            assert_eq!(
+                error.message,
+                "The Store gave a first offset that is higher than the last offset of the batch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_offsets_of_an_empty_batch_stay_within_the_bound() {
+        let (store, runtime) = runtime();
+        let empty = || AppendRecordsRequest {
+            records: vec![],
+            ..append(workflow(Some(epoch())))
+        };
+        for (first, last) in [(0, 0), (MAX_OFFSET_BYTES, MAX_OFFSET_BYTES)] {
+            *store.appended.lock() = AppendRecordsResponse {
+                first_offset: vec![1; first],
+                last_offset: vec![1; last],
+            };
+            runtime.append_records(empty()).await.unwrap();
+        }
+        let too_long = MAX_OFFSET_BYTES + 1;
+        for (first, last) in [(too_long, 0), (0, too_long)] {
+            *store.appended.lock() = AppendRecordsResponse {
+                first_offset: vec![1; first],
+                last_offset: vec![1; last],
+            };
+            let error = runtime.append_records(empty()).await.unwrap_err();
+            assert_eq!(error.reason, Reason::StorageCorrupt);
+            assert_eq!(
+                error.message,
+                format!("The Store gave an offset of {too_long} bytes, more than 1024")
+            );
+        }
     }
 }

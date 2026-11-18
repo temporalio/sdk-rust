@@ -23,6 +23,8 @@ pub(crate) struct Scripted {
     pub(crate) page: Mutex<ReadRecordsResponse>,
     pub(crate) appended: Mutex<AppendRecordsResponse>,
     pub(crate) described: Mutex<DescribeStreamResponse>,
+    /// The answer of a create. It is the request's ref, as created, when it is `None`.
+    pub(crate) created: Mutex<Option<CreateStreamResponse>>,
     pub(crate) error: Mutex<Option<StreamError>>,
     /// A read tells `entered`, and then waits for `release` if `hold_reads` is set.
     pub(crate) hold_reads: AtomicBool,
@@ -45,10 +47,11 @@ impl StreamStore for Scripted {
         &self,
         request: CreateStreamRequest,
     ) -> StreamResult<CreateStreamResponse> {
-        self.answer(CreateStreamResponse {
+        let created = self.created.lock().clone();
+        self.answer(created.unwrap_or(CreateStreamResponse {
             r#ref: request.stream_ref,
             created: true,
-        })
+        }))
     }
 
     async fn append_records(

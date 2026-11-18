@@ -8,7 +8,7 @@ use crate::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRef,
-        producer::Kind,
+        StreamStatus, producer::Kind,
     },
     record::{check_records, data_records},
     store,
@@ -60,6 +60,35 @@ fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
         .unwrap_or_default();
     check_stream_id(id)?;
     Ok(id)
+}
+
+/// Refuses a create answer with no ref, or with the ref of another Stream.
+fn check_created(response: &CreateStreamResponse, id: &str) -> StreamResult<()> {
+    match response.r#ref.as_ref() {
+        None => Err(StreamError::storage_corrupt(
+            "The Store answered a create with no ref",
+        )),
+        Some(stream_ref) if stream_ref.id != id => Err(StreamError::storage_corrupt(
+            "The Store answered a create with the ref of another Stream",
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Refuses a describe answer with a long `last_offset`, no status, or a status that the Stream
+/// service doesn't know. An empty `last_offset` is fine, since a Stream may have no Record.
+fn check_described(response: &DescribeStreamResponse) -> StreamResult<()> {
+    store::offset_bound(&response.last_offset, "a last offset")?;
+    match StreamStatus::try_from(response.status) {
+        Ok(StreamStatus::Unspecified) => Err(StreamError::storage_corrupt(
+            "The Store answered a describe with no status",
+        )),
+        Ok(_) => Ok(()),
+        Err(_) => Err(StreamError::storage_corrupt(format!(
+            "The Store answered a describe with the unknown status {}",
+            response.status
+        ))),
+    }
 }
 
 /// Checks the Producer of a close. Any kind may close, and a Workflow closes with its Workflow
@@ -119,9 +148,11 @@ impl StreamRuntime {
         &self,
         request: CreateStreamRequest,
     ) -> StreamResult<CreateStreamResponse> {
-        stream_id(request.stream_ref.as_ref())?;
+        let id = stream_id(request.stream_ref.as_ref())?.to_string();
         check_conflict_policy(request.id_conflict_policy)?;
-        self.store.create_stream(request).await
+        let created = self.store.create_stream(request).await?;
+        check_created(&created, &id)?;
+        Ok(created)
     }
 
     /// Appends one batch as one Producer. A Workflow Producer appends with its Workflow Task as the
@@ -169,7 +200,9 @@ impl StreamRuntime {
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse> {
         stream_id(request.r#ref.as_ref())?;
-        self.store.describe_stream(request).await
+        let described = self.store.describe_stream(request).await?;
+        check_described(&described)?;
+        Ok(described)
     }
 }
 
@@ -177,6 +210,7 @@ impl StreamRuntime {
 mod tests {
     use super::*;
     use crate::{
+        ids::MAX_OFFSET_BYTES,
         proto::{AppendRecord, ClientProducer, WorkflowProducer},
         record::MAX_BATCH_RECORDS,
         test_store::{Scripted, runtime},
@@ -445,5 +479,100 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.message, "reached the Store");
+    }
+
+    #[tokio::test]
+    async fn a_create_answer_needs_the_ref_of_its_request() {
+        let (store, runtime) = runtime();
+        let create = || {
+            runtime.create_stream(CreateStreamRequest {
+                stream_ref: stream_ref(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(create().await.unwrap().r#ref, stream_ref());
+        // The Store may set its own `store`, and USE_EXISTING may get a Stream that existed.
+        let named = StreamRef {
+            id: "s".to_string(),
+            store: "redis".to_string(),
+        };
+        *store.created.lock() = Some(CreateStreamResponse {
+            r#ref: Some(named.clone()),
+            created: false,
+        });
+        assert_eq!(create().await.unwrap().r#ref, Some(named));
+        let other = StreamRef {
+            id: "other".to_string(),
+            ..Default::default()
+        };
+        for (answer, message) in [
+            (None, "The Store answered a create with no ref"),
+            (
+                Some(other),
+                "The Store answered a create with the ref of another Stream",
+            ),
+        ] {
+            *store.created.lock() = Some(CreateStreamResponse {
+                r#ref: answer,
+                created: true,
+            });
+            let error = create().await.unwrap_err();
+            assert_eq!(error.reason, Reason::StorageCorrupt);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_describe_answer_needs_a_known_status_and_a_bounded_offset() {
+        let (store, runtime) = runtime();
+        let describe = || {
+            runtime.describe_stream(DescribeStreamRequest {
+                r#ref: stream_ref(),
+                ..Default::default()
+            })
+        };
+        // A Stream with no Record has no offset.
+        for status in [
+            StreamStatus::Open,
+            StreamStatus::Closed,
+            StreamStatus::Expired,
+        ] {
+            for last_offset in [vec![], vec![1; MAX_OFFSET_BYTES]] {
+                *store.described.lock() = DescribeStreamResponse {
+                    status: status as i32,
+                    last_offset: last_offset.clone(),
+                };
+                assert_eq!(describe().await.unwrap().last_offset, last_offset);
+            }
+        }
+        let bad = [
+            (
+                StreamStatus::Unspecified as i32,
+                0,
+                "The Store answered a describe with no status".to_string(),
+            ),
+            (
+                99,
+                0,
+                "The Store answered a describe with the unknown status 99".to_string(),
+            ),
+            (
+                StreamStatus::Open as i32,
+                MAX_OFFSET_BYTES + 1,
+                format!(
+                    "The Store gave a last offset of {} bytes, more than {MAX_OFFSET_BYTES}",
+                    MAX_OFFSET_BYTES + 1
+                ),
+            ),
+        ];
+        for (status, length, message) in bad {
+            *store.described.lock() = DescribeStreamResponse {
+                status,
+                last_offset: vec![1; length],
+            };
+            let error = describe().await.unwrap_err();
+            assert_eq!(error.reason, Reason::StorageCorrupt);
+            assert_eq!(error.message, message);
+        }
     }
 }
