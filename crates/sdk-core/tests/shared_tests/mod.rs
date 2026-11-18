@@ -496,11 +496,14 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: b
     }
 
     let task_queue = starter.get_task_queue().to_owned();
+    // The Workflow id has the random part of the task queue, since two runs of this test can
+    // share a namespace, as in the cloud tests.
+    let wf_id = starter.get_wf_id().to_owned();
     let handle = worker
         .submit_workflow(
             CancelWithoutHeartbeatWorkflow::run,
             disable_eager,
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned())
+            WorkflowStartOptions::new(task_queue, wf_id)
                 .run_timeout(Duration::from_secs(10))
                 .build(),
         )

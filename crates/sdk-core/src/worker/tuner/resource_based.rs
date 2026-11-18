@@ -551,7 +551,9 @@ impl RealSysInfoInner {
                 .store(cgroup_limits.total_memory, Ordering::Release);
             // Gate on anonymous memory (`rss`) rather than `memory.current`
             // (`total - free`), which includes reclaimable page cache and can
-            // permanently starve slot admission.
+            // permanently starve slot admission. Swapped-out pages are left out
+            // of `rss` on purpose, since `memory.max` limits only memory in RAM
+            // and swap has its own limit.
             self.cur_mem_usage
                 .store(cgroup_limits.rss, Ordering::Release);
 
