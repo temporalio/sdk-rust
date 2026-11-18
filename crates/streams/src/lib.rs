@@ -5,6 +5,7 @@
 
 pub mod epoch;
 mod error;
+pub mod record;
 
 pub use error::{Reason, StreamError, StreamResult};
 

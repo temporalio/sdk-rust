@@ -16,6 +16,14 @@ by this order, so every Store refuses the same writes. `testdata/epochs.json` ha
 vectors. `examples/gen_vectors.rs` writes them from a second implementation that shares no code
 with the crate. Run it with `cargo run -p temporalio-streams --example gen_vectors`.
 
+## The stored form of a Record
+
+`record::data_record` gives the bytes that a Store keeps for one Record. They have the Producer of
+the Record and its body, and no offset. `record::BatchLimits` has the limits of one batch: its
+Records, its bytes, and the bytes of one Record. The default is `MAX_BATCH_RECORDS`,
+`MAX_BATCH_BYTES` and `MAX_RECORD_BYTES`, and a Store can set less. The sizes are of the stored
+form.
+
 ## Protos
 
 The crate defines no protos. `temporalio-protos` generates them, and `temporalio_streams::proto`
