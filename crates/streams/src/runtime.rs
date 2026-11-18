@@ -10,7 +10,7 @@ use crate::{
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRef,
         StreamStatus, producer::Kind,
     },
-    record::{check_records, data_records},
+    record::{check_bounds, check_records},
     store,
 };
 use std::sync::Arc;
@@ -163,7 +163,7 @@ impl StreamRuntime {
     ) -> StreamResult<AppendRecordsResponse> {
         let producer = append_producer(&request)?;
         // The same bounds hold for every Store, so a batch over them fails here too.
-        data_records(producer, request.records.clone())?;
+        check_bounds(producer, &request.records)?;
         let appended = store::append(self.store.as_ref(), request).await;
         if let Err(error) = &appended
             && error.reason == Reason::Fenced
