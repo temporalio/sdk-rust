@@ -44,49 +44,31 @@ relevant information.
 * [lang-internal] Added the experimental `temporalio-streams` crate. `StreamRuntime` checks each
   Stream call and passes it to a `StreamStore`, which a bridge implements for a Store in its own
   language.
-* [lang-internal] Experimental: Workflow code can read, append and close a Stream directly. A Worker
-  takes its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store name. Lang starts a read
-  with `StartStreamRead`, stops it with `CloseStreamRead`, appends with `AppendToStream`, and closes
-  the Stream with `CloseStream`. The results come in the `ResolveStreamRead`, `ResolveStreamAppend`
-  and `ResolveStreamClose` jobs. Core calls the Store itself and records one `core_stream` marker
-  for each Workflow Task in which Workflow code got a result, which a replay gives back in the same
-  activations. A close takes effect only after the server took the task that asked for it, so its
-  result comes in a later task. The Worker's meter counts these calls, their failures and the
-  Records that reads gave, and records append, close and replay read latencies, as `stream_*`.
-  A graceful shutdown of the Worker waits for each close in flight, for at most 10 s.
-  `StreamRuntimes::with_read_ahead_bytes` sets how many bytes of one read's Records may wait for
-  Workflow code before the read stops asking the Store, 4 MiB by default.
-  A read gives Workflow code what it has as soon as no activation of the run is out, and one page
-  holds at most 256 Records by default. Core gives the Records over it in the next activation,
-  with no wait. `StreamRuntimes::with_read_page_records` sets that cap, from 1 to 1000. Another
-  value fails the build of the `WorkerConfig`. `StreamRuntimes::with_read_min_gap` sets an opt-in
-  least time between two batches of one read from the Store, with no gap by default. A gap over
-  1 s fails the build of the `WorkerConfig`. With a gap, a read gives its first batch
-  immediately, and the Records that come in the gap after a batch come together in the next one,
-  still at most the cap in one page. The end of a read
-  waits at most one gap too. Records over the cap come in the next activation with no gap.
-  Replay gives each page as History has it, also one over the cap, and with no gap.
-  Core refuses a read, an append or a close whose Stream id or Store name has more than 4096 bytes,
-  or a read whose `from_offset` has more than 1024 bytes, which is
-  `temporalio_streams::ids::MAX_OFFSET_BYTES`. Workflow code gets `stream_invalid` in the next
-  activation, also for a close. The refused call reaches no Store and no marker, and a replay
-  refuses it again. A Store answer with a longer offset fails its call with
-  `stream_storage_corrupt`. The message of a Stream failure that Workflow code gets, and that the
-  marker records, is cut at 4096 bytes on a character boundary, with `...` at the end. The rest of
-  one task's marker apart from its Records holds at most 256 KiB. Past it, the task completes with
-  a new one forced, as at a heartbeat, and the results and close intents that didn't fit come in
-  the new task.
-  A read with no `idle_timeout` ends after 1 minute with no Record. A graceful shutdown completes a
-  task that only reads hold open, and a cached run that gets another Worker's events is evicted.
-  That completion forces a new task, with none inline and no sticky queue, so that another Worker
-  resumes the reads. No read starts on a Worker after its shutdown began.
-  With `WorkflowErrorType::StreamReplay`, a replay that can't read its Records fails the Workflow
-  instead of its task, and the marker of one task holds at most 1 MiB of Records.
-  A read, an append or a close whose Store is unavailable is tried again, from 100 ms up to 2 s
-  apart, for 30 s, before Workflow code gets `stream_storage_unavailable`. An append whose Store
-  `sequence` is zero has no dedupe, so it isn't tried again. A replay read retries the same way
-  for 5 s, and if the Store stays down the task fails with `StreamReplayUnavailable`, never the
-  Workflow.
+* [lang-internal] Added experimental Stream calls, so Workflow code can read, append to and close a
+  Stream directly. A Worker takes its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store
+  name. Lang sends `StartStreamRead`, `CloseStreamRead`, `AppendToStream` and `CloseStream`, and
+  gets the results in the `ResolveStreamRead`, `ResolveStreamAppend` and `ResolveStreamClose` jobs.
+* [lang-internal] Core records one `core_stream` marker for each Workflow Task in which Workflow
+  code got a Stream result, and a replay gives those results back in the same activations. A close
+  takes effect only after the server accepted the task that asked for it, so its result comes in a
+  later task.
+* [lang-internal] `StreamRuntimes::with_read_ahead_bytes`, `with_read_page_records` and
+  `with_read_min_gap` set the read-ahead bound of a read (4 MiB by default), the Records in one page
+  (256 by default, from 1 to 1000), and an opt-in minimum gap between batches (at most 1 s). A zero
+  read-ahead, or a value out of range, fails the build of the `WorkerConfig`.
+* [lang-internal] A Stream read with no `idle_timeout` ends after 1 minute with no Record.
+* [lang-internal] Core refuses a Stream call with `stream_invalid` when its Stream id or Store name
+  has more than 4096 bytes, or its `from_offset` has more than 1024 bytes.
+* [lang-internal] Core retries a Stream call for up to 30 s while the Store is unavailable. A replay
+  retries its read for up to 5 s, and then fails the task with `StreamReplayUnavailable`.
+* [lang-internal] With `WorkflowErrorType::StreamReplay`, a replay that can't read or check its
+  Records fails the Workflow instead of its task. That happens after the Stream's Retention passed,
+  for example, or on a Worker with no Stream runtime for the Store.
+* [lang-internal] A graceful shutdown of the Worker waits for each Stream close in flight, for at
+  most 10 s. It also completes a task that only reads hold open, and forces a new task so that
+  another Worker resumes the reads.
+* [lang-internal] The Worker's meter records Stream calls, their failures, the Records that reads
+  return, and the latencies of appends, closes and replay reads, as `stream_*` metrics.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or

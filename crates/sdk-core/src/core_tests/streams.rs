@@ -10,10 +10,10 @@ use crate::{
         WorkerExt, WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker,
         schedule_local_activity_cmd, test_worker_cfg,
     },
-    worker::client::WorkflowTaskCompletion,
     worker::{
         MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES,
         MAX_STORE_NAME_BYTES, STORE_RETRY_BOUND, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
+        client::WorkflowTaskCompletion,
     },
 };
 use futures_util::FutureExt;
@@ -27,36 +27,39 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-use temporalio_common::protos::{
-    constants::STREAM_MARKER_NAME,
-    coresdk::{
-        ActivityTaskCompletion,
-        activity_result::ActivityExecutionResult,
-        common::StreamReadStop,
-        external_data::{
-            StreamAppendEntry, StreamCloseEntry, StreamMarkerData, StreamReadEnded, StreamReadEntry,
+use temporalio_common::{
+    protos::{
+        constants::STREAM_MARKER_NAME,
+        coresdk::{
+            ActivityTaskCompletion,
+            activity_result::ActivityExecutionResult,
+            common::StreamReadStop,
+            external_data::{
+                StreamAppendEntry, StreamCloseEntry, StreamMarkerData, StreamReadEnded,
+                StreamReadEntry,
+            },
+            workflow_activation::{
+                ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, WorkflowActivation,
+                resolve_stream_append, workflow_activation_job,
+            },
+            workflow_commands::{
+                ActivityCancellationType, AppendToStream, CloseStream, CloseStreamRead,
+                CompleteWorkflowExecution, StartStreamRead, StartTimer, UpdateResponse,
+                update_response, workflow_command,
+            },
+            workflow_completion::WorkflowActivationCompletion,
         },
-        workflow_activation::{
-            ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, WorkflowActivation,
-            resolve_stream_append, workflow_activation_job,
+        temporal::api::{
+            command::v1::command::Attributes,
+            common::v1::{Payload, Payloads},
+            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+            history::v1::MarkerRecordedEventAttributes,
+            workflowservice::v1::RespondWorkflowTaskCompletedResponse,
         },
-        workflow_commands::{
-            ActivityCancellationType, AppendToStream, CloseStream, CloseStreamRead,
-            CompleteWorkflowExecution, StartStreamRead, StartTimer, UpdateResponse,
-            update_response, workflow_command,
-        },
-        workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::{
-        command::v1::command::Attributes,
-        common::v1::{Payload, Payloads},
-        enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
-        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
-        history::v1::MarkerRecordedEventAttributes,
-        workflowservice::v1::RespondWorkflowTaskCompletedResponse,
-    },
+    worker::WorkerTaskTypes,
 };
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_streams::{
     Reason, StreamError, StreamResult, StreamRuntime, StreamStore,
     digest::records_digest,
