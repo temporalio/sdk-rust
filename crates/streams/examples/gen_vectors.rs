@@ -1,19 +1,16 @@
-//! Writes the shared test vectors of the Stream runtime to `testdata/`.
+//! Writes the golden vectors of the epoch keys to `testdata/epochs.json`.
 //!
-//! This is a second implementation of the layout. It calls none of the crate's own code for ids,
-//! offsets, epochs, fields or digests, so the crate's tests check that code against values it did
-//! not compute. The crate's README says which side reads each file. Run it from any directory:
+//! This is a second implementation of the key layout. It calls none of the crate's own code, so
+//! the crate's test checks `epoch_key` against values it did not compute. Run it from any
+//! directory:
 //!
 //! ```text
 //! cargo run -p temporalio-streams --example gen_vectors
 //! ```
 
-use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
-const SEQ_BITS: u32 = 20;
-
-/// A JSON value that keeps the order of its keys, so the files do not depend on a map type.
+/// A JSON value that keeps the order of its keys, so the file does not depend on a map type.
 enum Json {
     Str(String),
     Int(i128),
@@ -80,7 +77,7 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
-/// Escapes as the readers of the files need, and leaves non-ASCII text as it is.
+/// Escapes as the readers of the file need, and leaves non-ASCII text as it is.
 fn quote_json(out: &mut String, text: &str) {
     out.push('"');
     for ch in text.chars() {
@@ -101,68 +98,6 @@ fn quote_json(out: &mut String, text: &str) {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Percent-encodes every byte but ASCII letters, digits and `_.-~`.
-fn part(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"_.-~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
-fn ids() -> Json {
-    let cases = [
-        ("temporal-streams", "agent-1:run-1:turn-3"),
-        ("p:x", "a%3Ab%2Fc:r%251:%C3%A9%20name"),
-        ("temporal-streams", "{x}:a|b é"),
-    ];
-    // A Stream id is opaque, so the keys take its bytes, whatever they hold.
-    let streams = cases
-        .iter()
-        .map(|(prefix, stream_id)| {
-            let base = format!("{}:{{{}}}", part(prefix), part(stream_id));
-            Json::Obj(vec![
-                ("prefix", Json::str(*prefix)),
-                ("stream_id", Json::str(*stream_id)),
-                ("meta", Json::str(format!("{base}:meta"))),
-                ("log", Json::str(format!("{base}:log"))),
-                ("closed", Json::str(format!("{base}:closed"))),
-            ])
-        })
-        .collect();
-    Json::Obj(vec![("streams", Json::Arr(streams))])
-}
-
-fn offsets() -> Json {
-    let ids = [
-        "0-1",
-        "1-0",
-        "1700000000000-0",
-        "1700000000000-7",
-        "1760000000123-1048575",
-    ];
-    Json::Arr(
-        ids.iter()
-            .map(|entry_id| {
-                let (ms, seq) = split_entry_id(entry_id);
-                Json::Obj(vec![
-                    ("entry_id", Json::str(*entry_id)),
-                    ("offset", Json::int((ms << SEQ_BITS) | seq)),
-                ])
-            })
-            .collect(),
-    )
-}
-
-fn split_entry_id(text: &str) -> (u64, u64) {
-    let (ms, seq) = text.split_once('-').expect("an entry id has a dash");
-    (ms.parse().unwrap(), seq.parse().unwrap())
 }
 
 /// The fields of an epoch that a case sets. The rest are zero.
@@ -267,228 +202,7 @@ fn epochs() -> Json {
     )
 }
 
-/// An entry id in a Producer field, the ms in 8 bytes and the seq in 4, zero for none.
-fn entry_id(text: &str) -> Vec<u8> {
-    if text.is_empty() {
-        return vec![0; 12];
-    }
-    let (ms, seq) = split_entry_id(text);
-    let mut out = ms.to_be_bytes().to_vec();
-    out.extend((seq as u32).to_be_bytes());
-    out
-}
-
-fn producer_values() -> Json {
-    let with_records = Epoch {
-        attempt_scheduled_time: Some((1760000001, 999999999)),
-        attempt: Some(2),
-        ..Epoch::default()
-    };
-    let empty = Epoch {
-        attempt_scheduled_time: Some((1760000002, 0)),
-        attempt: Some(3),
-        ..Epoch::default()
-    };
-    let cases = [
-        (
-            "a batch with Records",
-            with_records.key(),
-            3u64,
-            "1760000000123-4",
-            "1760000000123-6",
-            vec![Record {
-                data: Some(vec![1]),
-                ..Record::default()
-            }],
-        ),
-        (
-            "an empty batch that wrote no entry",
-            empty.key(),
-            1,
-            "",
-            "",
-            vec![],
-        ),
-    ];
-    Json::Arr(
-        cases
-            .iter()
-            .map(|(name, fence, sequence, first, last, records)| {
-                let batch_digest = digest(records);
-                // The 88 bytes of a `p|` field.
-                let mut value = fence.clone();
-                value.extend(sequence.to_be_bytes());
-                value.extend(entry_id(first));
-                value.extend(entry_id(last));
-                value.extend(&batch_digest);
-                Json::Obj(vec![
-                    ("name", Json::str(*name)),
-                    ("fence", Json::str(hex(fence))),
-                    ("sequence", Json::int(*sequence)),
-                    ("first", Json::str(*first)),
-                    ("last", Json::str(*last)),
-                    ("digest", Json::str(hex(&batch_digest))),
-                    ("value", Json::str(hex(&value))),
-                ])
-            })
-            .collect(),
-    )
-}
-
-fn fields() -> Json {
-    // A Producer id is opaque, so its field name takes the bytes, also a separator in them.
-    let producer = "ingest|eu:1 é";
-    Json::Obj(vec![
-        ("kind", Json::int(3)),
-        ("producer_id", Json::str(producer)),
-        ("producer", Json::str(format!("p|3|{producer}"))),
-        ("producer_values", producer_values()),
-    ])
-}
-
-/// A Record of a batch. A key that a case leaves out is `None`, which is not the same as empty.
-#[derive(Default)]
-struct Record {
-    metadata: Option<Vec<(&'static str, Vec<u8>)>>,
-    data: Option<Vec<u8>>,
-    external_payloads: Option<Vec<i64>>,
-}
-
-impl Record {
-    fn json(&self) -> Json {
-        let mut fields = Vec::new();
-        if let Some(metadata) = &self.metadata {
-            let entries = metadata
-                .iter()
-                .map(|(key, value)| (*key, Json::str(hex(value))))
-                .collect();
-            fields.push(("metadata", Json::Obj(entries)));
-        }
-        if let Some(data) = &self.data {
-            fields.push(("data", Json::str(hex(data))));
-        }
-        if let Some(sizes) = &self.external_payloads {
-            let sizes = sizes.iter().map(|size| Json::int(*size)).collect();
-            fields.push(("external_payloads", Json::Arr(sizes)));
-        }
-        Json::Obj(fields)
-    }
-}
-
-/// The content digest of a batch, which a dedupe entry keeps, as the first 16 bytes of the
-/// SHA-256.
-fn digest(records: &[Record]) -> Vec<u8> {
-    let mut out = Sha256::new();
-    let part = |out: &mut Sha256, data: &[u8]| {
-        out.update((data.len() as u64).to_be_bytes());
-        out.update(data);
-    };
-    for record in records {
-        // A Record with none of these keys has no body.
-        if record.metadata.is_none() && record.data.is_none() && record.external_payloads.is_none()
-        {
-            out.update([0u8]);
-            continue;
-        }
-        out.update([1u8]);
-        let mut metadata: Vec<(&[u8], &[u8])> = record
-            .metadata
-            .iter()
-            .flatten()
-            .map(|(key, value)| (key.as_bytes(), value.as_slice()))
-            .collect();
-        metadata.sort();
-        out.update((metadata.len() as u64).to_be_bytes());
-        for (key, value) in metadata {
-            part(&mut out, key);
-            part(&mut out, value);
-        }
-        part(&mut out, record.data.as_deref().unwrap_or(&[]));
-        let external = record.external_payloads.as_deref().unwrap_or(&[]);
-        out.update((external.len() as u64).to_be_bytes());
-        for size in external {
-            out.update(size.to_be_bytes());
-        }
-    }
-    out.finalize()[..16].to_vec()
-}
-
-fn digests() -> Json {
-    let data = |bytes: &[u8]| Record {
-        data: Some(bytes.to_vec()),
-        ..Record::default()
-    };
-    let cases = [
-        ("empty batch", vec![]),
-        ("one record, no body", vec![Record::default()]),
-        ("one record, an empty body", vec![data(b"")]),
-        ("one record", vec![data(b"hello")]),
-        (
-            "metadata in key order",
-            vec![Record {
-                metadata: Some(vec![
-                    ("encoding", b"json/plain".to_vec()),
-                    ("a", vec![0x00, 0xff]),
-                ]),
-                data: Some(br#"{"x":1}"#.to_vec()),
-                ..Record::default()
-            }],
-        ),
-        ("two records", vec![data(&[1]), data(&[2, 3])]),
-        (
-            "external payloads",
-            vec![Record {
-                data: Some(vec![1]),
-                external_payloads: Some(vec![10, 20]),
-                ..Record::default()
-            }],
-        ),
-        // The length prefixes give these two different digests, though their joined bytes are equal.
-        (
-            "metadata key and value split one way",
-            vec![Record {
-                metadata: Some(vec![("ab", b"c".to_vec())]),
-                ..Record::default()
-            }],
-        ),
-        (
-            "metadata key and value split another way",
-            vec![Record {
-                metadata: Some(vec![("a", b"bc".to_vec())]),
-                ..Record::default()
-            }],
-        ),
-    ];
-    let sums: Vec<Vec<u8>> = cases.iter().map(|(_, records)| digest(records)).collect();
-    assert_ne!(sums[sums.len() - 1], sums[sums.len() - 2]);
-    assert_ne!(sums[1], sums[2]);
-    Json::Arr(
-        cases
-            .iter()
-            .zip(&sums)
-            .map(|((name, records), sum)| {
-                Json::Obj(vec![
-                    ("name", Json::str(*name)),
-                    (
-                        "records",
-                        Json::Arr(records.iter().map(Record::json).collect()),
-                    ),
-                    ("digest", Json::str(hex(sum))),
-                ])
-            })
-            .collect(),
-    )
-}
-
 fn main() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
-    for (name, value) in [
-        ("ids.json", ids()),
-        ("offsets.json", offsets()),
-        ("epochs.json", epochs()),
-        ("fields.json", fields()),
-        ("digests.json", digests()),
-    ] {
-        fs::write(dir.join(name), value.pretty()).unwrap();
-    }
+    fs::write(dir.join("epochs.json"), epochs().pretty()).unwrap();
 }

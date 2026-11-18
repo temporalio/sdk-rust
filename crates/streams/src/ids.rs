@@ -1,16 +1,5 @@
-//! The checks of Stream ids and Producers, and the Redis key layout. A caller builds both kinds of
-//! id, so the crate treats each as opaque text. `testdata/ids.json` has the shared vectors of the
-//! key layout.
-//!
-//! ```text
-//! <prefix>:{<stream id>}:meta     the create key, the fence, dedupe and close state
-//! <prefix>:{<stream id>}:log      the log, one entry per Record
-//! <prefix>:{<stream id>}:closed   the entry that a close adds, which wakes a waiting read
-//! ```
-//!
-//! A key has no Temporal namespace, so a Stream id is unique in one Store and key prefix. The part
-//! in braces is the Redis Cluster hash tag, so that the keys are in one slot for one script. Each
-//! part is percent-encoded, so a `:` or a brace in an id can't make two Streams share a key.
+//! The checks of Stream ids and Producers. A caller builds both kinds of id, so the crate treats
+//! each as opaque text.
 
 use crate::{
     StreamError, StreamResult,
@@ -21,28 +10,17 @@ use crate::{
 /// The longest Stream id, in bytes.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
 
+/// The longest offset, in bytes, that a caller may give or a Store may give back. An offset is
+/// opaque to a caller, and a Worker records the offsets of its calls in History, so an offset of
+/// any size could make a History event of any size.
+pub const MAX_OFFSET_BYTES: usize = 1024;
+
 /// The longest Producer id, in bytes. A caller builds the id from names that Temporal limits to
-/// 1000 characters, so an id with two of them still fits. A Store keeps the id in one meta field of
-/// each Producer for as long as the Stream lives. Each Record of a batch holds its Producer, so the
-/// size check counts the Producer once for each Record against
-/// [MAX_BATCH_BYTES](crate::store::MAX_BATCH_BYTES).
+/// 1000 characters, so an id with two of them still fits. A Store keeps the id of each Producer for
+/// as long as the Stream lives. Each Record of a batch holds its Producer, so the size check counts
+/// the Producer once for each Record against
+/// [MAX_BATCH_BYTES](crate::record::MAX_BATCH_BYTES).
 pub const MAX_PRODUCER_ID_BYTES: usize = 4096;
-
-/// The key prefix when the Store options set none.
-pub const DEFAULT_KEY_PREFIX: &str = "temporal-streams";
-
-/// Percent-encodes every byte but the unreserved ones, so an id never holds a key separator.
-pub fn encode_part(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
 
 /// Refuses an empty or too long Stream id.
 pub fn check_stream_id(id: &str) -> StreamResult<()> {
@@ -141,37 +119,6 @@ pub fn check_required(producer: &Producer) -> StreamResult<()> {
         }
         Some(Kind::Client(_)) => Ok(()),
         None => missing("kind"),
-    }
-}
-
-/// The keys of one Stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamKeys {
-    base: String,
-}
-
-impl StreamKeys {
-    /// The keys of `stream_id` under `prefix`.
-    pub fn new(prefix: &str, stream_id: &str) -> Self {
-        Self {
-            base: format!("{}:{{{}}}", encode_part(prefix), encode_part(stream_id)),
-        }
-    }
-
-    /// The hash with the format version, the fence, dedupe and close state.
-    pub fn meta(&self) -> String {
-        format!("{}:meta", self.base)
-    }
-
-    /// The log.
-    pub fn log(&self) -> String {
-        format!("{}:log", self.base)
-    }
-
-    /// The key that a close adds one entry to. A close writes no log entry, so a waiting read also
-    /// waits on this key, and the close wakes it.
-    pub fn closed(&self) -> String {
-        format!("{}:closed", self.base)
     }
 }
 

@@ -3,28 +3,23 @@
 //! The Stream runtime of Temporal SDKs. It is experimental.
 //!
 //! The crate serves the five operations of the Stream service on a Stream Store. A lang bridge
-//! builds the runtime and calls it with an operation name and the encoded request. A Store is a
-//! [store::Store] of log calls, or an [operations::OperationStore] that answers whole operations.
+//! builds the runtime and calls it with an operation name and the encoded request. A Store is an
+//! [operations::OperationStore] that answers whole operations.
 
-pub mod digest;
 mod dispatch;
 pub mod epoch;
 mod error;
 pub mod ids;
-pub mod memory;
 mod metrics;
-pub mod offset;
 pub mod operations;
-mod read;
-mod record;
+pub mod record;
 mod runtime;
-pub mod store;
-#[cfg(any(test, feature = "test-support"))]
-pub mod testing;
+#[cfg(test)]
+mod test_store;
 
 pub use error::{Reason, StreamError, StreamResult};
-pub use read::MAX_WAIT;
-pub use runtime::{MemoryStreamOptions, MemoryStreamRuntime, StreamRuntime};
+pub use operations::MAX_WAIT;
+pub use runtime::{MAX_SEQUENCE, StreamRuntime};
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.

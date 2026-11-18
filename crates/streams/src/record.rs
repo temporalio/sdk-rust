@@ -1,14 +1,21 @@
-//! The stored Records of a batch.
+//! The stored Records of a batch, and the bounds that measure them.
 
 use crate::{
     Reason, StreamError, StreamResult,
     proto::{AppendRecord, Producer, StreamRecord},
-    store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
 };
 use prost::Message;
 
+/// The maximum size of a stored Record, in bytes.
+pub const MAX_RECORD_BYTES: usize = 1536 * 1024;
+/// The maximum size of a stored append, in bytes.
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// The maximum number of Records in an append. Many small Records fit under [MAX_BATCH_BYTES], but
+/// they keep a Store busy for long.
+pub const MAX_BATCH_RECORDS: usize = 1000;
+
 /// One stored data Record. It has no offset, since the Store gives the entry its offset.
-pub(crate) fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
+pub fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
     StreamRecord {
         producer: Some(producer.clone()),
         body: record.body,
@@ -18,7 +25,7 @@ pub(crate) fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> 
 }
 
 /// Refuses a batch with a Record that has no body, before the Store.
-pub(crate) fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
+pub fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
     match records.iter().position(|record| record.body.is_none()) {
         Some(at) => Err(StreamError::invalid(format!(
             "Record {at} of the batch has no body"
@@ -27,12 +34,9 @@ pub(crate) fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
     }
 }
 
-/// The stored Records of one batch from outside Workflow code. A batch over the Store's limits
-/// fails, since the crate doesn't split a batch it didn't build.
-pub(crate) fn data_records(
-    producer: &Producer,
-    records: Vec<AppendRecord>,
-) -> StreamResult<Vec<Vec<u8>>> {
+/// The stored Records of one batch. A batch over [MAX_BATCH_RECORDS], [MAX_RECORD_BYTES] or
+/// [MAX_BATCH_BYTES] fails with [Reason::TooLarge].
+pub fn data_records(producer: &Producer, records: Vec<AppendRecord>) -> StreamResult<Vec<Vec<u8>>> {
     if records.len() > MAX_BATCH_RECORDS {
         return Err(StreamError::new(
             Reason::TooLarge,

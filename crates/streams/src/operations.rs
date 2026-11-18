@@ -1,23 +1,27 @@
-//! A Store that answers whole Stream operations, such as a Store that a user of a lang SDK writes
-//! in that language. Such a Store keeps its own log and offsets, so the runtime can't call the log
-//! calls of [crate::store::Store] on it.
+//! The Store of the Stream runtime, which answers whole Stream operations. It keeps its own log and
+//! offsets, and it applies the rules of the Stream service itself.
 
 use crate::{
     StreamError, StreamResult,
     ids::MAX_OFFSET_BYTES,
+    metrics::Metrics,
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         ReadRecordsRequest, ReadRecordsResponse,
     },
-    read::{MAX_RECORDS, max_bytes},
-    runtime::duration,
 };
 use prost::Message;
+use std::time::Duration;
+
+/// The longest wait of one read for new Records.
+pub const MAX_WAIT: Duration = Duration::from_secs(60);
+/// The maximum number of Records in one read.
+pub const MAX_RECORDS: usize = 1000;
 
 /// The five operations of the Stream service, each answered whole. A runtime that
-/// [crate::StreamRuntime::with_operations] builds checks each request as it does for a
-/// [crate::store::Store] before the call, and each answer after it.
+/// [crate::StreamRuntime::with_operations] builds checks each request before the call, and each
+/// answer after it.
 ///
 /// The Store applies the rules of the Stream service itself. An append fences a lower epoch of its
 /// Producer and takes a resend of the same Producer, epoch and `sequence` once. A read waits up to
@@ -79,9 +83,26 @@ fn store_offset(offset: &[u8]) -> StreamResult<()> {
     Ok(())
 }
 
-/// Reads one page, with the caps and the longest wait of a read on a [crate::store::Store].
+/// A proto Duration as a `Duration`, `None` when it is unset, zero or negative.
+fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
+    let value = value?;
+    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
+    (!duration.is_zero()).then_some(duration)
+}
+
+/// The byte cap of a page, from a request's `max_bytes`. Zero is no cap.
+fn max_bytes(value: i64) -> StreamResult<usize> {
+    match value {
+        0 => Ok(usize::MAX),
+        n if n < 0 => Err(StreamError::invalid("max_bytes must be 0 or more")),
+        n => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+    }
+}
+
+/// Reads one page, with the caps and the longest wait of a read.
 pub(crate) async fn read(
     store: &dyn OperationStore,
+    metrics: &Metrics,
     mut request: ReadRecordsRequest,
 ) -> StreamResult<ReadRecordsResponse> {
     caller_offset(&request.from_offset)?;
@@ -92,9 +113,14 @@ pub(crate) async fn read(
     };
     request.max_records = max as i32;
     request.wait = duration(request.wait)
-        .map(|wait| wait.min(crate::MAX_WAIT))
+        .map(|wait| wait.min(MAX_WAIT))
         .and_then(|wait| prost_types::Duration::try_from(wait).ok());
-    let response = store.read_records(request).await?;
+    let response = {
+        // The Store holds a read for up to its `wait`. The guard counts the read down again when
+        // the Store answers and when the read's future is dropped.
+        let _waiting = metrics.read_waiting();
+        store.read_records(request).await?
+    };
     fit_page(response, max, max_bytes)
 }
 
@@ -151,82 +177,26 @@ pub(crate) async fn append(
 mod tests {
     use super::*;
     use crate::{
-        Reason, StreamRuntime,
+        Reason,
         proto::{
             AppendRecord, Producer, StreamRecord, StreamRef, WorkflowProducer, WorkflowTaskEpoch,
             producer::Kind,
         },
+        test_store::runtime,
     };
-    use parking_lot::Mutex;
-    use std::sync::Arc;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
 
-    /// A Store that keeps the requests it got and gives the answers that a test set.
-    #[derive(Default)]
-    struct Scripted {
-        reads: Mutex<Vec<ReadRecordsRequest>>,
-        appends: Mutex<Vec<AppendRecordsRequest>>,
-        page: Mutex<ReadRecordsResponse>,
-        appended: Mutex<AppendRecordsResponse>,
-        error: Mutex<Option<StreamError>>,
-    }
-
-    impl Scripted {
-        fn answer<T>(&self, value: T) -> StreamResult<T> {
-            match self.error.lock().clone() {
-                Some(error) => Err(error),
-                None => Ok(value),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl OperationStore for Scripted {
-        async fn create_stream(
-            &self,
-            request: CreateStreamRequest,
-        ) -> StreamResult<CreateStreamResponse> {
-            self.answer(CreateStreamResponse {
-                r#ref: request.stream_ref,
-                created: true,
-            })
-        }
-
-        async fn append_records(
-            &self,
-            request: AppendRecordsRequest,
-        ) -> StreamResult<AppendRecordsResponse> {
-            self.appends.lock().push(request);
-            self.answer(self.appended.lock().clone())
-        }
-
-        async fn read_records(
-            &self,
-            request: ReadRecordsRequest,
-        ) -> StreamResult<ReadRecordsResponse> {
-            self.reads.lock().push(request);
-            self.answer(self.page.lock().clone())
-        }
-
-        async fn close_stream(
-            &self,
-            _request: CloseStreamRequest,
-        ) -> StreamResult<CloseStreamResponse> {
-            self.answer(CloseStreamResponse {})
-        }
-
-        async fn describe_stream(
-            &self,
-            _request: DescribeStreamRequest,
-        ) -> StreamResult<DescribeStreamResponse> {
-            self.answer(DescribeStreamResponse::default())
-        }
-    }
-
-    fn runtime() -> (Arc<Scripted>, Arc<StreamRuntime>) {
-        let store = Arc::new(Scripted::default());
-        let runtime = StreamRuntime::with_operations("py", store.clone(), None);
-        (store, runtime)
+    #[test]
+    fn a_zero_or_negative_duration_is_unset_and_a_huge_one_stays() {
+        let proto = |seconds, nanos| Some(prost_types::Duration { seconds, nanos });
+        assert_eq!(duration(None), None);
+        assert_eq!(duration(proto(0, 0)), None);
+        assert_eq!(duration(proto(-5, 0)), None);
+        assert_eq!(duration(proto(0, -5)), None);
+        assert_eq!(
+            duration(proto(i64::MAX, 999_999_999)),
+            Some(Duration::new(i64::MAX as u64, 999_999_999))
+        );
     }
 
     fn stream_ref() -> Option<StreamRef> {
@@ -294,7 +264,7 @@ mod tests {
         // An offset is opaque to the runtime, so one of any length up to the bound passes.
         assert_eq!(sent.from_offset, vec![9; 20]);
         assert_eq!(sent.max_records, MAX_RECORDS as i32);
-        assert_eq!(duration(sent.wait), Some(crate::MAX_WAIT));
+        assert_eq!(duration(sent.wait), Some(MAX_WAIT));
     }
 
     #[tokio::test]

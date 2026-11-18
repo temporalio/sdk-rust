@@ -2,76 +2,49 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    digest::batch_digest,
     ids::{check_producer, check_required, check_stream_id},
-    memory::MemoryStore,
     metrics::Metrics,
-    offset::offset_to_wire,
     operations::{self, OperationStore},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, StreamIdConflictPolicy, StreamRef, StreamStatus, producer::Kind,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy, StreamRef,
+        producer::Kind,
     },
     record::{check_records, data_records},
-    store::{
-        Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, DEFAULT_RETENTION,
-        MAX_SEQUENCE, Store,
-    },
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use temporalio_common::telemetry::metrics::TemporalMeter;
+
+/// The highest batch `sequence`. A Store that keeps numbers as 64-bit floats holds an integer
+/// exactly up to this value.
+pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 
 /// The Stream runtime on one Store. It serves the five Stream service operations. A Store has no
 /// namespaces, so the runtime ignores a request's `namespace`. The SDK sets it, and only the
 /// server reads it.
 ///
 /// A bridge builds one for each client with a Stream Store, and that client's Workers share it.
-/// A Store crate, such as `temporalio-streams-redis`, builds it with its own Store. A bridge builds
-/// one with [StreamRuntime::with_operations] for a Store that lang's user wrote.
 pub struct StreamRuntime {
-    /// The name of the Store, which the refs that the runtime builds carry.
-    store_name: String,
-    pub(crate) backing: Backing,
-    pub(crate) metrics: Metrics,
-}
-
-/// The Store that a runtime calls.
-pub(crate) enum Backing {
-    /// A Store of log calls, whose rules the runtime applies.
-    Log(Arc<dyn Store>),
-    /// A Store that answers whole operations and applies the rules itself.
-    Operations(Arc<dyn OperationStore>),
+    store: Arc<dyn OperationStore>,
+    metrics: Metrics,
 }
 
 impl std::fmt::Debug for StreamRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamRuntime")
-            .field("store_name", &self.store_name)
-            .finish_non_exhaustive()
+        f.debug_struct("StreamRuntime").finish_non_exhaustive()
     }
 }
 
-pub(crate) fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
-    let value = value?;
-    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
-    (!duration.is_zero()).then_some(duration)
+/// Refuses a conflict policy that the Stream service doesn't know. The Store applies the policy,
+/// and takes an unspecified one as FAIL, as for a Workflow start.
+fn check_conflict_policy(value: i32) -> StreamResult<()> {
+    StreamIdConflictPolicy::try_from(value)
+        .map(drop)
+        .map_err(|_| StreamError::invalid(format!("The conflict policy {value} is unknown")))
 }
 
-/// The conflict policy of a create. Unspecified is FAIL, as for a Workflow start.
-fn conflict_policy(value: i32) -> StreamResult<ConflictPolicy> {
-    match StreamIdConflictPolicy::try_from(value) {
-        Ok(StreamIdConflictPolicy::Unspecified | StreamIdConflictPolicy::Fail) => {
-            Ok(ConflictPolicy::Fail)
-        }
-        Ok(StreamIdConflictPolicy::UseExisting) => Ok(ConflictPolicy::UseExisting),
-        Err(_) => Err(StreamError::invalid(format!(
-            "The conflict policy {value} is unknown"
-        ))),
-    }
-}
-
-pub(crate) fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
+fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
     let id = stream_ref
         .map(|stream_ref| stream_ref.id.as_str())
         .unwrap_or_default();
@@ -81,7 +54,7 @@ pub(crate) fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
 
 /// Checks the Producer of a close. Any kind may close, and a Workflow closes with its Workflow
 /// Task as the epoch, as it appends.
-fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
+fn check_close_producer(producer: Option<&Producer>) -> StreamResult<()> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
     // With no epoch, a close from a failed Workflow Task would pass the fence.
@@ -92,11 +65,10 @@ fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
             "A close from a Workflow needs the Workflow Task as its epoch",
         ));
     }
-    check_required(producer)?;
-    Ok(producer)
+    check_required(producer)
 }
 
-/// Checks an append before any Store sees it, and gives its Producer.
+/// Checks an append before the Store sees it, and gives its Producer.
 fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
     stream_id(request.r#ref.as_ref())?;
     let producer = request
@@ -122,82 +94,20 @@ fn append_producer(request: &AppendRecordsRequest) -> StreamResult<&Producer> {
     Ok(producer)
 }
 
-/// Appends a batch that [append_producer] checked to a Store of log calls.
-async fn append_to_log(
-    store: &dyn Store,
-    request: AppendRecordsRequest,
-) -> StreamResult<AppendRecordsResponse> {
-    let AppendRecordsRequest {
-        r#ref,
-        producer,
-        sequence,
-        records,
-        ..
-    } = request;
-    let stream = r#ref.unwrap_or_default();
-    let producer = producer.unwrap_or_default();
-    // Without the fence, a stale batch would reach Readers.
-    let capabilities = store.capabilities();
-    capabilities.require(Capabilities::PRODUCER_FENCE)?;
-    if sequence == 0 {
-        // Only the Store can number the batch in the same step as its dedupe check.
-        capabilities.require(Capabilities::NEXT_SEQUENCE)?;
-    }
-    let digest = batch_digest(&records);
-    let records = data_records(&producer, records)?;
-    let batch = Batch {
-        producer: &producer,
-        sequence,
-        records: &records,
-        digest,
-    };
-    // An empty batch has no offset, which is the empty wire value.
-    let (first_offset, last_offset) = store
-        .append(&stream, &batch)
-        .await?
-        .offsets
-        .unwrap_or_default();
-    Ok(AppendRecordsResponse {
-        first_offset: offset_to_wire(first_offset),
-        last_offset: offset_to_wire(last_offset),
-    })
-}
-
 impl StreamRuntime {
-    /// Builds a runtime on `store`. `store_name` is the name that lang registered the Store under,
-    /// which the refs that the runtime builds carry. The runtime records metrics on `meter`, lang's
-    /// runtime meter, if set. A Store that connects later, such as a [crate::store::LazyStore],
-    /// lets a bridge build the runtime with no async runtime.
-    pub fn new(
-        store_name: impl Into<String>,
-        store: Arc<dyn Store>,
-        meter: Option<TemporalMeter>,
-    ) -> Arc<Self> {
-        Self::build(store_name, Backing::Log(store), meter)
-    }
-
     /// Builds a runtime on a Store that answers whole operations, such as one that a user of a
-    /// lang SDK wrote in that language. The runtime checks each request as it does for a [Store],
-    /// with the same bounds on ids, Producers, Records and offsets. It caps each page by the
-    /// request's `max_records` and `max_bytes`, and fails an answer with a bad offset with
-    /// [Reason::StorageCorrupt].
+    /// lang SDK wrote in that language. The runtime checks each request before the Store sees it,
+    /// and each answer after it, with the same bounds on ids, Producers, Records and offsets for
+    /// every Store. It caps each page by the request's `max_records` and `max_bytes`, and fails an
+    /// answer with a bad offset with [Reason::StorageCorrupt]. The runtime records metrics on
+    /// `meter`, lang's runtime meter, if set.
     pub fn with_operations(
-        store_name: impl Into<String>,
         store: Arc<dyn OperationStore>,
-        meter: Option<TemporalMeter>,
-    ) -> Arc<Self> {
-        Self::build(store_name, Backing::Operations(store), meter)
-    }
-
-    fn build(
-        store_name: impl Into<String>,
-        backing: Backing,
         meter: Option<TemporalMeter>,
     ) -> Arc<Self> {
         let meter = meter.unwrap_or_else(TemporalMeter::no_op);
         Arc::new(Self {
-            store_name: store_name.into(),
-            backing,
+            store,
             metrics: Metrics::new(&meter),
         })
     }
@@ -208,26 +118,8 @@ impl StreamRuntime {
         request: CreateStreamRequest,
     ) -> StreamResult<CreateStreamResponse> {
         stream_id(request.stream_ref.as_ref())?;
-        let conflict = conflict_policy(request.id_conflict_policy)?;
-        let store = match &self.backing {
-            Backing::Log(store) => store,
-            Backing::Operations(store) => return store.create_stream(request).await,
-        };
-        let stream = request.stream_ref.clone().unwrap_or_default();
-        // The Store config holds the Retention, so a create takes the Store default.
-        let create = Create {
-            retention: None,
-            conflict,
-            request_id: &request.request_id,
-        };
-        let created = store.create(&stream, &create).await?;
-        Ok(CreateStreamResponse {
-            r#ref: Some(StreamRef {
-                id: stream.id,
-                store: self.store_name.clone(),
-            }),
-            created: created.outcome == CreateOutcome::Created,
-        })
+        check_conflict_policy(request.id_conflict_policy)?;
+        self.store.create_stream(request).await
     }
 
     /// Appends one batch as one Producer. A Workflow Producer appends with its Workflow Task as the
@@ -237,14 +129,9 @@ impl StreamRuntime {
         request: AppendRecordsRequest,
     ) -> StreamResult<AppendRecordsResponse> {
         let producer = append_producer(&request)?;
-        let appended = match &self.backing {
-            Backing::Log(store) => append_to_log(store.as_ref(), request).await,
-            Backing::Operations(store) => {
-                // The same bounds hold for every Store, so a batch over them fails here too.
-                data_records(producer, request.records.clone())?;
-                operations::append(store.as_ref(), request).await
-            }
-        };
+        // The same bounds hold for every Store, so a batch over them fails here too.
+        data_records(producer, request.records.clone())?;
+        let appended = operations::append(self.store.as_ref(), request).await;
         if let Err(error) = &appended
             && error.reason == Reason::Fenced
         {
@@ -253,21 +140,25 @@ impl StreamRuntime {
         appended
     }
 
+    /// Reads one page after `from_offset`. The Store waits up to the request's `wait` for a Record
+    /// when it has none to give, and the metric `stream_blocking_reads_waiting` counts the read for
+    /// that time.
+    pub async fn read_records(
+        &self,
+        request: ReadRecordsRequest,
+    ) -> StreamResult<ReadRecordsResponse> {
+        stream_id(request.r#ref.as_ref())?;
+        operations::read(self.store.as_ref(), &self.metrics, request).await
+    }
+
     /// Closes a Stream. Its readers drain what is left, and later appends fail.
     pub async fn close_stream(
         &self,
         request: CloseStreamRequest,
     ) -> StreamResult<CloseStreamResponse> {
         stream_id(request.r#ref.as_ref())?;
-        let producer = close_producer(request.producer.as_ref())?;
-        let store = match &self.backing {
-            Backing::Log(store) => store,
-            Backing::Operations(store) => return store.close_stream(request).await,
-        };
-        let stream = request.r#ref.clone().unwrap_or_default();
-        store.capabilities().require(Capabilities::CLOSE)?;
-        store.close(&stream, producer).await?;
-        Ok(CloseStreamResponse {})
+        check_close_producer(request.producer.as_ref())?;
+        self.store.close_stream(request).await
     }
 
     /// Gets the status and the newest offset of a Stream.
@@ -276,80 +167,281 @@ impl StreamRuntime {
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse> {
         stream_id(request.r#ref.as_ref())?;
-        let store = match &self.backing {
-            Backing::Log(store) => store,
-            Backing::Operations(store) => return store.describe_stream(request).await,
-        };
-        let stream = request.r#ref.clone().unwrap_or_default();
-        let (state, _) = store.read(&stream, 0, 0).await?;
-        if !state.exists {
-            return Err(StreamError::new(
-                Reason::NotFound,
-                "Nobody created the Stream",
-            ));
-        }
-        // A closed Stream that expired has lost its log, and every read fails.
-        let status = if state.expired() {
-            StreamStatus::Expired
-        } else if state.closed {
-            StreamStatus::Closed
-        } else {
-            StreamStatus::Open
-        };
-        Ok(DescribeStreamResponse {
-            status: status as i32,
-            last_offset: offset_to_wire(state.newest),
-        })
-    }
-}
-
-/// The settings of the memory Store runtime. A field left `None` takes its default.
-#[derive(Clone, Debug, Default)]
-pub struct MemoryStreamOptions {
-    /// The Retention of each Stream. `None` is [DEFAULT_RETENTION].
-    pub retention: Option<Duration>,
-    /// How long an open Stream stays after the last write of any Producer. `None` keeps an open
-    /// Stream until its close.
-    pub producer_idle_ttl: Option<Duration>,
-}
-
-/// The Stream runtime on the memory Store, for tests. It serves the same calls with the same
-/// rules as every other Store, and it keeps its Streams in this process only.
-#[derive(Debug)]
-pub struct MemoryStreamRuntime;
-
-impl MemoryStreamRuntime {
-    /// Builds a runtime on a new memory Store. A zero duration in `options` is the same as `None`.
-    /// The type only names this constructor, so it returns the runtime and not `Self`.
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
-        store_name: impl Into<String>,
-        options: MemoryStreamOptions,
-        meter: Option<TemporalMeter>,
-    ) -> Arc<StreamRuntime> {
-        let positive = |value: Option<Duration>| value.filter(|value| !value.is_zero());
-        let store = Arc::new(MemoryStore::new(
-            positive(options.retention).unwrap_or(DEFAULT_RETENTION),
-            positive(options.producer_idle_ttl),
-        ));
-        StreamRuntime::new(store_name, store, meter)
+        self.store.describe_stream(request).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        proto::{AppendRecord, ClientProducer, WorkflowProducer},
+        record::MAX_BATCH_RECORDS,
+        test_store::{Scripted, runtime},
+    };
+    use std::{
+        error::Error,
+        sync::atomic::{AtomicI64, Ordering},
+    };
+    use temporalio_common::{
+        protos::temporal::api::common::v1::Payload,
+        telemetry::{
+            TaskQueueLabelStrategy,
+            metrics::{
+                CoreMeter, Counter, CounterBase, Gauge, GaugeF64, Histogram, HistogramDuration,
+                HistogramF64, MetricAttributable, MetricAttributes, MetricParameters,
+                NewAttributes, NoOpCoreMeter, UpDownCounter, UpDownCounterBase,
+            },
+        },
+    };
 
-    #[test]
-    fn a_zero_or_negative_duration_is_unset_and_a_huge_one_stays() {
-        let proto = |seconds, nanos| Some(prost_types::Duration { seconds, nanos });
-        assert_eq!(duration(None), None);
-        assert_eq!(duration(proto(0, 0)), None);
-        assert_eq!(duration(proto(-5, 0)), None);
-        assert_eq!(duration(proto(0, -5)), None);
-        assert_eq!(
-            duration(proto(i64::MAX, 999_999_999)),
-            Some(Duration::new(i64::MAX as u64, 999_999_999))
+    /// A value that a counter and an up-down counter add into.
+    struct Cell(Arc<AtomicI64>);
+
+    impl CounterBase for Cell {
+        fn adds(&self, value: u64) {
+            self.0.fetch_add(value as i64, Ordering::SeqCst);
+        }
+    }
+
+    impl UpDownCounterBase for Cell {
+        fn adds(&self, value: i64) {
+            self.0.fetch_add(value, Ordering::SeqCst);
+        }
+    }
+
+    impl MetricAttributable<Box<dyn CounterBase>> for Cell {
+        fn with_attributes(
+            &self,
+            _: &MetricAttributes,
+        ) -> Result<Box<dyn CounterBase>, Box<dyn Error>> {
+            Ok(Box::new(Cell(self.0.clone())))
+        }
+    }
+
+    impl MetricAttributable<Box<dyn UpDownCounterBase>> for Cell {
+        fn with_attributes(
+            &self,
+            _: &MetricAttributes,
+        ) -> Result<Box<dyn UpDownCounterBase>, Box<dyn Error>> {
+            Ok(Box::new(Cell(self.0.clone())))
+        }
+    }
+
+    /// A meter for the runtime's two instruments, the counter `stream_fenced` and the up-down
+    /// counter `stream_blocking_reads_waiting`. It drops the values of any other instrument.
+    #[derive(Debug, Default)]
+    struct Meter {
+        fenced: Arc<AtomicI64>,
+        waiting: Arc<AtomicI64>,
+    }
+
+    impl CoreMeter for Meter {
+        fn new_attributes(&self, attribs: NewAttributes) -> MetricAttributes {
+            NoOpCoreMeter.new_attributes(attribs)
+        }
+
+        fn extend_attributes(
+            &self,
+            existing: MetricAttributes,
+            attribs: NewAttributes,
+        ) -> MetricAttributes {
+            NoOpCoreMeter.extend_attributes(existing, attribs)
+        }
+
+        fn counter(&self, _: MetricParameters) -> Counter {
+            Counter::new(Arc::new(Cell(self.fenced.clone())))
+        }
+
+        fn histogram(&self, params: MetricParameters) -> Histogram {
+            NoOpCoreMeter.histogram(params)
+        }
+
+        fn histogram_f64(&self, params: MetricParameters) -> HistogramF64 {
+            NoOpCoreMeter.histogram_f64(params)
+        }
+
+        fn histogram_duration(&self, params: MetricParameters) -> HistogramDuration {
+            NoOpCoreMeter.histogram_duration(params)
+        }
+
+        fn gauge(&self, params: MetricParameters) -> Gauge {
+            NoOpCoreMeter.gauge(params)
+        }
+
+        fn gauge_f64(&self, params: MetricParameters) -> GaugeF64 {
+            NoOpCoreMeter.gauge_f64(params)
+        }
+
+        fn up_down_counter(&self, _: MetricParameters) -> UpDownCounter {
+            UpDownCounter::new(Arc::new(Cell(self.waiting.clone())))
+        }
+    }
+
+    /// A runtime on a new [Scripted] Store, with a meter that the test reads.
+    fn metered() -> (Arc<Scripted>, Arc<StreamRuntime>, Arc<Meter>) {
+        let store = Arc::new(Scripted::default());
+        let meter = Arc::new(Meter::default());
+        let temporal_meter = TemporalMeter::new(
+            meter.clone(),
+            NewAttributes::default(),
+            TaskQueueLabelStrategy::UseNormal,
         );
+        let runtime = StreamRuntime::with_operations(store.clone(), Some(temporal_meter));
+        (store, runtime, meter)
+    }
+
+    fn stream_ref() -> Option<StreamRef> {
+        Some(StreamRef {
+            id: "s".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn client() -> Option<Producer> {
+        Some(Producer {
+            id: "client:n:p".to_string(),
+            kind: Some(Kind::Client(ClientProducer {})),
+        })
+    }
+
+    fn record() -> AppendRecord {
+        AppendRecord {
+            body: Some(Payload::default()),
+        }
+    }
+
+    fn append(sequence: i64, records: Vec<AppendRecord>) -> AppendRecordsRequest {
+        AppendRecordsRequest {
+            r#ref: stream_ref(),
+            producer: client(),
+            sequence,
+            records,
+            ..Default::default()
+        }
+    }
+
+    fn read() -> ReadRecordsRequest {
+        ReadRecordsRequest {
+            r#ref: stream_ref(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_counts_as_waiting_while_the_store_holds_it() {
+        let (store, runtime, meter) = metered();
+        store.hold_reads.store(true, Ordering::SeqCst);
+        let held = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.read_records(read()).await }
+        });
+        store.entered.notified().await;
+        assert_eq!(meter.waiting.load(Ordering::SeqCst), 1);
+        store.release.notify_one();
+        held.await.unwrap().unwrap();
+        assert_eq!(meter.waiting.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_read_whose_future_is_dropped_stops_counting_as_waiting() {
+        let (store, runtime, meter) = metered();
+        store.hold_reads.store(true, Ordering::SeqCst);
+        let held = tokio::spawn(async move { runtime.read_records(read()).await });
+        store.entered.notified().await;
+        assert_eq!(meter.waiting.load(Ordering::SeqCst), 1);
+        held.abort();
+        assert!(held.await.unwrap_err().is_cancelled());
+        assert_eq!(meter.waiting.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn only_a_fenced_append_counts_as_fenced() {
+        let (store, runtime, meter) = metered();
+        *store.error.lock() = Some(StreamError::new(Reason::Closed, "closed"));
+        runtime
+            .append_records(append(1, vec![record()]))
+            .await
+            .unwrap_err();
+        assert_eq!(meter.fenced.load(Ordering::SeqCst), 0);
+        *store.error.lock() = Some(StreamError::new(Reason::Fenced, "fenced"));
+        let error = runtime
+            .append_records(append(1, vec![record()]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, Reason::Fenced);
+        assert_eq!(meter.fenced.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_request_fails_before_the_store_for_every_operation() {
+        let (store, runtime) = runtime();
+        // A request that reaches the Store gets this error, so it can't pass for an invalid one.
+        *store.error.lock() = Some(StreamError::new(Reason::Closed, "reached the Store"));
+        let bad_create = |stream_ref, id_conflict_policy| CreateStreamRequest {
+            stream_ref,
+            id_conflict_policy,
+            ..Default::default()
+        };
+        let errors = [
+            runtime
+                .create_stream(bad_create(None, 0))
+                .await
+                .unwrap_err(),
+            runtime
+                .create_stream(bad_create(stream_ref(), 99))
+                .await
+                .unwrap_err(),
+            runtime
+                .append_records(append(-1, vec![record()]))
+                .await
+                .unwrap_err(),
+            runtime
+                .append_records(append(MAX_SEQUENCE + 1, vec![record()]))
+                .await
+                .unwrap_err(),
+            runtime
+                .append_records(append(1, vec![AppendRecord::default()]))
+                .await
+                .unwrap_err(),
+            runtime
+                .close_stream(CloseStreamRequest {
+                    r#ref: stream_ref(),
+                    producer: None,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+            runtime
+                .close_stream(CloseStreamRequest {
+                    r#ref: stream_ref(),
+                    producer: Some(Producer {
+                        id: "wf:r".to_string(),
+                        kind: Some(Kind::Workflow(WorkflowProducer {
+                            run_id: "r".to_string(),
+                            epoch: None,
+                        })),
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+            runtime
+                .describe_stream(DescribeStreamRequest::default())
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.reason, Reason::Invalid, "{}", error.message);
+        }
+        let big = vec![record(); MAX_BATCH_RECORDS + 1];
+        let error = runtime.append_records(append(1, big)).await.unwrap_err();
+        assert_eq!(error.reason, Reason::TooLarge);
+        // The highest sequence is inside the bound, so the Store gets that append.
+        let error = runtime
+            .append_records(append(MAX_SEQUENCE, vec![record()]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "reached the Store");
     }
 }

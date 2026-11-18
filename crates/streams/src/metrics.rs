@@ -44,8 +44,19 @@ impl Metrics {
         self.fenced.add(1, &self.attributes);
     }
 
-    pub(crate) fn read_waits(&self, waiting: bool) {
-        self.blocking_reads_waiting
-            .add(if waiting { 1 } else { -1 }, &self.attributes);
+    /// Counts a read as waiting until the guard drops. The guard drops with the read's future when
+    /// a caller drops it, so the count never stays up.
+    pub(crate) fn read_waiting(&self) -> ReadWaiting<'_> {
+        self.blocking_reads_waiting.add(1, &self.attributes);
+        ReadWaiting(self)
+    }
+}
+
+pub(crate) struct ReadWaiting<'a>(&'a Metrics);
+
+impl Drop for ReadWaiting<'_> {
+    fn drop(&mut self) {
+        let metrics = self.0;
+        metrics.blocking_reads_waiting.add(-1, &metrics.attributes);
     }
 }

@@ -1,0 +1,92 @@
+//! The Store that the unit tests of the crate share.
+
+use crate::{
+    StreamError, StreamResult, StreamRuntime,
+    operations::OperationStore,
+    proto::{
+        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
+        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
+        ReadRecordsRequest, ReadRecordsResponse,
+    },
+};
+use parking_lot::Mutex;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::Notify;
+
+/// A Store that keeps the requests it got and gives the answers that a test set.
+#[derive(Default)]
+pub(crate) struct Scripted {
+    pub(crate) reads: Mutex<Vec<ReadRecordsRequest>>,
+    pub(crate) appends: Mutex<Vec<AppendRecordsRequest>>,
+    pub(crate) page: Mutex<ReadRecordsResponse>,
+    pub(crate) appended: Mutex<AppendRecordsResponse>,
+    pub(crate) described: Mutex<DescribeStreamResponse>,
+    pub(crate) error: Mutex<Option<StreamError>>,
+    /// A read tells `entered`, and then waits for `release` if `hold_reads` is set.
+    pub(crate) hold_reads: AtomicBool,
+    pub(crate) entered: Notify,
+    pub(crate) release: Notify,
+}
+
+impl Scripted {
+    fn answer<T>(&self, value: T) -> StreamResult<T> {
+        match self.error.lock().clone() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl OperationStore for Scripted {
+    async fn create_stream(
+        &self,
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        self.answer(CreateStreamResponse {
+            r#ref: request.stream_ref,
+            created: true,
+        })
+    }
+
+    async fn append_records(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
+        self.appends.lock().push(request);
+        self.answer(self.appended.lock().clone())
+    }
+
+    async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
+        self.reads.lock().push(request);
+        self.entered.notify_one();
+        if self.hold_reads.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        self.answer(self.page.lock().clone())
+    }
+
+    async fn close_stream(
+        &self,
+        _request: CloseStreamRequest,
+    ) -> StreamResult<CloseStreamResponse> {
+        self.answer(CloseStreamResponse {})
+    }
+
+    async fn describe_stream(
+        &self,
+        _request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        self.answer(self.described.lock().clone())
+    }
+}
+
+/// A runtime on a new [Scripted] Store, and the Store.
+pub(crate) fn runtime() -> (Arc<Scripted>, Arc<StreamRuntime>) {
+    let store = Arc::new(Scripted::default());
+    let runtime = StreamRuntime::with_operations(store.clone(), None);
+    (store, runtime)
+}
