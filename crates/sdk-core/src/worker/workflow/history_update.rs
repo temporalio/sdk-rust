@@ -17,6 +17,7 @@ use std::{
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
+    vec,
 };
 use temporalio_common::protos::temporal::api::{
     enums::v1::EventType,
@@ -35,7 +36,8 @@ static EMPTY_TASK_ERR: LazyLock<tonic::Status> = LazyLock::new(|| {
 /// Represents one or more complete WFT sequences. History events are expected to be consumed from
 /// it and applied to the state machines via [HistoryUpdate::take_next_wft_sequence]
 pub(crate) struct HistoryUpdate {
-    events: Vec<HistoryEvent>,
+    // Consuming tasks from the front must not repeatedly shift the remaining history.
+    events: vec::IntoIter<HistoryEvent>,
     /// The event ID of the last started WFT, as according to the WFT which this update was
     /// extracted from. Hence, while processing multiple logical WFTs during replay which were part
     /// of one large history fetched from server, multiple updates may have the same value here.
@@ -60,7 +62,7 @@ impl Debug for HistoryUpdate {
                 self.previous_wft_started_id,
                 self.wft_started_id,
                 self.events.len(),
-                self.events.first().map(|e| e.event_id)
+                self.first_event_id()
             )
         } else {
             write!(f, "DummyHistoryUpdate")
@@ -70,7 +72,7 @@ impl Debug for HistoryUpdate {
 
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
-        &self.events
+        self.events.as_slice()
     }
 }
 
@@ -187,7 +189,7 @@ impl HistoryPaginator {
             client,
             event_queue: Default::default(),
             next_page_token: NextPageToken::FetchFromStart,
-            final_events: req.original_wft.work.update.events,
+            final_events: req.original_wft.work.update.events.collect(),
             chunking_disabled: false,
         };
         let first_update = paginator.extract_next_update().await?;
@@ -320,7 +322,7 @@ impl HistoryPaginator {
             }
             self.chunking_disabled = update.chunking_disabled;
             self.id_of_last_event_in_last_extracted_update =
-                update.events.last().map(|e| e.event_id);
+                update.get_events().last().map(|e| e.event_id);
             #[cfg(debug_assertions)]
             update.assert_contiguous();
             return Ok(update);
@@ -445,7 +447,7 @@ impl HistoryUpdate {
     /// field. Use this to replace the field with an empty update.
     pub(crate) fn dummy() -> Self {
         Self {
-            events: vec![],
+            events: vec![].into_iter(),
             previous_wft_started_id: -1,
             wft_started_id: -1,
             has_last_wft: false,
@@ -459,14 +461,14 @@ impl HistoryUpdate {
     }
 
     pub(crate) fn first_event_id(&self) -> Option<i64> {
-        self.events.first().map(|e| e.event_id)
+        self.get_events().first().map(|e| e.event_id)
     }
 
     #[cfg(debug_assertions)]
     fn assert_contiguous(&self) -> bool {
         use crate::abstractions::dbg_panic;
 
-        for win in self.events.as_slice().windows(2) {
+        for win in self.get_events().windows(2) {
             if let &[e1, e2] = &win
                 && e2.event_id != e1.event_id + 1
             {
@@ -505,7 +507,7 @@ impl HistoryUpdate {
             return if has_last_wft {
                 (
                     Self {
-                        events: all_events,
+                        events: all_events.into_iter(),
                         previous_wft_started_id,
                         wft_started_id,
                         has_last_wft,
@@ -517,7 +519,7 @@ impl HistoryUpdate {
             } else {
                 (
                     Self {
-                        events: vec![],
+                        events: vec![].into_iter(),
                         previous_wft_started_id,
                         wft_started_id,
                         has_last_wft,
@@ -556,7 +558,7 @@ impl HistoryUpdate {
 
         (
             Self {
-                events: all_events,
+                events: all_events.into_iter(),
                 previous_wft_started_id,
                 wft_started_id,
                 has_last_wft,
@@ -591,11 +593,13 @@ impl HistoryUpdate {
     /// vec, indicating more pages will need to be fetched.
     pub(crate) fn take_next_wft_sequence(&mut self, from_wft_started_id: i64) -> NextWFT {
         // First, drop any events from the queue which are earlier than the passed-in id.
-        if let Some(ix_first_relevant) = self.starting_index_after_skipping(from_wft_started_id) {
-            self.events.drain(0..ix_first_relevant);
+        if let Some(ix_first_relevant) = self.starting_index_after_skipping(from_wft_started_id)
+            && ix_first_relevant > 0
+        {
+            self.events.nth(ix_first_relevant - 1);
         }
         let next_wft_ix = find_end_index_of_next_wft_seq(
-            &self.events,
+            self.get_events(),
             from_wft_started_id,
             self.has_last_wft || self.ends_at_known_boundary(),
             self.chunking_disabled,
@@ -622,8 +626,8 @@ impl HistoryUpdate {
     }
 
     fn build_next_wft(&mut self, drain_this_much: usize) -> NextWFT {
-        let events: Vec<_> = self.events.drain(0..=drain_this_much).collect();
-        NextWFT::WFT(events, self.events.is_empty() && self.has_last_wft)
+        let events = self.events.by_ref().take(drain_this_much + 1).collect();
+        NextWFT::WFT(events, self.get_events().is_empty() && self.has_last_wft)
     }
 
     /// Lets the caller peek ahead at the next WFT sequence that will be returned by
@@ -634,7 +638,7 @@ impl HistoryUpdate {
         let ix_first_relevant = self
             .starting_index_after_skipping(from_wft_started_id)
             .unwrap_or_default();
-        let relevant_events = &self.events[ix_first_relevant..];
+        let relevant_events = &self.get_events()[ix_first_relevant..];
         if relevant_events.is_empty() {
             return relevant_events;
         }
@@ -652,7 +656,7 @@ impl HistoryUpdate {
     /// be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
         let next_wft_ix = find_end_index_of_next_wft_seq(
-            &self.events,
+            self.get_events(),
             from_wft_started_id,
             self.has_last_wft || self.ends_at_known_boundary(),
             self.chunking_disabled,
@@ -671,7 +675,7 @@ impl HistoryUpdate {
         &self,
         from_id: i64,
     ) -> Option<&WorkflowTaskCompletedEventAttributes> {
-        self.events
+        self.get_events()
             .iter()
             .skip_while(|e| e.event_id < from_id)
             .find_map(|e| match &e.attributes {
@@ -683,13 +687,13 @@ impl HistoryUpdate {
     fn ends_at_known_boundary(&self) -> bool {
         // Extraction already checked the outcome of the last started task before splitting
         // off its lookahead. Do not require that lookahead again after earlier tasks are drained.
-        self.events
+        self.get_events()
             .last()
             .is_some_and(|e| e.event_type() == EventType::WorkflowTaskStarted)
     }
 
     fn starting_index_after_skipping(&self, from_wft_started_id: i64) -> Option<usize> {
-        self.events
+        self.get_events()
             .iter()
             .find_position(|e| e.event_id > from_wft_started_id)
             .map(|(ix, _)| ix)
@@ -1323,8 +1327,7 @@ mod tests {
         #[values(18, 19, 20, 21)] truncate_at: usize,
     ) {
         let t = three_wfts_then_heartbeats();
-        let mut ends_in_middle_of_seq = t.as_history_update().events;
-        ends_in_middle_of_seq.truncate(truncate_at);
+        let ends_in_middle_of_seq = t.as_history_update().events.take(truncate_at);
         // The update should contain the first three complete WFTs, ending on the 11th event which
         // is WFT started. The remaining events should be returned. False flags means the creator
         // knows there are more events, so we should return need fetch

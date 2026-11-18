@@ -283,7 +283,7 @@ macro_rules! cancel_machine {
 }
 
 impl WorkflowMachines {
-    pub(crate) fn new(basics: RunBasics, driven_wf: DrivenWorkflow) -> Self {
+    pub(crate) fn new(basics: RunBasics) -> Self {
         let replaying = basics.history.previous_wft_started_id > 0;
         let mut observed_internal_flags = InternalFlags::new(
             basics.capabilities,
@@ -303,7 +303,7 @@ impl WorkflowMachines {
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
-            drive_me: driven_wf,
+            drive_me: DrivenWorkflow::default(),
             replaying,
             preparing_legacy_query: false,
             update_only_task: false,
@@ -680,10 +680,9 @@ impl WorkflowMachines {
         }
     }
 
-    /// Iterate the state machines, which consists of grabbing any pending outgoing commands from
-    /// the workflow code, handling them, and preparing them to be sent off to the server.
-    pub(crate) fn iterate_machines(&mut self) -> Result<()> {
-        let results = self.drive_me.fetch_workflow_iteration_output();
+    /// Apply the language SDK's workflow commands and prepare the resulting commands for the server.
+    pub(crate) fn iterate_machines(&mut self, results: Vec<WFCommand>) -> Result<()> {
+        debug!(in_cmds = %results.display(), "wf bridge iteration fetch");
         if self.update_only_task {
             let accepts_update = results.iter().any(|cmd| {
                 matches!(&cmd.variant, WFCommandVariant::UpdateResponse(response)

@@ -7,13 +7,12 @@ use crate::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
-            ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
-            LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
-            OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
-            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
-            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
-            WorkflowTaskInfo,
+            ActivationOrAuto, BufferedTasks, EvictionRequestResult, FailedActivationWFTReport,
+            HeartbeatTimeoutMsg, HistoryUpdate, LocalActivityRequestSink, LocalResolution,
+            NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, RequestEvictMsg,
+            RunBasics, ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand,
+            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
+            WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -25,7 +24,7 @@ use std::{
     mem,
     ops::{Add, Sub},
     rc::Rc,
-    sync::{Arc, mpsc::Sender},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use temporalio_common::protos::{
@@ -1530,9 +1529,6 @@ struct CompletionDataForWFT {
 /// associated with that specific workflow run.
 struct WorkflowManager {
     machines: WorkflowMachines,
-    /// Is always `Some` in normal operation. Optional to allow for unit testing with the test
-    /// workflow driver, which does not need to complete activations the normal way.
-    command_sink: Option<Sender<Vec<WFCommand>>>,
     awaiting_activation_completion: bool,
     awaiting_next_wft: bool,
     /// Replay can only apply a peeked resolution after lang responds to the activation before it,
@@ -1547,11 +1543,8 @@ impl WorkflowManager {
     /// Create a new workflow manager given workflow history and execution info as would be found
     /// in [PollWorkflowTaskQueueResponse]
     fn new(basics: RunBasics) -> Self {
-        let (wfb, cmd_sink) = DrivenWorkflow::new();
-        let state_machines = WorkflowMachines::new(basics, wfb);
         Self {
-            machines: state_machines,
-            command_sink: Some(cmd_sink),
+            machines: WorkflowMachines::new(basics),
             awaiting_activation_completion: false,
             awaiting_next_wft: false,
             deferred_local_resolutions: vec![],
@@ -1659,12 +1652,7 @@ impl WorkflowManager {
     /// Feed the workflow machines new commands issued by the executing workflow code, and iterate
     /// the machines.
     fn push_commands_and_iterate(&mut self, cmds: Vec<WFCommand>) -> Result<()> {
-        if let Some(cs) = self.command_sink.as_mut() {
-            cs.send(cmds).map_err(|_| {
-                WFMachinesError::Fatal("Internal error buffering workflow commands".to_string())
-            })?;
-        }
-        self.machines.iterate_machines()?;
+        self.machines.iterate_machines(cmds)?;
         self.awaiting_activation_completion = false;
         self.apply_deferred_local_resolutions()
     }
