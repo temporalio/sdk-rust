@@ -228,6 +228,19 @@ mod tests {
         }
     }
 
+    // A Store persists these numbers in its keys, so they must never change.
+    #[test]
+    fn the_numbers_of_the_kinds_never_change() {
+        let kinds = [
+            ProducerKind::Workflow,
+            ProducerKind::LocalActivity,
+            ProducerKind::Activity,
+            ProducerKind::Client,
+            ProducerKind::StandaloneActivity,
+        ];
+        assert_eq!(kinds.map(|kind| kind as u8), [1, 2, 3, 4, 5]);
+    }
+
     // A Store persists the key as its fence, so its bytes must never change.
     #[test]
     fn the_bytes_of_a_key_never_change() {
