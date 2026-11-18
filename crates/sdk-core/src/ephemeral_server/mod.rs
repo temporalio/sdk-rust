@@ -971,14 +971,22 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener as TokioTcpListener,
-        sync::Notify,
+        sync::{Notify, RwLock},
         task::JoinHandle,
         time::timeout,
     };
 
+    // A child process holds copies of all sockets of this process until its exec closes them. So a
+    // spawn can keep the listener of `get_free_port` open after `get_free_port` drops it, and a
+    // bind to that port at that time fails. Each test in this binary that spawns a child must hold
+    // a read guard. Tests that bind a port right after `get_free_port` returns it hold the write
+    // guard.
+    static PROCESS_SPAWN_LOCK: RwLock<()> = RwLock::const_new(());
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_start_kills_server_process() {
+        let _spawn = PROCESS_SPAWN_LOCK.read().await;
         let pid_file = temp_dir().join(format!("core-test-pid-{}", rand::random::<u64>()));
 
         // Stand in for a server that starts but never begins listening: it
@@ -1032,6 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_timeout_bounds_get_system_info() {
+        let _spawn = PROCESS_SPAWN_LOCK.read().await;
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let request_received = Arc::new(Notify::new());
         let notify = request_received.clone();
@@ -1082,6 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn respects_startup_timeout() {
+        let _spawn = PROCESS_SPAWN_LOCK.read().await;
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let request_received = Arc::new(Notify::new());
         let ready = Arc::new(Notify::new());
@@ -1143,6 +1153,7 @@ mod tests {
 
     #[test]
     fn get_free_port_can_bind_immediately() {
+        let _no_spawns = PROCESS_SPAWN_LOCK.blocking_write();
         let host = "127.0.0.1";
 
         // Each iteration leaves sockets in TIME_WAIT. Keep the count low, since this runs in
