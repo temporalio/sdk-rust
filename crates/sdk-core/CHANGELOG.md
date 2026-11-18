@@ -57,6 +57,8 @@ relevant information.
   `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
   late completions of abandoned activities already were.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+* Downloading an ephemeral dev or test server binary retries a transfer that breaks while the
+  archive streams in, such as a reset connection, instead of failing the server start.
 ### Changed
 * [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
   compatible with current nexgen default expressions and workflow-target generation.
