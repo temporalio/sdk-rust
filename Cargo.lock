@@ -4602,11 +4602,13 @@ name = "temporalio-streams"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "parking_lot",
  "prost",
  "prost-wkt-types",
  "serde_json",
  "temporalio-common",
  "thiserror 2.0.21",
+ "tokio",
  "tonic",
 ]
 

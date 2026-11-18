@@ -1,7 +1,7 @@
 # temporalio-streams
 
-Experimental. What every Store of a Temporal Stream shares: the error of a failed call, the order
-of a Producer's epochs, and the stored form of a Record.
+Experimental. The Stream runtime for Core and the Temporal SDK bridges. It answers the five
+operations of the Stream service on a Stream Store, and it has no Store of its own.
 
 ## The Store
 
@@ -19,6 +19,26 @@ Store applies the rules of the service itself.
 A lang bridge implements the trait for a Store that is written in that language. The Stores that
 Temporal provides, and the shared rules that a Store in Rust builds on, are in
 [temporal-community/sdk-streams](https://github.com/temporal-community/sdk-streams).
+
+## The runtime
+
+`StreamRuntime::new` builds the runtime on one Store. It has one typed method for each operation:
+`create_stream`, `append_records`, `read_records`, `close_stream` and `describe_stream`.
+
+The runtime checks each request before the Store sees it, and the answer to a create, an append, a
+read or a describe after it. The checks are the same for every Store.
+
+- A Stream id and a Producer id are opaque text of 1 to 4096 bytes. The caller builds both.
+- A Workflow Producer appends and closes with its Workflow Task as the epoch, so that a Store can
+  refuse a write of an older task.
+- A batch has at most 1000 Records and 4 MiB, and a Record at most 1536 KiB. The sizes are of the
+  stored form, in which each Record has its Producer.
+- A read gives at most 1000 Records, and the runtime asks the Store to wait at most 60 s. A page
+  over the caps of its request is cut.
+- The offsets of a page rise, start after the read's `from_offset`, and end at or before its
+  `last_offset`.
+- An answer that breaks these rules, a create with no ref, or a describe with no status fails with
+  `Reason::StorageCorrupt`.
 
 ## Errors
 
