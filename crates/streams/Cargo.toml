@@ -1,0 +1,31 @@
+[package]
+name = "temporalio-streams"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license-file = { workspace = true }
+description = "The Stream runtime of Temporal, and the trait that each Stream Store implements"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporalio/sdk-rust"
+keywords = ["temporal", "workflow", "streams"]
+categories = ["development-tools"]
+
+[dependencies]
+enum-iterator = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+prost = { workspace = true }
+
+[dependencies.temporalio-common]
+path = "../common"
+version = "~1.3.0"
+default-features = false
+
+[dev-dependencies]
+parking_lot = "0.12"
+prost-types = { workspace = true }
+rand = "0.10"
+tokio = { version = "1.47", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

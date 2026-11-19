@@ -4619,6 +4619,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "temporalio-streams"
+version = "0.1.0"
+dependencies = [
+ "enum-iterator",
+ "futures-util",
+ "parking_lot",
+ "prost",
+ "prost-wkt-types",
+ "rand 0.10.3",
+ "temporalio-common",
+ "tokio",
+]
+
+[[package]]
 name = "temporalio-workflow"
 version = "1.3.0"
 dependencies = [
