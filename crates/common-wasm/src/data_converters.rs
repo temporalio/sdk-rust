@@ -2,7 +2,16 @@
 //! serialization related functionality.
 
 mod failure_converter;
+mod transfer_types;
 mod well_known;
+
+pub use transfer_types::HasTransferType;
+
+/// Implementation details used by generated transfer-type adapters.
+#[doc(hidden)]
+pub mod __private {
+    pub use super::transfer_types::{TransferDecoder, TransferValue, to_transfer_value};
+}
 
 #[cfg(feature = "experimental")]
 pub use failure_converter::NexusOperationDecodeHint;
@@ -415,7 +424,17 @@ pub struct DefaultPayloadCodec;
 ///
 /// You don't need to implement this unless you are using a non-serde-compatible custom converter,
 /// in which case you should implement the to/from_payload functions on some wrapper type.
+/// Models implementing [`HasTransferType`] can derive `temporalio_macros::TemporalTransfer`
+/// instead of implementing this trait manually.
 pub trait TemporalSerializable {
+    /// Converts a model to its declared transfer representation, if present.
+    #[doc(hidden)]
+    fn to_transfer_value(
+        &self,
+    ) -> Result<Option<__private::TransferValue>, PayloadConversionError> {
+        Ok(None)
+    }
+
     /// Return a reference to this value as a serde-serializable trait object.
     fn as_serde(&self) -> Result<&dyn erased_serde::Serialize, PayloadConversionError> {
         Err(PayloadConversionError::WrongEncoding)
@@ -437,7 +456,15 @@ pub trait TemporalSerializable {
 ///
 /// You don't need to implement this unless you are using a non-serde-compatible custom converter,
 /// in which case you should implement the to/from_payload functions on some wrapper type.
+/// Models implementing [`HasTransferType`] can derive `temporalio_macros::TemporalTransfer`
+/// instead of implementing this trait manually.
 pub trait TemporalDeserializable: Sized {
+    /// Selects the transfer representation and model reconstruction adapter, if present.
+    #[doc(hidden)]
+    fn transfer_decoder() -> Option<__private::TransferDecoder<Self>> {
+        None
+    }
+
     /// Deserialize from a serde-based payload converter.
     fn from_serde(
         _: &dyn ErasedSerdePayloadConverter,
