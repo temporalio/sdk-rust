@@ -20,8 +20,10 @@ pub const MAX_RECORDS: usize = 1000;
 /// A Stream Store. It runs each operation of the Stream service with the service's messages, and
 /// applies the service's rules itself.
 ///
-/// - An append fences a lower epoch of its Producer. A retried batch with the same Producer, epoch
-///   and sequence is written once.
+/// - A retried batch with the same Producer, epoch and sequence is written once.
+/// - A Store can refuse an append or a close of a lower epoch of its Producer, with
+///   [`Reason::Fenced`](crate::Reason::Fenced). It doesn't have to. Each Record has its Producer
+///   and its epoch, so a reader can tell the attempts apart.
 /// - A read with no Records to return waits up to its `wait`, and a close wakes it.
 /// - Offsets are opaque bytes, at most [`MAX_OFFSET_BYTES`](crate::ids::MAX_OFFSET_BYTES) long,
 ///   and the offsets of one Stream sort in the order of its Records.
