@@ -45,6 +45,9 @@ relevant information.
   progress queries.
 * Cloud API bindings support v0.27.0, including user group memberships, projects,
   project-scoped custom roles, and caller rate limit operations.
+* [lang-internal] Added the experimental `temporalio-streams` crate. Its `StreamRuntime` checks each
+  Stream call and its answer for a `StreamStore`, which a lang SDK implements for a Store in its
+  own language.
 
 ### Fixed
 * Nexus operations cancelled or timed out before starting retain their cancellation or timeout
