@@ -16,6 +16,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
@@ -55,6 +56,10 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        StartStreamRead start_stream_read = 23;
+        CloseStreamRead close_stream_read = 24;
+        AppendToStream append_to_stream = 25;
+        CloseStream close_stream = 26;
     }
 }
 
@@ -418,5 +423,47 @@ message ScheduleNexusOperation {
 // Request cancellation of a nexus operation started via `ScheduleNexusOperation`
 message RequestCancelNexusOperation {
     // Lang's incremental sequence number as passed to `ScheduleNexusOperation`
+    uint32 seq = 1;
+}
+
+// Appends Records as the Workflow Producer. The result comes in a `ResolveStreamAppend` job. An
+// append is at-least-once. A next attempt or a next Worker can write it again, with a higher epoch.
+message AppendToStream {
+    // Lang's sequence number of appends. It starts at 1.
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    repeated temporal.api.common.v1.Payload bodies = 3;
+    // The batch's `sequence` for the Store. Zero sends `seq`.
+    int64 sequence = 4;
+}
+
+// Closes a Stream once History has its intent. The result comes in a later task. A close in
+// History can stay with no result when the run ends by Core's own failure for an error with the
+// opt-in, by a terminate or by a timeout. Workflow code runs no `finally` in those runs.
+message CloseStream {
+    // Lang's sequence number of closes. It starts at 1.
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+}
+
+// Reads a Stream. The Records come in `ResolveStreamRead` jobs. A task gives at most 16 MiB of
+// Records, and its marker holds at most 1 MiB of them for reads with `records_in_history`, so a
+// fast read spans several tasks.
+message StartStreamRead {
+    // Lang's sequence number of reads. It starts at 1.
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The read starts after this offset. Empty is the start of the Stream.
+    bytes from_offset = 3;
+    // The read ends when no Record came for this long. Unset is 1 minute. Zero gives what the
+    // Stream has, and ends.
+    google.protobuf.Duration idle_timeout = 4;
+    // Each task's marker has the Records, so a replay reads no Store.
+    bool records_in_history = 5;
+}
+
+// Stops a read. Lang gets no job for it.
+message CloseStreamRead {
+    // The `seq` of the `StartStreamRead`
     uint32 seq = 1;
 }

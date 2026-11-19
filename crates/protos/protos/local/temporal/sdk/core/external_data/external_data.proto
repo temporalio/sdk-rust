@@ -5,6 +5,8 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::ExternalData";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "temporal/api/failure/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 
 // This file defines data that Core might write externally. The first motivating case being
 // storing data in markers in event history. Defining such data as protos provides an easy way
@@ -39,4 +41,66 @@ message PatchedMarkerData {
   string id = 1;
   // Whether or not the patch is marked deprecated.
   bool deprecated = 2;
+}
+
+// The marker `core_stream` has it in the detail `data`, as `binary/protobuf`. Core records one in
+// each Workflow Task in which Workflow code got a Stream result or asked for a close.
+message StreamMarkerData {
+  // Each Stream of the entries, once. An entry gives its index here.
+  repeated temporal.api.stream.v1.StreamRef streams = 1;
+  repeated StreamCloseIntent close_intents = 2;
+  repeated StreamAppendResult appends = 3;
+  repeated StreamCloseResult closes = 4;
+  repeated StreamReadEntry reads = 5;
+}
+
+message StreamCloseIntent {
+  uint32 seq = 1;
+  uint32 stream = 2;
+}
+
+message StreamAppendResult {
+  uint32 seq = 1;
+  uint32 stream = 2;
+  // The activation of the task in which Workflow code got the result.
+  uint64 activation = 3;
+  oneof result {
+    StreamAppendOffsets appended = 4;
+    temporal.api.failure.v1.Failure failure = 5;
+  }
+}
+
+message StreamAppendOffsets {
+  bytes first_offset = 1;
+  bytes last_offset = 2;
+}
+
+message StreamCloseResult {
+  uint32 seq = 1;
+  uint64 activation = 2;
+  // Unset when the Stream is closed.
+  temporal.api.failure.v1.Failure failure = 3;
+}
+
+// What one read gave Workflow code in this task.
+message StreamReadEntry {
+  uint32 seq = 1;
+  uint32 stream = 2;
+  // The offset of the Record before this task's first one. It's `from_offset` in the first task.
+  bytes after_offset = 3;
+  // The Record count of each page, and the activation that got it. Both have one length.
+  repeated uint32 page_records = 4;
+  repeated uint64 page_activations = 5;
+  // The first 16 bytes of the SHA-256 of this task's Records. Empty when `records` is set.
+  bytes digest = 6;
+  // This task's Records, for a read with `records_in_history`.
+  repeated temporal.api.stream.v1.StreamRecord records = 7;
+  // Set in the task in which Workflow code got the end.
+  StreamReadEnded end = 8;
+}
+
+message StreamReadEnded {
+  uint64 activation = 1;
+  bool done = 2;
+  temporal.api.failure.v1.Failure failure = 3;
 }

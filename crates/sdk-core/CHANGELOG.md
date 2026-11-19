@@ -44,6 +44,13 @@ relevant information.
 * [lang-internal] Added the experimental `temporalio-streams` crate. Its `StreamRuntime` checks each
   Stream call and its answer for a `StreamStore`, which a lang SDK implements for a Store in its
   own language.
+* [lang-internal] Workflow code can append to and close a Stream with the experimental
+  `AppendToStream` and `CloseStream` commands, on a Store in `WorkerConfig::stream_runtimes`. A call
+  writes as its workflow task. Its result comes in `ResolveStreamAppend` or `ResolveStreamClose`
+  and goes into a `core_stream` marker, so a replay makes no Store call. A close runs once History
+  has the task that asked for it, and the workflow's last command waits until each close has its
+  result in a marker. A call that the Store doesn't answer by the task's heartbeat fails the task
+  with `StreamStoreUnavailable`. The Stream read commands fail the workflow task for now.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
