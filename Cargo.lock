@@ -4511,6 +4511,7 @@ dependencies = [
  "temporalio-macros",
  "temporalio-sdk-core",
  "temporalio-workflow",
+ "temporalio-workflow-wasm",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -4518,7 +4519,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "wasmtime",
 ]
 
 [[package]]
@@ -4640,6 +4640,14 @@ dependencies = [
  "thiserror 2.0.21",
  "uuid",
  "wit-bindgen 0.62.0",
+]
+
+[[package]]
+name = "temporalio-workflow-wasm"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "wasmtime",
 ]
 
 [[package]]

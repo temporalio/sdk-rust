@@ -15,9 +15,12 @@ use temporalio_workflow::{
     PatchActivationCaller,
     workflows::{UpdateDefinitionDescriptor, WorkflowDefinitionDescriptor},
 };
-use wasmtime::{
-    Config, Engine, Store,
-    component::{Component, HasSelf, Linker, ResourceAny},
+use temporalio_workflow_wasm::{
+    CompiledComponent,
+    wasmtime::{
+        self, Store,
+        component::{HasSelf, Linker, ResourceAny},
+    },
 };
 
 use crate::workflow_registry::{
@@ -27,6 +30,7 @@ use crate::workflow_registry::{
 wasmtime::component::bindgen!({
     path: "../workflow/wit",
     world: "workflow-module",
+    wasmtime_crate: ::temporalio_workflow_wasm::wasmtime,
 });
 
 use self::{
@@ -114,50 +118,42 @@ impl WorkflowDefinitions {
 }
 
 struct CompiledWasmWorkflowModule {
-    engine: Engine,
-    component: Component,
+    component: CompiledComponent,
     definitions: Vec<WorkflowDefinitionDescriptor>,
 }
 
 impl CompiledWasmWorkflowModule {
     fn new(component: WasmWorkflowComponent) -> Result<Self, anyhow::Error> {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        let engine = Engine::new(&config)?;
         let bytes: Arc<[u8]> = match &component.source {
             WasmWorkflowComponentSource::File(path) => fs::read(path)
                 .with_context(|| format!("Failed reading WASM component {}", path.display()))?
                 .into(),
             WasmWorkflowComponentSource::Bytes(bytes) => bytes.clone(),
         };
-        let component = Component::new(&engine, bytes.as_ref()).map_err(|err| {
+        let component = CompiledComponent::new(bytes.as_ref(), false).map_err(|err| {
             anyhow::Error::msg(format!(
                 "Failed to compile WASM component {}: {err}",
                 component.component_id
             ))
         })?;
-        let definitions = Self::read_definitions(&engine, &component)?;
+        let definitions = Self::read_definitions(&component)?;
         if definitions.is_empty() {
             bail!("WASM component exports no workflows");
         }
         Ok(Self {
-            engine,
             component,
             definitions,
         })
     }
 
     fn read_definitions(
-        engine: &Engine,
-        component: &Component,
+        component: &CompiledComponent,
     ) -> Result<Vec<WorkflowDefinitionDescriptor>, anyhow::Error> {
-        let mut linker = Linker::new(engine);
+        let mut linker = Linker::new(&component.engine);
         WorkflowModule::add_to_linker::<_, HasSelf<_>>(&mut linker, |data| data)?;
-        let mut store = Store::new(
-            engine,
-            WasmWorkflowHostState::new(Rc::new(NoopWorkflowHost), None),
-        );
-        let module = WorkflowModule::instantiate(&mut store, component, &linker)?;
+        let mut store =
+            component.store(WasmWorkflowHostState::new(Rc::new(NoopWorkflowHost), None));
+        let module = WorkflowModule::instantiate(&mut store, &component.component, &linker)?;
         module
             .temporal_workflow_runtime_workflow_guest()
             .call_list_workflows(&mut store)
@@ -191,7 +187,7 @@ impl CompiledWasmWorkflowModule {
         &self,
         input: WorkflowExecutionInput,
     ) -> Result<Box<dyn WorkflowInstance>, anyhow::Error> {
-        let mut linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.component.engine);
         WorkflowModule::add_to_linker::<_, HasSelf<_>>(&mut linker, |data| data)?;
         let WorkflowExecutionInput {
             namespace,
@@ -219,11 +215,10 @@ impl CompiledWasmWorkflowModule {
                 data_converter.payload_converter().clone(),
             )
         });
-        let mut store = Store::new(
-            &self.engine,
-            WasmWorkflowHostState::new(host, patch_activation),
-        );
-        let module = WorkflowModule::instantiate(&mut store, &self.component, &linker)?;
+        let mut store = self
+            .component
+            .store(WasmWorkflowHostState::new(host, patch_activation));
+        let module = WorkflowModule::instantiate(&mut store, &self.component.component, &linker)?;
         let guest = module.temporal_workflow_runtime_workflow_guest();
         let workflow_instance = guest
             .call_instantiate_workflow(&mut store, &workflow_init)

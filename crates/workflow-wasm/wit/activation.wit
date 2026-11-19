@@ -1,0 +1,25 @@
+package temporal:workflow-activation@0.1.0;
+
+interface guest {
+  record local-activities {
+    names: list<string>,
+    has-dynamic-handler: bool,
+  }
+
+  list-workflows: func() -> result<list<string>, string>;
+  instantiate-workflow: func(
+    namespace: string,
+    task-queue: string,
+    enabled-logic-flags: list<u32>,
+    local-activity-registry: option<local-activities>,
+    disable-eager-activity-execution: bool,
+  ) -> result<workflow-instance, string>;
+
+  resource workflow-instance {
+    activate: func(activation: list<u8>) -> result<list<u8>, string>;
+  }
+}
+
+world activation-workflow-module {
+  export guest;
+}
