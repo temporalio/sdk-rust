@@ -480,6 +480,7 @@ message OnConflictOptions {
 // but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
 // "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
 // parent execution as its start time.
+// Experimental. Might change in the future.
 message TimeSkippingConfig {
     
     // Enables or disables time skipping for this workflow execution.
@@ -507,6 +508,8 @@ message TimeSkippingConfig {
     int32 max_session_skip_count = 4;
 }
 
+// Controls a time-skipping fast-forward for an execution.
+// Experimental. Might change in the future.
 message FastForwardConfig {
     // A client-supplied ID, required field, set alongside `duration`. It is used to poll for
     // fast-forward completion via PollWorkflowExecutionTimeSkipping.
@@ -527,6 +530,7 @@ message FastForwardConfig {
 
 // The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs
 // within the same execution.
+// Experimental. Might change in the future.
 message TimeSkippingStatePropagation {
 
     // The time skipped by the previous run. It is propagated both to executions started by the
@@ -542,6 +546,7 @@ message TimeSkippingStatePropagation {
 
 
 // Describes the current time-skipping state of a workflow execution.
+// Experimental. Might change in the future.
 message TimeSkippingInfo {
     // Current virtual time of the execution. If the execution hasn't skipped
     // any time yet, it will be the same as wall clock time.
@@ -563,6 +568,7 @@ message TimeSkippingInfo {
 
 
 // TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
+// Experimental. Might change in the future.
 message TimeSkippingFastForwardInfo {
     // The client-supplied `fast_forward` duration.
     google.protobuf.Duration fast_forward_duration = 1;

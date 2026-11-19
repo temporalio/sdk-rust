@@ -41,8 +41,14 @@ relevant information.
   for new workflows only. The mode is recorded on the first successful task completion and defaults to off.
   Core handles tasks with no activation jobs internally, without polling workflow routines; see
   [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
+* Low-level Operator Service calls support namespace soft deletion, restoration, and restore
+  progress queries.
+* Cloud API bindings support v0.27.0, including user group memberships, projects,
+  project-scoped custom roles, and caller rate limit operations.
 
 ### Fixed
+* Nexus operations cancelled or timed out before starting retain their cancellation or timeout
+  failure type even when the corresponding history event omits its failure.
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
   times out no longer fails workflow tasks with a nondeterminism error.
 * Cancelling a Nexus operation with `ABANDON` or `TRY_CANCEL` before it starts now resolves it with
@@ -55,7 +61,11 @@ relevant information.
   `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
   late completions of abandoned activities already were.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+* Downloading an ephemeral dev or test server binary retries a transfer that breaks while the
+  archive streams in, such as a reset connection, instead of failing the server start.
 ### Changed
+* [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
+  compatible with current nexgen default expressions and workflow-target generation.
 * Workflow task completions and failures set `resource_id` to `workflow:<workflow_id>`, on every
   page of a paginated completion. Activity task completions, failures, cancellations, and
   heartbeats set it to `workflow:<workflow_id>`, or `activity:<activity_id>` for a standalone

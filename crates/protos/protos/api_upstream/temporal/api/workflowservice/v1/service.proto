@@ -877,7 +877,12 @@ service WorkflowService {
     //
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: We do yet expose versioning API to HTTP. --)
-    rpc UpdateWorkerBuildIdCompatibility (UpdateWorkerBuildIdCompatibilityRequest) returns (UpdateWorkerBuildIdCompatibilityResponse) {}
+    rpc UpdateWorkerBuildIdCompatibility (UpdateWorkerBuildIdCompatibilityRequest) returns (UpdateWorkerBuildIdCompatibilityResponse) {
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "taskqueue:{task_queue}"
+        };
+    }
 
     // Deprecated. Use `GetWorkerVersioningRules`.
     // Will be removed in server version v1.32.0.
@@ -888,6 +893,10 @@ service WorkflowService {
             additional_bindings {
                 get: "/api/v1/namespaces/{namespace}/task-queues/{task_queue}/worker-build-id-compatibility"
             }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "taskqueue:{task_queue}"
         };
     }
 
@@ -915,7 +924,12 @@ service WorkflowService {
     // Will be removed in server version v1.32.0.
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: We do yet expose versioning API to HTTP. --)
-    rpc UpdateWorkerVersioningRules (UpdateWorkerVersioningRulesRequest) returns (UpdateWorkerVersioningRulesResponse) {}
+    rpc UpdateWorkerVersioningRules (UpdateWorkerVersioningRulesRequest) returns (UpdateWorkerVersioningRulesResponse) {
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "taskqueue:{task_queue}"
+        };
+    }
 
     // Fetches the Build ID assignment and redirect rules for a Task Queue.
     // Will be removed in server version v1.32.0.
@@ -925,6 +939,10 @@ service WorkflowService {
             additional_bindings {
                 get: "/api/v1/namespaces/{namespace}/task-queues/{task_queue}/worker-versioning-rules"
             }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "taskqueue:{task_queue}"
         };
     }
 
@@ -1136,6 +1154,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "deployment:{deployment_name}"
+        };
     }
 
     // Creates a new Worker Deployment Version.
@@ -1151,6 +1173,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "deployment:{deployment_version.deployment_name}"
+        };
     }
 
     // Updates the compute config attached to a Worker Deployment Version.
@@ -1164,6 +1190,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "deployment:{deployment_version.deployment_name}"
+        };
     }
 
     // Validates the compute config without attaching it to a Worker Deployment Version.
@@ -1176,6 +1206,10 @@ service WorkflowService {
                 post: "/api/v1/namespaces/{namespace}/worker-deployment-versions/{deployment_version.deployment_name}/{deployment_version.build_id}/validate-compute-config"
                 body: "*"
             }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "deployment:{deployment_version.deployment_name}"
         };
     }
 
@@ -1704,6 +1738,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "nexus-operation:{operation_id}"
+        };
     }
 
     // DescribeActivityExecution returns information about an activity execution.
@@ -1736,6 +1774,10 @@ service WorkflowService {
                 get: "/api/v1/namespaces/{namespace}/nexus-operations/{operation_id}"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "nexus-operation:{operation_id}"
+        };
     }
 
     // PollActivityExecution long-polls for an activity execution to complete and returns the
@@ -1761,6 +1803,10 @@ service WorkflowService {
             additional_bindings {
                 get: "/api/v1/namespaces/{namespace}/nexus-operations/{operation_id}/poll"
             }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "nexus-operation:{operation_id}"
         };
     }
 
@@ -1839,6 +1885,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "nexus-operation:{operation_id}"
+        };
     }
 
     // TerminateActivityExecution terminates an existing activity execution immediately.
@@ -1867,7 +1917,12 @@ service WorkflowService {
     //
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: Activity deletion not exposed to HTTP, users should use cancel or terminate. --)
-    rpc DeleteActivityExecution (DeleteActivityExecutionRequest) returns (DeleteActivityExecutionResponse) {}
+    rpc DeleteActivityExecution (DeleteActivityExecutionRequest) returns (DeleteActivityExecutionResponse) {
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "activity:{activity_id}"
+        };
+    }
 
     // PauseActivityExecution pauses the execution of an activity specified by its ID.
     // This API can be used to target a workflow activity or a standalone activity
@@ -2017,6 +2072,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "nexus-operation:{operation_id}"
+        };
     }
 
     // DeleteNexusOperationExecution asynchronously deletes a specific Nexus operation run (when
@@ -2025,8 +2084,16 @@ service WorkflowService {
     //
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: Nexus operation deletion not exposed to HTTP, users should use cancel or terminate. --)
-    rpc DeleteNexusOperationExecution (DeleteNexusOperationExecutionRequest) returns (DeleteNexusOperationExecutionResponse) {}
+    rpc DeleteNexusOperationExecution (DeleteNexusOperationExecutionRequest) returns (DeleteNexusOperationExecutionResponse) {
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "nexus-operation:{operation_id}"
+        };
+    }
 
+    // PollWorkflowExecutionTimeSkipping waits for a fast-forward outcome for a workflow execution.
+    //
+    // Experimental. Might change in the future.
     rpc PollWorkflowExecutionTimeSkipping (PollWorkflowExecutionTimeSkippingRequest) returns (PollWorkflowExecutionTimeSkippingResponse) {
         option (google.api.http) = {
             get: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll"

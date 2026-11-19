@@ -199,6 +199,7 @@ message WorkflowExecutionStartedEventAttributes {
     // Should not be read or interpreted by SDKs.
     DeclinedTargetVersionUpgrade declined_target_version_upgrade = 40;
 
+    // Experimental.
     // Initial time-skipping configuration for this workflow execution, recorded at start time.
     // This may have been set explicitly via the start workflow request, or propagated from a
     // parent/previous execution.
@@ -210,6 +211,7 @@ message WorkflowExecutionStartedEventAttributes {
     reserved 42;
     reserved "initial_skipped_duration";
 
+    // Experimental.
     // The time-skipping state propagated from a previous run of this workflow. This can be nil
     // if no time skipping has occurred or there is no previous run.
     temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 43;
@@ -786,12 +788,14 @@ message StartChildWorkflowExecutionInitiatedEventAttributes {
     // Priority metadata
     temporal.api.common.v1.Priority priority = 20;
 
+    // Experimental.
     // The propagated time-skipping configuration for the child workflow.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 21;
 
     reserved 22;
     reserved "initial_skipped_duration";
 
+    // Experimental.
     // The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
     // has occurred or there is no previous run.
     temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 23;
@@ -925,9 +929,11 @@ message WorkflowExecutionOptionsUpdatedEventAttributes {
     // Ignored if nil.
     temporal.api.common.v1.Priority priority = 6;
 
+    // Experimental.
     // TimeSkippingConfig override upserted in this event. Represents the full config.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 7;
 
+    // Experimental.
     // Indicates the time skipping config was updated by the recent call to update
     // workflow execution options.
     bool time_skipping_config_updated = 9;
@@ -1029,6 +1035,7 @@ message WorkflowExecutionUnpausedEventAttributes {
 // Attributes for an event indicating that time skipping state changed for a workflow execution:
 // either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
 // The worker_may_ignore field in HistoryEvent should always be set true for this event.
+// Experimental. Might change in the future.
 message WorkflowExecutionTimeSkippingTransitionedEventAttributes {
     // The virtual time point that time skipping advanced to.
     google.protobuf.Timestamp target_time = 1;
@@ -1280,6 +1287,7 @@ message HistoryEvent {
         NexusOperationCancelRequestFailedEventAttributes nexus_operation_cancel_request_failed_event_attributes = 62;
         WorkflowExecutionPausedEventAttributes workflow_execution_paused_event_attributes = 63;
         WorkflowExecutionUnpausedEventAttributes workflow_execution_unpaused_event_attributes = 64;
+        // Experimental.
         WorkflowExecutionTimeSkippingTransitionedEventAttributes workflow_execution_time_skipping_transitioned_event_attributes = 65;
     }
 }

@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 use changelog_release_notes::{
-    ReleaseOptions, check_fragments, core_notes, prepare_release,
-    published_changelog_release_notes, published_release_notes, release_section, update_core,
+    ReleaseOptions, check_changelog, check_fragments, core_notes, prepare_release,
+    published_changelog_release_notes, published_release_notes, update_core,
 };
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
@@ -37,6 +37,8 @@ enum Command {
         submodule: Option<PathBuf>,
         #[arg(long)]
         version: String,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        date: Option<NaiveDate>,
         #[arg(long, default_value = "CHANGELOG.md")]
         changelog: PathBuf,
         #[arg(long, requires = "submodule")]
@@ -46,10 +48,12 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    #[command(about = "Validate fragments and optionally require a new PR fragment")]
+    #[command(about = "Validate changelog and optionally require a new PR fragment")]
     Check {
         #[arg(long, default_value = "changelog")]
         fragments: PathBuf,
+        #[arg(long)]
+        changelog: Option<PathBuf>,
         #[arg(long)]
         base: Option<String>,
         #[arg(long, default_value = "HEAD")]
@@ -67,13 +71,6 @@ enum Command {
         version: String,
         #[arg(long, value_name = "YYYY-MM-DD")]
         date: NaiveDate,
-    },
-    #[command(about = "Extract the changelog notes for a released version")]
-    Notes {
-        #[arg(long, default_value = "CHANGELOG.md")]
-        changelog: PathBuf,
-        #[arg(long)]
-        version: String,
     },
     #[command(about = "Extract Core notes using the SDK repository's Git links")]
     CoreNotes {
@@ -113,6 +110,7 @@ fn main() -> Result<()> {
         Command::ReleaseNotes {
             submodule,
             version,
+            date,
             changelog,
             from,
             to,
@@ -124,10 +122,11 @@ fn main() -> Result<()> {
                     &changelog,
                     &submodule,
                     &version,
+                    date,
                     from.as_deref(),
                     &to,
                 )?,
-                None => published_changelog_release_notes(&repo, &changelog, &version)?,
+                None => published_changelog_release_notes(&repo, &changelog, &version, date)?,
             };
             match output {
                 Some(path) => fs::write(repo.join(path), notes)?,
@@ -136,10 +135,17 @@ fn main() -> Result<()> {
         }
         Command::Check {
             fragments,
+            changelog,
             base,
             head,
             require_new,
-        } => check_fragments(&repo, &fragments, base.as_deref(), &head, require_new)?,
+        } => {
+            if let Some(changelog) = changelog {
+                let text = fs::read_to_string(repo.join(changelog))?;
+                check_changelog(&text)?;
+            }
+            check_fragments(&repo, &fragments, base.as_deref(), &head, require_new)?;
+        }
         Command::Prepare {
             fragments,
             changelog,
@@ -156,11 +162,6 @@ fn main() -> Result<()> {
                 },
             )?;
             println!("Prepared release {version}; consumed {count} changelog fragments");
-        }
-        Command::Notes { changelog, version } => {
-            let text = fs::read_to_string(repo.join(changelog))?;
-            let notes = release_section(&text, &version)?;
-            print!("{notes}");
         }
         Command::CoreNotes {
             submodule,

@@ -105,7 +105,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-core = "0.1"
 url = "2.5"
-uuid = { version = "1.18", default-features = false, features = ["v4"] }
 
 [dependencies.temporalio-protos]
 path = "../protos"

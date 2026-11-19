@@ -19,6 +19,7 @@ import "temporal/api/cloud/region/v1/message.proto";
 import "temporal/api/cloud/account/v1/message.proto";
 import "temporal/api/cloud/usage/v1/message.proto";
 import "temporal/api/cloud/connectivityrule/v1/message.proto";
+import "temporal/api/cloud/project/v1/message.proto";
 import "temporal/api/cloud/auditlog/v1/message.proto";
 import "temporal/api/cloud/billing/v1/message.proto";
 
@@ -47,6 +48,9 @@ message GetUsersRequest {
     string email = 3;
     // Filter users by the namespace they have access to - optional.
     string namespace = 4;
+    // Whether to include each user's group memberships in the response - optional.
+    // Defaults to false.
+    bool include_group_memberships = 5;
 }
 
 message GetUsersResponse {
@@ -59,6 +63,9 @@ message GetUsersResponse {
 message GetUserRequest {
     // The id of the user to get
     string user_id = 1;
+    // Whether to include the user's group memberships in the response - optional.
+    // Defaults to false.
+    bool include_group_memberships = 2;
 }
 
 message GetUserResponse {
@@ -150,6 +157,9 @@ message CreateNamespaceRequest {
     // The tags to add to the namespace.
     // Note: This field can be set by global admins or account owners only.
     map<string, string> tags = 4;
+    // The id of the project to create the namespace in - optional.
+    // If not set, the namespace will be created in the account's default project.
+    string project_id = 5;
 }
 
 message CreateNamespaceResponse {
@@ -170,6 +180,8 @@ message GetNamespacesRequest {
     // Filter namespaces by their name.
     // Optional, defaults to empty.
     string name = 3;
+    // Filter namespaces by project id - optional.
+    string project_id = 4;
 }
 
 message GetNamespacesResponse {
@@ -419,6 +431,8 @@ message GetNexusEndpointsRequest {
 
     // Filter endpoints by their name - optional, treated as an AND if specified. Specifying this will result in zero or one results.
     string name = 5;
+    // Filter endpoints by their project id - optional.
+    string project_id = 6;
 }
 
 message GetNexusEndpointsResponse {
@@ -445,6 +459,9 @@ message CreateNexusEndpointRequest {
 
     // The id to use for this async operation - optional.
     string async_operation_id = 2;
+    // The id of the project to associate this endpoint with - optional.
+    // If not set, the endpoint will be created in the account's default project.
+    string project_id = 3;
 }
 
 message CreateNexusEndpointResponse {
@@ -488,6 +505,29 @@ message DeleteNexusEndpointRequest {
 }
 
 message DeleteNexusEndpointResponse {
+    // The async operation
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+message MoveNexusEndpointToProjectRequest {
+    // The id of the nexus endpoint to move.
+    string endpoint_id = 1;
+
+    // The id of the project to move the endpoint to.
+    string destination_project_id = 2;
+
+    // The id of the project the caller expects the endpoint to currently belong to.
+    string expected_source_project_id = 3;
+
+    // The version of the endpoint for which this move is intended for.
+    // The latest version can be found in the GetNexusEndpoint operation response.
+    string resource_version = 4;
+
+    // The id to use for this async operation - optional.
+    string async_operation_id = 5;
+}
+
+message MoveNexusEndpointToProjectResponse {
     // The async operation
     temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
 }
@@ -695,6 +735,23 @@ message GetServiceAccountsResponse {
     string next_page_token = 2;
 }
 
+message GetProjectScopedServiceAccountsRequest {
+    // The project to list project scoped service accounts for.
+    string project_id = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetProjectScopedServiceAccountsResponse {
+    // The list of project scoped service accounts in ascending ID order.
+    repeated temporal.api.cloud.identity.v1.ServiceAccount service_accounts = 1;
+    // The next page token, set if there is another page.
+    string next_page_token = 2;
+}
+
 message UpdateServiceAccountRequest {
     // The ID of the service account to update.
     string service_account_id = 1;
@@ -887,6 +944,134 @@ message ValidateNamespaceExportSinkRequest {
 message ValidateNamespaceExportSinkResponse {
 }
 
+message CreateCallerRateLimitRequest {
+    // The target namespace for this caller rate limit.
+    // Required.
+    string namespace = 1;
+
+    // The caller rate limit specification.
+    // Required.
+    temporal.api.cloud.namespace.v1.CallerRateLimitSpec spec = 2;
+
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 3;
+}
+
+message CreateCallerRateLimitResponse {
+    // The target namespace for this caller rate limit.
+    string namespace = 1;
+
+    // The id of the created caller rate limit.
+    string caller_rate_limit_id = 2;
+
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 3;
+}
+
+message GetCallerRateLimitRequest {
+    // The target namespace for the caller rate limit.
+    // Required.
+    string namespace = 1;
+
+    // The id of the caller rate limit.
+    // Required.
+    string caller_rate_limit_id = 2;
+}
+
+message GetCallerRateLimitResponse {
+    // The caller rate limit retrieved.
+    temporal.api.cloud.namespace.v1.CallerRateLimit caller_rate_limit = 1;
+}
+
+message GetCallerRateLimitsRequest {
+    // The target namespace for the caller rate limits.
+    // Required.
+    string namespace = 1;
+
+    // The size of the page to retrieve.
+    // Optional, defaults to 100. Cannot exceed 1000.
+    int32 page_size = 2;
+
+    // Optional. The page token when continuing from another response.
+    string page_token = 3;
+
+    // Optional. Filter the caller rate limits by caller.
+    CallerFilter caller_filter = 4;
+
+    message CallerFilter {
+        // The type of caller to filter on.
+        // Required when caller_filter is set. Accepted values are "namespace".
+        string caller_type = 1;
+
+        // Optional, list the default rate limit for the type.
+        bool default = 2;
+
+        // Optional, list the rate limit for a specific caller.
+        string caller = 3;
+    }
+}
+
+message GetCallerRateLimitsResponse {
+    // The list of caller rate limits.
+    repeated temporal.api.cloud.namespace.v1.CallerRateLimit caller_rate_limits = 1;
+
+    // The page token to list the next page of rate limits.
+    string next_page_token = 2;
+}
+
+message UpdateCallerRateLimitRequest {
+    // The target namespace for the caller rate limit.
+    // Required.
+    string namespace = 1;
+
+    // The id of the caller rate limit.
+    // Required.
+    string caller_rate_limit_id = 2;
+
+    // The updated caller rate limit specification.
+    // Required.
+    temporal.api.cloud.namespace.v1.CallerRateLimitSpec spec = 3;
+
+    // The version of the caller rate limit spec being updated.
+    // The latest version can be found in the GetCallerRateLimit operation response.
+    // Required.
+    string resource_version = 4;
+
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 5;
+}
+
+message UpdateCallerRateLimitResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+message DeleteCallerRateLimitRequest {
+    // The target namespace for the caller rate limit.
+    // Required.
+    string namespace = 1;
+
+    // The id of the caller rate limit.
+    // Required.
+    string caller_rate_limit_id = 2;
+
+    // The version of the caller rate limit spec being deleted.
+    // The latest version can be found in the GetCallerRateLimit operation response.
+    // Required.
+    string resource_version = 3;
+
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 4;
+}
+
+message DeleteCallerRateLimitResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
 message UpdateNamespaceTagsRequest {
     // The namespace to set tags for.
     string namespace = 1;
@@ -913,6 +1098,9 @@ message CreateConnectivityRuleRequest {
     // The id to use for this async operation.
     // Optional, if not provided a random id will be generated.
     string async_operation_id = 2;
+    // The ID of the project this connectivity rule belongs to - optional.
+    // If not set, the connectivity rule will be created in the account's default project.
+    string project_id = 3;
 }
 
 message CreateConnectivityRuleResponse {
@@ -940,6 +1128,8 @@ message GetConnectivityRulesRequest {
     string page_token = 2;
     // Filter connectivity rule by the namespace id.
     string namespace = 3;
+    // Filter connectivity rules by project id - optional.
+    string project_id = 4;
 }
 
 message GetConnectivityRulesResponse {
@@ -1101,6 +1291,9 @@ message GetCustomRolesRequest {
     int32 page_size = 1;
     // The page token if this is continuing from another response.
     string page_token = 2;
+    // Filter to only the custom roles scoped to this project - optional.
+    // If unset, only account-scoped custom roles are returned.
+    string project_id = 3;
 }
 
 message GetCustomRolesResponse {
@@ -1169,6 +1362,57 @@ message DeleteCustomRoleResponse {
     temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
 }
 
+message GetUserProjectAssignmentsRequest {
+    // The id of the project to get users for.
+    string project_id = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetUserProjectAssignmentsResponse {
+    // The list of users with access to the project.
+    repeated temporal.api.cloud.identity.v1.UserProjectAssignment users = 1;
+    // The next page's token.
+    string next_page_token = 2;
+}
+
+message GetServiceAccountProjectAssignmentsRequest {
+    // The id of the project to get service accounts for.
+    string project_id = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetServiceAccountProjectAssignmentsResponse {
+    // The list of service accounts with access to the project.
+    repeated temporal.api.cloud.identity.v1.ServiceAccountProjectAssignment service_accounts = 1;
+    // The next page's token.
+    string next_page_token = 2;
+}
+
+message GetUserGroupProjectAssignmentsRequest {
+    // The id of the project to get user groups for.
+    string project_id = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetUserGroupProjectAssignmentsResponse {
+    // The list of user groups with access to the project.
+    repeated temporal.api.cloud.identity.v1.UserGroupProjectAssignment groups = 1;
+    // The next page's token.
+    string next_page_token = 2;
+}
+
 message GetUserNamespaceAssignmentsRequest {
     // The namespace to get users for.
     string namespace = 1;
@@ -1218,4 +1462,171 @@ message GetUserGroupNamespaceAssignmentsResponse {
     repeated temporal.api.cloud.identity.v1.UserGroupNamespaceAssignment groups = 1;
     // The next page's token.
     string next_page_token = 2;
+}
+
+message GetProjectsRequest {
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 1;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 2;
+    // Filter by project IDs - optional.
+    repeated string project_ids = 3;
+}
+
+message GetProjectsResponse {
+    // The list of projects in ascending ids order
+    repeated temporal.api.cloud.project.v1.Project projects = 1;
+    // The next page's token
+    string next_page_token = 2;
+}
+
+message GetProjectRequest {
+    // The id of the project to get
+    string project_id = 1;
+}
+
+message GetProjectResponse {
+    // The project
+    temporal.api.cloud.project.v1.Project project = 1;
+}
+
+message CreateProjectRequest {
+    // The spec for the project to create.
+    temporal.api.cloud.project.v1.ProjectSpec spec = 1;
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 2;
+}
+
+message CreateProjectResponse {
+    // The id of the project that was created.
+    string project_id = 1;
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 2;
+}
+
+message UpdateProjectRequest {
+    // The id of the project to update.
+    string project_id = 1;
+    // The new project specification.
+    temporal.api.cloud.project.v1.ProjectSpec spec = 2;
+    // The version of the project for which this update is intended for.
+    // The latest version can be found in the GetProject operation response.
+    string resource_version = 3;
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 4;
+}
+
+message UpdateProjectResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+// The full set of connectivity rules a namespace should carry after a move.
+message ConnectivityRuleIDs {
+    // One or more rule ids to attach in the destination project.
+    repeated string connectivity_rule_ids = 1;
+}
+
+message NoConnectivityRules {}
+
+message MoveNamespaceToProjectRequest {
+    // The namespace to move.
+    string namespace = 1;
+    // The project to move the namespace to.
+    string destination_project_id = 2;
+    // The project the caller expects the namespace to currently belong to.
+    string expected_source_project_id = 3;
+    // The version of the namespace for which this move is intended for.
+    // The latest version can be found in the GetNamespace operation response.
+    string resource_version = 4;
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 5;
+    // The connectivity rules the namespace should have in the destination project.
+    // Leave unset only when the namespace has no connectivity rules today.
+    oneof destination_connectivity_rules {
+        ConnectivityRuleIDs rule_ids = 6;
+        NoConnectivityRules unrestricted = 7;
+    }
+}
+
+message MoveNamespaceToProjectResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+message DeleteProjectRequest {
+    // The id of the project to delete.
+    string project_id = 1;
+    // The version of the project for which this delete is intended for.
+    // The latest version can be found in the GetProject operation response.
+    string resource_version = 2;
+    // The id to use for this async operation.
+    // Optional, if not provided a random id will be generated.
+    string async_operation_id = 3;
+}
+
+message DeleteProjectResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+message SetUserProjectAccessRequest {
+    // The project to set permissions for.
+    string project_id = 1;
+    // The id of the user to set permissions for.
+    string user_id = 2;
+    // The project access to assign the user. If left empty, the user will be removed from the project access.
+    temporal.api.cloud.identity.v1.ProjectAccess access = 3;
+    // The version of the user for which this update is intended for.
+    // The latest version can be found in the GetUser operation response.
+    string resource_version = 4;
+    // The id to use for this async operation - optional.
+    string async_operation_id = 5;
+}
+
+message SetUserProjectAccessResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+message SetUserGroupProjectAccessRequest {
+    // The project to set permissions for.
+    string project_id = 1;
+    // The id of the group to set permissions for.
+    string group_id = 2;
+    // The project access to assign the group. If left empty, the group will be removed from the project access.
+    temporal.api.cloud.identity.v1.ProjectAccess access = 3;
+    // The version of the group for which this update is intended for.
+    // The latest version can be found in the GetGroup operation response.
+    string resource_version = 4;
+    // The id to use for this async operation - optional.
+    string async_operation_id = 5;
+}
+
+message SetUserGroupProjectAccessResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
+}
+
+message SetServiceAccountProjectAccessRequest {
+    // The project to set permissions for.
+    string project_id = 1;
+    // The id of the service account to set permissions for.
+    string service_account_id = 2;
+    // The project access to assign the service account. If left empty, the service account will be removed from the project access.
+    temporal.api.cloud.identity.v1.ProjectAccess access = 3;
+    // The version of the service account for which this update is intended for.
+    // The latest version can be found in the GetServiceAccount operation response.
+    string resource_version = 4;
+    // The id to use for this async operation - optional.
+    string async_operation_id = 5;
+}
+
+message SetServiceAccountProjectAccessResponse {
+    // The async operation.
+    temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
 }

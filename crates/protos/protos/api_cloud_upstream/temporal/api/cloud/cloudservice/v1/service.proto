@@ -46,9 +46,11 @@ option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
         {name: "High Availability"; description: "Manage high availability (multi-region, multi-cloud, and same-region replication) namespace configurations"},
         {name: "Export"; description: "Manage workflow history export configurations"},
         {name: "Connectivity Rules"; description: "Manage network connectivity rules"},
+        {name: "Caller Rate Limits"; description: "Manage per-caller rate limits for namespaces (Pre-Release: To get early access contact Temporal Cloud support)."},
         {name: "Regions"; description: "Query available regions"},
         {name: "Account"; description: "Manage account settings and usage"},
         {name: "Custom Roles"; description: "Manage custom roles and their permissions"},
+        {name: "Projects"; description: "Manage projects and project-level access control. Projects are an upcoming feature and may not be enabled for your account. Contact Temporal support to request access."},
         {name: "Operations"; description: "Query async operation status"}
     ];
 };
@@ -518,6 +520,19 @@ service CloudService {
         };
     }
 
+    // Move a nexus endpoint to a different project within the same account
+    rpc MoveNexusEndpointToProject(MoveNexusEndpointToProjectRequest) returns (MoveNexusEndpointToProjectResponse) {
+        option (google.api.http) = {
+            post: "/cloud/nexus/endpoints/{endpoint_id}/move-to-project",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Move a Nexus endpoint to a project";
+            description: "Moves a Nexus endpoint to a different project within the same account.";
+        };
+    }
+
     // Get all user groups
     rpc GetUserGroups (GetUserGroupsRequest) returns (GetUserGroupsResponse) {
         option (google.api.http) = {
@@ -912,6 +927,68 @@ service CloudService {
         };
     }
 
+    // Create a caller rate limit
+    rpc CreateCallerRateLimit(CreateCallerRateLimitRequest) returns (CreateCallerRateLimitResponse) {
+        option (google.api.http) = {
+            post: "/cloud/namespaces/{namespace}/caller-ratelimits",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Caller Rate Limits"];
+            summary: "Create caller rate limit";
+            description: "Creates a new caller rate limit that limits the requests per second a caller can make to a namespace";
+        };
+    }
+
+    // Get a caller rate limit
+    rpc GetCallerRateLimit(GetCallerRateLimitRequest) returns (GetCallerRateLimitResponse) {
+        option (google.api.http) = {
+            get: "/cloud/namespaces/{namespace}/caller-ratelimits/{caller_rate_limit_id}"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Caller Rate Limits"];
+            summary: "Get caller rate limit details";
+            description: "Returns detailed information about a specific caller rate limit";
+        };
+    }
+
+    // Get caller rate limits
+    rpc GetCallerRateLimits(GetCallerRateLimitsRequest) returns (GetCallerRateLimitsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/namespaces/{namespace}/caller-ratelimits"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Caller Rate Limits"];
+            summary: "List caller rate limits";
+            description: "Returns a list of all caller rate limits for a namespace";
+        };
+    }
+
+    // Update a caller rate limit
+    rpc UpdateCallerRateLimit(UpdateCallerRateLimitRequest) returns (UpdateCallerRateLimitResponse) {
+        option (google.api.http) = {
+            post: "/cloud/namespaces/{namespace}/caller-ratelimits/{caller_rate_limit_id}",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Caller Rate Limits"];
+            summary: "Update caller rate limit";
+            description: "Updates an existing caller rate limit's configuration";
+        };
+    }
+
+    // Delete a caller rate limit
+    rpc DeleteCallerRateLimit(DeleteCallerRateLimitRequest) returns (DeleteCallerRateLimitResponse) {
+        option (google.api.http) = {
+            delete: "/cloud/namespaces/{namespace}/caller-ratelimits/{caller_rate_limit_id}"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Caller Rate Limits"];
+            summary: "Delete caller rate limit";
+            description: "Removes a caller rate limit from a namespace";
+        };
+    }
+
     // Update the tags for a namespace
      rpc UpdateNamespaceTags(UpdateNamespaceTagsRequest) returns (UpdateNamespaceTagsResponse) {
         option (google.api.http) = {
@@ -1286,6 +1363,168 @@ service CloudService {
                 url: "https://docs.temporal.io/cloud/user-groups";
                 description: "User groups documentation";
             };
+        };
+    }
+
+    // Get all projects
+    rpc GetProjects(GetProjectsRequest) returns (GetProjectsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/projects",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "List all projects";
+            description: "Returns a list of all projects in the account.";
+        };
+    }
+
+    // Get a project
+    rpc GetProject(GetProjectRequest) returns (GetProjectResponse) {
+        option (google.api.http) = {
+            get: "/cloud/projects/{project_id}",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Get a project";
+            description: "Returns the project with the given id.";
+        };
+    }
+
+    // Create a new project
+    rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse) {
+        option (google.api.http) = {
+            post: "/cloud/projects",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Create a project";
+            description: "Creates a new project.";
+        };
+    }
+
+    // Update a project
+    rpc UpdateProject(UpdateProjectRequest) returns (UpdateProjectResponse) {
+        option (google.api.http) = {
+            post: "/cloud/projects/{project_id}",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Update a project";
+            description: "Updates the configuration of an existing project.";
+        };
+    }
+
+    // Move a namespace to a different project within the same account
+    rpc MoveNamespaceToProject(MoveNamespaceToProjectRequest) returns (MoveNamespaceToProjectResponse) {
+        option (google.api.http) = {
+            post: "/cloud/namespaces/{namespace}/move-to-project",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Move a namespace to a project";
+            description: "Moves a namespace to a different project within the same account.";
+        };
+    }
+
+    // Delete a project
+    rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse) {
+        option (google.api.http) = {
+            delete: "/cloud/projects/{project_id}",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Delete a project";
+            description: "Deletes an existing project.";
+        };
+    }
+
+    // Set a user's access to a project
+    rpc SetUserProjectAccess(SetUserProjectAccessRequest) returns (SetUserProjectAccessResponse) {
+        option (google.api.http) = {
+            post: "/cloud/projects/{project_id}/users/{user_id}/access",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Set user project access";
+            description: "Sets or removes a user's access to a project.";
+        };
+    }
+
+    // Set a user group's access to a project
+    rpc SetUserGroupProjectAccess(SetUserGroupProjectAccessRequest) returns (SetUserGroupProjectAccessResponse) {
+        option (google.api.http) = {
+            post: "/cloud/projects/{project_id}/user-groups/{group_id}/access",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Set user group project access";
+            description: "Sets or removes a user group's access to a project.";
+        };
+    }
+
+    // Set a service account's access to a project
+    rpc SetServiceAccountProjectAccess(SetServiceAccountProjectAccessRequest) returns (SetServiceAccountProjectAccessResponse) {
+        option (google.api.http) = {
+            post: "/cloud/projects/{project_id}/service-accounts/{service_account_id}/access",
+            body: "*"
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "Set service account project access";
+            description: "Sets or removes a service account's access to a project.";
+        };
+    }
+
+    // Get users with access to a project
+    rpc GetUserProjectAssignments(GetUserProjectAssignmentsRequest) returns (GetUserProjectAssignmentsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/projects/{project_id}/user-assignments",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "List users with access to a project";
+            description: "Returns the users that have access to the project, including each user's project-level access.";
+        };
+    }
+
+    // Get service accounts with access to a project
+    rpc GetServiceAccountProjectAssignments(GetServiceAccountProjectAssignmentsRequest) returns (GetServiceAccountProjectAssignmentsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/projects/{project_id}/service-account-assignments",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "List service accounts with access to a project";
+            description: "Returns the service accounts that have access to the project, including each service account's project-level access.";
+        };
+    }
+
+    // Get user groups with access to a project
+    rpc GetUserGroupProjectAssignments(GetUserGroupProjectAssignmentsRequest) returns (GetUserGroupProjectAssignmentsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/projects/{project_id}/user-group-assignments",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "List user groups with access to a project";
+            description: "Returns the user groups that have access to the project, including each group's project-level access.";
+        };
+    }
+
+    // Get service accounts scoped to a project
+    rpc GetProjectScopedServiceAccounts(GetProjectScopedServiceAccountsRequest) returns (GetProjectScopedServiceAccountsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/projects/{project_id}/service-accounts",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Projects"];
+            summary: "List project-scoped service accounts";
+            description: "Returns the service accounts that are scoped to the project.";
         };
     }
 }

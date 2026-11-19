@@ -4559,6 +4559,10 @@ paths:
     get:
       tags:
         - WorkflowService
+      description: |-
+        PollWorkflowExecutionTimeSkipping waits for a fast-forward outcome for a workflow execution.
+
+         Experimental. Might change in the future.
       operationId: PollWorkflowExecutionTimeSkipping
       parameters:
         - name: namespace
@@ -9582,6 +9586,10 @@ paths:
     get:
       tags:
         - WorkflowService
+      description: |-
+        PollWorkflowExecutionTimeSkipping waits for a fast-forward outcome for a workflow execution.
+
+         Experimental. Might change in the future.
       operationId: PollWorkflowExecutionTimeSkipping
       parameters:
         - name: namespace
@@ -11404,6 +11412,26 @@ components:
       description: |-
         ProviderValidationStatus represents the result of the most recent
          connectivity check between Temporal and a customer's compute provider.
+    ConcurrencyLimit:
+      type: object
+      properties:
+        concurrentTasks:
+          type: integer
+          description: |-
+            Maximum number of concurrent tasks that may be running at a time across the scope of the
+             limit. e.g. in TaskQueueConfig, the scope is the whole task queue.
+
+             Note that in situations like network partitions, the server's idea of what is running on
+             workers may be out of date, and this limit could be exceeded from the point of view of
+             workers.
+          format: int32
+    ConcurrencyLimitConfig:
+      type: object
+      properties:
+        concurrencyLimit:
+          $ref: '#/components/schemas/ConcurrencyLimit'
+        metadata:
+          $ref: '#/components/schemas/ConfigMetadata'
     ConfigMetadata:
       type: object
       properties:
@@ -12602,6 +12630,9 @@ components:
 
              If this duration exceeds the remaining execution timeout, time will not pass beyond the end
              of the execution, and the fast-forward won't have a chance to complete.
+      description: |-
+        Controls a time-skipping fast-forward for an execution.
+         Experimental. Might change in the future.
     FetchWorkerConfigRequest:
       type: object
       properties:
@@ -13110,7 +13141,9 @@ components:
         workflowExecutionUnpausedEventAttributes:
           $ref: '#/components/schemas/WorkflowExecutionUnpausedEventAttributes'
         workflowExecutionTimeSkippingTransitionedEventAttributes:
-          $ref: '#/components/schemas/WorkflowExecutionTimeSkippingTransitionedEventAttributes'
+          allOf:
+            - $ref: '#/components/schemas/WorkflowExecutionTimeSkippingTransitionedEventAttributes'
+          description: Experimental.
       description: |-
         History events are the method by which Temporal SDKs advance (or recreate) workflow state.
          See the `EventType` enum for more info about what each event is for.
@@ -13586,6 +13619,7 @@ components:
             - NAMESPACE_STATE_REGISTERED
             - NAMESPACE_STATE_DEPRECATED
             - NAMESPACE_STATE_DELETED
+            - NAMESPACE_STATE_SOFT_DELETED
           type: string
           format: enum
         description:
@@ -14921,6 +14955,9 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
           description: The execution's current fast-forward, if any.
+      description: |-
+        Result of polling a workflow execution's time-skipping fast-forward.
+         Experimental. Might change in the future.
     PollWorkflowTaskQueueResponse:
       type: object
       properties:
@@ -16486,7 +16523,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingInfo'
           description: |-
-            Information about time skipping for this schedule.
+            Experimental.
+             Information about time skipping for this schedule.
              If the schedule has never enabled time skipping, this will be unset.
     ScheduleListEntry:
       type: object
@@ -16563,7 +16601,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
           description: |-
-            If set, applies the specified time-skipping configuration to this schedule,
+            Experimental.
+             If set, applies the specified time-skipping configuration to this schedule,
              replacing any existing time-skipping configuration.
     SchedulePolicies:
       type: object
@@ -17173,7 +17212,9 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: Time-skipping configuration. If not set, time skipping is disabled.
+          description: |-
+            Experimental.
+             Time-skipping configuration. If not set, time skipping is disabled.
     SignalWithStartWorkflowExecutionResponse:
       type: object
       properties:
@@ -17575,12 +17616,15 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: The propagated time-skipping configuration for the child workflow.
+          description: |-
+            Experimental.
+             The propagated time-skipping configuration for the child workflow.
         timeSkippingStatePropagation:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingStatePropagation'
           description: |-
-            The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
+            Experimental.
+             The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
              has occurred or there is no previous run.
         versioningOverride:
           allOf:
@@ -17889,7 +17933,9 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: Time-skipping configuration. If not set, time skipping is disabled.
+          description: |-
+            Experimental.
+             Time-skipping configuration. If not set, time skipping is disabled.
         propagatedNexusSerializationContext:
           allOf:
             - $ref: '#/components/schemas/PropagatedSerializationContext'
@@ -17898,7 +17944,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingStatePropagation'
           description: |-
-            Time-skipping state propagated by the execution that started this workflow.
+            Experimental.
+             Time-skipping state propagated by the execution that started this workflow.
              This field is intended for use by the Temporal server, for example when a schedule
              starts a workflow, and is not intended to be set by external clients.
     StartWorkflowExecutionResponse:
@@ -18067,7 +18114,7 @@ components:
         queueRateLimit:
           allOf:
             - $ref: '#/components/schemas/RateLimitConfig'
-          description: Unless modified, this is the system-defined rate limit.
+          description: Rate limit for the whole queue.
         fairnessKeysRateLimitDefault:
           allOf:
             - $ref: '#/components/schemas/RateLimitConfig'
@@ -18078,6 +18125,10 @@ components:
             type: number
             format: float
           description: If set, overrides the fairness weights for the corresponding fairness keys.
+        queueConcurrencyLimit:
+          allOf:
+            - $ref: '#/components/schemas/ConcurrencyLimitConfig'
+          description: Concurrency limit for the whole queue.
     TaskQueueReachability:
       type: object
       properties:
@@ -18386,6 +18437,7 @@ components:
          but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
          "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
          parent execution as its start time.
+         Experimental. Might change in the future.
     TimeSkippingFastForwardInfo:
       type: object
       properties:
@@ -18403,7 +18455,9 @@ components:
         hasCompleted:
           type: boolean
           description: True once `target_time` has been reached.
-      description: TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
+      description: |-
+        TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
+         Experimental. Might change in the future.
     TimeSkippingInfo:
       type: object
       properties:
@@ -18431,7 +18485,9 @@ components:
             The number of skips accumulated in the current session, bounded by `max_session_skip_count`.
              A new session begins — and this resets to 0 — each time `max_session_skip_count` is updated.
           format: int32
-      description: Describes the current time-skipping state of a workflow execution.
+      description: |-
+        Describes the current time-skipping state of a workflow execution.
+         Experimental. Might change in the future.
     TimeSkippingStatePropagation:
       type: object
       properties:
@@ -18452,6 +18508,7 @@ components:
       description: |-
         The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs
          within the same execution.
+         Experimental. Might change in the future.
     TimeoutFailureInfo:
       type: object
       properties:
@@ -18800,6 +18857,7 @@ components:
             - NAMESPACE_STATE_REGISTERED
             - NAMESPACE_STATE_DEPRECATED
             - NAMESPACE_STATE_DELETED
+            - NAMESPACE_STATE_SOFT_DELETED
           type: string
           description: |-
             New namespace state, server will reject if transition is not allowed.
@@ -18962,16 +19020,33 @@ components:
             If set, removes any existing fairness weight overrides for each specified fairness key.
              Fairness weights for corresponding keys fall back to the values set during task creation (if any),
              or to the default weight of 1.0.
+        updateQueueConcurrencyLimit:
+          allOf:
+            - $ref: '#/components/schemas/UpdateTaskQueueConfigRequest_ConcurrencyLimitUpdate'
+          description: |-
+            Update queue-wide concurrency limit.
+             If not set, this configuration is unchanged.
+             If the `concurrency_limit` field in the `ConcurrencyLimitUpdate` is missing, remove the existing limit.
+    UpdateTaskQueueConfigRequest_ConcurrencyLimitUpdate:
+      type: object
+      properties:
+        concurrencyLimit:
+          allOf:
+            - $ref: '#/components/schemas/ConcurrencyLimit'
+          description: Limit to be updated
+        reason:
+          type: string
+          description: Reason why the limit was updated
     UpdateTaskQueueConfigRequest_RateLimitUpdate:
       type: object
       properties:
         rateLimit:
           allOf:
             - $ref: '#/components/schemas/RateLimit'
-          description: Rate Limit to be updated
+          description: Rate limit to be updated
         reason:
           type: string
-          description: Reason for why the rate limit was set.
+          description: Reason why the rate limit was updated
     UpdateTaskQueueConfigResponse:
       type: object
       properties:
@@ -19119,10 +19194,7 @@ components:
         updateTime:
           type: string
           description: |-
-            The Workflow Execution time when the options were updated. When time skipping is
-             enabled, this is the workflow's virtual time rather than wall-clock time.
-
-             This timestamp cannot be used for time-skipping fast-forward verification,
+            Deprecated. Not populated by the server; for time-skipping fast-forward verification,
              use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
           format: date-time
     UpdateWorkflowExecutionRequest:
@@ -19982,6 +20054,12 @@ components:
         isAutoscaling:
           type: boolean
           description: Set true if the number of concurrent pollers is auto-scaled
+        targetPollers:
+          type: integer
+          description: |-
+            Number of pollers this poller pool is currently targeting, which may differ from current_pollers.
+             0 if unknown, such as a poller pool of fixed size.
+          format: int32
     WorkerSelector:
       type: object
       properties:
@@ -20392,7 +20470,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingInfo'
           description: |-
-            Information about time skipping of the workflow execution.
+            Experimental.
+             Information about time skipping of the workflow execution.
              If the execution has never enabled time skipping, it will be nil.
         propagatedNexusSerializationContext:
           allOf:
@@ -20566,7 +20645,7 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: "The time-skipping configuration for this workflow execution.\n When `fast_forward` is set, time will be fast-forwarded to a future point relative\n to the current workflow timestamp. Each call takes effect, even if\n `fast_forward` is set to the same duration, since the target time is recalculated\n from the current timestamp on every call.\n\n This field must be updated as a whole; updating individual sub-fields is not supported.\n When setting the update mask in `UpdateWorkflowExecutionOptionsRequest`, \n `BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field."
+          description: "Experimental.\n The time-skipping configuration for this workflow execution.\n When `fast_forward` is set, time will be fast-forwarded to a future point relative\n to the current workflow timestamp. Each call takes effect, even if\n `fast_forward` is set to the same duration, since the target time is recalculated\n from the current timestamp on every call.\n\n This field must be updated as a whole; updating individual sub-fields is not supported.\n When setting the update mask in `UpdateWorkflowExecutionOptionsRequest`, \n `BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field."
     WorkflowExecutionOptionsUpdatedEventAttributes:
       type: object
       properties:
@@ -20601,11 +20680,14 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: TimeSkippingConfig override upserted in this event. Represents the full config.
+          description: |-
+            Experimental.
+             TimeSkippingConfig override upserted in this event. Represents the full config.
         timeSkippingConfigUpdated:
           type: boolean
           description: |-
-            Indicates the time skipping config was updated by the recent call to update
+            Experimental.
+             Indicates the time skipping config was updated by the recent call to update
              workflow execution options.
         workflowUpdateOptions:
           type: array
@@ -20930,7 +21012,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
           description: |-
-            Initial time-skipping configuration for this workflow execution, recorded at start time.
+            Experimental.
+             Initial time-skipping configuration for this workflow execution, recorded at start time.
              This may have been set explicitly via the start workflow request, or propagated from a
              parent/previous execution.
 
@@ -20940,7 +21023,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingStatePropagation'
           description: |-
-            The time-skipping state propagated from a previous run of this workflow. This can be nil
+            Experimental.
+             The time-skipping state propagated from a previous run of this workflow. This can be nil
              if no time skipping has occurred or there is no previous run.
         propagatedNexusSerializationContext:
           allOf:
@@ -20979,6 +21063,7 @@ components:
         Attributes for an event indicating that time skipping state changed for a workflow execution:
          either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
          The worker_may_ignore field in HistoryEvent should always be set true for this event.
+         Experimental. Might change in the future.
     WorkflowExecutionTimedOutEventAttributes:
       type: object
       properties:

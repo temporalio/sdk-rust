@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::{
     error::Error,
     fs::OpenOptions,
-    io,
+    io::{self, Seek},
     path::{Path, PathBuf},
 };
 use temporalio_client::{Connection, ConnectionOptions, errors::ClientConnectError};
@@ -517,11 +517,19 @@ impl EphemeralExe {
                         "https://temporal.download/{artifact_name}/{version_name}"
                     ))
                     .query(&get_info_params);
-                let resp = send_download_request(request).await?;
-                let info: DownloadInfo = resp
-                    .json()
-                    .await
-                    .map_err(EphemeralServerError::download_error)?;
+                let info: DownloadInfo = retry_download(|| {
+                    let request = request
+                        .try_clone()
+                        .expect("download request has no streaming body");
+                    async move {
+                        send_download_request(request)
+                            .await?
+                            .json()
+                            .await
+                            .map_err(EphemeralServerError::download_error)
+                    }
+                })
+                .await?;
 
                 // Attempt download, looping because it could have waited for
                 // concurrent one to finish
@@ -596,38 +604,99 @@ fn get_free_port(bind_ip: &str) -> io::Result<u16> {
 
 const DOWNLOAD_MAX_ATTEMPTS: u32 = 4;
 
-/// Retries transient download failures. `temporal.download` can answer `503` during a
-/// release deploy, and a short connection failure should not fail a worker's download.
-/// A plain `GET` is safe to replay.
+/// Retries a download that fails in transit. `temporal.download` can answer `503` during a
+/// release deploy, and a connection can break while the body streams in. Neither should fail a
+/// worker's download. Each attempt starts again from the request, since a plain `GET` is safe to
+/// replay.
+async fn retry_download<T, F, Fut>(mut attempt: F) -> Result<T, EphemeralServerError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, EphemeralServerError>>,
+{
+    for attempt_number in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        let err = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        if attempt_number == DOWNLOAD_MAX_ATTEMPTS || !is_transient_download_error(&err) {
+            return Err(err);
+        }
+        warn!("Retrying ephemeral server download after a transient failure: {err:?}");
+        sleep(Duration::from_millis(200 * 2u64.pow(attempt_number - 1))).await;
+    }
+    unreachable!("download retry loop returns on its final attempt");
+}
+
 async fn send_download_request(
     request: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, EphemeralServerError> {
-    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
-        let send = request
-            .try_clone()
-            .expect("download request has no streaming body");
-        let err = match send
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-        {
-            Ok(resp) => return Ok(resp),
-            Err(err) => err,
-        };
-        let transient = err.is_timeout()
-            || err.is_connect()
-            || matches!(
-                err.status(),
-                Some(status)
-                    if status.is_server_error()
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            );
-        if attempt == DOWNLOAD_MAX_ATTEMPTS || !transient {
-            return Err(EphemeralServerError::download_error(err));
-        }
-        sleep(Duration::from_millis(200 * 2u64.pow(attempt - 1))).await;
+    request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(EphemeralServerError::download_error)
+}
+
+/// Only a failure of the transfer is worth another attempt. A truncated archive in a complete
+/// body gives the same I/O error kinds as a broken connection. So only an error from `reqwest`
+/// can count.
+fn is_transient_download_error(err: &EphemeralServerError) -> bool {
+    let source = match err {
+        EphemeralServerError::Download { source }
+        | EphemeralServerError::InvalidDownload {
+            source: Some(source),
+            ..
+        } => source.as_ref(),
+        _ => return false,
+    };
+    let Some(transfer_err) = find_reqwest_error(source) else {
+        return false;
+    };
+    if transfer_err.is_timeout() || transfer_err.is_connect() {
+        return true;
     }
-    unreachable!("download retry loop returns on its final attempt");
+    if let Some(status) = transfer_err.status() {
+        return status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+    }
+    let mut cause = transfer_err.source();
+    while let Some(err) = cause {
+        if err
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+        {
+            return true;
+        }
+        if let Some(io_err) = err.downcast_ref::<io::Error>()
+            && matches!(
+                io_err.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+            )
+        {
+            return true;
+        }
+        cause = err.source();
+    }
+    false
+}
+
+/// The archive readers wrap a body error in `io::Error`. Its `source` skips the error it wraps, so
+/// the walk looks inside each `io::Error` too.
+fn find_reqwest_error<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a reqwest::Error> {
+    let mut next = Some(err);
+    while let Some(err) = next {
+        if let Some(transfer_err) = err.downcast_ref::<reqwest::Error>() {
+            return Some(transfer_err);
+        }
+        next = match err.downcast_ref::<io::Error>().and_then(io::Error::get_ref) {
+            Some(inner) => Some(inner as &(dyn Error + 'static)),
+            None => err.source(),
+        };
+    }
+    None
 }
 
 /// Returns false if we successfully waited for another download to complete, or
@@ -714,9 +783,9 @@ async fn lazy_download_exe(
             return Ok(true);
         }
         // Download and extract the binary
-        Ok(mut temp_file) => {
+        Ok(temp_file) => {
             info!("Downloading {} to {}", uri, dest.display());
-            download_and_extract(client, uri, file_to_extract, &mut temp_file)
+            download_and_extract(client, uri, file_to_extract, &temp_file)
                 .await
                 .inspect_err(|_| {
                     // Failed to download, just remove file
@@ -739,19 +808,8 @@ async fn download_and_extract(
     client: &reqwest::Client,
     uri: &str,
     file_to_extract: &Path,
-    dest: &mut std::fs::File,
+    dest: &std::fs::File,
 ) -> Result<(), EphemeralServerError> {
-    // Start download. We are using streaming here to extract the file from the
-    // tarball or zip instead of loading into memory for Cursor/Seek.
-    let resp = send_download_request(client.get(uri)).await?;
-    // We have to map the error type to an io error
-    let stream = resp
-        .bytes_stream()
-        .map(|item| item.map_err(io::Error::other));
-
-    // Since our tar/zip impls use sync IO, we have to create a bridge and run
-    // in a blocking closure.
-    let mut reader = SyncIoBridge::new(StreamReader::new(stream));
     let tarball = if uri.ends_with(".tar.gz") {
         true
     } else if uri.ends_with(".zip") {
@@ -761,10 +819,37 @@ async fn download_and_extract(
             "archive URL has unsupported format: {uri}"
         )));
     };
-    let file_to_extract = file_to_extract.to_path_buf();
-    let mut dest = dest
-        .try_clone()
-        .map_err(EphemeralServerError::download_error)?;
+    retry_download(|| async move {
+        let mut dest = dest
+            .try_clone()
+            .map_err(EphemeralServerError::download_error)?;
+        // A failed attempt can leave part of the executable behind.
+        dest.set_len(0)
+            .map_err(EphemeralServerError::download_error)?;
+        dest.rewind()
+            .map_err(EphemeralServerError::download_error)?;
+        let resp = send_download_request(client.get(uri)).await?;
+        extract(resp, tarball, file_to_extract.to_path_buf(), dest).await
+    })
+    .await
+}
+
+// Extraction is its own function so the retry closure stays short. It runs on each attempt.
+async fn extract(
+    resp: reqwest::Response,
+    tarball: bool,
+    file_to_extract: PathBuf,
+    mut dest: std::fs::File,
+) -> Result<(), EphemeralServerError> {
+    // We are using streaming here to extract the file from the tarball or zip instead of loading
+    // into memory for Cursor/Seek. We have to map the error type to an io error.
+    let stream = resp
+        .bytes_stream()
+        .map(|item| item.map_err(io::Error::other));
+
+    // Since our tar/zip impls use sync IO, we have to create a bridge and run
+    // in a blocking closure.
+    let mut reader = SyncIoBridge::new(StreamReader::new(stream));
 
     spawn_blocking(move || -> Result<(), EphemeralServerError> {
         if tarball {
@@ -862,9 +947,10 @@ fn remove_file_past_ttl(
 mod tests {
     use super::{
         EphemeralServer, EphemeralServerConfig, EphemeralServerError, get_free_port,
-        remove_file_past_ttl,
+        lazy_download_exe, remove_file_past_ttl,
     };
     use bytes::Bytes;
+    use flate2::{Compression, write::GzEncoder};
     use http_body_util::{Empty, Full};
     use hyper::{Response, server::conn::http2, service::service_fn};
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -874,15 +960,33 @@ mod tests {
         fs::File,
         future::pending,
         net::{TcpListener, TcpStream},
+        path::{Path, PathBuf},
         process::Stdio,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime},
     };
-    use tokio::{net::TcpListener as TokioTcpListener, sync::Notify, time::timeout};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener as TokioTcpListener,
+        sync::{Notify, RwLock},
+        task::JoinHandle,
+        time::timeout,
+    };
+
+    // A child process holds copies of all sockets of this process until its exec closes them. So a
+    // spawn can keep the listener of `get_free_port` open after `get_free_port` drops it, and a
+    // bind to that port at that time fails. Each test in this binary that spawns a child must hold
+    // a read guard. Tests that bind a port right after `get_free_port` returns it hold the write
+    // guard.
+    static PROCESS_SPAWN_LOCK: RwLock<()> = RwLock::const_new(());
 
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_start_kills_server_process() {
+        let _spawn = PROCESS_SPAWN_LOCK.read().await;
         let pid_file = temp_dir().join(format!("core-test-pid-{}", rand::random::<u64>()));
 
         // Stand in for a server that starts but never begins listening: it
@@ -936,6 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_timeout_bounds_get_system_info() {
+        let _spawn = PROCESS_SPAWN_LOCK.read().await;
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let request_received = Arc::new(Notify::new());
         let notify = request_received.clone();
@@ -986,6 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn respects_startup_timeout() {
+        let _spawn = PROCESS_SPAWN_LOCK.read().await;
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let request_received = Arc::new(Notify::new());
         let ready = Arc::new(Notify::new());
@@ -1047,6 +1153,7 @@ mod tests {
 
     #[test]
     fn get_free_port_can_bind_immediately() {
+        let _no_spawns = PROCESS_SPAWN_LOCK.blocking_write();
         let host = "127.0.0.1";
 
         // Each iteration leaves sockets in TIME_WAIT. Keep the count low, since this runs in
@@ -1071,6 +1178,136 @@ mod tests {
 
         // file should be gone
         assert!(!dest_file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn download_retries_a_body_that_breaks() {
+        let executable = random_executable();
+        let archive = tar_gz("temporal", &executable);
+        // The first response promises the whole archive, sends half, and closes the connection.
+        let (uri, requests, server) = serve_archive(vec![
+            (archive[..archive.len() / 2].to_vec(), archive.len()),
+            (archive.clone(), archive.len()),
+        ])
+        .await;
+        let dest = download_dest();
+
+        let result = timeout(
+            Duration::from_secs(10),
+            lazy_download_exe(
+                &download_client(),
+                &uri,
+                Path::new("temporal"),
+                &dest,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+        assert!(result.unwrap());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(std::fs::read(&dest).unwrap() == executable);
+        assert!(!downloading_path(&dest).exists());
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::not_an_archive(b"this body is complete and is not an archive".to_vec())]
+    #[case::truncated_archive({
+        let archive = tar_gz("temporal", &random_executable());
+        archive[..archive.len() / 2].to_vec()
+    })]
+    #[tokio::test]
+    async fn download_of_a_complete_invalid_archive_is_not_retried(#[case] body: Vec<u8>) {
+        let length = body.len();
+        let (uri, requests, server) = serve_archive(vec![(body, length)]).await;
+        let dest = download_dest();
+
+        let result = timeout(
+            Duration::from_secs(10),
+            lazy_download_exe(
+                &download_client(),
+                &uri,
+                Path::new("temporal"),
+                &dest,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EphemeralServerError::InvalidDownload { .. }),
+            "{err:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!dest.exists());
+        assert!(!downloading_path(&dest).exists());
+    }
+
+    /// Random bytes do not compress, so half of the archive ends inside the executable.
+    fn random_executable() -> Vec<u8> {
+        (0..64 * 1024).map(|_| rand::random::<u8>()).collect()
+    }
+
+    fn tar_gz(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        builder.append_data(&mut header, path, contents).unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Serves one `(body, content length)` response per connection and repeats the last one, so
+    /// a retry the test does not expect still shows in the request count. A body shorter than its
+    /// content length ends with a closed connection.
+    async fn serve_archive(
+        responses: Vec<(Vec<u8>, usize)>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}/temporal.tar.gz", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let served = counter.fetch_add(1, Ordering::SeqCst);
+                let (body, length) = &responses[served.min(responses.len() - 1)];
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
+                );
+                // The client can stop reading once it has the executable.
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        (uri, requests, server)
+    }
+
+    fn download_client() -> reqwest::Client {
+        temporalio_common::telemetry::ensure_default_crypto_provider();
+        reqwest::Client::new()
+    }
+
+    fn download_dest() -> PathBuf {
+        temp_dir().join(format!("core-test-download-{}", rand::random::<u64>()))
+    }
+
+    fn downloading_path(dest: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.downloading", dest.display()))
     }
 
     fn try_listen_and_dial_on(host: &str, port: u16) -> std::io::Result<()> {
