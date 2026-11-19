@@ -14,11 +14,12 @@ use temporalio_client::{
 };
 use temporalio_common::{
     data_converters::{
-        DataConverter, DefaultFailureConverter, DefaultPayloadCodec, FailureConverter, MultiArgs2,
-        PayloadCodec, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable, TemporalSerializable,
+        DataConverter, DefaultFailureConverter, DefaultPayloadCodec, FailureConverter,
+        GenericPayloadConverter, MultiArgs2, PayloadCodec, PayloadConversionError,
+        PayloadConverter, SerializationContext, SerializationContextData, TemporalDeserializable,
+        TemporalSerializable,
     },
-    error::{IncomingError, OutgoingError},
+    error::{ActivityExecutionError, IncomingError, OutgoingError},
     protos::{
         coresdk::AsJsonPayloadExt,
         temporal::api::{
@@ -28,7 +29,7 @@ use temporalio_common::{
         },
     },
 };
-use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_macros::{TemporalTransfer, activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ApplicationFailure, CancellableFuture, MemoValue, SyncWorkflowContext,
     WorkflowContext, WorkflowContextView, WorkflowResult,
@@ -42,6 +43,25 @@ struct TrackedValue {
     data: String,
     serialize_count: u32,
     deserialize_count: u32,
+}
+
+#[derive(Clone, Debug, TemporalTransfer)]
+#[temporal(transfer_type = TrackedValue)]
+struct TransferTracked(TrackedValue);
+
+impl From<&TransferTracked> for TrackedValue {
+    fn from(value: &TransferTracked) -> Self {
+        let mut wire = value.0.clone();
+        wire.serialize_count += 1;
+        wire
+    }
+}
+
+impl From<TrackedValue> for TransferTracked {
+    fn from(mut wire: TrackedValue) -> Self {
+        wire.deserialize_count += 1;
+        Self(wire)
+    }
 }
 
 impl TrackedValue {
@@ -95,6 +115,29 @@ impl TestActivities {
     ) -> Result<TrackedWrapper, ActivityError> {
         input.0.data = format!("activity-processed:{}", input.0.data);
         Ok(input)
+    }
+
+    #[activity]
+    async fn process_transfer(
+        _ctx: ActivityContext,
+        mut input: TransferTracked,
+    ) -> Result<TransferTracked, ActivityError> {
+        input.0.data = format!("activity-processed:{}", input.0.data);
+        Ok(input)
+    }
+
+    #[activity]
+    async fn fail_with_transfer_detail(
+        _ctx: ActivityContext,
+        input: TransferTracked,
+    ) -> Result<(), ActivityError> {
+        Err(
+            ApplicationFailure::builder(std::io::Error::other("transfer failure"))
+                .details(input)
+                .non_retryable(true)
+                .build()
+                .into(),
+        )
     }
 }
 
@@ -197,6 +240,196 @@ impl DataConverterTestWorkflow {
 
         Ok(output)
     }
+}
+
+#[workflow]
+#[derive(Default)]
+struct TransferWorkflow {
+    signalled: bool,
+    updated: bool,
+}
+
+#[workflow_methods]
+impl TransferWorkflow {
+    #[run]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        input: TransferTracked,
+    ) -> WorkflowResult<TransferTracked> {
+        let converter = ctx.payload_converter();
+        let data = SerializationContextData::Workflow(
+            temporalio_common::data_converters::WorkflowSerializationContext::new(),
+        );
+        let context = SerializationContext::new(&data, converter);
+        let payload = converter.to_payload(
+            &context,
+            &TransferTracked(TrackedValue::new("direct".to_owned())),
+        )?;
+        let direct: TransferTracked = converter.from_payload(&context, payload)?;
+        assert_eq!(direct.0.serialize_count, 1);
+        assert_eq!(direct.0.deserialize_count, 1);
+
+        let output = ctx
+            .execute_activity(
+                TestActivities::process_transfer,
+                input,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?;
+        let error = ctx
+            .execute_activity(
+                TestActivities::fail_with_transfer_detail,
+                TransferTracked(TrackedValue::new("failure-detail".to_owned())),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await
+            .expect_err("activity must fail");
+        let ActivityExecutionError::Failed(failure) = error else {
+            panic!("expected activity failure");
+        };
+        let Some(IncomingError::Application(application)) = failure.cause() else {
+            panic!("expected application failure");
+        };
+        let detail: TransferTracked = application.details()?.expect("missing failure detail");
+        assert_eq!(detail.0.data, "failure-detail");
+        assert_eq!(detail.0.serialize_count, 2);
+        assert_eq!(detail.0.deserialize_count, 2);
+        ctx.wait_condition(|state| state.signalled && state.updated)
+            .await?;
+        Ok(output)
+    }
+
+    #[signal]
+    fn accept_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: TransferTracked) {
+        assert_eq!(input.0.data, "signal");
+        assert_eq!(input.0.deserialize_count, 1);
+        self.signalled = true;
+    }
+
+    #[query]
+    fn echo_query(&self, _ctx: &WorkflowContextView, input: TransferTracked) -> TransferTracked {
+        input
+    }
+
+    #[update]
+    fn echo_update(
+        &mut self,
+        _ctx: &mut SyncWorkflowContext<Self>,
+        input: TransferTracked,
+    ) -> TransferTracked {
+        self.updated = true;
+        input
+    }
+}
+
+#[rstest::rstest]
+#[case::plain(false)]
+#[case::codec(true)]
+#[tokio::test]
+async fn transfer_types_round_trip_through_workflows_and_activities(#[case] with_codec: bool) {
+    let codec = Arc::new(XorCodec::new(0x42));
+    let connection = get_integ_connection(None).await;
+    let data_converter = if with_codec {
+        DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            codec.clone(),
+        )
+    } else {
+        DataConverter::default()
+    };
+    let client = Client::new(
+        connection,
+        ClientOptions::new(integ_namespace())
+            .data_converter(data_converter)
+            .build(),
+    )
+    .unwrap();
+    let mut starter = CoreWfStarter::new_with_overrides(
+        &format!("transfer_types_{with_codec}"),
+        None,
+        Some(client),
+    );
+    starter.sdk_config.register_activities(TestActivities);
+    starter
+        .sdk_config
+        .register_workflow::<TransferWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let handle = worker
+        .submit_workflow(
+            TransferWorkflow::run,
+            TransferTracked(TrackedValue::new("input".to_owned())),
+            WorkflowStartOptions::new(starter.get_task_queue(), starter.get_task_queue()).build(),
+        )
+        .await
+        .unwrap();
+
+    let interact = async {
+        let queried = handle
+            .query(
+                TransferWorkflow::echo_query,
+                TransferTracked(TrackedValue::new("query".to_owned())),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queried.0.data, "query");
+        assert_eq!(queried.0.serialize_count, 2);
+        assert_eq!(queried.0.deserialize_count, 2);
+        let updated = handle
+            .execute_update(
+                TransferWorkflow::echo_update,
+                TransferTracked(TrackedValue::new("update".to_owned())),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.0.data, "update");
+        assert_eq!(updated.0.serialize_count, 2);
+        assert_eq!(updated.0.deserialize_count, 2);
+        handle
+            .signal(
+                TransferWorkflow::accept_signal,
+                TransferTracked(TrackedValue::new("signal".to_owned())),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let (_, worker_result) = tokio::join!(interact, worker.run_until_done());
+    worker_result.unwrap();
+    let result = handle.get_result(Default::default()).await.unwrap().0;
+    assert_eq!(result.data, "activity-processed:input");
+    assert_eq!(result.serialize_count, 4);
+    assert_eq!(result.deserialize_count, 4);
+    if with_codec {
+        assert!(codec.encode_count() > 0);
+        assert!(codec.decode_count() > 0);
+    }
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    let input = history
+        .iter()
+        .find_map(|event| match &event.attributes {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attrs)) => {
+                attrs.input.as_ref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.payloads[0].metadata["encoding"], b"json/plain");
+    let mut bytes = input.payloads[0].data.clone();
+    if with_codec {
+        bytes.iter_mut().for_each(|byte| *byte ^= 0x42);
+    }
+    let wire: TrackedValue = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(wire.data, "input");
+    assert_eq!(wire.serialize_count, 1);
+    assert_eq!(wire.deserialize_count, 0);
 }
 
 #[workflow]

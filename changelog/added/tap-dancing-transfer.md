@@ -1,1 +1,1 @@
-Added `HasTransferType` and the `TemporalTransfer` derive to declare model-to-transfer conversions and generate typed adapters. Automatic payload-conversion dispatch is not enabled yet.
+Added `HasTransferType` and the `TemporalTransfer` derive to serialize ergonomic model types through a canonical transfer representation using standard `From`/`TryFrom` conversions. Transfer conversion applies once per top-level payload value, including failure details, but not to memo values.

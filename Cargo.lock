@@ -4448,6 +4448,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "temporalio-macros",
  "temporalio-protos",
  "thiserror 2.0.21",
  "tokio",

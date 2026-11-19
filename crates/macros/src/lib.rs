@@ -45,8 +45,8 @@ mod workflow_definitions;
 /// The default SDK path is `::temporalio_common`. Use `#[temporal(crate = path)]` when that crate
 /// has been renamed or re-exported.
 ///
-/// Currently the generated implementations supply transfer metadata and adapters only.
-/// Normal payload-conversion entry points do not yet invoke transfer conversion.
+/// Transfer conversion applies once per top-level payload value, including failure details.
+/// It does not recursively convert nested fields and is not applied to memo values.
 #[proc_macro_derive(TemporalTransfer, attributes(temporal))]
 pub fn temporal_transfer(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);

@@ -141,19 +141,19 @@ impl From<String> for CannotEncode {
     }
 }
 
-fn encode<T: HasTransferType>(value: &T) -> Result<Payload, PayloadConversionError> {
+fn encode<T: HasTransferType + 'static>(value: &T) -> Result<Payload, PayloadConversionError> {
     let converter = PayloadConverter::default();
     let context = SerializationContext::new(&SerializationContextData::None, &converter);
-    value.to_transfer_value()?.unwrap().to_payload(&context)
+    converter.to_payload(&context, value)
 }
 
-fn decode<T: HasTransferType>(payload: Payload) -> Result<T, PayloadConversionError> {
+fn decode<T: HasTransferType + 'static>(payload: Payload) -> Result<T, PayloadConversionError> {
     let converter = PayloadConverter::default();
     let context = SerializationContext::new(&SerializationContextData::None, &converter);
-    T::transfer_decoder().unwrap().decode(&context, payload)
+    converter.from_payload(&context, payload)
 }
 
-fn round_trip<T: HasTransferType>(value: &T) -> T {
+fn round_trip<T: HasTransferType + 'static>(value: &T) -> T {
     decode(encode(value).unwrap()).unwrap()
 }
 

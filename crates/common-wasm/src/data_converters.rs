@@ -653,6 +653,52 @@ impl GenericPayloadConverter for PayloadConverter {
         context: &SerializationContext<'_>,
         val: &T,
     ) -> Result<Payload, PayloadConversionError> {
+        match val.to_transfer_value()? {
+            Some(transfer) => transfer.to_payload(self, context),
+            None => self.to_payload_without_transfer(context, val),
+        }
+    }
+
+    fn from_payload<T: TemporalDeserializable + 'static>(
+        &self,
+        context: &SerializationContext<'_>,
+        payload: Payload,
+    ) -> Result<T, PayloadConversionError> {
+        match T::transfer_decoder() {
+            Some(decoder) => decoder.decode(self, context, payload),
+            None => self.from_payload_without_transfer(context, payload),
+        }
+    }
+
+    fn to_payloads<T: TemporalSerializable + 'static>(
+        &self,
+        context: &SerializationContext<'_>,
+        val: &T,
+    ) -> Result<Vec<Payload>, PayloadConversionError> {
+        match val.to_transfer_value()? {
+            Some(transfer) => transfer.to_payloads(self, context),
+            None => self.to_payloads_without_transfer(context, val),
+        }
+    }
+
+    fn from_payloads<T: TemporalDeserializable + 'static>(
+        &self,
+        context: &SerializationContext<'_>,
+        payloads: Vec<Payload>,
+    ) -> Result<T, PayloadConversionError> {
+        match T::transfer_decoder() {
+            Some(decoder) => decoder.decode_payloads(self, context, payloads),
+            None => self.from_payloads_without_transfer(context, payloads),
+        }
+    }
+}
+
+impl PayloadConverter {
+    pub(crate) fn to_payload_without_transfer<T: TemporalSerializable + 'static>(
+        &self,
+        context: &SerializationContext<'_>,
+        val: &T,
+    ) -> Result<Payload, PayloadConversionError> {
         match self {
             PayloadConverter::Serde(pc) => {
                 if let Some(well_known_type) = WellKnownType::of::<T>() {
@@ -664,7 +710,7 @@ impl GenericPayloadConverter for PayloadConverter {
             PayloadConverter::UseWrappers => T::to_payload(val, context),
             PayloadConverter::Composite(composite) => {
                 for converter in &composite.converters {
-                    match converter.to_payload(context, val) {
+                    match converter.to_payload_without_transfer(context, val) {
                         Ok(payload) => return Ok(payload),
                         Err(PayloadConversionError::WrongEncoding) => continue,
                         Err(e) => return Err(e),
@@ -675,7 +721,8 @@ impl GenericPayloadConverter for PayloadConverter {
         }
     }
 
-    fn from_payload<T: TemporalDeserializable + 'static>(
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn from_payload_without_transfer<T: TemporalDeserializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
         mut payload: Payload,
@@ -693,7 +740,7 @@ impl GenericPayloadConverter for PayloadConverter {
             PayloadConverter::UseWrappers => T::from_payload(context, payload),
             PayloadConverter::Composite(composite) => {
                 for converter in &composite.converters {
-                    match converter.from_payload(context, payload.clone()) {
+                    match converter.from_payload_without_transfer(context, payload.clone()) {
                         Ok(value) => return Ok(value),
                         Err(PayloadConversionError::WrongEncoding) => continue,
                         Err(e) => return Err(e),
@@ -704,7 +751,7 @@ impl GenericPayloadConverter for PayloadConverter {
         }
     }
 
-    fn to_payloads<T: TemporalSerializable + 'static>(
+    pub(crate) fn to_payloads_without_transfer<T: TemporalSerializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
         val: &T,
@@ -720,7 +767,7 @@ impl GenericPayloadConverter for PayloadConverter {
             PayloadConverter::UseWrappers => T::to_payloads(val, context),
             PayloadConverter::Composite(composite) => {
                 for converter in &composite.converters {
-                    match converter.to_payloads(context, val) {
+                    match converter.to_payloads_without_transfer(context, val) {
                         Ok(payloads) => return Ok(payloads),
                         Err(PayloadConversionError::WrongEncoding) => continue,
                         Err(e) => return Err(e),
@@ -731,7 +778,8 @@ impl GenericPayloadConverter for PayloadConverter {
         }
     }
 
-    fn from_payloads<T: TemporalDeserializable + 'static>(
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn from_payloads_without_transfer<T: TemporalDeserializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
         mut payloads: Vec<Payload>,
@@ -753,7 +801,7 @@ impl GenericPayloadConverter for PayloadConverter {
             PayloadConverter::UseWrappers => T::from_payloads(context, payloads),
             PayloadConverter::Composite(composite) => {
                 for converter in &composite.converters {
-                    match converter.from_payloads(context, payloads.clone()) {
+                    match converter.from_payloads_without_transfer(context, payloads.clone()) {
                         Ok(val) => return Ok(val),
                         Err(PayloadConversionError::WrongEncoding) => continue,
                         Err(e) => return Err(e),
