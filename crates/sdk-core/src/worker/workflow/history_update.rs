@@ -2,6 +2,7 @@ use crate::{
     internal_flags::CoreInternalFlags,
     protosext::ValidPollWFTQResponse,
     worker::{
+        WorkerConfig,
         client::WorkerClient,
         workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
     },
@@ -23,6 +24,9 @@ use temporalio_common::protos::temporal::api::{
     history::v1::{
         History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
     },
+};
+use temporalio_streams::workflow::{
+    MarkerReads, ReplayReads, is_stream_marker, read_marker_records,
 };
 use tracing::Instrument;
 
@@ -48,6 +52,9 @@ pub(crate) struct HistoryUpdate {
     has_last_wft: bool,
     wft_count: usize,
     pub(super) chunking_disabled: bool,
+    /// The Records that a run new to the cache read for the Stream markers of these events, or
+    /// `None` if it read none.
+    stream_reads: Option<ReplayReads>,
 }
 
 impl Debug for HistoryUpdate {
@@ -71,6 +78,23 @@ impl Debug for HistoryUpdate {
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
+    }
+
+    /// Returns true if a run new to the cache must read the Records of the Stream markers in these
+    /// events before it replays them.
+    pub(crate) fn needs_stream_records(&self) -> bool {
+        self.stream_reads.is_none() && self.events.iter().any(is_stream_marker)
+    }
+
+    /// Reads the Records that the Stream markers of these events count but don't hold.
+    pub(crate) async fn read_stream_records(&mut self, config: &WorkerConfig) {
+        let reads = read_marker_records(&self.events, &config.stream_runtimes, &config.namespace);
+        self.stream_reads = Some(reads.await);
+    }
+
+    /// Takes the Records that were read for the Stream marker event `event_id`.
+    pub(crate) fn take_stream_reads(&mut self, event_id: i64) -> MarkerReads {
+        (self.stream_reads.as_mut()).map_or_else(Vec::new, |reads| reads.take(event_id))
     }
 }
 
@@ -97,6 +121,9 @@ pub(crate) struct HistoryPaginator {
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
     chunking_disabled: bool,
+    /// The config of the Worker, set for a run new to the cache, which reads the Records of the
+    /// Stream markers of each update that it replays.
+    stream_config: Option<Arc<WorkerConfig>>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +216,7 @@ impl HistoryPaginator {
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
             chunking_disabled: false,
+            stream_config: req.original_wft.paginator.stream_config.take(),
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -223,6 +251,20 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             chunking_disabled: false,
+            stream_config: None,
+        }
+    }
+
+    /// Makes each later update read the Records of its Stream markers, for a run new to the
+    /// cache.
+    pub(super) fn read_stream_records_with(&mut self, config: &Arc<WorkerConfig>) {
+        self.stream_config = Some(config.clone());
+    }
+
+    /// Reads the Records of the Stream markers of `update`, for a run new to the cache.
+    pub(super) async fn read_stream_records(&self, update: &mut HistoryUpdate) {
+        if let Some(config) = &self.stream_config {
+            update.read_stream_records(config).await;
         }
     }
 
@@ -290,7 +332,7 @@ impl HistoryPaginator {
             // We only *really* have the last WFT if the events go all the way up to at least the
             // WFT started event id. Otherwise we somehow still have partial history.
             let no_more = matches!(self.next_page_token, NextPageToken::Done) && seen_enough_events;
-            let (update, extra) = HistoryUpdate::from_events(
+            let (mut update, extra) = HistoryUpdate::from_events(
                 current_events,
                 self.previous_wft_started_id,
                 self.wft_started_event_id,
@@ -323,6 +365,7 @@ impl HistoryPaginator {
                 update.events.last().map(|e| e.event_id);
             #[cfg(debug_assertions)]
             update.assert_contiguous();
+            self.read_stream_records(&mut update).await;
             return Ok(update);
         }
     }
@@ -451,6 +494,7 @@ impl HistoryUpdate {
             has_last_wft: false,
             wft_count: 0,
             chunking_disabled: false,
+            stream_reads: None,
         }
     }
 
@@ -511,6 +555,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 1,
                         chunking_disabled,
+                        stream_reads: None,
                     },
                     vec![],
                 )
@@ -523,6 +568,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 0,
                         chunking_disabled,
+                        stream_reads: None,
                     },
                     all_events,
                 )
@@ -562,6 +608,7 @@ impl HistoryUpdate {
                 has_last_wft,
                 wft_count,
                 chunking_disabled,
+                stream_reads: None,
             },
             remaining_events,
         )

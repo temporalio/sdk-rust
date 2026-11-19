@@ -2,15 +2,26 @@
 //! doesn't need any of it.
 
 mod calls;
+mod digest;
 mod manager;
 mod marker;
+mod reader;
+mod replay;
 
 pub use calls::{CallError, Phase, StreamCalls};
 pub use manager::{Request, StreamManager, StreamResolution};
 pub use marker::{is_stream_marker, marker_details, peeked_marker};
+pub use replay::{MarkerReads, ReplayError, ReplayReads, read_marker_records};
 
-use crate::StreamRuntime;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use crate::{MAX_RECORDS, StreamRuntime};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use temporalio_common::protos::temporal::api::stream::v1::WorkflowTaskEpoch;
 use tokio::sync::watch;
 
@@ -43,9 +54,9 @@ impl StreamRuntimes {
     }
 }
 
-/// The settings for how a Stream call tries its Store. A try that fails with
-/// [`Reason::StorageUnavailable`](crate::Reason::StorageUnavailable), or gets no answer within its
-/// deadline, counts as an outage, and the call then tries again with no limit in time.
+/// The settings for how a Stream call tries its Store, and for how a read asks it. A try that fails
+/// with [`Reason::StorageUnavailable`](crate::Reason::StorageUnavailable), or gets no answer within
+/// its deadline, counts as an outage, and the call then tries again with no limit in time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try. Each later wait doubles, and the actual wait is a
@@ -54,8 +65,23 @@ pub struct StreamSettings {
     pub retry_first_wait: Duration,
     /// The maximum wait between two tries. It must be at most 60 seconds.
     pub retry_max_wait: Duration,
-    /// How long one try waits for the Store. It must be more than 0 and at most 60 seconds.
+    /// How long one try waits for the Store. A read's try also waits as long as the read asks the
+    /// Store to wait. It must be more than 0 and at most 60 seconds.
     pub try_deadline: Duration,
+    /// The maximum bytes of Records in one page of a read, which is all that waits in Core for the
+    /// next activation. It must be more than 0.
+    pub read_ahead_bytes: usize,
+    /// The maximum number of Records in one page of a read. It must be from 1 to 1000.
+    pub read_page_records: usize,
+    /// The minimum time between two pages of a read, so that Records which come one at a time reach
+    /// Workflow code in fewer activations. Zero is no gap, and it must be at most 1 second.
+    pub read_min_gap: Duration,
+    /// How long a replay tries a Store that is in an outage, for the Records of one marker entry.
+    /// Zero is one try, and it must be at most 60 seconds.
+    pub replay_retry_bound: Duration,
+    /// The maximum number of marker entries whose Records a replay reads at the same time. It must
+    /// be from 1 to 64.
+    pub replay_concurrency: usize,
 }
 
 impl Default for StreamSettings {
@@ -64,11 +90,18 @@ impl Default for StreamSettings {
             retry_first_wait: Duration::from_millis(100),
             retry_max_wait: Duration::from_secs(2),
             try_deadline: Duration::from_secs(5),
+            read_ahead_bytes: 4 * 1024 * 1024,
+            read_page_records: 256,
+            read_min_gap: Duration::ZERO,
+            replay_retry_bound: Duration::from_secs(5),
+            replay_concurrency: 8,
         }
     }
 }
 
 const MAX_SETTING_WAIT: Duration = Duration::from_secs(60);
+const MAX_READ_MIN_GAP: Duration = Duration::from_secs(1);
+const MAX_REPLAY_CONCURRENCY: usize = 64;
 
 impl StreamSettings {
     /// Checks that each setting is within its bounds.
@@ -88,6 +121,23 @@ impl StreamSettings {
                 "The Stream setting `try_deadline` must be more than 0 and at most 60 s"
                     .to_string(),
             );
+        }
+        if self.read_ahead_bytes == 0 {
+            return Err("The Stream setting `read_ahead_bytes` must be more than 0".to_string());
+        }
+        if self.read_page_records == 0 || self.read_page_records > MAX_RECORDS {
+            return Err(
+                "The Stream setting `read_page_records` must be from 1 to 1000".to_string(),
+            );
+        }
+        if self.read_min_gap > MAX_READ_MIN_GAP {
+            return Err("The Stream setting `read_min_gap` must be at most 1 s".to_string());
+        }
+        if self.replay_retry_bound > MAX_SETTING_WAIT {
+            return Err("The Stream setting `replay_retry_bound` must be at most 60 s".to_string());
+        }
+        if self.replay_concurrency == 0 || self.replay_concurrency > MAX_REPLAY_CONCURRENCY {
+            return Err("The Stream setting `replay_concurrency` must be from 1 to 64".to_string());
         }
         Ok(())
     }
@@ -129,6 +179,33 @@ impl RunGate {
             TaskState::NoTask => None,
         }
     }
+
+    /// Returns a receiver for a reader, which wakes it each time the task state changes.
+    fn subscribe(&self) -> watch::Receiver<TaskState> {
+        self.0.subscribe()
+    }
+}
+
+/// The bytes of Records that the task in hand can still give Workflow code, and that its marker
+/// can still hold for reads with `records_in_history`. The run is its one writer, and its readers
+/// only read it.
+#[derive(Debug, Default)]
+pub(crate) struct TaskRoom {
+    task: AtomicUsize,
+    marker: AtomicUsize,
+}
+
+impl TaskRoom {
+    fn set(&self, (task, marker): (usize, usize)) {
+        self.task.store(task, Ordering::Release);
+        self.marker.store(marker, Ordering::Release);
+    }
+
+    /// Returns the bytes of Records that the task, and then its marker, can still take.
+    fn get(&self) -> (usize, usize) {
+        let task = self.task.load(Ordering::Acquire);
+        (task, self.marker.load(Ordering::Acquire))
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +235,7 @@ mod tests {
                 retry_first_wait,
                 retry_max_wait,
                 try_deadline,
+                ..StreamSettings::default()
             };
             let expected = error.map_or(Ok(()), |error| Err(error.to_string()));
             assert_eq!(settings.check(), expected, "{settings:?}");
