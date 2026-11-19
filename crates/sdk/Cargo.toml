@@ -44,7 +44,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
-wasmtime = { version = "48.0.7", optional = true, features = ["component-model"] }
+temporalio-workflow-wasm = { version = "~1.2.0", path = "../workflow-wasm", optional = true, features = ["rust-sdk"] }
 url = { version = "2.5", optional = true }
 
 [dependencies.temporalio-sdk-core]
@@ -84,7 +84,7 @@ otel = ["temporalio-sdk-core/otel"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 examples = ["serde/derive", "dep:serde_json", "envconfig"]
 wasm-examples = []
-wasm-workflows = ["dep:wasmtime"]
+wasm-workflows = ["dep:temporalio-workflow-wasm"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]
 testing = ["temporalio-sdk-core/ephemeral-server", "dep:url"]
 

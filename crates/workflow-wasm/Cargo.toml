@@ -1,0 +1,25 @@
+[package]
+name = "temporalio-workflow-wasm"
+version = "1.2.0"
+edition = "2024"
+rust-version = "1.95.0"
+license-file = { workspace = true }
+description = "Wasmtime host for Temporal workflow components"
+repository = "https://github.com/temporalio/sdk-rust"
+
+[features]
+rust-sdk = ["wasmtime/default"]
+
+[dependencies]
+anyhow = "1.0"
+wasmtime = { version = "48.0.7", default-features = false, features = [
+    "anyhow",
+    "component-model",
+    "cranelift",
+    "parallel-compilation",
+    "runtime",
+    "std",
+] }
+
+[lints]
+workspace = true
