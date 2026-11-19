@@ -4,6 +4,7 @@ use crate::{
     worker::workflow::{
         HistoryUpdate, LocalActivityRequestSink, PermittedWFT, RequestEvictMsg, RunBasics,
         managed_run::{ManagedRun, RunUpdateAct},
+        streams::StreamManager,
     },
 };
 use lru::LruCache;
@@ -20,6 +21,7 @@ pub(super) struct RunCache {
     /// Run id -> Data
     runs: LruCache<String, ManagedRun>,
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+    stream_manager: Arc<StreamManager>,
 
     metrics: MetricsContext,
 }
@@ -30,6 +32,7 @@ impl RunCache {
         sdk_name_and_version: (String, String),
         server_capabilities: get_system_info_response::Capabilities,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        stream_manager: Arc<StreamManager>,
         metrics: MetricsContext,
     ) -> Self {
         // The cache needs room for at least one run, otherwise we couldn't do anything. In
@@ -48,6 +51,7 @@ impl RunCache {
             ),
             local_activity_request_sink: local_activity_request_sink
                 .map(|s| Rc::new(s) as Rc<dyn LocalActivityRequestSink>),
+            stream_manager,
             metrics,
         }
     }
@@ -81,6 +85,7 @@ impl RunCache {
             },
             pwft,
             self.local_activity_request_sink.clone(),
+            self.stream_manager.clone(),
         );
         if self.runs.push(run_id, mrh).is_some() {
             panic!("Overflowed run cache! Cache owner is expected to avoid this!");
@@ -139,6 +144,12 @@ impl RunCache {
 
     pub(super) fn is_full(&self) -> bool {
         self.runs.cap().get() == self.runs.len()
+    }
+
+    /// True while a Stream close of a run of this cache, or of one that left it, waits for the
+    /// Store.
+    pub(super) fn has_stream_closes_in_flight(&self) -> bool {
+        self.stream_manager.has_closes_in_flight()
     }
 
     pub(super) fn len(&self) -> usize {

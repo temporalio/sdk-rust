@@ -1141,6 +1141,16 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                // This SDK has no Stream API, so it issues no Stream command that could resolve.
+                Some(
+                    ActivationVariant::ResolveStreamAppend(_)
+                    | ActivationVariant::ResolveStreamClose(_),
+                ) => {
+                    return Err(Box::new(Failure {
+                        message: "This SDK does not append to or close Streams".to_string(),
+                        ..Default::default()
+                    }));
+                }
                 None => {
                     return Err(Box::new(Failure {
                         message: "Activation job missing variant".to_string(),

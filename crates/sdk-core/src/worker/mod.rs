@@ -41,6 +41,11 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+pub use workflow::StreamRuntimes;
+#[cfg(test)]
+pub(crate) use workflow::{
+    MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_STORE_NAME_BYTES, StreamTestHooks,
+};
 
 use crate::{
     ActivityHeartbeat,
@@ -281,6 +286,22 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// The Stream runtimes of this Worker, by the name of the Store that each serves. Workflow
+    /// code appends to and closes a Stream through the runtime of its Store, and a call on a Store
+    /// with no runtime here fails the Workflow Task.
+    /// NOTE: Experimental
+    #[builder(default)]
+    pub stream_runtimes: StreamRuntimes,
+
+    /// True on a replay Worker, which makes no live Stream call.
+    #[builder(skip)]
+    pub(crate) replays_only: bool,
+
+    /// Lets a test see and shorten the wait of a graceful shutdown for a Stream close.
+    #[cfg(test)]
+    #[builder(skip)]
+    pub(crate) stream_test_hooks: workflow::StreamTestHooks,
 
     /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
     /// oversized payloads are still warned about, and the server still rejects them. When unset, an

@@ -5,6 +5,8 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::ExternalData";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "temporal/api/failure/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 
 // This file defines data that Core might write externally. The first motivating case being
 // storing data in markers in event history. Defining such data as protos provides an easy way
@@ -39,4 +41,42 @@ message PatchedMarkerData {
   string id = 1;
   // Whether or not the patch is marked deprecated.
   bool deprecated = 2;
+}
+
+// The data of the marker `core_stream`, which Core records once for each workflow task in which
+// the workflow got a Stream result. It is in the detail `data` as `binary/protobuf`, so that a
+// marker with results stays small.
+message StreamMarkerData {
+  repeated StreamAppendEntry appends = 2;
+  repeated StreamCloseEntry closes = 3;
+  // Each Stream of the entries, once. An entry gives the index of its Stream here, so that a task
+  // with many results on one Stream holds its ref once.
+  repeated temporal.api.stream.v1.StreamRef streams = 4;
+}
+
+// The result of one append, in the workflow task whose activation got it.
+message StreamAppendEntry {
+  uint32 seq = 1;
+  // The index of the append's Stream in `StreamMarkerData.streams`.
+  uint32 stream_index = 2;
+  bytes first_offset = 3;
+  bytes last_offset = 4;
+  temporal.api.failure.v1.Failure failure = 5;
+  // The activation in the task that got the result.
+  uint32 activation = 6;
+}
+
+// A close in one workflow task: its intent, in the task that asked for it, or its result, in the
+// task whose activation got it.
+message StreamCloseEntry {
+  uint32 seq = 1;
+  // The index of the closed Stream in `StreamMarkerData.streams`.
+  uint32 stream_index = 2;
+  // Set on the intent, the epoch that Core closes with after the server took the task.
+  temporal.api.stream.v1.WorkflowTaskEpoch intent_epoch = 3;
+  // True on the result. `failure` is unset when the Stream is closed.
+  bool resolved = 4;
+  temporal.api.failure.v1.Failure failure = 5;
+  // The activation in the task that got the result.
+  uint32 activation = 6;
 }

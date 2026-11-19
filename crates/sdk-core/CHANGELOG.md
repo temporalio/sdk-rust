@@ -43,7 +43,24 @@ relevant information.
   [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
 * [lang-internal] Added the experimental `temporalio-streams` crate. `StreamRuntime` checks each
   Stream call and passes it to a `StreamStore`, which a bridge implements for a Store in its own
-  language. Core's worker doesn't use it.
+  language.
+* [lang-internal] Added experimental Stream calls, so Workflow code can append to and close a
+  Stream directly. A Worker takes its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store
+  name. Lang sends `AppendToStream` and `CloseStream`, and gets the results in the
+  `ResolveStreamAppend` and `ResolveStreamClose` jobs.
+* [lang-internal] Core records one `core_stream` marker for each Workflow Task in which Workflow
+  code got a Stream result, and a replay gives those results back in the same activations. A close
+  takes effect only after the server accepted the task that asked for it, so its result comes in a
+  later task.
+* [lang-internal] Core refuses a Stream call with `stream_invalid` when its Stream id or Store name
+  has more than 4096 bytes.
+* [lang-internal] Core retries an append or a close of a Stream while the Store is unavailable. If
+  one is still in the outage at the heartbeat of its Workflow Task, the task fails with
+  `StreamStoreUnavailable`, and Core forces no task for it.
+* [lang-internal] A graceful shutdown of the Worker waits for each Stream close in flight, for at
+  most 10 s.
+* [lang-internal] The Worker's meter records Stream calls, their failures, and the latencies of
+  appends and closes, as `stream_*` metrics.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or

@@ -4553,6 +4553,7 @@ dependencies = [
  "temporalio-common",
  "temporalio-macros",
  "temporalio-sdk",
+ "temporalio-streams",
  "temporalio-workflow",
  "thiserror 2.0.21",
  "tokio",
@@ -4602,13 +4603,16 @@ name = "temporalio-streams"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "parking_lot",
  "prost",
  "prost-wkt-types",
  "temporalio-common",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

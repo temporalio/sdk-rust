@@ -1254,6 +1254,12 @@ pub mod coresdk {
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
                         }
+                        workflow_activation_job::Variant::ResolveStreamAppend(r) => {
+                            write!(f, "ResolveStreamAppend({})", r.seq)
+                        }
+                        workflow_activation_job::Variant::ResolveStreamClose(r) => {
+                            write!(f, "ResolveStreamClose({})", r.seq)
+                        }
                     }
                 }
             }
@@ -1619,6 +1625,18 @@ pub mod coresdk {
             impl Display for RequestCancelNexusOperation {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "RequestCancelNexusOperation({})", self.seq)
+                }
+            }
+
+            impl Display for AppendToStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "AppendToStream({})", self.seq)
+                }
+            }
+
+            impl Display for CloseStream {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "CloseStream({})", self.seq)
                 }
             }
 

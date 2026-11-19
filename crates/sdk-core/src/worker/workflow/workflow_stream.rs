@@ -5,6 +5,7 @@ use crate::{
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
+        streams::StreamManager,
         wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
         *,
     },
@@ -66,6 +67,7 @@ impl WFStream {
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        stream_manager: Arc<StreamManager>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let all_inputs = stream::select_with_strategy(
             local_rx.map(Into::into),
@@ -77,13 +79,19 @@ impl WFStream {
             // Priority always goes to the local stream
             |_: &mut ()| PollNext::Left,
         );
-        Self::build_internal(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(
+            all_inputs,
+            basics,
+            local_activity_request_sink,
+            stream_manager,
+        )
     }
 
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        stream_manager: Arc<StreamManager>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
@@ -92,6 +100,7 @@ impl WFStream {
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
                 basics.server_capabilities,
                 local_activity_request_sink,
+                stream_manager,
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
@@ -258,6 +267,9 @@ impl WFStream {
         // it yet.
         let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
             if let Some(w) = rh.buffer_wft_if_outstanding_work(pwft) {
+                if rh.has_foreign_stream_events(&w.work.update) {
+                    return Ok(rh.evict_for_foreign_task(w));
+                }
                 w
             } else {
                 return Ok(None);
@@ -608,6 +620,11 @@ impl WFStream {
         if self.shutdown_token.is_cancelled() {
             if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
                 // Don't exit if there are outstanding fetch requests
+                return false;
+            }
+            // History has the intent of a close in flight, and Workflow code may never await it,
+            // so the end of the Worker would lose it.
+            if self.runs.has_stream_closes_in_flight() {
                 return false;
             }
             let all_runs_ready = self.runs.handles().all(|r| !r.has_any_pending_work(false));

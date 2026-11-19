@@ -143,6 +143,10 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // An append to a Stream resolved.
+        ResolveStreamAppend resolve_stream_append = 18;
+        // A close of a Stream resolved.
+        ResolveStreamClose resolve_stream_close = 19;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -427,4 +431,27 @@ message RemoveFromCache {
         WORKFLOW_EXECUTION_ENDING = 10;
     }
     EvictionReason reason = 2;
+}
+
+// The result of an `AppendToStream`.
+message ResolveStreamAppend {
+    // The sequence number of the `AppendToStream`
+    uint32 seq = 1;
+    oneof status {
+        StreamAppended appended = 2;
+        temporal.api.failure.v1.Failure failed = 3;
+    }
+}
+
+message StreamAppended {
+    bytes first_offset = 1;
+    bytes last_offset = 2;
+}
+
+// The result of a `CloseStream`, in a workflow task after the one that asked for it.
+message ResolveStreamClose {
+    // The sequence number of the `CloseStream`
+    uint32 seq = 1;
+    // Unset when the Stream is closed, also when it was closed already.
+    temporal.api.failure.v1.Failure failed = 2;
 }

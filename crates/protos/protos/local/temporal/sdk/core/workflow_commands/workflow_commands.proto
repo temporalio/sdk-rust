@@ -16,6 +16,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
@@ -55,6 +56,8 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        AppendToStream append_to_stream = 25;
+        CloseStream close_stream = 26;
     }
 }
 
@@ -419,4 +422,30 @@ message ScheduleNexusOperation {
 message RequestCancelNexusOperation {
     // Lang's incremental sequence number as passed to `ScheduleNexusOperation`
     uint32 seq = 1;
+}
+
+// Append Records to a Stream. Core calls the Store itself and gives the result in a
+// `ResolveStreamAppend` job.
+message AppendToStream {
+    // Lang's incremental sequence number of Stream appends, used as the append's identifier
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The bodies of the Records, in order
+    repeated temporal.api.common.v1.Payload bodies = 3;
+    // The workflow's Producer, of kind workflow, with its id and run id and no epoch. Core sets the
+    // epoch to the current workflow task.
+    temporal.api.stream.v1.Producer producer = 4;
+    // The `sequence` of the Store request, as the caller gives it. Zero means Core uses `seq`.
+    int64 sequence = 5;
+}
+
+// Close a Stream. Core records the intent in this workflow task, closes the Stream after the
+// server took the task, and gives the result in a `ResolveStreamClose` job of a later task.
+message CloseStream {
+    // Lang's incremental sequence number of Stream closes, used as the close's identifier
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The workflow's Producer, of kind workflow, with its id and run id and no epoch. Core sets the
+    // epoch to the workflow task that recorded the close.
+    temporal.api.stream.v1.Producer producer = 3;
 }
