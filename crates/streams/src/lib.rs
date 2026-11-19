@@ -32,6 +32,8 @@ mod runtime;
 mod store;
 #[cfg(test)]
 mod test_store;
+#[cfg(feature = "workflow")]
+pub mod workflow;
 
 pub use error::{Reason, StreamError, StreamResult};
 pub use runtime::{MAX_RECORDS, MAX_SEQUENCE, MAX_WAIT, StreamRuntime};

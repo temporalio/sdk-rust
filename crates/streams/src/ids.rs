@@ -1,5 +1,5 @@
-//! Size limits for Stream ids, Producer ids and offsets, and the checks that enforce them. Callers
-//! choose the ids and Stores choose the offsets, so this crate treats both as opaque.
+//! Size limits for Stream ids, Store names, Producer ids and offsets, and the checks that enforce
+//! them. Callers choose the ids and Stores choose the offsets, so this crate treats both as opaque.
 
 use crate::{
     Reason, StreamError, StreamResult,
@@ -17,10 +17,25 @@ pub const MAX_PRODUCER_ID_BYTES: usize = 4096;
 /// bound too.
 pub const MAX_OFFSET_BYTES: usize = 1024;
 
+/// The maximum length of a Store name in a Workflow call, in bytes. A marker records the Store of
+/// each call, so the name needs a bound.
+pub const MAX_STORE_NAME_BYTES: usize = 4096;
+
 pub(crate) fn check_ref(stream: Option<&StreamRef>) -> StreamResult<&StreamRef> {
     let stream = stream.ok_or_else(|| StreamError::invalid("The request has no Stream ref"))?;
     check_id("Stream", &stream.id, MAX_STREAM_ID_BYTES)?;
     Ok(stream)
+}
+
+#[cfg(feature = "workflow")]
+pub(crate) fn check_store_name(store: &str) -> StreamResult<()> {
+    if store.len() > MAX_STORE_NAME_BYTES {
+        return Err(StreamError::invalid(format!(
+            "The Store name has {} bytes, more than {MAX_STORE_NAME_BYTES}",
+            store.len()
+        )));
+    }
+    Ok(())
 }
 
 fn check_id(of: &str, id: &str, max: usize) -> StreamResult<()> {

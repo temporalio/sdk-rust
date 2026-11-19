@@ -4,6 +4,7 @@ use crate::{
     worker::workflow::{
         HistoryUpdate, LocalActivityRequestSink, PermittedWFT, RequestEvictMsg, RunBasics,
         managed_run::{ManagedRun, RunUpdateAct},
+        streams::Streams,
     },
 };
 use lru::LruCache;
@@ -20,6 +21,7 @@ pub(super) struct RunCache {
     /// Run id -> Data
     runs: LruCache<String, ManagedRun>,
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+    streams: Arc<Streams>,
 
     metrics: MetricsContext,
 }
@@ -30,6 +32,7 @@ impl RunCache {
         sdk_name_and_version: (String, String),
         server_capabilities: get_system_info_response::Capabilities,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        streams: Arc<Streams>,
         metrics: MetricsContext,
     ) -> Self {
         // The cache needs room for at least one run, otherwise we couldn't do anything. In
@@ -48,6 +51,7 @@ impl RunCache {
             ),
             local_activity_request_sink: local_activity_request_sink
                 .map(|s| Rc::new(s) as Rc<dyn LocalActivityRequestSink>),
+            streams,
             metrics,
         }
     }
@@ -81,6 +85,7 @@ impl RunCache {
             },
             pwft,
             self.local_activity_request_sink.clone(),
+            self.streams.clone(),
         );
         if self.runs.push(run_id, mrh).is_some() {
             panic!("Overflowed run cache! Cache owner is expected to avoid this!");
