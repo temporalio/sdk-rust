@@ -38,6 +38,7 @@ pub use crate::worker::client::{
 };
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
+pub use temporalio_streams::workflow::{StreamRuntimes, StreamSettings};
 pub use url::Url;
 pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
