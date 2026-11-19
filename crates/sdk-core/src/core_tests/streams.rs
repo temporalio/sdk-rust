@@ -1,17 +1,19 @@
-//! Direct appends and closes of a Stream, on a test Store. A test drives the Worker with a mock
-//! history.
+//! Direct reads and appends of a Stream, on a test Store. A test drives the Worker with a mock
+//! history, and adds Records to the Store between its polls.
+
+mod reads;
 
 use super::stream_store::TestStreamStore;
 use crate::{
-    StreamRuntimes, Worker, WorkerConfig,
+    StreamRuntimes, Worker, WorkerConfig, WorkflowErrorType,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder},
     test_help::{
         CounterRecordingMeter, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
         build_mock_pollers, hist_to_poll_resp, mock_worker, test_worker_cfg,
     },
     worker::{
-        MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_STORE_NAME_BYTES, StreamTestHooks,
-        client::WorkflowTaskCompletion,
+        MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_STORE_NAME_BYTES, STORE_RETRY_BOUND,
+        StreamTestHooks, client::WorkflowTaskCompletion,
     },
 };
 use futures_util::FutureExt;
@@ -29,13 +31,18 @@ use temporalio_common::{
     protos::{
         constants::STREAM_MARKER_NAME,
         coresdk::{
-            external_data::{StreamAppendEntry, StreamCloseEntry, StreamMarkerData},
+            common::StreamReadStop,
+            external_data::{
+                StreamAppendEntry, StreamCloseEntry, StreamMarkerData, StreamReadEnded,
+                StreamReadEntry,
+            },
             workflow_activation::{
-                ResolveStreamAppend, ResolveStreamClose, WorkflowActivation, resolve_stream_append,
-                workflow_activation_job,
+                ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, WorkflowActivation,
+                resolve_stream_append, workflow_activation_job,
             },
             workflow_commands::{
-                AppendToStream, CloseStream, CompleteWorkflowExecution, workflow_command,
+                AppendToStream, CloseStream, CompleteWorkflowExecution, StartStreamRead,
+                workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -52,6 +59,7 @@ use temporalio_common::{
 };
 use temporalio_streams::{
     Reason, StreamError, StreamResult, StreamRuntime, StreamStore,
+    digest::records_digest,
     ids::MAX_STREAM_ID_BYTES,
     proto::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
@@ -100,6 +108,24 @@ async fn create(runtime: &StreamRuntime, id: &str) {
         .unwrap();
 }
 
+/// Appends `texts` as a client, as a Producer outside the Workflow would.
+async fn put(runtime: &StreamRuntime, id: &str, texts: &[&str]) {
+    runtime
+        .append_records(AppendRecordsRequest {
+            r#ref: Some(stream(id)),
+            producer: Some(client()),
+            records: texts
+                .iter()
+                .map(|text| AppendRecord {
+                    body: Some(body(text)),
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
 async fn close(runtime: &StreamRuntime, id: &str) {
     runtime
         .close_stream(CloseStreamRequest {
@@ -127,6 +153,15 @@ fn texts(records: &[StreamRecord]) -> Vec<String> {
         .iter()
         .map(|record| String::from_utf8(record.body.clone().unwrap().data).unwrap())
         .collect()
+}
+
+fn read_cmd(seq: u32, id: &str) -> StartStreamRead {
+    StartStreamRead {
+        seq,
+        stream: Some(stream(id)),
+        idle_timeout: Some(Duration::from_secs(30).try_into().unwrap()),
+        ..Default::default()
+    }
 }
 
 fn workflow_producer(run_id: &str) -> Producer {
@@ -172,8 +207,8 @@ struct Run {
     history: Option<Arc<Mutex<TestHistoryBuilder>>>,
 }
 
-/// A Worker whose mock poller stays alive. The end of a poller begins a shutdown, so a test shuts
-/// the Worker down when it asks.
+/// A Worker whose mock poller stays alive. The end of a poller begins a shutdown, which ends a
+/// task that only reads hold open, so a test shuts the Worker down when it asks.
 fn start(
     t: TestHistoryBuilder,
     responses: impl IntoIterator<Item = ResponseType>,
@@ -365,6 +400,17 @@ async fn complete(
         ))
         .await
         .unwrap();
+}
+
+fn reads(activation: &WorkflowActivation) -> Vec<ResolveStreamRead> {
+    activation
+        .jobs
+        .iter()
+        .filter_map(|job| match &job.variant {
+            Some(workflow_activation_job::Variant::ResolveStreamRead(read)) => Some(read.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn appends(activation: &WorkflowActivation) -> Vec<ResolveStreamAppend> {
@@ -629,7 +675,72 @@ async fn append_without_a_workflow_producer_fails_the_task() {
     assert!(all_records(&runtime, "s").await.is_empty());
 }
 
-// Replays. A test builds the marker that Core would have written.
+// Replays. A test builds the marker that Core would have written, from the Records in the Store.
+
+/// One page of a read entry: its Records and its activation in the Workflow Task.
+struct Page<'a> {
+    records: &'a [StreamRecord],
+    activation: u32,
+}
+
+/// The marker entry of read `seq` of Stream `id`, with its pages and its end.
+fn read_entry(
+    seq: u32,
+    after_offset: Vec<u8>,
+    pages: &[Page<'_>],
+    end: Option<(StreamReadStop, u32)>,
+    records_in_history: bool,
+) -> StreamReadEntry {
+    let records: Vec<StreamRecord> = pages
+        .iter()
+        .flat_map(|page| page.records.iter().cloned())
+        .collect();
+    let last_offset = records
+        .last()
+        .map(|record| record.offset.clone())
+        .unwrap_or_default();
+    let mut before = 0;
+    let page_activations = pages
+        .iter()
+        .enumerate()
+        .map(|(at, page)| {
+            let gap = if at == 0 {
+                page.activation
+            } else {
+                page.activation - before
+            };
+            before = page.activation;
+            gap
+        })
+        .collect();
+    StreamReadEntry {
+        seq,
+        stream_index: 0,
+        from_offset: vec![],
+        end: end.map(|(stop, activation)| StreamReadEnded {
+            last_offset: if last_offset.is_empty() {
+                after_offset.clone()
+            } else {
+                last_offset.clone()
+            },
+            stop: stop as i32,
+            done: stop == StreamReadStop::Done,
+            failure: None,
+            activation,
+        }),
+        after_offset,
+        last_offset,
+        count: records.len() as u32,
+        digest: if records_in_history || records.is_empty() {
+            vec![]
+        } else {
+            records_digest(&records).to_vec()
+        },
+        page_counts: pages.iter().map(|page| page.records.len() as u32).collect(),
+        page_activations,
+        records: if records_in_history { records } else { vec![] },
+    }
+}
 
 /// A `core_stream` marker event with `data`.
 fn stream_marker_event(
@@ -655,9 +766,9 @@ fn stream_marker_event(
     });
 }
 
-/// A history whose first Workflow Task recorded `data`. A signal starts the second task, so that
-/// Workflow code gets an activation in it.
-fn replayed_history(data: &StreamMarkerData) -> TestHistoryBuilder {
+/// A history whose first Workflow Task started read 1 of Stream `s` and recorded `data`. A signal
+/// starts the second task, so that Workflow code gets an activation in it.
+fn replayed_read_history(data: &StreamMarkerData) -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
@@ -680,6 +791,34 @@ fn signaled(activation: &WorkflowActivation) -> bool {
     })
 }
 
+/// The marker of a read of `records` from the start of Stream `s`, and the range in its messages.
+fn one_page(records: &[StreamRecord]) -> (StreamMarkerData, String) {
+    let page = Page {
+        records,
+        activation: 1,
+    };
+    let entry = read_entry(1, vec![], &[page], None, false);
+    let range = format!(
+        "Stream `s` in Store `mem`, the Records after the start through offset {}",
+        records
+            .last()
+            .unwrap()
+            .offset
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    (
+        StreamMarkerData {
+            reads: vec![entry],
+            appends: vec![],
+            closes: vec![],
+            streams: vec![stream("s")],
+        },
+        range,
+    )
+}
+
 /// A replayed append gives the result that history has, and writes nothing.
 #[tokio::test]
 async fn append_replay_calls_no_store() {
@@ -693,7 +832,7 @@ async fn append_replay_calls_no_store() {
         failure: None,
         activation: 1,
     };
-    let t = replayed_history(&StreamMarkerData {
+    let t = replayed_read_history(&StreamMarkerData {
         reads: vec![],
         appends: vec![appended.clone()],
         closes: vec![],
@@ -865,7 +1004,7 @@ async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
         failure: None,
         activation: 1,
     };
-    let t = replayed_history(&StreamMarkerData {
+    let t = replayed_read_history(&StreamMarkerData {
         reads: vec![],
         appends: vec![appended],
         closes: vec![],
@@ -1354,6 +1493,8 @@ async fn a_new_worker_sends_a_recorded_close() {
     let closes = Arc::new(Mutex::new(vec![]));
     let store = WatchedStore {
         inner: TestStreamStore::default(),
+        gave: Default::default(),
+        waits: Default::default(),
         closes: closes.clone(),
     };
     let runtime = StreamRuntime::new(Arc::new(store), None);
@@ -1609,12 +1750,16 @@ fn totals(meter: &CounterRecordingMeter, names: &[&str]) -> Vec<u64> {
 
 /// Polls and completes activations with no command until every Stream call of the run has its
 /// result, and returns the last activation.
-async fn until_resolved(worker: &Worker, appends: usize) -> WorkflowActivation {
-    let mut appended = 0;
+async fn until_resolved(worker: &Worker, reads: usize, appends: usize) -> WorkflowActivation {
+    let (mut ended, mut appended) = (0, 0);
     loop {
         let next = worker.poll_workflow_activation().await.unwrap();
+        ended += self::reads(&next)
+            .iter()
+            .filter(|read| read.end.is_some())
+            .count();
         appended += self::appends(&next).len();
-        if appended == appends {
+        if ended == reads && appended == appends {
             return next;
         }
         complete(worker, &next, vec![]).await;
@@ -1636,7 +1781,7 @@ async fn an_append_counts_its_start_and_its_latency() {
         vec![append_cmd(1, "s", &run_id, &["a"]).into()],
     )
     .await;
-    let last = until_resolved(&run.worker, 1).await;
+    let last = until_resolved(&run.worker, 0, 1).await;
     run.worker.complete_execution(&last.run_id).await;
     run.worker.drain_pollers_and_shutdown().await;
     assert_eq!(
@@ -1669,7 +1814,8 @@ async fn a_close_counts_its_start_and_its_latency() {
     assert_eq!(meter.duration_count("stream_close_latency", MEM), 1);
 }
 
-/// An append and a close that fail each count as failed.
+/// A read, an append, a close and a replay's read of a marker entry that fail each count as
+/// failed.
 #[tokio::test]
 async fn each_failed_call_counts_as_failed() {
     let runtime = runtime();
@@ -1682,15 +1828,26 @@ async fn each_failed_call_counts_as_failed() {
     complete(
         &run.worker,
         &first,
-        vec![append_cmd(1, "closed", &run_id, &["a"]).into()],
+        vec![
+            read_cmd(1, "missing").into(),
+            append_cmd(1, "closed", &run_id, &["a"]).into(),
+        ],
     )
     .await;
-    let last = until_resolved(&run.worker, 1).await;
+    let last = until_resolved(&run.worker, 1, 1).await;
     run.worker.complete_execution(&last.run_id).await;
     run.worker.drain_pollers_and_shutdown().await;
     assert_eq!(
-        totals(&meter, &["stream_append_total", "stream_append_failed"]),
-        [1, 1]
+        totals(
+            &meter,
+            &[
+                "stream_read_total",
+                "stream_read_failed",
+                "stream_append_total",
+                "stream_append_failed",
+            ]
+        ),
+        [1, 1, 1, 1]
     );
 
     // A write of a later Workflow Task of the run raises the fence over the task of the close.
@@ -1729,15 +1886,62 @@ async fn each_failed_call_counts_as_failed() {
         totals(&meter, &["stream_close_total", "stream_close_failed"]),
         [1, 1]
     );
+
+    create(&runtime, "s").await;
+    put(&runtime, "s", &["a", "b"]).await;
+    let (mut data, _) = one_page(&all_records(&runtime, "s").await);
+    data.reads[0].digest[0] ^= 1;
+    let meter = Arc::new(CounterRecordingMeter::default());
+    let run = start_metered(
+        replayed_read_history(&data),
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        1,
+        1,
+        true,
+        Some(&meter),
+    );
+    // The task fails before any activation, so the poll ends when the failure is in.
+    tokio::select! {
+        _ = until("the failed task", || run.failed.lock().len() == 1) => {}
+        polled = run.worker.poll_workflow_activation() => panic!("an activation came: {polled:?}"),
+    }
+    run.worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        totals(
+            &meter,
+            &["stream_replay_read_total", "stream_replay_read_failed"]
+        ),
+        [1, 1]
+    );
+    assert_eq!(meter.duration_count("stream_replay_read_latency", MEM), 1);
 }
 
-/// An append and a close that a replay gives from History count nothing.
+/// A read, an append and a close that a replay gives from History count nothing, and neither does
+/// a replay of a marker that holds its Records.
 #[tokio::test]
 async fn replayed_calls_count_nothing() {
     let runtime = runtime();
     create(&runtime, "s").await;
     let meter = Arc::new(CounterRecordingMeter::default());
 
+    put(&runtime, "s", &["a"]).await;
+    let records = all_records(&runtime, "s").await;
+    let page = Page {
+        records: &records,
+        activation: 1,
+    };
+    let entry = read_entry(1, vec![], &[page], Some((StreamReadStop::Done, 1)), true);
+    let read_history = replayed_read_history(&StreamMarkerData {
+        reads: vec![entry],
+        appends: vec![],
+        closes: vec![],
+        streams: vec![stream("s")],
+    });
+    let read = StartStreamRead {
+        records_in_history: true,
+        ..read_cmd(1, "s")
+    };
     let appended = StreamAppendEntry {
         seq: 1,
         stream_index: 0,
@@ -1746,7 +1950,7 @@ async fn replayed_calls_count_nothing() {
         failure: None,
         activation: 1,
     };
-    let append_history = replayed_history(&StreamMarkerData {
+    let append_history = replayed_read_history(&StreamMarkerData {
         reads: vec![],
         appends: vec![appended],
         closes: vec![],
@@ -1756,6 +1960,7 @@ async fn replayed_calls_count_nothing() {
     let close_events = close_history(intent_entry(1), Some(close_result_entry(1, None)));
     let close_run = close_events.get_orig_run_id().to_string();
     for (t, command) in [
+        (read_history, workflow_command::Variant::from(read)),
         (
             append_history,
             append_cmd(1, "s", &append_run, &["x"]).into(),
@@ -1782,10 +1987,16 @@ async fn replayed_calls_count_nothing() {
         run.worker.complete_execution(&next.run_id).await;
         run.worker.drain_pollers_and_shutdown().await;
     }
-    // The meter took the metrics of the two Workers.
-    assert_eq!(meter.counter_total("worker_start", &[]), 2);
-    let names = ["stream_append_total", "stream_close_total"];
-    assert_eq!(totals(&meter, &names), [0; 2]);
+    // The meter took the metrics of the three Workers.
+    assert_eq!(meter.counter_total("worker_start", &[]), 3);
+    let names = [
+        "stream_read_total",
+        "stream_read_records",
+        "stream_append_total",
+        "stream_close_total",
+        "stream_replay_read_total",
+    ];
+    assert_eq!(totals(&meter, &names), [0; 5]);
     assert!(
         names
             .iter()
@@ -1830,7 +2041,7 @@ async fn stream_metrics_have_the_store_of_the_call() {
         vec![append_cmd(1, "s", &run_id, &["a"]).into(), to_other.into()],
     )
     .await;
-    let last = until_resolved(&run.worker, 2).await;
+    let last = until_resolved(&run.worker, 0, 2).await;
     run.worker.complete_execution(&last.run_id).await;
     run.worker.drain_pollers_and_shutdown().await;
     for store in [STORE, "other"] {
@@ -2112,7 +2323,7 @@ async fn a_marker_has_each_stream_once() {
     entries.sort();
     assert_eq!(entries, [(1, "s"), (2, "t"), (3, "s"), (4, "t")]);
 
-    let replayed = replayed_history(&data);
+    let replayed = replayed_read_history(&data);
     let run_id = replayed.get_orig_run_id().to_string();
     let run = start_with(
         replayed,
@@ -2153,9 +2364,15 @@ async fn all_appends(worker: &Worker, count: usize) -> (AppendResults, WorkflowA
     }
 }
 
-/// A test Store that keeps the Producer of each close.
+/// A test Store that keeps when each of its reads gave Records, and counts the reads that ask it to
+/// wait.
 struct WatchedStore {
     inner: TestStreamStore,
+    /// The clock time and the count of each read that gave Records.
+    gave: Arc<Mutex<Vec<(tokio::time::Instant, usize)>>>,
+    /// The reads that reached the Store with a wait. Such a read waits when it finds no Record.
+    waits: Arc<AtomicUsize>,
+    /// The Producer of each close.
     closes: Arc<Mutex<Vec<Producer>>>,
 }
 
@@ -2176,7 +2393,19 @@ impl StreamStore for WatchedStore {
     }
 
     async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
-        self.inner.read_records(request).await
+        if request
+            .wait
+            .is_some_and(|wait| wait.seconds > 0 || wait.nanos > 0)
+        {
+            self.waits.fetch_add(1, Ordering::AcqRel);
+        }
+        let page = self.inner.read_records(request).await?;
+        if !page.records.is_empty() {
+            self.gave
+                .lock()
+                .push((tokio::time::Instant::now(), page.records.len()));
+        }
+        Ok(page)
     }
 
     async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
@@ -2257,6 +2486,8 @@ async fn a_cache_full_eviction_stops_a_call_in_flight() {
 /// What makes a [FlakyStore] fail, and what reached it.
 #[derive(Default)]
 struct Flaky {
+    /// The next reads of the Store that fail with `StorageUnavailable`.
+    fail_reads: AtomicUsize,
     /// The next appends that fail with `StorageUnavailable`. A test sets `usize::MAX` to fail every
     /// append, and zero to turn the failures off.
     fail_appends: AtomicUsize,
@@ -2289,7 +2520,7 @@ impl Flaky {
     }
 }
 
-/// A test Store whose next appends or closes fail with `StorageUnavailable`.
+/// A test Store whose next reads, appends or closes fail with `StorageUnavailable`.
 struct FlakyStore {
     inner: TestStreamStore,
     flaky: Arc<Flaky>,
@@ -2319,7 +2550,11 @@ impl StreamStore for FlakyStore {
     }
 
     async fn read_records(&self, request: ReadRecordsRequest) -> StreamResult<ReadRecordsResponse> {
-        self.inner.read_records(request).await
+        Flaky::fails(&self.flaky.fail_reads)?;
+        let page = self.inner.read_records(request).await?;
+        // An outage that began while the read waited fails it when its wait ends.
+        Flaky::fails(&self.flaky.fail_reads)?;
+        Ok(page)
     }
 
     async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
@@ -2440,7 +2675,7 @@ async fn an_append_retries_a_store_outage() {
 async fn a_replay_of_a_retried_append_calls_no_store() {
     let done = append_through_an_outage().await;
     let before = done.flaky.appends.load(Ordering::Acquire);
-    let t = replayed_history(&done.marker);
+    let t = replayed_read_history(&done.marker);
     let run_id = t.get_orig_run_id().to_string();
     let run = start(t, [ResponseType::AllHistory], runtimes(&done.runtime), 1, 0);
     let first = run.worker.poll_workflow_activation().await.unwrap();
@@ -2468,9 +2703,9 @@ async fn a_replay_of_a_retried_append_calls_no_store() {
     assert_eq!(all_records(&done.runtime, "s").await.len(), 2);
 }
 
-/// An append whose Store stays down for 40 s doesn't resolve, since a write has no bound in time.
-/// Each failed try wrote its batch and lost the answer. Once the Store answers, the append
-/// succeeds and the Store has one copy of its Records. Tokio's paused clock moves the time.
+/// An append whose Store stays down past the bound of a read doesn't resolve, since a write has no
+/// bound in time. Each failed try wrote its batch and lost the answer. Once the Store answers, the
+/// append succeeds and the Store has one copy of its Records. Tokio's paused clock moves the time.
 #[tokio::test]
 async fn an_append_has_no_retry_bound() {
     let (runtime, flaky) = flaky_runtime().await;
@@ -2491,16 +2726,15 @@ async fn an_append_has_no_retry_bound() {
     )
     .await;
     tokio::time::pause();
-    let outage = Duration::from_secs(40);
     let started = tokio::time::Instant::now();
     let result = {
         let next = worker.poll_workflow_activation();
         tokio::pin!(next);
         tokio::select! {
             early = &mut next => panic!("The append resolved while the Store was down: {early:?}"),
-            _ = tokio::time::sleep(outage) => {}
+            _ = tokio::time::sleep(STORE_RETRY_BOUND + Duration::from_secs(10)) => {}
         }
-        assert!(started.elapsed() >= outage);
+        assert!(started.elapsed() > STORE_RETRY_BOUND);
         assert!(flaky.appends.load(Ordering::Acquire) > 10);
         flaky.fail_appends.store(0, Ordering::Release);
         next.await.unwrap()
@@ -2537,8 +2771,9 @@ async fn complete_eviction_of_failed_task(worker: &Worker) {
         .unwrap();
 }
 
-/// A Workflow Task whose append is in a Store outage at the heartbeat fails. Core forces no task,
-/// Workflow code gets no result of the append, and the Store gets no more tries after the failure.
+/// A Workflow Task whose append is in a Store outage at the heartbeat fails, also on a Worker that
+/// fails the Workflow for a Stream replay error. Core forces no task, Workflow code gets no result
+/// of the append, and the Store gets no more tries after the failure.
 #[tokio::test]
 async fn an_append_in_an_outage_fails_its_task_at_the_heartbeat() {
     let (runtime, flaky) = flaky_runtime().await;
@@ -2547,7 +2782,14 @@ async fn an_append_in_an_outage_fails_its_task_at_the_heartbeat() {
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(300));
     t.add_workflow_task_scheduled_and_started();
     let run_id = t.get_orig_run_id().to_string();
-    let run = start(t, [ResponseType::AllHistory], runtimes(&runtime), 1, 1);
+    let run = start_configured(
+        t,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        (1, 1, true),
+        None,
+        |wc| wc.workflow_failure_errors = [WorkflowErrorType::StreamReplay].into(),
+    );
     let first = run.worker.poll_workflow_activation().await.unwrap();
     complete(
         &run.worker,
@@ -2911,7 +3153,11 @@ async fn refused_calls(
     run.worker.drain_pollers_and_shutdown().await;
     assert!(run.failed.lock().is_empty(), "{:?}", run.failed.lock());
     let sent = run.sent.lock()[0].clone();
-    let names = ["stream_append_total", "stream_close_total"];
+    let names = [
+        "stream_read_total",
+        "stream_append_total",
+        "stream_close_total",
+    ];
     let calls = names
         .iter()
         .map(|name| meter.counter_total(name, &[]))
@@ -2919,8 +3165,8 @@ async fn refused_calls(
     (refused, sent, calls)
 }
 
-/// An append and a close of a Stream id over its limit are refused with `stream_invalid` in the
-/// next activation, with no Store call and nothing in the marker.
+/// A read, an append and a close of a Stream id over its limit are refused with `stream_invalid`
+/// in the next activation, with no Store call and nothing in the marker.
 #[tokio::test]
 async fn a_stream_id_over_its_limit_is_refused() {
     let long = StreamRef {
@@ -2929,6 +3175,11 @@ async fn a_stream_id_over_its_limit_is_refused() {
     };
     let (refused, sent, calls) = refused_calls(|run_id| {
         vec![
+            StartStreamRead {
+                stream: Some(long.clone()),
+                ..read_cmd(1, "s")
+            }
+            .into(),
             AppendToStream {
                 stream: Some(long.clone()),
                 ..append_cmd(1, "s", run_id, &["a"])
@@ -2942,6 +3193,12 @@ async fn a_stream_id_over_its_limit_is_refused() {
         ]
     })
     .await;
+    let read = reads(&refused).pop().unwrap();
+    assert!(read.records.is_empty());
+    let end = read.end.unwrap();
+    assert!(!end.done);
+    assert_eq!(end.stop, StreamReadStop::Unspecified as i32);
+    assert_refused(end.failure.as_ref(), "The Stream id", MAX_STREAM_ID_BYTES);
     let append = appends(&refused).pop().unwrap();
     let Some(resolve_stream_append::Status::Failed(failed)) = &append.status else {
         panic!("{append:?}");
@@ -2950,7 +3207,7 @@ async fn a_stream_id_over_its_limit_is_refused() {
     let close = closes(&refused).pop().unwrap();
     assert_refused(close.failed.as_ref(), "The Stream id", MAX_STREAM_ID_BYTES);
     assert!(marker(&sent).is_none(), "{:?}", marker(&sent));
-    assert_eq!(calls, [0, 0]);
+    assert_eq!(calls, [0, 0, 0]);
 }
 
 /// An append to a Store name over its limit is refused before the Worker looks for a runtime of
@@ -2977,7 +3234,7 @@ async fn a_store_name_over_its_limit_is_refused() {
     };
     assert_refused(Some(failed), "The Store name", MAX_STORE_NAME_BYTES);
     assert!(marker(&sent).is_none(), "{:?}", marker(&sent));
-    assert_eq!(calls, [0, 0]);
+    assert_eq!(calls, [0, 0, 0]);
 }
 
 /// The seqs of the append entries of a completion's marker.
