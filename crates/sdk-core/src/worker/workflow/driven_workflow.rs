@@ -8,7 +8,9 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
 };
 use temporalio_common::protos::{
-    coresdk::workflow_activation::start_workflow_from_attribs,
+    coresdk::workflow_activation::{
+        ResolveStreamRead, start_workflow_from_attribs, workflow_activation_job,
+    },
     temporal::api::{
         common::v1::{Payload, SearchAttributes},
         history::v1::WorkflowExecutionStartedEventAttributes,
@@ -68,6 +70,58 @@ impl DrivenWorkflow {
     /// Enqueue a new job to be sent to the driven workflow
     pub(super) fn send_job(&mut self, job: OutgoingJob) {
         self.outgoing_wf_activation_jobs.push(job);
+    }
+
+    /// Adds the Records and the end of a read to its pending job, so that one activation gets one
+    /// page of the read. Returns the page back if the read has no pending job.
+    pub(super) fn merge_stream_read(
+        &mut self,
+        page: ResolveStreamRead,
+    ) -> Option<ResolveStreamRead> {
+        let pending =
+            self.outgoing_wf_activation_jobs
+                .iter_mut()
+                .find_map(|job| match &mut job.variant {
+                    workflow_activation_job::Variant::ResolveStreamRead(pending)
+                        if pending.seq == page.seq =>
+                    {
+                        Some(pending)
+                    }
+                    _ => None,
+                });
+        match pending {
+            Some(pending) => {
+                pending.records.extend(page.records);
+                if page.end.is_some() {
+                    pending.end = page.end;
+                }
+                None
+            }
+            None => Some(page),
+        }
+    }
+
+    /// The Records in the pending job of read `seq`, or zero if it has none.
+    pub(super) fn pending_stream_records(&self, seq: u32) -> usize {
+        self.outgoing_wf_activation_jobs
+            .iter()
+            .find_map(|job| match &job.variant {
+                workflow_activation_job::Variant::ResolveStreamRead(pending)
+                    if pending.seq == seq =>
+                {
+                    Some(pending.records.len())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drops the pending job of a read that Workflow code closed.
+    pub(super) fn drop_stream_read(&mut self, seq: u32) {
+        self.outgoing_wf_activation_jobs.retain(|job| {
+            !matches!(&job.variant,
+                workflow_activation_job::Variant::ResolveStreamRead(pending) if pending.seq == seq)
+        });
     }
 
     /// Observe pending jobs

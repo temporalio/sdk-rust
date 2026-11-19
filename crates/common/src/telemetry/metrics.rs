@@ -32,6 +32,8 @@ pub const ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME: &str = "activity_execution_laten
 pub const STREAM_APPEND_LATENCY_HISTOGRAM_NAME: &str = "stream_append_latency";
 /// The string name (which may be prefixed) for this metric
 pub const STREAM_CLOSE_LATENCY_HISTOGRAM_NAME: &str = "stream_close_latency";
+/// The string name (which may be prefixed) for this metric
+pub const STREAM_REPLAY_READ_LATENCY_HISTOGRAM_NAME: &str = "stream_replay_read_latency";
 
 /// Helps define buckets once in terms of millis, but also generates a seconds version
 macro_rules! define_latency_buckets {
@@ -95,7 +97,9 @@ define_latency_buckets!(
     ),
     (
         // One call to a Stream Store, which a nearby Store answers in a few milliseconds.
-        STREAM_APPEND_LATENCY_HISTOGRAM_NAME | STREAM_CLOSE_LATENCY_HISTOGRAM_NAME,
+        STREAM_APPEND_LATENCY_HISTOGRAM_NAME
+            | STREAM_CLOSE_LATENCY_HISTOGRAM_NAME
+            | STREAM_REPLAY_READ_LATENCY_HISTOGRAM_NAME,
         STREAM_CALL_MS_BUCKETS,
         STREAM_CALL_S_BUCKETS,
         [1., 2., 5., 10., 20., 50., 100., 200., 500., 1000., 5000.]
@@ -1121,6 +1125,7 @@ mod bucket_tests {
         for name in [
             STREAM_APPEND_LATENCY_HISTOGRAM_NAME,
             STREAM_CLOSE_LATENCY_HISTOGRAM_NAME,
+            STREAM_REPLAY_READ_LATENCY_HISTOGRAM_NAME,
         ] {
             assert_eq!(default_buckets_for(name, false)[0], 1.0, "{name}");
             assert_eq!(default_buckets_for(name, true)[0], 0.001, "{name}");

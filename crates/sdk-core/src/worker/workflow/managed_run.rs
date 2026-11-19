@@ -7,16 +7,16 @@ use crate::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
-            ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
+            ActivationOrAuto, BufferedTasks, CommandAnnotations, DrivenWorkflow,
+            EvictionRequestResult, FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
-            OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
+            OutstandingTask, PermittedWFT, ProtoCommandExt, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
             WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
-            streams::{StreamManager, stream_marker_payload_of},
+            streams::{StreamManager, is_stream_replay_failure, stream_marker_payload_of},
         },
     },
 };
@@ -42,6 +42,9 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
+        command::v1::{
+            Command as ProtoCommand, FailWorkflowExecutionCommandAttributes, command::Attributes,
+        },
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
         stream::v1::WorkflowTaskEpoch,
@@ -79,6 +82,11 @@ pub(super) struct ManagedRun {
     stream_manager: Arc<StreamManager>,
     /// Set if the run is currently waiting on local work: local activities, or Stream calls.
     waiting_on_la: Option<WaitingOnLAs>,
+    /// The time in this Workflow Task in which only Stream calls held it open.
+    stream_hold: StreamHold,
+    /// True once a graceful shutdown stopped the run's reads with no job. Workflow code still
+    /// waits on them, so each later completion of the run on this Worker leaves it to another one.
+    reads_ended_for_shutdown: bool,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
     /// do is be evicted.
     am_broken: bool,
@@ -122,6 +130,8 @@ impl ManagedRun {
             local_activity_request_sink,
             stream_manager,
             waiting_on_la: None,
+            stream_hold: StreamHold::default(),
+            reads_ended_for_shutdown: false,
             am_broken: false,
             wft: None,
             activation: None,
@@ -189,7 +199,8 @@ impl ManagedRun {
         }
         let start_time = Instant::now();
 
-        let work = pwft.work;
+        let mut work = pwft.work;
+        let stream_replay_error = work.stream_replay_error.take();
         debug!(
             task_token = %&work.task_token,
             update = ?work.update,
@@ -241,6 +252,9 @@ impl ManagedRun {
             waiting.hb_timeout_handle.abort();
             waiting.heartbeat_timeout_pending = false;
         }
+        if let Some(error) = stream_replay_error {
+            return Err(error.into());
+        }
 
         if was_legacy_query
             && work.update.wft_started_id == 0
@@ -289,6 +303,7 @@ impl ManagedRun {
                         .expect("waiting_on_la was just checked");
                     lawait.hb_timeout_handle.abort();
                     lawait.hb_timeout_handle = hb_timeout_handle;
+                    self.start_stream_hold();
                     // No activation needs to be sent to lang. We just need to wait for another
                     // heartbeat timeout or for the local work to resolve
                     return Ok(None);
@@ -314,11 +329,18 @@ impl ManagedRun {
         debug!("Marking WFT completed");
         let retme = self.wft.take();
 
+        let stream_held = self.stream_hold.take(report_status.completion_time());
         if let Some(ot) = &retme
             && let Some(ct) = report_status.completion_time()
         {
             let task_duration = ct.sub(ot.start_time);
             self.metrics.wf_task_latency(task_duration);
+            #[cfg(test)]
+            TASK_DURATIONS
+                .lock()
+                .entry(self.wfm.machines.run_id.clone())
+                .or_default()
+                .push((task_duration, stream_held));
             log_workflow_task_duration(
                 &self.wfm.machines.run_id,
                 &self.wfm.machines.workflow_type,
@@ -326,6 +348,7 @@ impl ManagedRun {
                 ot.info.attempt,
                 self.wfm.machines.history_size_bytes(),
                 task_duration,
+                stream_held,
                 task_storage_metrics,
             );
         }
@@ -654,22 +677,6 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let rur = if is_no_report_query_fail {
-            None
-        } else {
-            // A failed task writes no marker, so no result of its Stream calls may reach Workflow
-            // code. A query that failed with no report keeps the run, and with it its calls.
-            self.stop_stream_calls();
-            // Blow up any cached data associated with the workflow
-            self.request_eviction(RequestEvictMsg {
-                run_id: self.run_id().to_string(),
-                message,
-                reason,
-                auto_reply_fail: None,
-            })
-            .into_run_update_resp()
-        };
-
         let kind = if !self.pending_work_is_legacy_query() {
             WftFailureKind::Task
         } else if is_no_report_query_fail {
@@ -678,18 +685,57 @@ impl ManagedRun {
             WftFailureKind::LegacyQuery
         };
 
+        // A replay that can't read its Records fails the run on its own, with a typed failure.
+        let error_type = if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError) {
+            Some(WorkflowErrorType::Nondeterminism)
+        } else if is_auto_fail && is_stream_replay_failure(&failure) {
+            Some(WorkflowErrorType::StreamReplay)
+        } else {
+            None
+        };
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
         // Only done on the first attempt: if that attempt's completion didn't reach the server,
         // later attempts fall through to the normal task failure path, which won't re-report.
-        if kind == WftFailureKind::Task
+        let fails_workflow = kind == WftFailureKind::Task
             && attempt <= 1
-            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-            && self.config.should_fail_workflow(
-                &self.wfm.machines.workflow_type,
-                &WorkflowErrorType::Nondeterminism,
-            )
-        {
-            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            && error_type.as_ref().is_some_and(|error_type| {
+                self.config
+                    .should_fail_workflow(&self.wfm.machines.workflow_type, error_type)
+            });
+
+        let rur = if is_no_report_query_fail {
+            None
+        } else {
+            // A failed task writes no marker, so no result of its Stream calls may reach Workflow
+            // code. A query that failed with no report keeps the run, and with it its calls.
+            self.stop_stream_calls();
+            let evict = RequestEvictMsg {
+                run_id: self.run_id().to_string(),
+                message,
+                reason,
+                auto_reply_fail: None,
+            };
+            if fails_workflow && self.activation.is_none() {
+                // The completion that fails the Workflow goes out first. The eviction follows it,
+                // as it does when lang's activation is still out.
+                self.trying_to_evict = Some(evict);
+                None
+            } else {
+                // Blow up any cached data associated with the workflow
+                self.request_eviction(evict).into_run_update_resp()
+            }
+        };
+
+        if fails_workflow && let Some(error_type) = error_type {
+            match error_type {
+                WorkflowErrorType::Nondeterminism => {
+                    warn!(failure=?failure, "Failing workflow due to nondeterminism error")
+                }
+                WorkflowErrorType::StreamReplay => {
+                    warn!(failure=?failure, "Failing workflow due to a Stream replay error");
+                    return self.fail_workflow_with_no_history(tt, attempt, failure, resp_chan);
+                }
+            }
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -721,6 +767,44 @@ impl ManagedRun {
             resp_chan,
         );
         rur
+    }
+
+    /// Fails the Workflow in a completion that has only the failure. A run whose replay couldn't
+    /// read its Records applied no history, so its machines can't take a command.
+    fn fail_workflow_with_no_history(
+        &mut self,
+        task_token: TaskToken,
+        attempt: u32,
+        failure: workflow_completion::Failure,
+        resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
+    ) -> RunUpdateAct {
+        let command = ProtoCommand::new(
+            Attributes::FailWorkflowExecutionCommandAttributes(
+                FailWorkflowExecutionCommandAttributes {
+                    failure: failure.failure,
+                },
+            ),
+            CommandAnnotations::default(),
+        );
+        self.reply_to_complete(
+            ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
+                task_token,
+                workflow_id: self.wfm.machines.workflow_id.clone(),
+                action: ActivationAction::WftComplete {
+                    commands: vec![command],
+                    messages: vec![],
+                    query_responses: vec![],
+                    force_new_wft: false,
+                    leaves_worker: false,
+                    sdk_metadata: Default::default(),
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    attempt,
+                },
+                metrics: self.metrics.clone(),
+            }),
+            resp_chan,
+        );
+        None
     }
 
     /// Must be called after the processing of the activation completion and WFT reporting.
@@ -841,6 +925,17 @@ impl ManagedRun {
 
             if self.wfm.machines.outstanding_local_work() == 0 {
                 Ok(AfterCompletion::Complete)
+            } else if self.wfm.machines.outstanding_local_activity_count() == 0
+                && self.wfm.machines.outstanding_stream_writes() == 0
+                && (self.wfm.machines.has_server_commands()
+                    || self.wfm.machines.has_messages_for_server()
+                    || self.wfm.machines.has_pending_close_intents()
+                    || self.wfm.machines.stream_marker_full())
+            {
+                // Only reads are left. A command or a message for the server, or a close, must not
+                // wait for a read, so the task completes immediately, and the read gives its next
+                // pages to the next task.
+                Ok(AfterCompletion::CompleteBeforeReads)
             } else {
                 let wft_timeout: Duration = self
                     .wfm
@@ -875,6 +970,16 @@ impl ManagedRun {
                     completion.resp_chan,
                     data,
                     completing_heartbeat_autocomplete || closing,
+                )))
+            }
+            Ok(AfterCompletion::CompleteBeforeReads) => {
+                if let Some(waiting) = self.waiting_on_la.take() {
+                    waiting.hb_timeout_handle.abort();
+                }
+                Ok(Some(self.prepare_complete_resp(
+                    completion.resp_chan,
+                    data,
+                    true,
                 )))
             }
             Ok(AfterCompletion::Wait {
@@ -913,6 +1018,7 @@ impl ManagedRun {
                         hb_timeout_handle: self.start_heartbeat_timeout(start_t, wft_timeout),
                         heartbeat_timeout_pending: false,
                     });
+                    self.start_stream_hold();
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -1025,7 +1131,8 @@ impl ManagedRun {
 
     /// True if `update` has events of a Workflow Task that another Worker completed, and Stream
     /// state that they would mix with. The run's own live calls and the results that no task took
-    /// would then reach Workflow code in a replayed task.
+    /// would then reach Workflow code in a replayed task, and its markers would lack the Records
+    /// that a run new to the cache reads.
     pub(super) fn has_foreign_stream_events(&self, update: &HistoryUpdate) -> bool {
         update.is_real()
             && update.previous_wft_started_id > self.wfm.machines.get_last_wft_started_id()
@@ -1036,8 +1143,32 @@ impl ManagedRun {
                     .any(|event| stream_marker_payload_of(event).is_some()))
     }
 
-    /// Evicts the run and keeps `work`, which the run new to the cache then takes. That run replays
-    /// the Stream markers as the other Worker wrote them.
+    /// At a graceful shutdown, completes a Workflow Task that only reads hold open, with what they
+    /// gave. Each heartbeat would otherwise get the run a new task inline, and the shutdown would
+    /// never end. The completion forces a new task for the task queue, since the run would sleep
+    /// with no task until a Signal or a timer came. The reads stop, and the Worker that takes the
+    /// new task resumes each from History.
+    pub(super) fn end_reads_for_shutdown(&mut self) -> RunUpdateAct {
+        if self.activation.is_some()
+            || self.wft.is_none()
+            || self.trying_to_evict.is_some()
+            || self.wfm.machines.activation_needed()
+            || !self.wfm.machines.only_stream_reads_open()
+        {
+            return None;
+        }
+        self.waiting_on_la.take()?.hb_timeout_handle.abort();
+        self.wfm.machines.stop_stream_reads();
+        self.dispatch_stream_requests();
+        self.reads_ended_for_shutdown = true;
+        self.update_to_acts(Ok(Some(ActivationOrAuto::Autocomplete {
+            run_id: self.run_id().to_string(),
+        })
+        .into()))
+    }
+
+    /// Evicts the run and keeps `work`, which the run new to the cache then takes. That run reads
+    /// the Stream markers and replays them as the other Worker wrote them.
     pub(super) fn evict_for_foreign_task(&mut self, work: PermittedWFT) -> RunUpdateAct {
         self.task_buffer.buffer(work);
         self.request_eviction(RequestEvictMsg {
@@ -1271,6 +1402,7 @@ impl ManagedRun {
                 OutstandingActivation::Autocomplete
             }
         };
+        self.stream_hold.end(Instant::now());
         if let Some(old_act) = self.activation {
             // This is a panic because we have screwed up core logic if this is violated. It must be
             // upheld.
@@ -1282,6 +1414,14 @@ impl ManagedRun {
         self.activation = Some(act_type);
     }
 
+    /// Starts to count the time in which the task waits only for Stream calls. A Local Activity
+    /// that holds the task too keeps the time in the task's duration, as it always did.
+    fn start_stream_hold(&mut self) {
+        if self.wfm.machines.outstanding_local_activity_count() == 0 {
+            self.stream_hold.start(Instant::now());
+        }
+    }
+
     fn prepare_complete_resp(
         &mut self,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
@@ -1289,6 +1429,10 @@ impl ManagedRun {
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
         let outstanding_las = self.wfm.machines.outstanding_local_work() > 0;
+        // Workflow code waits on reads that the shutdown stopped, and this Worker resumes none. A
+        // task that came back here through a poll still open goes on to another Worker.
+        let leaves_worker =
+            self.reads_ended_for_shutdown && !self.wfm.machines.workflow_is_finished();
         let workflow_id = self.wfm.machines.workflow_id.clone();
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
@@ -1304,7 +1448,7 @@ impl ManagedRun {
         // Unrecorded local work (LAs or Stream calls) must get a replacement task on which to
         // finish after eviction, just like work that remains outstanding across a heartbeat.
         let mut force_new_wft =
-            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las);
+            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las) || leaves_worker;
 
         // We only actually want to send commands back to the server if there are no more pending
         // activations and we are caught up on replay. We don't want to complete a wft if we already
@@ -1343,6 +1487,7 @@ impl ManagedRun {
                 workflow_id,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
+                    leaves_worker,
                     commands,
                     messages,
                     query_responses,
@@ -1621,10 +1766,54 @@ fn sink_heartbeat_timeout_start(
     abort_handle
 }
 
+/// The duration of each Workflow Task of a run, and the time in it that only Stream calls held it
+/// open.
+#[cfg(test)]
+type TaskDurations = std::collections::HashMap<String, Vec<(Duration, Duration)>>;
+
+/// The [TaskDurations] of each run, by run id, so that a test sees what the duration warning looks
+/// at.
+#[cfg(test)]
+pub(crate) static TASK_DURATIONS: std::sync::LazyLock<parking_lot::Mutex<TaskDurations>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The time in which only Stream calls held a Workflow Task open, with no activation out. The
+/// duration warning leaves it out, since a read holds its task open until the heartbeat with
+/// nothing wrong, and the warning is for a task that Workflow code or Core made slow.
+#[derive(Debug, Default)]
+struct StreamHold {
+    since: Option<Instant>,
+    total: Duration,
+}
+
+impl StreamHold {
+    fn start(&mut self, at: Instant) {
+        self.since.get_or_insert(at);
+    }
+
+    fn end(&mut self, at: Instant) {
+        if let Some(since) = self.since.take() {
+            self.total += at.saturating_duration_since(since);
+        }
+    }
+
+    /// The time of the task, which it ended at `at`. It clears the count for the next task.
+    fn take(&mut self, at: Option<Instant>) -> Duration {
+        if let Some(at) = at {
+            self.end(at);
+        }
+        self.since = None;
+        std::mem::take(&mut self.total)
+    }
+}
+
 /// What a completion of lang does to the Workflow Task.
 enum AfterCompletion {
     /// Nothing holds the task, so it completes.
     Complete,
+    /// Only reads hold the task, and something must not wait for them. The task completes, and
+    /// a new one takes the read's next pages.
+    CompleteBeforeReads,
     /// Local work holds the task, so it waits, with a heartbeat at its timeout.
     Wait {
         start_time: Instant,
@@ -1857,10 +2046,11 @@ fn log_workflow_task_duration(
     attempt: u32,
     history_size_bytes: u64,
     duration: Duration,
+    stream_held: Duration,
     storage: &TaskStorageMetrics,
 ) {
     let threshold = wft_duration_warn_threshold();
-    if duration <= threshold {
+    if duration.saturating_sub(stream_held) <= threshold {
         return;
     }
     let dl = storage.download.as_ref();
@@ -1927,7 +2117,8 @@ fn task_epoch(wft: &OutstandingTask) -> WorkflowTaskEpoch {
 #[cfg(test)]
 mod tests {
     use super::{
-        TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
+        StreamHold, TaskStorageMetrics, log_workflow_task_duration,
+        parse_wft_duration_warn_threshold,
     };
     use crate::worker::workflow::{WFCommand, WFCommandVariant};
     use std::{
@@ -1991,11 +2182,66 @@ mod tests {
     }
 
     fn capture(duration: Duration, storage: &TaskStorageMetrics) -> Option<CapturedEvent> {
+        capture_held(duration, Duration::ZERO, storage)
+    }
+
+    /// As [capture], for a task in which only Stream calls held it open for `stream_held`.
+    fn capture_held(
+        duration: Duration,
+        stream_held: Duration,
+        storage: &TaskStorageMetrics,
+    ) -> Option<CapturedEvent> {
         let sub = CapturingSub::default();
         tracing::subscriber::with_default(sub.clone(), || {
-            log_workflow_task_duration("run-1", "MyWorkflow", 12, 3, 4096, duration, storage);
+            log_workflow_task_duration(
+                "run-1",
+                "MyWorkflow",
+                12,
+                3,
+                4096,
+                duration,
+                stream_held,
+                storage,
+            );
         });
         sub.events.lock().unwrap().drain(..).next()
+    }
+
+    /// A task that a Stream read held open until its heartbeat at 8 s logs nothing. A task that
+    /// was slow for another reason still logs, also when a read held it open for a while.
+    #[test]
+    fn tmprl1104_leaves_out_the_time_that_stream_calls_held_the_task() {
+        let none = TaskStorageMetrics::default();
+        let held_by_a_read =
+            capture_held(Duration::from_secs(8), Duration::from_millis(7_900), &none);
+        assert!(held_by_a_read.is_none());
+        let slow_code = capture_held(Duration::from_secs(9), Duration::from_secs(3), &none)
+            .expect("warn emitted");
+        assert!(
+            slow_code.fields.contains("workflow_task_duration=9000"),
+            "fields: {}",
+            slow_code.fields
+        );
+    }
+
+    /// The hold counts only the spans in which Stream calls alone held the task, and the next
+    /// task starts from zero.
+    #[test]
+    fn stream_hold_counts_each_span_of_the_task() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut hold = StreamHold::default();
+        hold.start(at(1));
+        // A second start while the hold runs keeps the first.
+        hold.start(at(2));
+        hold.end(at(4));
+        hold.end(at(5));
+        hold.start(at(6));
+        assert_eq!(hold.take(Some(at(10))), Duration::from_secs(7));
+        assert_eq!(hold.take(Some(at(12))), Duration::ZERO);
+        hold.start(at(13));
+        assert_eq!(hold.take(None), Duration::ZERO);
+        assert_eq!(hold.take(Some(at(20))), Duration::ZERO);
     }
 
     #[test]

@@ -1,28 +1,38 @@
-//! Direct calls to Streams. Core appends to and closes a Stream on the Worker's Stream runtimes, in
+//! Direct calls to Streams. Core reads and appends a Stream on the Worker's Stream runtimes, in
 //! tasks on the Worker's runtime, and gives each result to the run through a [RunSink].
 
 use super::{RunInput, RunSink, StreamMetrics};
 use crate::{
-    Reason, StreamError, StreamRuntime,
+    MAX_WAIT, Reason, StreamError, StreamRuntime,
+    digest::records_digest,
     ids::{MAX_OFFSET_BYTES, MAX_STREAM_ID_BYTES},
     proto::{
-        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, StreamRef,
-        WorkflowTaskEpoch, producer::Kind,
+        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, ReadRecordsRequest,
+        StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind,
     },
 };
-use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
+use futures_util::{
+    StreamExt, TryStreamExt,
+    future::{AbortHandle, AbortRegistration, Abortable},
+};
 use parking_lot::Mutex;
+use prost::Message;
 use std::{
     collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use temporalio_common::protos::{
     constants::STREAM_MARKER_NAME,
-    coresdk::workflow_activation::{StreamAppended, resolve_stream_append},
+    coresdk::{
+        common::StreamReadStop,
+        external_data::{StreamMarkerData, StreamReadEntry},
+        workflow_activation::{StreamAppended, StreamReadEnd, resolve_stream_append},
+        workflow_completion,
+    },
     temporal::api::{
         common::v1::{Payload, Payloads},
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
@@ -33,11 +43,18 @@ use tokio::{runtime::Handle, sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, warn};
 
-/// The Stream runtimes of a Worker, by the name of the Store that each serves. A Workflow call on a
-/// Stream uses the runtime of its `StreamRef.store`.
+/// The Stream runtimes of a Worker, by the name of the Store that each serves, and the Worker's
+/// options of a read. A Workflow call on a Stream uses the runtime of its `StreamRef.store`.
 #[derive(Clone, Debug, Default)]
 pub struct StreamRuntimes {
     runtimes: HashMap<String, Arc<StreamRuntime>>,
+    /// The bytes of one read's Records that may wait for Workflow code, or `None` for
+    /// [DEFAULT_READ_AHEAD_BYTES].
+    read_ahead_bytes: Option<usize>,
+    /// The Records of one read in one activation, or `None` for [STREAM_PAGE_MAX_RECORDS].
+    read_page_records: Option<usize>,
+    /// The least time between two batches of one read from the Store, or `None` for no gap.
+    read_min_gap: Option<Duration>,
 }
 
 impl StreamRuntimes {
@@ -45,6 +62,74 @@ impl StreamRuntimes {
     pub fn new(runtimes: impl IntoIterator<Item = (String, Arc<StreamRuntime>)>) -> Self {
         Self {
             runtimes: runtimes.into_iter().collect(),
+            read_ahead_bytes: None,
+            read_page_records: None,
+            read_min_gap: None,
+        }
+    }
+
+    /// The runtimes with `bytes` as the bound of one read's Records that may wait for Workflow
+    /// code. A read stops asking the Store while that many bytes wait, and goes on when an
+    /// activation takes Records. Its first page always comes. The Records wait in the Worker's
+    /// memory, whichever Store they come from, so the bound is the Worker's and not a Store's.
+    /// Unset is 4 MiB. Zero is refused when the Worker's config is built.
+    pub fn with_read_ahead_bytes(self, bytes: usize) -> Self {
+        Self {
+            read_ahead_bytes: Some(bytes),
+            ..self
+        }
+    }
+
+    /// The bound that [StreamRuntimes::with_read_ahead_bytes] set, if it set one.
+    pub fn read_ahead_bytes(&self) -> Option<usize> {
+        self.read_ahead_bytes
+    }
+
+    /// The runtimes with `records` as the most Records of one read in one activation. Core keeps
+    /// the Records over it and gives them in the next activation, with no wait. Unset is 256. A
+    /// value under 1 or over 1000 is refused when the Worker's config is built. A replay gives
+    /// each page as History has it, whatever this value is.
+    pub fn with_read_page_records(self, records: usize) -> Self {
+        Self {
+            read_page_records: Some(records),
+            ..self
+        }
+    }
+
+    /// The cap that [StreamRuntimes::with_read_page_records] set, if it set one.
+    pub fn read_page_records(&self) -> Option<usize> {
+        self.read_page_records
+    }
+
+    /// The runtimes with `gap` as the least time between two batches of one read. A read gives its
+    /// first batch immediately. After it gave a batch to its run, it asks the Store again only once
+    /// `gap` has passed, so the Records that came in between go in one batch, still at most
+    /// `read_page_records` in one activation. On a Stream that gets single Records, this caps how
+    /// often Workflow code wakes, and a Record or the end of a read waits at most one gap. Unset
+    /// and zero are no gap. A gap over 1 s is refused when the Worker's config is built. A replay
+    /// gives each page as History has it, whatever this value is.
+    pub fn with_read_min_gap(self, gap: Duration) -> Self {
+        Self {
+            read_min_gap: Some(gap),
+            ..self
+        }
+    }
+
+    /// The gap that [StreamRuntimes::with_read_min_gap] set, if it set one.
+    pub fn read_min_gap(&self) -> Option<Duration> {
+        self.read_min_gap
+    }
+
+    /// The Records of one read in one activation, with the default when the Worker set none.
+    pub fn page_cap(&self) -> usize {
+        self.read_page_records.unwrap_or(STREAM_PAGE_MAX_RECORDS)
+    }
+
+    /// The Worker's options of a read.
+    fn read_options(&self) -> ReadOptions {
+        ReadOptions {
+            read_ahead_bytes: self.read_ahead_bytes.unwrap_or(DEFAULT_READ_AHEAD_BYTES),
+            min_gap: self.read_min_gap.unwrap_or_default(),
         }
     }
 
@@ -59,18 +144,40 @@ impl StreamRuntimes {
     }
 }
 
-/// What the Worker builds from its config for its Stream calls. Its runs share it.
-#[derive(Debug)]
+/// Says for a Workflow type whether a replay that can't read its Records fails the Workflow.
+type FailsWorkflow = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// What the Worker builds from its config for its Stream calls. A run and each history page share
+/// it.
+#[derive(derive_more::Debug)]
 pub struct WorkerStreams {
     runtimes: StreamRuntimes,
+    /// False for a replay Worker, which reads the Store only for the Records of a marker.
+    calls_stores: bool,
+    /// The Worker's metrics, which a replay's reads of the Store count in. `None` for a Worker
+    /// with no meter, so that it builds no attributes for a read.
+    #[debug(skip)]
+    metrics: Option<Arc<dyn StreamMetrics>>,
+    /// True for a Workflow type that the Worker fails, and not only its task, when a replay can't
+    /// read its Records.
+    #[debug(skip)]
+    fails_workflow: FailsWorkflow,
     hooks: StreamTestHooks,
 }
 
 impl WorkerStreams {
     /// The Stream state of a Worker, from the values that Core takes from its config.
-    pub fn new(runtimes: StreamRuntimes) -> Self {
+    pub fn new(
+        runtimes: StreamRuntimes,
+        calls_stores: bool,
+        metrics: Option<Arc<dyn StreamMetrics>>,
+        fails_workflow: FailsWorkflow,
+    ) -> Self {
         Self {
             runtimes,
+            calls_stores,
+            metrics,
+            fails_workflow,
             hooks: StreamTestHooks::default(),
         }
     }
@@ -86,11 +193,61 @@ impl WorkerStreams {
         self.runtimes.get(store)
     }
 
+    /// False for a replay Worker, which makes no live call.
+    pub fn calls_stores(&self) -> bool {
+        self.calls_stores
+    }
+
+    /// True if a replay of `workflow_type` that can't read its Records fails the Workflow.
+    pub fn fails_workflow(&self, workflow_type: &str) -> bool {
+        (self.fails_workflow)(workflow_type)
+    }
+
+    /// How long a replay's read of the Store tries again after its first `StorageUnavailable`.
+    fn replay_retry_bound(&self) -> Duration {
+        if let Some(bound) = self.hooks.replay_retry_bound {
+            return bound;
+        }
+        STORE_REPLAY_RETRY_BOUND
+    }
+
     fn close_bound(&self) -> Duration {
         if let Some(bound) = self.hooks.close_bound {
             return bound;
         }
         CLOSE_SHUTDOWN_BOUND
+    }
+}
+
+/// The Worker's Stream state for the history of one run, which reads its markers with it.
+#[derive(Clone, Debug)]
+pub struct RunStreams {
+    worker: Arc<WorkerStreams>,
+    /// The run's Workflow type, which a replay's reads count under. Kept only with a meter.
+    workflow_type: Option<String>,
+}
+
+impl RunStreams {
+    /// The Stream state for the history of a run of `workflow_type`.
+    pub fn new(worker: &Arc<WorkerStreams>, workflow_type: &str) -> Self {
+        Self {
+            worker: worker.clone(),
+            workflow_type: worker.metrics.is_some().then(|| workflow_type.to_string()),
+        }
+    }
+
+    /// The Worker's Stream state.
+    pub fn worker(&self) -> &WorkerStreams {
+        &self.worker
+    }
+
+    /// The metrics of a replay's read of `store`, or `None` with no meter.
+    fn replay_metrics(&self, store: &str) -> Option<Arc<dyn StreamMetrics>> {
+        let metrics = self.worker.metrics.as_ref()?;
+        Some(match &self.workflow_type {
+            Some(ty) => metrics.with_workflow_and_store(ty, store),
+            None => metrics.with_store(store),
+        })
     }
 }
 
@@ -102,26 +259,72 @@ pub struct StreamTestHooks {
     pub close_bound: Option<Duration>,
     /// Told each time a graceful shutdown waits for a close in flight.
     pub shutdown_waits: Option<Arc<Notify>>,
+    /// A shorter bound in place of [STORE_REPLAY_RETRY_BOUND] for a replay's reads. They run on the
+    /// Worker's own thread, whose clock a test can't pause.
+    pub replay_retry_bound: Option<Duration>,
 }
 
+/// The bytes of one read's Records that may wait for Workflow code when the Worker sets no
+/// `read_ahead_bytes`. Past the bound the read stops asking the Store, so that a run with no
+/// Workflow Task in hand doesn't gather Records in the Worker's memory without a limit.
+pub(crate) const DEFAULT_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// The Records of one read in one activation when the Worker sets no `read_page_records`. With no
+/// bound, a read of a long backlog would give Workflow code all of it in one page, which lang must
+/// handle in one activation. A count adds no wait, unlike a time gap, and means the same on any
+/// machine. Core keeps the Records over it and gives them in the next activation, which it issues
+/// with no wait. Replay gives the pages of History as they are, so the bound doesn't apply there.
+pub const STREAM_PAGE_MAX_RECORDS: usize = 256;
+/// The highest `read_page_records` that a Worker may set. A larger page is one activation that
+/// lang must handle in one go, which is what the cap bounds.
+pub const MAX_READ_PAGE_RECORDS: usize = 1000;
+/// The longest `read_min_gap` that a Worker may set. Each Record and each end of a read may wait
+/// one gap, so the bound caps the wait that the gap adds.
+pub const MAX_READ_MIN_GAP: Duration = Duration::from_secs(1);
 /// The wait before the second try of a Store call that failed with `StorageUnavailable`. A short
 /// Store outage should not reach Workflow code, as the retry of a Local Activity keeps it away.
 pub(crate) const STORE_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(100);
 /// The longest wait between two tries of such a call. The wait doubles up to it.
 pub(crate) const STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
-/// The bytes of one Workflow Task's Stream marker: the entries of appends and closes, and the table
-/// of Streams. A long task with many small results would otherwise make a marker with no limit.
-/// Past the bound, the task completes with a new one forced, as at a heartbeat, and the results
-/// that didn't fit go to the new task.
+/// How long after its first failure a read stops trying and gives Workflow code the error. A
+/// longer outage is one that Workflow code should see and handle. A write has no bound of its own.
+/// Its Workflow Task fails at its heartbeat while the write is in an outage.
+pub const STORE_RETRY_BOUND: Duration = Duration::from_secs(30);
+/// The same bound for a replay's read of the Store. It is shorter than the default Workflow Task
+/// timeout, so the task fails with its cause and not with a timeout.
+pub(crate) const STORE_REPLAY_RETRY_BOUND: Duration = Duration::from_secs(5);
+/// The bytes of Records that one Workflow Task may put into its marker, for reads with their
+/// Records in History. A larger marker could pass the server's payload limit, and the task would
+/// then fail for good. The first Record of a task always comes, also when it is larger.
+pub const MAX_MARKER_RECORD_BYTES: usize = 1024 * 1024;
+/// The bytes of one Workflow Task's Stream marker that aren't Records: the entries of reads,
+/// appends and closes, and the table of Streams. A long task with many small results would
+/// otherwise make a marker with no limit. Past the bound, the task completes with a new one
+/// forced, as at a heartbeat, and the results that didn't fit go to the new task.
 ///
 /// Core counts an estimate that is never below the encoded size. No single entry comes near the
-/// bound, since each input is bounded. A Stream of the table has at most 8202 bytes, an id and a
+/// bound, since each input is bounded. The largest is a read entry with one page, 8402 bytes:
+/// four offsets of [MAX_OFFSET_BYTES] and an end with a failure of 4228 bytes, whose message has
+/// at most [MAX_FAILURE_MESSAGE_BYTES]. Each further page adds at most 10 bytes, and the pages
+/// past the bound go to the next task. A Stream of the table has at most 8202 bytes, an id and a
 /// Store name of 4096 bytes each. An append entry has at most 4249 bytes, and a close entry 4251.
 /// The test `the_largest_entries_are_far_under_the_entry_bound` checks each against its estimate.
 pub const MAX_MARKER_ENTRY_BYTES: usize = 256 * 1024;
 /// The bytes of the message of a Stream failure that Workflow code gets and the marker records. A
 /// Store can give an error text of any size, and one failure must not fill a marker.
 pub const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
+/// The idle timeout of a read that sets none. A quiet read holds its Workflow Task open, and each
+/// heartbeat adds three events to History, so a read with no bound would grow History for good.
+/// The server also ends a chain of heartbeat tasks after 30 minutes. One constant in Core gives
+/// every SDK the same default.
+pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The Worker's options of a read.
+#[derive(Clone, Copy, Debug)]
+struct ReadOptions {
+    read_ahead_bytes: usize,
+    /// Zero for no gap.
+    min_gap: Duration,
+}
 /// How long a graceful shutdown waits for a close in flight, from the start of the shutdown or
 /// of the close if it is later. The Worker has no other bound for the work of its runs at a
 /// shutdown, and a Store that never answers must not hold the shutdown for ever.
@@ -130,14 +333,32 @@ pub(crate) const CLOSE_SHUTDOWN_BOUND: Duration = Duration::from_secs(10);
 /// The tries of one Store call that fails with `StorageUnavailable`.
 #[derive(Clone, Copy, Debug)]
 struct StoreRetry {
+    first_failure: Option<Instant>,
     backoff: Duration,
+    /// How long after the first failure the tries stop, or `None` for tries with no bound in time.
+    bound: Option<Duration>,
 }
 
 impl StoreRetry {
+    /// The tries of a read, which stop at [STORE_RETRY_BOUND].
+    fn new() -> Self {
+        Self::with_bound(STORE_RETRY_BOUND)
+    }
+
+    fn with_bound(bound: Duration) -> Self {
+        Self::bounded_by(Some(bound))
+    }
+
     /// The tries of a write, which go on until the call is stopped.
     fn unbounded() -> Self {
+        Self::bounded_by(None)
+    }
+
+    fn bounded_by(bound: Option<Duration>) -> Self {
         Self {
+            first_failure: None,
             backoff: STORE_RETRY_FIRST_BACKOFF,
+            bound,
         }
     }
 
@@ -148,7 +369,18 @@ impl StoreRetry {
         if error.reason != Reason::StorageUnavailable {
             return None;
         }
-        let wait = self.backoff;
+        let now = Instant::now();
+        let first = *self.first_failure.get_or_insert(now);
+        let wait = match self.bound {
+            Some(bound) => {
+                let left = (first + bound).saturating_duration_since(now);
+                if left.is_zero() {
+                    return None;
+                }
+                self.backoff.min(left)
+            }
+            None => self.backoff,
+        };
         self.backoff = (self.backoff * 2).min(STORE_RETRY_MAX_BACKOFF);
         Some(wait)
     }
@@ -268,15 +500,100 @@ pub(crate) fn store_metrics(
     run.has_meter().then(|| run.with_store(store))
 }
 
+/// The Records that a read gave to the run and that no activation took yet.
+#[derive(Debug, Default)]
+pub(crate) struct ReadFlow {
+    undelivered: AtomicUsize,
+    taken: Notify,
+    /// When an activation last took every Record that the read had sent.
+    all_taken_at: parking_lot::Mutex<Option<Instant>>,
+}
+
+impl ReadFlow {
+    /// The bytes of the read's Records that no activation took yet.
+    fn undelivered(&self) -> usize {
+        self.undelivered.load(Ordering::Acquire)
+    }
+
+    fn sent(&self, bytes: usize) {
+        self.undelivered.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// Notes that an activation took `bytes` of the read's Records.
+    pub(crate) fn delivered(&self, bytes: usize) {
+        let mut held = self.undelivered.load(Ordering::Acquire);
+        while let Err(now) = self.undelivered.compare_exchange_weak(
+            held,
+            held.saturating_sub(bytes),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            held = now;
+        }
+        if held <= bytes {
+            *self.all_taken_at.lock() = Some(Instant::now());
+        }
+        self.taken.notify_one();
+    }
+
+    /// When the idle time of the read started to count, or `None` while Workflow code hasn't
+    /// taken all of its Records. The idle time counts only while the read waits for the Store, so
+    /// a page that waits for a Workflow Task or a paused read doesn't use it up.
+    fn idle_since(&self, last_record_at: Instant) -> Option<Instant> {
+        if self.undelivered.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        Some(
+            self.all_taken_at
+                .lock()
+                .map_or(last_record_at, |taken| taken.max(last_record_at)),
+        )
+    }
+
+    /// Waits until an activation takes Records of the read.
+    async fn wait_for_take(&self) {
+        self.taken.notified().await;
+    }
+
+    async fn wait_for_room(&self, read_ahead_bytes: usize) {
+        while self.undelivered.load(Ordering::Acquire) >= read_ahead_bytes {
+            self.taken.notified().await;
+        }
+    }
+}
+
 /// A call that the machines ask the Worker to make or to stop.
 #[derive(Debug)]
 pub enum StreamRequest {
+    /// Starts a read.
+    Read(ReadSpec),
     /// Starts an append.
     Append(AppendSpec),
     /// Starts a close.
     Close(CloseSpec),
     /// Stops the call with this id.
     Cancel(u64),
+}
+
+/// A read to run, with what is left of its caps.
+#[derive(Debug)]
+pub struct ReadSpec {
+    pub(crate) call_id: u64,
+    pub(crate) seq: u32,
+    pub(crate) stream: StreamRef,
+    pub(crate) from_offset: Vec<u8>,
+    /// The Workflow time at which the read started, plus its `timeout`.
+    pub(crate) deadline: Option<SystemTime>,
+    /// How long the read waits for the Store with no Record. Zero gives what is in the Stream and
+    /// doesn't wait.
+    pub(crate) idle_timeout: Duration,
+    /// The Records left under `max_records`, or `None` for no cap.
+    pub(crate) records_left: Option<u32>,
+    /// The bytes left under `max_bytes`, or `None` for no cap.
+    pub(crate) bytes_left: Option<u64>,
+    /// True once Workflow code took a Record of the read, so the first-Record rule is spent.
+    pub(crate) took_a_record: bool,
+    pub(crate) flow: Arc<ReadFlow>,
 }
 
 /// An append to run.
@@ -315,6 +632,11 @@ pub struct StreamResolution {
 
 #[derive(Debug)]
 pub(crate) enum StreamCallResult {
+    /// The Records that a read gave since its last page, and its end if it ended.
+    Page {
+        records: Vec<StreamRecord>,
+        end: Option<StreamReadEnd>,
+    },
     Append(resolve_stream_append::Status),
     /// `None` when the Stream is closed.
     Close(Option<Failure>),
@@ -335,7 +657,8 @@ pub struct StreamManager {
     /// The writes that wait for their next try after `StorageUnavailable`, by call id. A run asks
     /// for them at the heartbeat of its Workflow Task.
     outages: Outages,
-    /// The Worker's shutdown, from whose start a close in flight has [CLOSE_SHUTDOWN_BOUND].
+    /// The Worker's shutdown, from whose start a close in flight has [CLOSE_SHUTDOWN_BOUND] and
+    /// no read starts.
     shutdown: CancellationToken,
 }
 
@@ -399,6 +722,26 @@ impl StreamManager {
                         task.handle.abort();
                     }
                     self.outages.lock().remove(&call_id);
+                }
+                // A graceful shutdown ends each task that only reads hold, and the next Worker
+                // resumes the reads from History. A read that started now would only hold the
+                // shutdown, also in a task that came back here through a poll still open.
+                StreamRequest::Read(_) if self.shutdown.is_cancelled() => {}
+                StreamRequest::Read(spec) => {
+                    let (call_id, seq) = (spec.call_id, spec.seq);
+                    match self.runtime(&spec.stream) {
+                        Some(runtime) => {
+                            let sink = self.sink(run_id, call_id, seq);
+                            let metrics = store_metrics(metrics, &spec.stream.store);
+                            if let Some(metrics) = &metrics {
+                                metrics.stream_read_started();
+                            }
+                            let options = self.streams.runtimes.read_options();
+                            let call = read(runtime, spec, sink, metrics, options);
+                            self.spawn(run_id, call_id, false, call);
+                        }
+                        None => self.no_runtime(run_id, call_id, seq, Call::Read),
+                    }
                 }
                 StreamRequest::Append(spec) => {
                     let (call_id, seq) = (spec.call_id, spec.seq);
@@ -512,7 +855,7 @@ impl StreamManager {
     ) {
         let local_tx = self.local_tx.clone();
         let span = Span::current();
-        // A duration, so that the timer runs on the runtime's own clock, as other call timers do.
+        // A duration, so that the timer runs on the runtime's own clock, as the read's timers do.
         let wait = deadline.saturating_duration_since(std::time::Instant::now());
         let sleep = {
             let _runtime = self.handle.enter();
@@ -581,6 +924,13 @@ impl StreamManager {
             "This Worker has no Stream runtime for the Store of the call",
         ));
         let result = match call {
+            Call::Read => StreamCallResult::Page {
+                records: vec![],
+                end: Some(StreamReadEnd {
+                    failure: Some(failure),
+                    ..Default::default()
+                }),
+            },
             Call::Append => {
                 StreamCallResult::Append(resolve_stream_append::Status::Failed(failure))
             }
@@ -641,6 +991,202 @@ impl StreamManager {
     }
 }
 
+/// Reads until the first stop. It sends each response with Records as one batch immediately, and
+/// looks at the Store again right after, or once the Worker's `read_min_gap` after that batch has
+/// passed. Batches that come while an activation of the run is out join, up to the Worker's
+/// `read_page_records` for one activation.
+async fn read(
+    runtime: Arc<StreamRuntime>,
+    spec: ReadSpec,
+    sink: impl Fn(StreamCallResult),
+    metrics: Option<Arc<dyn StreamMetrics>>,
+    options: ReadOptions,
+) {
+    let deadline = spec.deadline.map(|deadline| {
+        Instant::now()
+            + deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+    });
+    let mut last_offset = spec.from_offset.clone();
+    let mut records_left = spec.records_left;
+    let mut bytes_left = spec.bytes_left;
+    let mut took_a_record = spec.took_a_record;
+    let mut last_record_at = Instant::now();
+    let end = |last_offset: Vec<u8>, stop: StreamReadStop| StreamReadEnd {
+        last_offset,
+        stop: stop as i32,
+        done: stop == StreamReadStop::Done,
+        failure: None,
+    };
+    // A resumed read whose caps were spent before its Workflow Task failed ends at once.
+    if records_left == Some(0) {
+        sink(StreamCallResult::Page {
+            records: vec![],
+            end: Some(end(last_offset, StreamReadStop::MaxRecords)),
+        });
+        return;
+    }
+    // A read that gave no Record yet looks at the Store once before its timeout ends it. Its
+    // deadline counts from the Workflow time of its task, so a slow start would otherwise end a
+    // short read with no Record, and a loop of such reads could stand still.
+    let mut looked = spec.took_a_record;
+    // The tries of the current Store outage. A read that fails asks again from `last_offset`, so
+    // it gives no Record twice and skips none.
+    let mut retry = StoreRetry::new();
+    // When the gap after the last batch ends. The read asks the Store again only then, so the
+    // Records that come in the gap go in one batch.
+    let mut next_batch_at: Option<Instant> = None;
+    loop {
+        if let Some(at) = next_batch_at.take() {
+            // A deadline in the gap ends the read at the deadline, and not at the gap's end.
+            tokio::time::sleep_until(deadline.map_or(at, |deadline| deadline.min(at))).await;
+        }
+        spec.flow.wait_for_room(options.read_ahead_bytes).await;
+        let now = Instant::now();
+        if looked && deadline.is_some_and(|deadline| deadline <= now) {
+            sink(StreamCallResult::Page {
+                records: vec![],
+                end: Some(end(last_offset, StreamReadStop::Timeout)),
+            });
+            return;
+        }
+        let idle_deadline = |last_record_at: Instant| {
+            spec.flow
+                .idle_since(last_record_at)
+                .map(|since| since + spec.idle_timeout)
+        };
+        // While the idle time doesn't count, the read looks again after one idle timeout.
+        let idle_check = idle_deadline(last_record_at).unwrap_or(now + spec.idle_timeout);
+        let wait_until = deadline
+            .into_iter()
+            .fold(idle_check.min(now + MAX_WAIT), Instant::min);
+        let request = ReadRecordsRequest {
+            namespace: String::new(),
+            r#ref: Some(spec.stream.clone()),
+            from_offset: last_offset.clone(),
+            max_records: records_left.map_or(0, |left| left.min(i32::MAX as u32) as i32),
+            max_bytes: page_bytes_cap(bytes_left, &spec.flow, options.read_ahead_bytes),
+            wait: Some(proto_duration(wait_until.saturating_duration_since(now))),
+        };
+        let answer = runtime.read_records(request).await.and_then(|response| {
+            let offsets = response
+                .records
+                .iter()
+                .map(|record| record.offset.as_slice());
+            store_offsets(offsets).map(|()| response)
+        });
+        let response = match answer {
+            Ok(response) => {
+                retry = StoreRetry::new();
+                response
+            }
+            Err(error) => {
+                if let Some(wait) = retry.next_wait(&error) {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                if let Some(metrics) = &metrics {
+                    metrics.stream_read_failed();
+                }
+                sink(StreamCallResult::Page {
+                    records: vec![],
+                    end: Some(StreamReadEnd {
+                        last_offset,
+                        failure: Some(failure(&error)),
+                        ..Default::default()
+                    }),
+                });
+                return;
+            }
+        };
+        looked = true;
+        let given = response.records.len();
+        let mut page = Vec::with_capacity(given);
+        let mut stop = None;
+        let mut page_bytes = 0;
+        for record in response.records {
+            let size = record.encoded_len();
+            if let Some(left) = bytes_left.as_mut() {
+                if size as u64 > *left && took_a_record {
+                    stop = Some(StreamReadStop::MaxBytes);
+                    break;
+                }
+                *left = left.saturating_sub(size as u64);
+            }
+            last_offset.clone_from(&record.offset);
+            page_bytes += size;
+            page.push(record);
+            took_a_record = true;
+            if let Some(left) = records_left.as_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    stop = Some(StreamReadStop::MaxRecords);
+                    break;
+                }
+            }
+        }
+        // A read that took the last Record of a closed Stream is done, also when that Record
+        // filled a cap, so that Workflow code knows that nothing more comes.
+        if response.done && page.len() == given {
+            stop = Some(StreamReadStop::Done);
+        }
+        if stop.is_none() && bytes_left == Some(0) {
+            stop = Some(StreamReadStop::MaxBytes);
+        }
+        if !page.is_empty() {
+            last_record_at = Instant::now();
+            spec.flow.sent(page_bytes);
+        }
+        match stop {
+            Some(stop) => {
+                sink(StreamCallResult::Page {
+                    records: page,
+                    end: Some(end(last_offset, stop)),
+                });
+                return;
+            }
+            None if !page.is_empty() => {
+                sink(StreamCallResult::Page {
+                    records: page,
+                    end: None,
+                });
+                if !options.min_gap.is_zero() {
+                    next_batch_at = Some(Instant::now() + options.min_gap);
+                }
+            }
+            // The idle end comes after a look at the Store, so that a read with a zero idle
+            // timeout gives the Records that are there.
+            None if idle_deadline(last_record_at).is_some_and(|idle| idle <= Instant::now()) => {
+                sink(StreamCallResult::Page {
+                    records: vec![],
+                    end: Some(end(last_offset, StreamReadStop::Idle)),
+                });
+                return;
+            }
+            // A read that doesn't wait for the Store found nothing, while its idle time doesn't
+            // count. It looks again once Workflow code takes its Records, and not in a loop.
+            None if spec.idle_timeout.is_zero() => match deadline {
+                Some(deadline) => {
+                    let _ = tokio::time::timeout_at(deadline, spec.flow.wait_for_take()).await;
+                }
+                None => spec.flow.wait_for_take().await,
+            },
+            None => {}
+        }
+    }
+}
+
+/// The byte cap of the next page: the room left under `read_ahead_bytes`, and under the read's
+/// `max_bytes` if it set one. A cap of one byte still gives one Record, so the read moves on, and
+/// a cap of zero bytes left ends the read with that Record.
+fn page_bytes_cap(bytes_left: Option<u64>, flow: &ReadFlow, read_ahead_bytes: usize) -> i64 {
+    let room = read_ahead_bytes.saturating_sub(flow.undelivered()) as u64;
+    bytes_left
+        .map_or(room, |left| left.min(room))
+        .clamp(1, i64::MAX as u64) as i64
+}
+
 /// The metrics of an append or a close, and when Core started it.
 struct CallTimer {
     metrics: Arc<dyn StreamMetrics>,
@@ -659,6 +1205,7 @@ impl CallTimer {
 
 /// The kind of a call, for the failure of one that can't run.
 enum Call {
+    Read,
     Append,
     Close,
 }
@@ -796,11 +1343,11 @@ fn store_offsets<'a>(offsets: impl IntoIterator<Item = &'a [u8]>) -> Result<(), 
 /// The longest Store name of a Stream call, in bytes. The marker records the Store of each call.
 pub const MAX_STORE_NAME_BYTES: usize = 4096;
 
-/// The failure of a Stream call of Workflow code whose Stream is over its limit, if it is. Core
-/// refuses such a call before any Store call and records nothing of it in the marker, so that no
-/// input of Workflow code makes a marker entry of any size. The message gives the limit and not
-/// the value.
-pub fn input_over_limit(stream: &StreamRef) -> Option<Failure> {
+/// The failure of a Stream call of Workflow code whose Stream or `from_offset` is over its limit,
+/// if it is. Core refuses such a call before any Store call and records nothing of it in the
+/// marker, so that no input of Workflow code makes a marker entry of any size. The message gives
+/// the limit and not the value.
+pub fn input_over_limit(stream: &StreamRef, from_offset: &[u8]) -> Option<Failure> {
     let over = |what: &str, bytes: usize, limit: usize| {
         (bytes > limit).then(|| {
             failure(&StreamError::invalid(format!(
@@ -810,6 +1357,20 @@ pub fn input_over_limit(stream: &StreamRef) -> Option<Failure> {
     };
     over("The Stream id", stream.id.len(), MAX_STREAM_ID_BYTES)
         .or_else(|| over("The Store name", stream.store.len(), MAX_STORE_NAME_BYTES))
+        .or_else(|| {
+            over(
+                "The offset `from_offset`",
+                from_offset.len(),
+                MAX_OFFSET_BYTES,
+            )
+        })
+}
+
+fn proto_duration(duration: Duration) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: duration.as_secs().min(i64::MAX as u64) as i64,
+        nanos: duration.subsec_nanos() as i32,
+    }
 }
 
 /// The failure that Workflow code gets for a Store error. Its type is the reason's token, and its
@@ -855,8 +1416,28 @@ fn cut_message(text: String) -> String {
     format!("{}...", &text[..end])
 }
 
-/// The marker detail that holds the encoded `StreamMarkerData`.
+/// The marker detail that holds the encoded [StreamMarkerData].
 pub const STREAM_MARKER_DATA_KEY: &str = "data";
+/// The metadata key of a `tonic::Status` from a failed hydrate, so that the failed Workflow Task
+/// carries its message as is.
+pub(crate) const STREAM_REPLAY_ERROR_KEY: &str = "temporal-stream-replay-error";
+/// The Store reads that a hydrate runs at a time.
+const HYDRATE_CONCURRENCY: usize = 8;
+
+/// The encoded marker data of a `core_stream` marker event, if the event is one.
+pub(crate) fn stream_marker_payload(event: &mut HistoryEvent) -> Option<&mut Payload> {
+    match event.attributes.as_mut()? {
+        history_event::Attributes::MarkerRecordedEventAttributes(marker)
+            if marker.marker_name == STREAM_MARKER_NAME =>
+        {
+            marker
+                .details
+                .get_mut(STREAM_MARKER_DATA_KEY)
+                .and_then(|payloads| payloads.payloads.first_mut())
+        }
+        _ => None,
+    }
+}
 
 /// The encoded marker data of a `core_stream` marker event, if the event is one.
 pub fn stream_marker_payload_of(event: &HistoryEvent) -> Option<&Payload> {
@@ -871,6 +1452,250 @@ pub fn stream_marker_payload_of(event: &HistoryEvent) -> Option<&Payload> {
         }
         _ => None,
     }
+}
+
+/// True if a `core_stream` marker among the events counts Records that it doesn't hold.
+pub fn needs_stream_records(events: &[HistoryEvent]) -> bool {
+    events.iter().any(|event| {
+        stream_marker_payload_of(event)
+            .and_then(|payload| StreamMarkerData::decode(payload.data.as_slice()).ok())
+            .is_some_and(|data| {
+                data.reads
+                    .iter()
+                    .any(|entry| entry.count > 0 && entry.records.is_empty())
+            })
+    })
+}
+
+/// The type of the failure of a replay that can't read or check the Records of a marker. A replay
+/// whose Store stays unavailable has no type, so that it never fails the Workflow.
+pub const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
+
+/// True if a failure of a Workflow Task is one of a replay that can't read its Records.
+pub fn is_stream_replay_failure(failure: &workflow_completion::Failure) -> bool {
+    failure
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.maybe_application_failure())
+        .is_some_and(|info| info.r#type == STREAM_REPLAY_ERROR_TYPE)
+}
+
+/// True if the status comes from a failed hydrate.
+pub fn is_stream_replay_error(status: &tonic::Status) -> bool {
+    status.metadata().contains_key(STREAM_REPLAY_ERROR_KEY)
+}
+
+/// True if the status comes from a hydrate whose Store stayed unavailable. The Records may still be
+/// there, so such a replay fails only its task, and a later attempt may pass.
+pub fn is_stream_replay_unavailable(status: &tonic::Status) -> bool {
+    is_stream_replay_error(status) && status.code() == tonic::Code::Unavailable
+}
+
+/// Reads the Records of each `core_stream` marker that has their count and digest but not the
+/// Records themselves, and puts them in the marker. The machines are sync, so a replay reads the
+/// Store here, where history enters in async code, and gives them a marker that has its Records.
+pub async fn hydrate_stream_markers(
+    events: &mut [HistoryEvent],
+    streams: Option<&RunStreams>,
+) -> Result<(), tonic::Status> {
+    let mut markers = vec![];
+    for (at, event) in events.iter_mut().enumerate() {
+        let Some(payload) = stream_marker_payload(event) else {
+            continue;
+        };
+        let data = StreamMarkerData::decode(payload.data.as_slice()).map_err(|error| {
+            replay_error(
+                tonic::Code::DataLoss,
+                format!("StreamReplayError: a Stream marker is bad: {error}"),
+            )
+        })?;
+        if data
+            .reads
+            .iter()
+            .any(|entry| entry.count > 0 && entry.records.is_empty())
+        {
+            if let Some(entry) = data
+                .reads
+                .iter()
+                .find(|entry| data.streams.get(entry.stream_index as usize).is_none())
+            {
+                return Err(replay_error(
+                    tonic::Code::DataLoss,
+                    format!(
+                        "StreamReplayError: a Stream marker is bad: read {} has Stream {}, which the \
+                     marker doesn't have",
+                        entry.seq, entry.stream_index
+                    ),
+                ));
+            }
+            markers.push((at, data));
+        }
+    }
+    if markers.is_empty() {
+        return Ok(());
+    }
+    let reads: Vec<_> = markers
+        .iter()
+        .enumerate()
+        .flat_map(|(marker, (_, data))| {
+            data.reads
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.count > 0 && entry.records.is_empty())
+                .map(move |(entry, read)| {
+                    let stream = data.streams[read.stream_index as usize].clone();
+                    (marker, entry, stream, read.clone())
+                })
+        })
+        .collect();
+    // The first failure ends the hydrate. Each read may retry an unavailable Store for its
+    // bound, and the reads behind it would each wait that long again for the same outage.
+    let results: Vec<_> = futures_util::stream::iter(reads)
+        .map(|(marker, entry, stream, read)| async move {
+            let records = read_range(streams, &stream, &read).await?;
+            Ok::<_, tonic::Status>((marker, entry, records))
+        })
+        .buffer_unordered(HYDRATE_CONCURRENCY)
+        .try_collect()
+        .await?;
+    for (marker, entry, records) in results {
+        markers[marker].1.reads[entry].records = records;
+    }
+    for (at, data) in markers {
+        if let Some(payload) = stream_marker_payload(&mut events[at]) {
+            payload.data = data.encode_to_vec();
+        }
+    }
+    Ok(())
+}
+
+/// Reads the Records of one entry and checks them, and counts the read in the metrics.
+async fn read_range(
+    streams: Option<&RunStreams>,
+    stream: &StreamRef,
+    entry: &StreamReadEntry,
+) -> Result<Vec<StreamRecord>, tonic::Status> {
+    let runtime = streams.and_then(|streams| streams.worker.get(&stream.store));
+    let retry = StoreRetry::with_bound(streams.map_or(STORE_REPLAY_RETRY_BOUND, |streams| {
+        streams.worker.replay_retry_bound()
+    }));
+    let Some(metrics) = streams.and_then(|streams| streams.replay_metrics(&stream.store)) else {
+        return read_and_check(runtime, stream, entry, retry).await;
+    };
+    metrics.stream_replay_read_started();
+    let started = Instant::now();
+    let records = read_and_check(runtime, stream, entry, retry).await;
+    metrics.stream_replay_read_latency(started.elapsed());
+    if records.is_err() {
+        metrics.stream_replay_read_failed();
+    }
+    records
+}
+
+/// Reads the Records of one entry, with no wait, and checks them against the entry.
+async fn read_and_check(
+    runtime: Option<&Arc<StreamRuntime>>,
+    stream: &StreamRef,
+    entry: &StreamReadEntry,
+    fresh_retry: StoreRetry,
+) -> Result<Vec<StreamRecord>, tonic::Status> {
+    let range = || {
+        format!(
+            "Stream `{}` in Store `{}`, the Records after {} through {}",
+            stream.id,
+            stream.store,
+            offset_text(&entry.after_offset),
+            offset_text(&entry.last_offset),
+        )
+    };
+    let fail = |cause: String| {
+        replay_error(
+            tonic::Code::DataLoss,
+            format!("StreamReplayError: {}: {cause}", range()),
+        )
+    };
+    let runtime = runtime.ok_or_else(|| {
+        fail(format!(
+            "this Worker has no Stream runtime for the Store `{}`",
+            stream.store
+        ))
+    })?;
+    let count = entry.count as usize;
+    let mut records: Vec<StreamRecord> = Vec::with_capacity(count);
+    let mut from_offset = entry.after_offset.clone();
+    let mut retry = fresh_retry;
+    while records.len() < count {
+        let left = count - records.len();
+        let answer = runtime
+            .read_records(ReadRecordsRequest {
+                namespace: String::new(),
+                r#ref: Some(stream.clone()),
+                from_offset: from_offset.clone(),
+                max_records: i32::try_from(left).unwrap_or(i32::MAX),
+                wait: None,
+                max_bytes: 0,
+            })
+            .await;
+        let response = match answer {
+            Ok(response) => {
+                retry = fresh_retry;
+                response
+            }
+            Err(error) => {
+                if let Some(wait) = retry.next_wait(&error) {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                // A Store that didn't answer says nothing of the Records, so this failure must not
+                // count as Records that are gone.
+                if error.reason == Reason::StorageUnavailable {
+                    return Err(replay_error(
+                        tonic::Code::Unavailable,
+                        format!("StreamReplayUnavailable: {}: {error}", range()),
+                    ));
+                }
+                return Err(fail(error.to_string()));
+            }
+        };
+        if response.records.is_empty() {
+            return Err(fail(format!(
+                "the Store has {} of the {count} Records",
+                records.len()
+            )));
+        }
+        from_offset = response.last_offset;
+        records.extend(response.records.into_iter().take(left));
+    }
+    let last = records.last().map(|record| record.offset.clone());
+    if last.as_ref() != Some(&entry.last_offset) {
+        return Err(fail(format!(
+            "the last Record is at {}",
+            offset_text(&last.unwrap_or_default())
+        )));
+    }
+    if records_digest(&records).as_slice() != entry.digest.as_slice() {
+        return Err(fail("the digest of the Records differs".to_string()));
+    }
+    Ok(records)
+}
+
+fn offset_text(offset: &[u8]) -> String {
+    if offset.is_empty() {
+        return "the start".to_string();
+    }
+    let hex: String = offset.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("offset {hex}")
+}
+
+/// A status that carries `message` as is, with `code` to tell a Store that stayed unavailable
+/// from Records that a replay can't use.
+fn replay_error(code: tonic::Code, message: String) -> tonic::Status {
+    let mut status = tonic::Status::new(code, message);
+    status.metadata_mut().insert(
+        STREAM_REPLAY_ERROR_KEY,
+        "true".parse().expect("valid metadata"),
+    );
+    status
 }
 
 #[cfg(test)]
@@ -899,25 +1724,31 @@ mod tests {
             id: "x".repeat(MAX_STREAM_ID_BYTES),
             store: "m".repeat(MAX_STORE_NAME_BYTES),
         };
-        assert!(input_over_limit(&at_limit).is_none());
-        let over = |what: &str, stream: &StreamRef| {
-            let failure = input_over_limit(stream).expect("no refusal");
+        assert!(input_over_limit(&at_limit, &[1; MAX_OFFSET_BYTES]).is_none());
+        let over = |what: &str, stream: &StreamRef, from_offset: &[u8]| {
+            let failure = input_over_limit(stream, from_offset).expect("no refusal");
             assert!(failure.message.contains(what), "{}", failure.message);
         };
         let mut long_id = at_limit.clone();
         long_id.id.push('x');
-        over("Stream id", &long_id);
+        over("Stream id", &long_id, &[]);
         let mut long_store = at_limit.clone();
         long_store.store.push('m');
-        over("Store name", &long_store);
+        over("Store name", &long_store, &[]);
+        over("from_offset", &at_limit, &[1; MAX_OFFSET_BYTES + 1]);
     }
 
-    /// A write goes on with no bound in time. The wait of a write stays at the longest backoff.
+    /// A read stops at its bound, and a write goes on past it. The wait of a write stays at the
+    /// longest backoff.
     #[tokio::test(start_paused = true)]
-    async fn a_retry_with_no_bound_goes_on() {
+    async fn a_retry_with_no_bound_goes_on_past_the_bound_of_a_read() {
         let down = StreamError::storage_unavailable("down");
+        let mut read = StoreRetry::new();
         let mut write = StoreRetry::unbounded();
+        assert_eq!(read.next_wait(&down), Some(STORE_RETRY_FIRST_BACKOFF));
         assert_eq!(write.next_wait(&down), Some(STORE_RETRY_FIRST_BACKOFF));
+        tokio::time::advance(STORE_RETRY_BOUND + Duration::from_secs(1)).await;
+        assert_eq!(read.next_wait(&down), None);
         for _ in 0..100 {
             let wait = write.next_wait(&down).expect("a write has no bound");
             assert!(wait <= STORE_RETRY_MAX_BACKOFF, "{wait:?}");
@@ -939,7 +1770,8 @@ mod tests {
     }
 
     fn manager() -> StreamManager {
-        let streams = WorkerStreams::new(StreamRuntimes::default());
+        let streams =
+            WorkerStreams::new(StreamRuntimes::default(), true, None, Box::new(|_| false));
         StreamManager::new(
             Arc::new(streams),
             Handle::current(),

@@ -56,6 +56,8 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        StartStreamRead start_stream_read = 23;
+        CloseStreamRead close_stream_read = 24;
         AppendToStream append_to_stream = 25;
         CloseStream close_stream = 26;
     }
@@ -421,6 +423,37 @@ message ScheduleNexusOperation {
 // Request cancellation of a nexus operation started via `ScheduleNexusOperation`
 message RequestCancelNexusOperation {
     // Lang's incremental sequence number as passed to `ScheduleNexusOperation`
+    uint32 seq = 1;
+}
+
+// Start a read of a Stream. Core reads the Store itself and gives each page of Records to the
+// workflow in a `ResolveStreamRead` job, until the read ends or the workflow closes it.
+message StartStreamRead {
+    // Lang's incremental sequence number of Stream reads, used as the read's identifier
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The read starts after this offset. Empty means the start of the Stream.
+    bytes from_offset = 3;
+    // The longest time the read may take. Unset means no bound. A set value of zero or less fails
+    // the workflow task. A read that gave no Record yet looks at the Store once before its timeout
+    // ends it.
+    google.protobuf.Duration timeout = 4;
+    // The read ends when no Record comes for this long. Unset means 1 minute. Zero gives the
+    // Records that are in the Stream, and ends with no wait. A read that must wait longer sets a
+    // longer value.
+    google.protobuf.Duration idle_timeout = 5;
+    // The most Records the read gives. Zero means no cap.
+    uint32 max_records = 6;
+    // The most bytes of Records the read gives. The first Record is always given. Zero means no
+    // cap.
+    uint64 max_bytes = 7;
+    // If set, the Records go into the workflow history, so a replay reads no Store.
+    bool records_in_history = 8;
+}
+
+// Stop a read that `StartStreamRead` started. The workflow gets no job for it.
+message CloseStreamRead {
+    // Lang's sequence number as passed to `StartStreamRead`
     uint32 seq = 1;
 }
 

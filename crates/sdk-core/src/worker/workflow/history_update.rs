@@ -3,7 +3,10 @@ use crate::{
     protosext::ValidPollWFTQResponse,
     worker::{
         client::WorkerClient,
-        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
+        workflow::{
+            CacheMissFetchReq, PermittedWFT, PreparedWFT,
+            streams::{RunStreams, WorkerStreams, hydrate_stream_markers, needs_stream_records},
+        },
     },
 };
 use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
@@ -72,6 +75,19 @@ impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
     }
+
+    /// True if a marker of the update counts Records that it doesn't hold.
+    pub(crate) fn needs_stream_records(&self) -> bool {
+        needs_stream_records(&self.events)
+    }
+
+    /// Reads the Records that the markers of the update count from the Store.
+    pub(crate) async fn read_stream_records(
+        &mut self,
+        streams: Option<&RunStreams>,
+    ) -> Result<(), tonic::Status> {
+        hydrate_stream_markers(&mut self.events, streams).await
+    }
 }
 
 #[derive(Debug)]
@@ -97,6 +113,11 @@ pub(crate) struct HistoryPaginator {
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
     chunking_disabled: bool,
+    /// The Worker's Stream runtimes, which a replay reads the Records of its markers with.
+    streams: Option<RunStreams>,
+    /// True if the run of this history is new to the cache, so that it replays the markers that
+    /// it gives, which need their Records. A cached run has every marker it meets already.
+    hydrate: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -121,11 +142,22 @@ impl From<Vec<u8>> for NextPageToken {
 }
 
 impl HistoryPaginator {
+    /// Makes the paginator read the Records of the markers in its later pages, for a run that is
+    /// new to the cache.
+    pub(super) fn hydrate_new_run(&mut self) {
+        self.hydrate = true;
+    }
+
+    pub(super) fn streams(&self) -> Option<&RunStreams> {
+        self.streams.as_ref()
+    }
+
     /// Use a new poll response to create a new [WFTPaginator], returning it and the
     /// [PreparedWFT] extracted from it that can be fed into workflow state.
     pub(super) async fn from_poll(
         wft: ValidPollWFTQResponse,
         client: Arc<dyn WorkerClient>,
+        streams: Arc<WorkerStreams>,
     ) -> Result<(Self, PreparedWFT), tonic::Status> {
         let empty_hist = wft.history.events.is_empty();
         let npt = if empty_hist {
@@ -142,6 +174,7 @@ impl HistoryPaginator {
             npt,
             client,
         );
+        paginator.streams = Some(RunStreams::new(&streams, &wft.workflow_type));
         if empty_hist && wft.legacy_query.is_none() && wft.query_requests.is_empty() {
             return Err(EMPTY_TASK_ERR.clone());
         }
@@ -167,6 +200,7 @@ impl HistoryPaginator {
             query_requests: wft.query_requests,
             update,
             messages: wft.messages,
+            stream_replay_error: None,
         };
         Ok((paginator, prepared))
     }
@@ -189,6 +223,8 @@ impl HistoryPaginator {
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
             chunking_disabled: false,
+            streams: req.original_wft.paginator.streams.clone(),
+            hydrate: true,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -223,6 +259,8 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             chunking_disabled: false,
+            streams: None,
+            hydrate: false,
         }
     }
 
@@ -323,6 +361,10 @@ impl HistoryPaginator {
                 update.events.last().map(|e| e.event_id);
             #[cfg(debug_assertions)]
             update.assert_contiguous();
+            let mut update = update;
+            if self.hydrate {
+                hydrate_stream_markers(&mut update.events, self.streams.as_ref()).await?;
+            }
             return Ok(update);
         }
     }

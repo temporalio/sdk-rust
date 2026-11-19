@@ -14,11 +14,17 @@ mod workflow_stream;
 
 pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
+#[cfg(test)]
+pub(crate) use managed_run::TASK_DURATIONS;
+#[cfg(test)]
+pub(crate) use streams::STORE_RETRY_BOUND;
 pub use streams::StreamRuntimes;
 #[cfg(test)]
 pub(crate) use streams::{
-    MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_STORE_NAME_BYTES, StreamTestHooks,
+    MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES,
+    MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks,
 };
+pub(crate) use streams::{MAX_READ_MIN_GAP, MAX_READ_PAGE_RECORDS};
 
 use crate::{
     MetricsContext, WorkerConfig,
@@ -43,7 +49,9 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
-            streams::{LocalSink, StreamManager, worker_streams},
+            streams::{
+                LocalSink, STREAM_REPLAY_ERROR_TYPE, StreamManager, WorkerStreams, worker_streams,
+            },
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -154,6 +162,8 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+    /// The Worker's Stream runtimes, for the markers of a task that a completion returns.
+    streams: Arc<WorkerStreams>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -197,9 +207,11 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         // The subsystems of a Worker are built inside its runtime, as the pollers spawn there too.
         // Stream calls run on it, so that Store work never holds up the workflow processing thread.
-        let streams = Arc::new(worker_streams(&basics.worker_config));
+        // The Worker's Stream state carries its metrics, which a replay's reads of the Store count
+        // in, and its choice for a replay that can't read its Records.
+        let streams = Arc::new(worker_streams(&basics.worker_config, &basics.metrics));
         let stream_manager = Arc::new(StreamManager::new(
-            streams,
+            streams.clone(),
             tokio::runtime::Handle::current(),
             Arc::new(LocalSink(local_tx.clone())),
             basics.shutdown_token.clone(),
@@ -217,6 +229,7 @@ impl Workflows {
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
+            streams.clone(),
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang
@@ -310,6 +323,7 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+            streams,
         }
     }
 
@@ -397,6 +411,7 @@ impl Workflows {
                         messages,
                         query_responses,
                         force_new_wft,
+                        leaves_worker,
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
@@ -426,7 +441,7 @@ impl Workflows {
                     messages,
                     query_responses,
                     sticky_attributes: None,
-                    return_new_workflow_task: true,
+                    return_new_workflow_task: !leaves_worker,
                     force_create_new_workflow_task: force_new_wft,
                     sdk_metadata,
                     metering_metadata: MeteringMetadata {
@@ -441,7 +456,9 @@ impl Workflows {
                         .workflow_task_completion_size_limit(),
                     resource_id: format!("workflow:{workflow_id}"),
                 };
-                let sticky_attrs = self.sticky_attrs.clone();
+                // A run that leaves this Worker must not have its next task on the sticky queue
+                // of a Worker that shuts down. With no sticky attributes the server clears it.
+                let sticky_attrs = self.sticky_attrs.clone().filter(|_| !leaves_worker);
                 // Do not return new WFT if we would not cache, because returned new WFTs are
                 // always partial.
                 if sticky_attrs.is_none() {
@@ -679,7 +696,8 @@ impl Workflows {
             .await;
 
         let maybe_pwft = if let Some(wft) = wft_from_complete {
-            match HistoryPaginator::from_poll(wft, self.client.clone()).await {
+            match HistoryPaginator::from_poll(wft, self.client.clone(), self.streams.clone()).await
+            {
                 Ok((paginator, wft)) => Some(WFTWithPaginator { wft, paginator }),
                 Err(e) => {
                     self.request_eviction(
@@ -1065,6 +1083,10 @@ struct PreparedWFT {
     query_requests: Vec<QueryWorkflow>,
     update: HistoryUpdate,
     messages: Vec<IncomingProtocolMessage>,
+    /// Set when the Records of a marker couldn't be read, on a replay Worker or on a Worker that
+    /// may fail the Workflow for it. The run then fails with it, so that lang gets the eviction
+    /// and a replay ends, as for a non-determinism error.
+    stream_replay_error: Option<WFMachinesError>,
 }
 
 impl PreparedWFT {
@@ -1226,6 +1248,10 @@ pub(crate) enum ActivationAction {
         messages: Vec<ProtocolMessage>,
         query_responses: Vec<QueryResult>,
         force_new_wft: bool,
+        /// True when the run goes on another Worker, as after a graceful shutdown stopped its
+        /// reads. The completion then asks for no task inline and drops the sticky queue, so
+        /// that the next task goes to the task queue.
+        leaves_worker: bool,
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
@@ -1655,6 +1681,8 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    StartStreamRead(StartStreamRead),
+    CloseStreamRead(CloseStreamRead),
     AppendToStream(AppendToStream),
     CloseStream(CloseStream),
 }
@@ -1718,6 +1746,8 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::StartStreamRead(s) => WFCommandVariant::StartStreamRead(s),
+            workflow_command::Variant::CloseStreamRead(s) => WFCommandVariant::CloseStreamRead(s),
             workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
             workflow_command::Variant::CloseStream(s) => WFCommandVariant::CloseStream(s),
         };
@@ -1799,6 +1829,14 @@ pub(crate) enum WFMachinesError {
     /// failed Workflow Task names the cause in its own words.
     #[error("{0}")]
     Stream(String),
+    /// A replay that can't read or check the Records of a Stream marker from the Store. It fails
+    /// the Workflow Task, or the Workflow with [WorkflowErrorType::StreamReplay].
+    #[error("{0}")]
+    StreamReplay(String),
+    /// A replay whose Store stayed unavailable for each try. The Records may still be there, so it
+    /// fails only the Workflow Task, also with [WorkflowErrorType::StreamReplay].
+    #[error("{0}")]
+    StreamReplayUnavailable(String),
     /// A Stream write that is in a Store outage when its Workflow Task reaches its heartbeat. It
     /// fails only the Workflow Task, never the Workflow. The server tries the task again, and the
     /// write runs again with the epoch of the new task.
@@ -1840,18 +1878,26 @@ impl WFMachinesError {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
             WFMachinesError::Fatal(_)
             | WFMachinesError::Stream(_)
+            | WFMachinesError::StreamReplay(_)
+            | WFMachinesError::StreamReplayUnavailable(_)
             | WFMachinesError::StreamUnavailable(_) => EvictionReason::Fatal,
         }
     }
 
     fn as_failure(&self) -> Failure {
+        let mut failure =
+            temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
+                self.to_string(),
+                false,
+            );
+        // The type lets a Workflow failure of this error tell its cause, as the text does.
+        if let WFMachinesError::StreamReplay(_) = self
+            && let Some(FailureInfo::ApplicationFailureInfo(info)) = failure.failure_info.as_mut()
+        {
+            info.r#type = STREAM_REPLAY_ERROR_TYPE.to_string();
+        }
         Failure {
-            failure: Some(
-                temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
-                    self.to_string(),
-                    false,
-                ),
-            ),
+            failure: Some(failure),
             force_cause: WorkflowTaskFailedCause::from(self.evict_reason()) as i32,
         }
     }
@@ -1920,7 +1966,7 @@ impl LocalActivityRequestSink for LAReqSink {
 /// 4. signals/updates
 /// 5. all others
 /// 6. local activity resolutions
-/// 7. Stream results, appends, then closes, each by seq
+/// 7. Stream results, reads, then appends, then closes, each by seq
 /// 8. queries
 /// 9. evictions
 ///
@@ -1961,6 +2007,7 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => (5, 0, 0),
                 // Stream results come in the order of their calls, not of their arrival, so that
                 // a replay gives the same order.
+                workflow_activation_job::Variant::ResolveStreamRead(r) => (6, 0, r.seq),
                 workflow_activation_job::Variant::ResolveStreamAppend(r) => (6, 1, r.seq),
                 workflow_activation_job::Variant::ResolveStreamClose(r) => (6, 2, r.seq),
                 // In principle we should never actually need to sort these with the others, since
@@ -2199,6 +2246,10 @@ mod tests {
         let (paginator, work) = HistoryPaginator::from_poll(
             validate_wft(response).unwrap(),
             Arc::new(mock_worker_client()),
+            Arc::new(worker_streams(
+                &Arc::new(crate::test_help::test_worker_cfg().build().unwrap()),
+                &crate::telemetry::metrics::MetricsContext::no_op(),
+            )),
         )
         .await
         .unwrap();

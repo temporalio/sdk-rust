@@ -7,6 +7,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/stream/v1/message.proto";
+import "temporal/sdk/core/common/common.proto";
 
 // This file defines data that Core might write externally. The first motivating case being
 // storing data in markers in event history. Defining such data as protos provides an easy way
@@ -45,13 +46,49 @@ message PatchedMarkerData {
 
 // The data of the marker `core_stream`, which Core records once for each workflow task in which
 // the workflow got a Stream result. It is in the detail `data` as `binary/protobuf`, so that a
-// marker with results stays small.
+// marker with Records stays small.
 message StreamMarkerData {
+  repeated StreamReadEntry reads = 1;
   repeated StreamAppendEntry appends = 2;
   repeated StreamCloseEntry closes = 3;
   // Each Stream of the entries, once. An entry gives the index of its Stream here, so that a task
   // with many results on one Stream holds its ref once.
   repeated temporal.api.stream.v1.StreamRef streams = 4;
+}
+
+// What one read gave the workflow in one workflow task.
+message StreamReadEntry {
+  uint32 seq = 1;
+  // The index of the read's Stream in `StreamMarkerData.streams`.
+  uint32 stream_index = 2;
+  // The `from_offset` of the read, so a replay can check that the read is the same.
+  bytes from_offset = 3;
+  // The offset before the first Record of this task. A replay reads after it.
+  bytes after_offset = 4;
+  // The offset of the last Record of this task. Empty when the task got no Record.
+  bytes last_offset = 5;
+  // The number of Records of this task.
+  uint32 count = 6;
+  // The digest of the Records of this task. Empty when `records` holds them.
+  bytes digest = 7;
+  // The Records of this task, only for a read with its Records in history.
+  repeated temporal.api.stream.v1.StreamRecord records = 8;
+  // The number of Records of each page, in order. A page ends where its count ends.
+  repeated uint32 page_counts = 9;
+  // The activation of each page in the task. The first is the index, and each later one is the
+  // gap to the one before.
+  repeated uint32 page_activations = 10;
+  // Set when the read ended in this task.
+  StreamReadEnded end = 11;
+}
+
+message StreamReadEnded {
+  bytes last_offset = 1;
+  coresdk.common.StreamReadStop stop = 2;
+  bool done = 3;
+  temporal.api.failure.v1.Failure failure = 4;
+  // The activation in the task that got the end.
+  uint32 activation = 5;
 }
 
 // The result of one append, in the workflow task whose activation got it.

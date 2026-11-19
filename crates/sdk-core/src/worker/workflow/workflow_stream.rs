@@ -5,7 +5,7 @@ use crate::{
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
-        streams::StreamManager,
+        streams::{StreamManager, is_stream_replay_error},
         wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
         *,
     },
@@ -173,7 +173,12 @@ impl WFStream {
                         err,
                         auto_reply_fail,
                     } => {
-                        let message = format!("Fetching history failed: {err:?}");
+                        // A failed read of a marker's Records says its cause in its own words.
+                        let message = if is_stream_replay_error(&err) {
+                            err.message().to_string()
+                        } else {
+                            format!("Fetching history failed: {err:?}")
+                        };
                         if !state.runs.has_run(&run_id)
                             && let Some(info) = auto_reply_fail.clone()
                         {
@@ -215,6 +220,9 @@ impl WFStream {
 
                 activations.extend(maybe_act);
                 activations.extend(state.reconcile_buffered());
+                if state.shutdown_token.is_cancelled() {
+                    activations.extend(state.end_reads_for_shutdown());
+                }
                 actions.extend(
                     activations
                         .into_iter()
@@ -299,6 +307,18 @@ impl WFStream {
             ));
         }
 
+        let mut pwft = pwft;
+        if !self.runs.has_run(&run_id) {
+            // A new run replays its history, so the markers in it need their Records. A cached run
+            // has every marker it meets already, so it reads none.
+            pwft.paginator.hydrate_new_run();
+            if pwft.work.stream_replay_error.is_none() && pwft.work.update.needs_stream_records() {
+                return Err(HistoryFetchReq::StreamRecords(
+                    Box::new(pwft),
+                    self.history_fetch_refcounter.clone(),
+                ));
+            }
+        }
         let rur = self.runs.instantiate_or_update(pwft);
         Ok(rur)
     }
@@ -614,6 +634,19 @@ impl WFStream {
             );
         }
         acts
+    }
+
+    /// Completes each Workflow Task that only reads hold open, so that a graceful shutdown ends.
+    fn end_reads_for_shutdown(&mut self) -> Vec<ActivationOrAuto> {
+        let run_ids: Vec<_> = self
+            .runs
+            .runs_lru_order()
+            .map(|(run_id, _)| run_id.to_string())
+            .collect();
+        run_ids
+            .iter()
+            .filter_map(|run_id| self.runs.get_mut(run_id)?.end_reads_for_shutdown())
+            .collect()
     }
 
     fn shutdown_done(&self) -> bool {

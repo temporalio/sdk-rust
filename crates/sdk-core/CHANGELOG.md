@@ -44,23 +44,34 @@ relevant information.
 * [lang-internal] Added the experimental `temporalio-streams` crate. `StreamRuntime` checks each
   Stream call and passes it to a `StreamStore`, which a bridge implements for a Store in its own
   language.
-* [lang-internal] Added experimental Stream calls, so Workflow code can append to and close a
+* [lang-internal] Added experimental Stream calls, so Workflow code can read, append to and close a
   Stream directly. A Worker takes its Stream runtimes in `WorkerConfig::stream_runtimes`, by Store
-  name. Lang sends `AppendToStream` and `CloseStream`, and gets the results in the
-  `ResolveStreamAppend` and `ResolveStreamClose` jobs.
+  name. Lang sends `StartStreamRead`, `CloseStreamRead`, `AppendToStream` and `CloseStream`, and
+  gets the results in the `ResolveStreamRead`, `ResolveStreamAppend` and `ResolveStreamClose` jobs.
 * [lang-internal] Core records one `core_stream` marker for each Workflow Task in which Workflow
   code got a Stream result, and a replay gives those results back in the same activations. A close
   takes effect only after the server accepted the task that asked for it, so its result comes in a
   later task.
+* [lang-internal] `StreamRuntimes::with_read_ahead_bytes`, `with_read_page_records` and
+  `with_read_min_gap` set the read-ahead bound of a read (4 MiB by default), the Records in one page
+  (256 by default, from 1 to 1000), and an opt-in minimum gap between batches (at most 1 s). A zero
+  read-ahead, or a value out of range, fails the build of the `WorkerConfig`.
+* [lang-internal] A Stream read with no `idle_timeout` ends after 1 minute with no Record.
 * [lang-internal] Core refuses a Stream call with `stream_invalid` when its Stream id or Store name
-  has more than 4096 bytes.
+  has more than 4096 bytes, or its `from_offset` has more than 1024 bytes.
 * [lang-internal] Core retries an append or a close of a Stream while the Store is unavailable. If
   one is still in the outage at the heartbeat of its Workflow Task, the task fails with
-  `StreamStoreUnavailable`, and Core forces no task for it.
+  `StreamStoreUnavailable`, and Core forces no task for it. A read is retried for up to 30 s, and
+  then Workflow code gets its error. A replay retries its read for up to 5 s, and then fails the
+  task with `StreamReplayUnavailable`.
+* [lang-internal] With `WorkflowErrorType::StreamReplay`, a replay that can't read or check its
+  Records fails the Workflow instead of its task. That happens after the Stream's Retention passed,
+  for example, or on a Worker with no Stream runtime for the Store.
 * [lang-internal] A graceful shutdown of the Worker waits for each Stream close in flight, for at
-  most 10 s.
-* [lang-internal] The Worker's meter records Stream calls, their failures, and the latencies of
-  appends and closes, as `stream_*` metrics.
+  most 10 s. It also completes a task that only reads hold open, and forces a new task so that
+  another Worker resumes the reads.
+* [lang-internal] The Worker's meter records Stream calls, their failures, the Records that reads
+  return, and the latencies of appends, closes and replay reads, as `stream_*` metrics.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or

@@ -6,7 +6,8 @@ use super::{
         CoreMeter, Counter, DEFAULT_MS_BUCKETS, DEFAULT_S_BUCKETS, Gauge, GaugeF64, Histogram,
         HistogramBase, HistogramDuration, HistogramDurationBase, HistogramF64, HistogramF64Base,
         MetricAttributable, MetricAttributes, MetricParameters, NewAttributes,
-        STREAM_APPEND_LATENCY_HISTOGRAM_NAME, STREAM_CLOSE_LATENCY_HISTOGRAM_NAME, UpDownCounter,
+        STREAM_APPEND_LATENCY_HISTOGRAM_NAME, STREAM_CLOSE_LATENCY_HISTOGRAM_NAME,
+        STREAM_REPLAY_READ_LATENCY_HISTOGRAM_NAME, UpDownCounter,
         WORKFLOW_E2E_LATENCY_HISTOGRAM_NAME, WORKFLOW_TASK_EXECUTION_LATENCY_HISTOGRAM_NAME,
         WORKFLOW_TASK_REPLAY_LATENCY_HISTOGRAM_NAME,
         WORKFLOW_TASK_SCHED_TO_START_LATENCY_HISTOGRAM_NAME, default_buckets_for,
@@ -140,7 +141,11 @@ pub(super) fn augment_meter_provider_with_defaults(
             STREAM_APPEND_LATENCY_HISTOGRAM_NAME,
             use_seconds,
         ))
-        .with_view(histo_view(STREAM_CLOSE_LATENCY_HISTOGRAM_NAME, use_seconds));
+        .with_view(histo_view(STREAM_CLOSE_LATENCY_HISTOGRAM_NAME, use_seconds))
+        .with_view(histo_view(
+            STREAM_REPLAY_READ_LATENCY_HISTOGRAM_NAME,
+            use_seconds,
+        ));
     // Fallback default
     mpb = mpb.with_view(move |ins: &Instrument| {
         if ins.kind() == InstrumentKind::Histogram {

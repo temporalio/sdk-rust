@@ -6,7 +6,9 @@ use crate::{
         client::WorkerClient,
         workflow::{
             CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, UnstoredWftFailInfo,
+            WFMachinesError,
             history_update::HistoryPaginator,
+            streams::{WorkerStreams, is_stream_replay_unavailable},
         },
     },
 };
@@ -51,6 +53,9 @@ pub(crate) type WFTStreamIn = Result<
 pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
+    /// A task of a run that is new to the cache, whose markers need their Records read from the
+    /// Store before the run replays them.
+    StreamRecords(Box<PermittedWFT>, Arc<HistfetchRC>),
 }
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
 #[derive(Debug)]
@@ -62,11 +67,13 @@ impl WFTExtractor {
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
+        streams: Arc<WorkerStreams>,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
                 let client = client.clone();
+                let streams = streams.clone();
                 async move {
                     match stream_in {
                         Ok((wft, permit)) => {
@@ -77,21 +84,23 @@ impl WFTExtractor {
                                 attempt: wft.attempt,
                                 workflow_type: wft.workflow_type.clone(),
                             };
-                            Ok(match HistoryPaginator::from_poll(wft, client).await {
-                                Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
-                                    permit: permit.into_used(WorkflowSlotInfo {
-                                        workflow_type: prep.workflow_type.clone(),
-                                        is_sticky: prep.is_incremental(),
+                            Ok(
+                                match HistoryPaginator::from_poll(wft, client, streams).await {
+                                    Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
+                                        permit: permit.into_used(WorkflowSlotInfo {
+                                            workflow_type: prep.workflow_type.clone(),
+                                            is_sticky: prep.is_incremental(),
+                                        }),
+                                        work: prep,
+                                        paginator: pag,
                                     }),
-                                    work: prep,
-                                    paginator: pag,
-                                }),
-                                Err(err) => WFTExtractorOutput::FailedFetch {
-                                    run_id,
-                                    err,
-                                    auto_reply_fail: Some(fail_info),
+                                    Err(err) => WFTExtractorOutput::FailedFetch {
+                                        run_id,
+                                        err,
+                                        auto_reply_fail: Some(fail_info),
+                                    },
                                 },
-                            })
+                            )
                         }
                         Err(e) => Err(e),
                     }
@@ -124,6 +133,47 @@ impl WFTExtractor {
                             };
                             match HistoryPaginator::from_fetchreq(req, client).await {
                                 Ok(r) => WFTExtractorOutput::FetchResult(r, rc),
+                                Err(err) => WFTExtractorOutput::FailedFetch {
+                                    run_id,
+                                    err,
+                                    auto_reply_fail: Some(fail_info),
+                                },
+                            }
+                        }
+                        HistoryFetchReq::StreamRecords(mut pwft, rc) => {
+                            let run_id = pwft.work.execution.run_id.clone();
+                            let fail_info = UnstoredWftFailInfo {
+                                task_token: pwft.work.task_token.clone(),
+                                workflow_id: pwft.work.execution.workflow_id.clone(),
+                                attempt: pwft.work.attempt,
+                                workflow_type: pwft.work.workflow_type.clone(),
+                            };
+                            let streams = pwft.paginator.streams().cloned();
+                            match pwft.work.update.read_stream_records(streams.as_ref()).await {
+                                Ok(()) => WFTExtractorOutput::FetchResult(*pwft, rc),
+                                // A replay Worker fails the run instead, so that lang sees the
+                                // eviction and the replay of this history ends. So does a Worker
+                                // that fails the Workflow for this error, which needs the run. A
+                                // Store that stayed unavailable never fails the Workflow, since
+                                // the Records may still be there.
+                                Err(err)
+                                    if streams.as_ref().is_some_and(|streams| {
+                                        !streams.worker().calls_stores()
+                                            || (!is_stream_replay_unavailable(&err)
+                                                && streams
+                                                    .worker()
+                                                    .fails_workflow(&pwft.work.workflow_type))
+                                    }) =>
+                                {
+                                    let message = err.message().to_string();
+                                    pwft.work.stream_replay_error =
+                                        Some(if is_stream_replay_unavailable(&err) {
+                                            WFMachinesError::StreamReplayUnavailable(message)
+                                        } else {
+                                            WFMachinesError::StreamReplay(message)
+                                        });
+                                    WFTExtractorOutput::FetchResult(*pwft, rc)
+                                }
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,

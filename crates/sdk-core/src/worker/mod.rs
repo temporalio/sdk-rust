@@ -41,11 +41,15 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+#[cfg(test)]
+pub(crate) use workflow::STORE_RETRY_BOUND;
 pub use workflow::StreamRuntimes;
 #[cfg(test)]
 pub(crate) use workflow::{
-    MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_STORE_NAME_BYTES, StreamTestHooks,
+    MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES,
+    MAX_STORE_NAME_BYTES, STREAM_PAGE_MAX_RECORDS, StreamTestHooks, TASK_DURATIONS,
 };
+use workflow::{MAX_READ_MIN_GAP, MAX_READ_PAGE_RECORDS};
 
 use crate::{
     ActivityHeartbeat,
@@ -288,13 +292,14 @@ pub struct WorkerConfig {
     pub storage_drivers: HashSet<StorageDriverInfo>,
 
     /// The Stream runtimes of this Worker, by the name of the Store that each serves. Workflow
-    /// code appends to and closes a Stream through the runtime of its Store, and a call on a Store
-    /// with no runtime here fails the Workflow Task.
+    /// code reads and appends a Stream through the runtime of its Store, and a call on a Store with
+    /// no runtime here fails the Workflow Task.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,
 
-    /// True on a replay Worker, which makes no live Stream call.
+    /// True on a replay Worker, which reads a Store only for the Records of a marker and makes no
+    /// live Stream call.
     #[builder(skip)]
     pub(crate) replays_only: bool,
 
@@ -388,6 +393,25 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         }
         if matches!(config.max_outstanding_nexus_tasks, Some(v) if v == 0) {
             return Err("`max_outstanding_nexus_tasks` must be > 0".to_string());
+        }
+        if config.stream_runtimes.read_ahead_bytes() == Some(0) {
+            return Err("`read_ahead_bytes` of `stream_runtimes` must be > 0".to_string());
+        }
+        if let Some(records) = config.stream_runtimes.read_page_records()
+            && !(1..=MAX_READ_PAGE_RECORDS).contains(&records)
+        {
+            return Err(format!(
+                "`read_page_records` of `stream_runtimes` must be 1 to {MAX_READ_PAGE_RECORDS}"
+            ));
+        }
+        if config
+            .stream_runtimes
+            .read_min_gap()
+            .is_some_and(|gap| gap > MAX_READ_MIN_GAP)
+        {
+            return Err(format!(
+                "`read_min_gap` of `stream_runtimes` must be at most {MAX_READ_MIN_GAP:?}"
+            ));
         }
 
         if config.max_cached_workflows > 0 {
@@ -1864,6 +1888,11 @@ pub enum CompleteNexusError {
 pub enum WorkflowErrorType {
     /// A nondeterminism error
     Nondeterminism,
+    /// A replay that can't read or check the Records of a Stream marker from the Store, such as
+    /// after the Stream's Retention. The Workflow Task fails with `StreamReplayError` otherwise.
+    /// A Store that stays unavailable through each try fails only the task, with
+    /// `StreamReplayUnavailable`, since the Records may still be there.
+    StreamReplay,
 }
 
 /// This trait allows users to customize the performance characteristics of workers dynamically.

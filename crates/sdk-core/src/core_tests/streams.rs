@@ -694,6 +694,7 @@ async fn append_replay_calls_no_store() {
         activation: 1,
     };
     let t = replayed_history(&StreamMarkerData {
+        reads: vec![],
         appends: vec![appended.clone()],
         closes: vec![],
         streams: vec![stream("s")],
@@ -865,6 +866,7 @@ async fn a_replayed_append_with_no_store_name_takes_the_store_of_history() {
         activation: 1,
     };
     let t = replayed_history(&StreamMarkerData {
+        reads: vec![],
         appends: vec![appended],
         closes: vec![],
         streams: vec![stream("s")],
@@ -1307,6 +1309,7 @@ fn close_result_entry(seq: u32, failure: Option<Failure>) -> StreamCloseEntry {
 
 fn closes_only(closes: Vec<StreamCloseEntry>) -> StreamMarkerData {
     StreamMarkerData {
+        reads: vec![],
         appends: vec![],
         closes,
         streams: vec![stream("s")],
@@ -1744,6 +1747,7 @@ async fn replayed_calls_count_nothing() {
         activation: 1,
     };
     let append_history = replayed_history(&StreamMarkerData {
+        reads: vec![],
         appends: vec![appended],
         closes: vec![],
         streams: vec![stream("s")],
@@ -1957,6 +1961,7 @@ impl Held {
         let hooks = StreamTestHooks {
             close_bound,
             shutdown_waits: Some(self.shutdown_waits.clone()),
+            ..Default::default()
         };
         start_configured(
             t,
@@ -2769,6 +2774,7 @@ async fn a_close_in_an_outage_fails_its_task() {
     let hooks = StreamTestHooks {
         close_bound: Some(Duration::from_secs(1)),
         shutdown_waits: Some(waits.clone()),
+        ..Default::default()
     };
     let run = start_configured(
         t,

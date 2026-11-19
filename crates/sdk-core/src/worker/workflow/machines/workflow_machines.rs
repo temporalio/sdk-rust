@@ -342,7 +342,10 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
-            stream_calls: StreamCalls::new(!basics.worker_config.replays_only),
+            stream_calls: StreamCalls::new(
+                !basics.worker_config.replays_only,
+                basics.worker_config.stream_runtimes.page_cap(),
+            ),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -429,16 +432,27 @@ impl WorkflowMachines {
                 }
                 self.local_activity_data.done_executing(seq);
             }
-            LocalResolution::Stream(resolution) => match self.stream_calls.resolve(resolution) {
-                Some(job) => self.push_stream_job(job),
-                None => result_important = false,
-            },
+            LocalResolution::Stream(resolution) => {
+                let drive_me = &self.drive_me;
+                let job = self
+                    .stream_calls
+                    .resolve(resolution, |seq| drive_me.pending_stream_records(seq));
+                match job {
+                    Some(job) => self.push_stream_job(job),
+                    None => result_important = false,
+                }
+            }
         }
         Ok(result_important)
     }
 
     fn push_stream_job(&mut self, job: StreamJob) {
         match job {
+            StreamJob::Read(page) => {
+                if let Some(page) = self.drive_me.merge_stream_read(page) {
+                    self.drive_me.send_job(page.into());
+                }
+            }
             StreamJob::Append(result) => self.drive_me.send_job(result.into()),
             StreamJob::Close(result) => self.drive_me.send_job(result.into()),
         }
@@ -480,12 +494,27 @@ impl WorkflowMachines {
     }
 
     /// The number of local calls that hold the Workflow Task open: Local Activities, and Stream
-    /// writes.
+    /// reads and writes.
     pub(crate) fn outstanding_local_work(&self) -> usize {
-        self.outstanding_local_activity_count() + self.stream_calls.open_writes()
+        self.outstanding_local_activity_count()
+            + self.stream_calls.open_reads()
+            + self.stream_calls.open_writes()
     }
 
-    /// True once the entries of this task's Stream marker reached their bound.
+    /// True if only Stream reads hold the run's Workflow Task open.
+    pub(crate) fn only_stream_reads_open(&self) -> bool {
+        self.stream_calls.open_reads() > 0
+            && self.outstanding_local_activity_count() == 0
+            && self.stream_calls.open_writes() == 0
+    }
+
+    /// Stops the run's reads, with no job. Their pages that Workflow code got stay in the marker,
+    /// and History has no end for them, so a later Worker resumes each read from History.
+    pub(crate) fn stop_stream_reads(&mut self) {
+        self.stream_calls.stop_all();
+    }
+
+    /// True once the Records or the entries of this task's Stream marker reached their bound.
     pub(crate) fn stream_marker_full(&self) -> bool {
         self.stream_calls.marker_full()
     }
@@ -500,6 +529,11 @@ impl WorkflowMachines {
         self.stream_calls.has_calls()
     }
 
+    /// The number of Stream appends and closes that have no result yet.
+    pub(crate) fn outstanding_stream_writes(&self) -> usize {
+        self.stream_calls.open_writes()
+    }
+
     /// Stops every Stream call of the run, and drops the results still on their way. A failed
     /// Workflow Task does it, so that no result of it reaches Workflow code.
     pub(crate) fn stop_stream_calls(&mut self) {
@@ -507,6 +541,23 @@ impl WorkflowMachines {
         self.stream_calls.drop_held();
         self.stream_calls.drop_intents();
         self.stream_calls.drain_requests();
+    }
+
+    /// True if this Workflow Task has a command for the server, other than a marker. A marker asks
+    /// the server for nothing, so it never needs the task to complete early.
+    /// True if the run has a protocol message for the server, such as an Update rejection.
+    pub(crate) fn has_messages_for_server(&self) -> bool {
+        !self.message_outbox.is_empty()
+    }
+
+    pub(crate) fn has_server_commands(&self) -> bool {
+        self.commands
+            .iter()
+            .chain(self.current_wf_task_commands.iter())
+            .any(|c| {
+                !self.machine(c.machine).is_final_state()
+                    && c.command.command_type() != CommandType::RecordMarker
+            })
     }
 
     /// Adds the marker `core_stream` of this Workflow Task to the commands, if Workflow code got a
@@ -688,8 +739,14 @@ impl WorkflowMachines {
             self.stream_calls.note_delivered(
                 jobs.iter().map(|job| &job.variant),
                 u32::try_from(activation).unwrap_or(u32::MAX),
+                &self.metrics,
             );
             self.local_activity_data.activation_dispatched();
+            // A pending job makes the next activation, so the Records over the page cap come
+            // right after this one and need no new result of their read.
+            for job in self.stream_calls.release_over_cap() {
+                self.push_stream_job(job);
+            }
         }
         let is_replaying = self.replaying || all_query;
         let deployment_version_for_current_task = if is_replaying {
@@ -747,7 +804,8 @@ impl WorkflowMachines {
             v.variant.is_local_activity_resolution()
                 || matches!(
                     v.variant,
-                    workflow_activation_job::Variant::ResolveStreamAppend(_)
+                    workflow_activation_job::Variant::ResolveStreamRead(_)
+                        | workflow_activation_job::Variant::ResolveStreamAppend(_)
                         | workflow_activation_job::Variant::ResolveStreamClose(_)
                 )
         })
@@ -879,7 +937,11 @@ impl WorkflowMachines {
         if num_events_to_process > 0 {
             self.local_activity_data.wft_applied();
             self.stream_calls.wft_applied();
-            for job in self.stream_calls.release_carried() {
+            let drive_me = &self.drive_me;
+            let jobs = self
+                .stream_calls
+                .release_carried(|seq| drive_me.pending_stream_records(seq));
+            for job in jobs {
                 self.push_stream_job(job);
             }
         }
@@ -1894,15 +1956,26 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
+                WFCommandVariant::StartStreamRead(attrs) => {
+                    self.check_stream_call(attrs.stream.as_ref(), &attrs.from_offset)?;
+                    if let Some(job) = self.stream_calls.start_read(attrs, self.current_wf_time)? {
+                        self.push_stream_job(job);
+                    }
+                }
+                WFCommandVariant::CloseStreamRead(attrs) => {
+                    if self.stream_calls.close_read(attrs.seq)? {
+                        self.drive_me.drop_stream_read(attrs.seq);
+                    }
+                }
                 WFCommandVariant::CloseStream(attrs) => {
-                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.check_stream_call(attrs.stream.as_ref(), &[])?;
                     self.check_producer_run("close", attrs.seq, attrs.producer.as_ref())?;
                     if let Some(job) = self.stream_calls.close(attrs)? {
                         self.push_stream_job(job);
                     }
                 }
                 WFCommandVariant::AppendToStream(attrs) => {
-                    self.check_stream_call(attrs.stream.as_ref())?;
+                    self.check_stream_call(attrs.stream.as_ref(), &[])?;
                     self.check_producer_run("append", attrs.seq, attrs.producer.as_ref())?;
                     if let Some(job) = self.stream_calls.append(attrs)? {
                         self.push_stream_job(job);
@@ -1915,13 +1988,13 @@ impl WorkflowMachines {
 
     /// Fails the Workflow Task for a Stream call that this Worker can't make. Nothing goes into
     /// history, so a Worker with the runtime can run the task again.
-    fn check_stream_call(&self, stream: Option<&StreamRef>) -> Result<()> {
+    fn check_stream_call(&self, stream: Option<&StreamRef>, from_offset: &[u8]) -> Result<()> {
         // A replayed call takes its results from history, so only a live one needs the runtime.
         if !self.stream_calls.is_live() {
             return Ok(());
         }
         // A call with an input over its limit is refused with no Store call, so it needs none.
-        if stream.is_some_and(|stream| input_over_limit(stream).is_some()) {
+        if stream.is_some_and(|stream| input_over_limit(stream, from_offset).is_some()) {
             return Ok(());
         }
         let store = stream
