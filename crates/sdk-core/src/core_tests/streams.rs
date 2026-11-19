@@ -3293,8 +3293,23 @@ fn closes_only(closes: Vec<StreamCloseEntry>) -> StreamMarkerData {
 /// A history whose first task recorded `intent`, whose second one, if any, gave `result`, and
 /// whose last task a signal starts.
 fn close_history(intent: StreamCloseEntry, result: Option<StreamCloseEntry>) -> TestHistoryBuilder {
+    close_history_started(
+        |t| {
+            t.add_by_type(EventType::WorkflowExecutionStarted);
+        },
+        intent,
+        result,
+    )
+}
+
+/// As [close_history], with `started` adding the first event of the history.
+fn close_history_started(
+    started: impl FnOnce(&mut TestHistoryBuilder),
+    intent: StreamCloseEntry,
+    result: Option<StreamCloseEntry>,
+) -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
+    started(&mut t);
     t.add_full_wf_task();
     stream_marker_event(&mut t, 4, &closes_only(vec![intent]));
     if let Some(result) = result {
@@ -5633,12 +5648,17 @@ async fn a_cache_full_eviction_stops_a_call_in_flight() {
 struct Flaky {
     /// The next reads of the Store that fail with `StorageUnavailable`.
     fail_reads: AtomicUsize,
-    /// The next appends that fail with `StorageUnavailable`.
+    /// The next appends that fail with `StorageUnavailable`. A test sets `usize::MAX` to fail every
+    /// append, and zero to turn the failures off.
     fail_appends: AtomicUsize,
+    /// The next closes that fail with `StorageUnavailable`, set as `fail_appends` is.
+    fail_closes: AtomicUsize,
     /// True if a failed append writes its batch first, as when only the Store's answer is lost.
     lose_answers: AtomicBool,
     /// The appends that reached the Store.
     appends: AtomicUsize,
+    /// The closes that reached the Store.
+    closes: AtomicUsize,
 }
 
 impl Flaky {
@@ -5660,7 +5680,7 @@ impl Flaky {
     }
 }
 
-/// A test Store whose next reads or appends fail with `StorageUnavailable`.
+/// A test Store whose next reads, appends or closes fail with `StorageUnavailable`.
 struct FlakyStore {
     inner: TestStreamStore,
     flaky: Arc<Flaky>,
@@ -5698,6 +5718,8 @@ impl StreamStore for FlakyStore {
     }
 
     async fn close_stream(&self, request: CloseStreamRequest) -> StreamResult<CloseStreamResponse> {
+        self.flaky.closes.fetch_add(1, Ordering::AcqRel);
+        Flaky::fails(&self.flaky.fail_closes)?;
         self.inner.close_stream(request).await
     }
 
@@ -5879,13 +5901,15 @@ async fn a_read_retries_a_store_outage() {
     assert_eq!(entry.page_counts, [2, 1]);
 }
 
-/// An append whose Store stays down past the bound resolves with the retryable failure of the
-/// last try. Tokio's paused clock moves the 30 s.
+/// An append whose Store stays down past the bound of a read doesn't resolve, since a write has no
+/// bound in time. Each failed try wrote its batch and lost the answer. Once the Store answers, the
+/// append succeeds and the Store has one copy of its Records. Tokio's paused clock moves the time.
 #[tokio::test]
-async fn an_append_gives_up_after_the_bound() {
+async fn an_append_has_no_retry_bound() {
     let (runtime, flaky) = flaky_runtime().await;
+    flaky.lose_answers.store(true, Ordering::Release);
     flaky.fail_appends.store(usize::MAX, Ordering::Release);
-    // The task timeout is long, so that no heartbeat comes in the 30 s.
+    // The task timeout is long, so that no heartbeat comes while the Store is down.
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(3600));
     t.add_workflow_task_scheduled_and_started();
@@ -5901,21 +5925,346 @@ async fn an_append_gives_up_after_the_bound() {
     .await;
     tokio::time::pause();
     let started = tokio::time::Instant::now();
-    let result = worker.poll_workflow_activation().await.unwrap();
-    let waited = started.elapsed();
-    let failure = append_failure(&appends(&result)[0]);
-    assert_eq!(failure_info(&failure).r#type, "stream_storage_unavailable");
-    assert!(!failure_info(&failure).non_retryable);
-    assert!(
-        waited >= STORE_RETRY_BOUND && waited < STORE_RETRY_BOUND + Duration::from_secs(3),
-        "{waited:?}"
-    );
-    assert!(flaky.appends.load(Ordering::Acquire) > 10);
+    let result = {
+        let next = worker.poll_workflow_activation();
+        tokio::pin!(next);
+        tokio::select! {
+            early = &mut next => panic!("The append resolved while the Store was down: {early:?}"),
+            _ = tokio::time::sleep(STORE_RETRY_BOUND + Duration::from_secs(10)) => {}
+        }
+        assert!(started.elapsed() > STORE_RETRY_BOUND);
+        assert!(flaky.appends.load(Ordering::Acquire) > 10);
+        flaky.fail_appends.store(0, Ordering::Release);
+        next.await.unwrap()
+    };
+    let Some(resolve_stream_append::Status::Appended(appended)) = &appends(&result)[0].status
+    else {
+        panic!("The append failed: {:?}", appends(&result));
+    };
+    let offsets = (appended.first_offset.clone(), appended.last_offset.clone());
     worker.complete_execution(&result.run_id).await;
     worker.drain_pollers_and_shutdown().await;
+    let records = all_records(&runtime, "s").await;
+    assert_eq!(texts(&records), ["a"]);
+    assert_eq!(
+        offsets,
+        (records[0].offset.clone(), records[0].offset.clone())
+    );
     let entry = &marker(&sent.lock()[0]).unwrap().appends[0];
-    assert_eq!(entry.failure.as_ref(), Some(&failure));
-    assert!(all_records(&runtime, "s").await.is_empty());
+    assert!(entry.failure.is_none());
+}
+
+/// Polls the activation that a failed Workflow Task causes, which must be an eviction, and
+/// completes it. The wait has a bound, so that a task that didn't fail makes the test fail and not
+/// hang.
+async fn complete_eviction_of_failed_task(worker: &Worker) {
+    let evicted = tokio::time::timeout(Duration::from_secs(30), worker.poll_workflow_activation())
+        .await
+        .expect("The task didn't fail at its heartbeat")
+        .unwrap();
+    assert!(evicted.is_only_eviction(), "{:?}", evicted.jobs);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(evicted.run_id))
+        .await
+        .unwrap();
+}
+
+/// A Workflow Task whose append is in a Store outage at the heartbeat fails, also on a Worker that
+/// fails the Workflow for a Stream replay error. Core forces no task, Workflow code gets no result
+/// of the append, and the Store gets no more tries after the failure.
+#[tokio::test]
+async fn an_append_in_an_outage_fails_its_task_at_the_heartbeat() {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.fail_appends.store(usize::MAX, Ordering::Release);
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(300));
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start_configured(
+        t,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        (1, 1, true),
+        None,
+        |wc| wc.workflow_failure_errors = [WorkflowErrorType::StreamReplay].into(),
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    // No result of the append comes before the eviction.
+    complete_eviction_of_failed_task(&run.worker).await;
+    until("the failed task", || run.failed.lock().len() == 1).await;
+    let tries = flaky.appends.load(Ordering::Acquire);
+    assert!(tries > 1, "{tries}");
+    // The next wait of a try that went on is 400 ms, so another try would come inside this time.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        flaky.appends.load(Ordering::Acquire),
+        tries,
+        "The append went on after its task failed"
+    );
+    run.worker.drain_pollers_and_shutdown().await;
+
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].0,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    assert_eq!(
+        failed[0].1,
+        format!(
+            "StreamStoreUnavailable: append of Stream \"s\" on Store \"{STORE}\": \
+             stream_storage_unavailable: the Store is down"
+        )
+    );
+    assert!(
+        run.sent.lock().is_empty(),
+        "A completion went to the server: {:?}",
+        run.sent.lock()
+    );
+}
+
+/// A graceful shutdown doesn't stop the tries of an append in a Store outage. The task fails at
+/// its heartbeat, as at any other time, so Workflow code never gets the outage as an error of the
+/// append, and no completion goes to the server. The shutdown ends with that failed task, a few
+/// seconds at most after the task started. The heartbeat timer runs during a shutdown, with a
+/// Local Activity manager and without one.
+#[rstest::rstest]
+#[case::with_a_local_activity_manager(false)]
+#[case::with_no_local_activity_manager(true)]
+#[tokio::test]
+async fn a_shutdown_in_an_outage_fails_the_task_of_an_append(#[case] workflow_only: bool) {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.fail_appends.store(usize::MAX, Ordering::Release);
+    // The heartbeat comes at 800 ms, long after the shutdown starts.
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(1));
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let run = start_configured(
+        t,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        (1, 1, true),
+        None,
+        |wc| {
+            if workflow_only {
+                wc.task_types = WorkerTaskTypes::workflow_only();
+            }
+        },
+    );
+    let task_started = tokio::time::Instant::now();
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &run.worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    until("a failed try of the append", || {
+        flaky.appends.load(Ordering::Acquire) >= 1
+    })
+    .await;
+    run.worker.initiate_shutdown();
+    assert!(
+        run.failed.lock().is_empty(),
+        "The task failed before the shutdown started"
+    );
+    // The drain panics on an activation that is not an eviction, so a result of the append that
+    // reached Workflow code fails the test.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run.worker.drain_pollers_and_shutdown(),
+    )
+    .await
+    .expect("The shutdown didn't end within 10 s");
+    assert!(
+        task_started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        task_started.elapsed()
+    );
+
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].0,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    assert_eq!(
+        failed[0].1,
+        format!(
+            "StreamStoreUnavailable: append of Stream \"s\" on Store \"{STORE}\": \
+             stream_storage_unavailable: the Store is down"
+        )
+    );
+    assert!(
+        run.sent.lock().is_empty(),
+        "A completion went to the server: {:?}",
+        run.sent.lock()
+    );
+}
+
+/// The server tries the task that an outage failed again. Once the Store works, the append runs
+/// again with the epoch of the new task, and Workflow code gets its offsets.
+#[tokio::test]
+async fn a_task_that_an_outage_failed_runs_its_append_again() {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.fail_appends.store(usize::MAX, Ordering::Release);
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(300));
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let responses = [1, 1].map(ResponseType::ToTaskNum);
+    let (worker, sent) = worker(t, responses, &runtime, 1);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["x"]).into()],
+    )
+    .await;
+    complete_eviction_of_failed_task(&worker).await;
+    flaky.fail_appends.store(0, Ordering::Release);
+    let again = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &again,
+        vec![append_cmd(1, "s", &run_id, &["x"]).into()],
+    )
+    .await;
+    let result = worker.poll_workflow_activation().await.unwrap();
+    assert!(matches!(
+        appends(&result)[0].status,
+        Some(resolve_stream_append::Status::Appended(_))
+    ));
+    worker.complete_execution(&result.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let records = all_records(&runtime, "s").await;
+    assert_eq!(texts(&records), ["x"]);
+    let Some(Kind::Workflow(workflow)) = &records[0].producer.as_ref().unwrap().kind else {
+        panic!("The Producer is not a Workflow");
+    };
+    assert_eq!(workflow.epoch.as_ref().unwrap().attempt, 2);
+    assert!(
+        sent.lock()
+            .iter()
+            .all(|sent| !sent.force_create_new_workflow_task)
+    );
+}
+
+/// A task whose append the Store holds, with no answer and no error, still completes at its
+/// heartbeat with a new task forced. A write that is only in flight never fails a task.
+#[tokio::test]
+async fn an_append_in_flight_at_the_heartbeat_does_not_fail_its_task() {
+    let held = Held::holding(true).await;
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_millis(300));
+    t.add_workflow_task_scheduled_and_started();
+    let run_id = t.get_orig_run_id().to_string();
+    let run = served(t, held.runtimes(), None, |_| {}, |_| {});
+    let (worker, sent) = (run.worker, run.sent);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![append_cmd(1, "s", &run_id, &["a"]).into()],
+    )
+    .await;
+    held.held.notified().await;
+    let result = poll_after_heartbeat(&worker, &sent, || async {
+        held.release.add_permits(1);
+    })
+    .await;
+    let Some(resolve_stream_append::Status::Appended(appended)) = &appends(&result)[0].status
+    else {
+        panic!("The append failed: {:?}", appends(&result));
+    };
+    let records = all_records(&held.runtime, "s").await;
+    assert_eq!(texts(&records), ["a"]);
+    assert_eq!(appended.first_offset, records[0].offset);
+    worker.complete_execution(&result.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert!(sent.lock()[0].force_create_new_workflow_task);
+    assert!(run.failed.lock().is_empty());
+}
+
+/// A Workflow Task that waits for a close whose Store fails every try fails at its heartbeat, on a
+/// Worker with no Local Activity manager too. The close stops with its run, so the manager has no
+/// close in flight, and the Store gets no more tries.
+#[tokio::test]
+async fn a_close_in_an_outage_fails_its_task() {
+    let (runtime, flaky) = flaky_runtime().await;
+    flaky.fail_closes.store(usize::MAX, Ordering::Release);
+    let t = close_history_started(
+        |t| t.add_wfe_started_with_wft_timeout(Duration::from_millis(300)),
+        intent_entry(1),
+        None,
+    );
+    let run_id = t.get_orig_run_id().to_string();
+    let waits = Arc::new(Notify::new());
+    let hooks = StreamTestHooks {
+        close_bound: Some(Duration::from_secs(1)),
+        shutdown_waits: Some(waits.clone()),
+        ..Default::default()
+    };
+    let run = start_configured(
+        t,
+        [ResponseType::AllHistory],
+        runtimes(&runtime),
+        (1, 1, true),
+        None,
+        |wc| {
+            wc.task_types = WorkerTaskTypes::workflow_only();
+            wc.stream_test_hooks = hooks;
+        },
+    );
+    let first = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    complete(&run.worker, &first, vec![close_cmd(1, "s", &run_id).into()]).await;
+    // The signal starts the live task, which sends the close that History recorded.
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(signaled(&live) && !live.is_replaying);
+    complete(&run.worker, &live, vec![]).await;
+    complete_eviction_of_failed_task(&run.worker).await;
+    until("the failed task", || run.failed.lock().len() == 1).await;
+    let tries = flaky.closes.load(Ordering::Acquire);
+    assert!(tries > 1, "{tries}");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        flaky.closes.load(Ordering::Acquire),
+        tries,
+        "The close went on after its task failed"
+    );
+    run.worker.drain_pollers_and_shutdown().await;
+    assert!(
+        waits.notified().now_or_never().is_none(),
+        "The shutdown waited for a close in flight"
+    );
+
+    let failed = run.failed.lock();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].0,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    assert_eq!(
+        failed[0].1,
+        format!(
+            "StreamStoreUnavailable: close of Stream \"s\" on Store \"{STORE}\": \
+             stream_storage_unavailable: the Store is down"
+        )
+    );
+    assert!(run.sent.lock().is_empty());
+    assert!(!stream_is_closed(&runtime, "s"));
 }
 
 /// An append to a closed Stream resolves on its first try, with no retry.

@@ -59,8 +59,11 @@ relevant information.
 * [lang-internal] A Stream read with no `idle_timeout` ends after 1 minute with no Record.
 * [lang-internal] Core refuses a Stream call with `stream_invalid` when its Stream id or Store name
   has more than 4096 bytes, or its `from_offset` has more than 1024 bytes.
-* [lang-internal] Core retries a Stream call for up to 30 s while the Store is unavailable. A replay
-  retries its read for up to 5 s, and then fails the task with `StreamReplayUnavailable`.
+* [lang-internal] Core retries an append or a close of a Stream while the Store is unavailable. If
+  one is still in the outage at the heartbeat of its Workflow Task, the task fails with
+  `StreamStoreUnavailable`, and Core forces no task for it. A read is retried for up to 30 s, and
+  then Workflow code gets its error. A replay retries its read for up to 5 s, and then fails the
+  task with `StreamReplayUnavailable`.
 * [lang-internal] With `WorkflowErrorType::StreamReplay`, a replay that can't read or check its
   Records fails the Workflow instead of its task. That happens after the Stream's Retention passed,
   for example, or on a Worker with no Stream runtime for the Store.

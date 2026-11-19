@@ -285,8 +285,9 @@ pub const MAX_READ_MIN_GAP: Duration = Duration::from_secs(1);
 pub(crate) const STORE_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(100);
 /// The longest wait between two tries of such a call. The wait doubles up to it.
 pub(crate) const STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
-/// How long after its first failure a call stops trying and gives Workflow code the error. A
-/// longer outage is one that Workflow code should see and handle.
+/// How long after its first failure a read stops trying and gives Workflow code the error. A
+/// longer outage is one that Workflow code should see and handle. A write has no bound of its own.
+/// Its Workflow Task fails at its heartbeat while the write is in an outage.
 pub const STORE_RETRY_BOUND: Duration = Duration::from_secs(30);
 /// The same bound for a replay's read of the Store. It is shorter than the default Workflow Task
 /// timeout, so the task fails with its cause and not with a timeout.
@@ -334,15 +335,26 @@ pub(crate) const CLOSE_SHUTDOWN_BOUND: Duration = Duration::from_secs(10);
 struct StoreRetry {
     first_failure: Option<Instant>,
     backoff: Duration,
-    bound: Duration,
+    /// How long after the first failure the tries stop, or `None` for tries with no bound in time.
+    bound: Option<Duration>,
 }
 
 impl StoreRetry {
+    /// The tries of a read, which stop at [STORE_RETRY_BOUND].
     fn new() -> Self {
         Self::with_bound(STORE_RETRY_BOUND)
     }
 
     fn with_bound(bound: Duration) -> Self {
+        Self::bounded_by(Some(bound))
+    }
+
+    /// The tries of a write, which go on until the call is stopped.
+    fn unbounded() -> Self {
+        Self::bounded_by(None)
+    }
+
+    fn bounded_by(bound: Option<Duration>) -> Self {
         Self {
             first_failure: None,
             backoff: STORE_RETRY_FIRST_BACKOFF,
@@ -359,41 +371,115 @@ impl StoreRetry {
         }
         let now = Instant::now();
         let first = *self.first_failure.get_or_insert(now);
-        let left = (first + self.bound).saturating_duration_since(now);
-        if left.is_zero() {
-            return None;
-        }
-        let wait = self.backoff.min(left);
+        let wait = match self.bound {
+            Some(bound) => {
+                let left = (first + bound).saturating_duration_since(now);
+                if left.is_zero() {
+                    return None;
+                }
+                self.backoff.min(left)
+            }
+            None => self.backoff,
+        };
         self.backoff = (self.backoff * 2).min(STORE_RETRY_MAX_BACKOFF);
         Some(wait)
     }
 }
 
-/// Runs `call` again while it fails with `StorageUnavailable`, within [STORE_RETRY_BOUND] of its
-/// first failure. A cancelled `give_up` ends the wait and gives the last error.
+/// Runs the write `call` again while it fails with `StorageUnavailable`, with no bound in time. It
+/// ends only when the call answers, or when its task is stopped. A graceful shutdown doesn't stop
+/// it. After each failure, and until the call resolves, `note` says that the write is in an
+/// outage, so that a Workflow Task that waits for it can fail at its heartbeat.
 async fn retry_unavailable<T, F>(
     mut call: impl FnMut() -> F,
-    give_up: Option<&CancellationToken>,
+    note: &OutageNote,
 ) -> Result<T, StreamError>
 where
     F: Future<Output = Result<T, StreamError>>,
 {
-    let mut retry = StoreRetry::new();
+    let mut retry = StoreRetry::unbounded();
     loop {
         let error = match call().await {
-            Ok(answer) => return Ok(answer),
+            Ok(answer) => {
+                note.clear();
+                return Ok(answer);
+            }
             Err(error) => error,
         };
         let Some(wait) = retry.next_wait(&error) else {
+            note.clear();
             return Err(error);
         };
-        match give_up {
-            Some(give_up) => tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
-                _ = give_up.cancelled() => return Err(error),
+        note.set(&error);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// A write that is in a Store outage. It has failed with `StorageUnavailable` and waits for its
+/// next try, which comes with no bound in time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteOutage {
+    /// The id of the Stream that the write is for.
+    pub stream_id: String,
+    /// The name of the Store that the write is for.
+    pub store: String,
+    /// The whole text of the failure that a Workflow Task gets for this outage, in the form
+    /// `StreamStoreUnavailable: <call> of Stream "<id>" on Store "<store>": <error>`.
+    pub message: String,
+}
+
+/// The outage of one write, and the run that waits for it.
+#[derive(Debug)]
+struct OutageEntry {
+    run_id: String,
+    outage: WriteOutage,
+}
+
+/// The writes in an outage, by call id.
+type Outages = Arc<Mutex<HashMap<u64, OutageEntry>>>;
+
+/// The place of one write in the manager's outages. It lives as long as the call's future, so that
+/// a call that is stopped or dropped leaves no outage behind.
+struct OutageNote {
+    outages: Outages,
+    call_id: u64,
+    run_id: String,
+    /// `append` or `close`.
+    call: &'static str,
+    stream: StreamRef,
+}
+
+impl OutageNote {
+    /// Notes that the write waits for its next try after `error`, which replaces an older note.
+    fn set(&self, error: &StreamError) {
+        let message = format!(
+            "StreamStoreUnavailable: {} of Stream \"{}\" on Store \"{}\": {}",
+            self.call,
+            self.stream.id,
+            self.stream.store,
+            cut_message(error.to_string()),
+        );
+        self.outages.lock().insert(
+            self.call_id,
+            OutageEntry {
+                run_id: self.run_id.clone(),
+                outage: WriteOutage {
+                    stream_id: self.stream.id.clone(),
+                    store: self.stream.store.clone(),
+                    message,
+                },
             },
-            None => tokio::time::sleep(wait).await,
-        }
+        );
+    }
+
+    fn clear(&self) {
+        self.outages.lock().remove(&self.call_id);
+    }
+}
+
+impl Drop for OutageNote {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -568,6 +654,9 @@ pub struct StreamManager {
     /// The closes that the Store didn't answer yet. A graceful shutdown waits for them, since
     /// History has their intent and Workflow code may never await them.
     closes_in_flight: Arc<AtomicUsize>,
+    /// The writes that wait for their next try after `StorageUnavailable`, by call id. A run asks
+    /// for them at the heartbeat of its Workflow Task.
+    outages: Outages,
     /// The Worker's shutdown, from whose start a close in flight has [CLOSE_SHUTDOWN_BOUND] and
     /// no read starts.
     shutdown: CancellationToken,
@@ -603,6 +692,7 @@ impl StreamManager {
             local_tx,
             tasks: Default::default(),
             closes_in_flight: Default::default(),
+            outages: Default::default(),
             shutdown,
         }
     }
@@ -631,6 +721,7 @@ impl StreamManager {
                     if let Some(task) = self.tasks.lock().remove(&call_id) {
                         task.handle.abort();
                     }
+                    self.outages.lock().remove(&call_id);
                 }
                 // A graceful shutdown ends each task that only reads hold, and the next Worker
                 // resumes the reads from History. A read that started now would only hold the
@@ -661,8 +752,8 @@ impl StreamManager {
                             if let Some(timer) = &timer {
                                 timer.metrics.stream_append_started();
                             }
-                            let shutdown = self.shutdown.clone();
-                            let call = append(runtime, spec, epoch, sink, timer, shutdown);
+                            let note = self.outage_note(run_id, call_id, "append", &spec.stream);
+                            let call = append(runtime, spec, epoch, sink, timer, note);
                             self.spawn(run_id, call_id, false, call);
                         }
                         _ => self.no_runtime(run_id, call_id, seq, Call::Append),
@@ -679,8 +770,9 @@ impl StreamManager {
                             }
                             let in_flight = CloseInFlight::new(&self.closes_in_flight);
                             let stream = spec.stream.clone();
+                            let note = self.outage_note(run_id, call_id, "close", &stream);
                             let abandoned = timer.as_ref().map(|timer| timer.metrics.clone());
-                            let call = close(runtime, spec, epoch, sink, timer, in_flight);
+                            let call = close(runtime, spec, epoch, sink, timer, in_flight, note);
                             let call = self.bounded_by_shutdown(stream, call, abandoned);
                             // History recorded the close, so the end of the run must not stop it.
                             self.spawn(run_id, call_id, true, call);
@@ -695,14 +787,62 @@ impl StreamManager {
     /// Stops every call of the run but its closes. Results already on their way find no call and
     /// are dropped.
     pub fn cancel_run(&self, run_id: &str) {
-        self.tasks.lock().retain(|_, task| {
-            if task.run_id == run_id && !task.outlives_run {
+        self.cancel(run_id, false);
+    }
+
+    /// Stops every call of the run, its closes too. A run uses it when it fails its Workflow Task
+    /// for a write in a Store outage. History has the intent of each close, and a close outlives
+    /// its run. The next try of the task sends each recorded close again, so a close that stayed
+    /// would leave one more behind with each failed task.
+    pub fn cancel_run_with_closes(&self, run_id: &str) {
+        self.cancel(run_id, true);
+    }
+
+    fn cancel(&self, run_id: &str, with_closes: bool) {
+        let mut stopped = vec![];
+        self.tasks.lock().retain(|call_id, task| {
+            if task.run_id == run_id && (with_closes || !task.outlives_run) {
                 task.handle.abort();
+                stopped.push(*call_id);
                 false
             } else {
                 true
             }
         });
+        // An aborted call drops its own note when the runtime next polls it. A run asks for its
+        // outages right after it stops its calls, so the notes must go with the calls.
+        let mut outages = self.outages.lock();
+        for call_id in stopped {
+            outages.remove(&call_id);
+        }
+    }
+
+    /// The outage of one write of the run, the one with the lowest call id, or `None` when no
+    /// write of the run waits for its next try after `StorageUnavailable`. A write that the Store
+    /// has in hand and didn't answer yet is not in an outage.
+    pub fn write_outage(&self, run_id: &str) -> Option<WriteOutage> {
+        self.outages
+            .lock()
+            .iter()
+            .filter(|(_, entry)| entry.run_id == run_id)
+            .min_by_key(|(call_id, _)| **call_id)
+            .map(|(_, entry)| entry.outage.clone())
+    }
+
+    fn outage_note(
+        &self,
+        run_id: &str,
+        call_id: u64,
+        call: &'static str,
+        stream: &StreamRef,
+    ) -> OutageNote {
+        OutageNote {
+            outages: self.outages.clone(),
+            call_id,
+            run_id: run_id.to_string(),
+            call,
+            stream: stream.clone(),
+        }
     }
 
     /// Sends a heartbeat timeout for the run at `deadline`, for a Worker with no Local Activity
@@ -1095,6 +1235,7 @@ async fn close(
     sink: impl Fn(StreamCallResult),
     timer: Option<CallTimer>,
     in_flight: CloseInFlight,
+    note: OutageNote,
 ) {
     let mut producer = spec.producer;
     if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
@@ -1106,10 +1247,11 @@ async fn close(
         producer: Some(producer),
     };
     // A second close of a closed Stream succeeds, so a try whose answer was lost is safe to send
-    // again. A graceful shutdown bounds the tries, as it bounds the first one.
+    // again. The tries have no bound in time. A graceful shutdown gives them up, as it gives up
+    // the first one.
     let runtime = &*runtime;
     let request = &request;
-    let result = retry_unavailable(move || runtime.close_stream(request.clone()), None)
+    let result = retry_unavailable(move || runtime.close_stream(request.clone()), &note)
         .await
         .err();
     // The Store answered, so the result that wakes the run also finds no close in flight.
@@ -1130,7 +1272,7 @@ async fn append(
     epoch: WorkflowTaskEpoch,
     sink: impl Fn(StreamCallResult),
     timer: Option<CallTimer>,
-    shutdown: CancellationToken,
+    note: OutageNote,
 ) {
     let mut producer = spec.producer;
     if let Some(Kind::Workflow(workflow)) = producer.kind.as_mut() {
@@ -1153,15 +1295,12 @@ async fn append(
         runtime.append_records(request).await
     } else {
         // The Store takes a resend of the same Producer, epoch, sequence and Records once, and
-        // gives the offsets of the first write. A shutdown stops the tries, since the task waits
-        // for this result.
+        // gives the offsets of the first write. The tries have no bound in time, and a graceful
+        // shutdown doesn't stop them. The task that waits for this result fails at its heartbeat
+        // while they go on, so Workflow code never gets the outage as an error of the append.
         let runtime = &*runtime;
         let request = &request;
-        retry_unavailable(
-            move || runtime.append_records(request.clone()),
-            Some(&shutdown),
-        )
-        .await
+        retry_unavailable(move || runtime.append_records(request.clone()), &note).await
     };
     let answer = answer.and_then(|response| {
         store_offsets([
@@ -1597,5 +1736,109 @@ mod tests {
         long_store.store.push('m');
         over("Store name", &long_store, &[]);
         over("from_offset", &at_limit, &[1; MAX_OFFSET_BYTES + 1]);
+    }
+
+    /// A read stops at its bound, and a write goes on past it. The wait of a write stays at the
+    /// longest backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_with_no_bound_goes_on_past_the_bound_of_a_read() {
+        let down = StreamError::storage_unavailable("down");
+        let mut read = StoreRetry::new();
+        let mut write = StoreRetry::unbounded();
+        assert_eq!(read.next_wait(&down), Some(STORE_RETRY_FIRST_BACKOFF));
+        assert_eq!(write.next_wait(&down), Some(STORE_RETRY_FIRST_BACKOFF));
+        tokio::time::advance(STORE_RETRY_BOUND + Duration::from_secs(1)).await;
+        assert_eq!(read.next_wait(&down), None);
+        for _ in 0..100 {
+            let wait = write.next_wait(&down).expect("a write has no bound");
+            assert!(wait <= STORE_RETRY_MAX_BACKOFF, "{wait:?}");
+            tokio::time::advance(wait).await;
+        }
+        assert_eq!(write.next_wait(&down), Some(STORE_RETRY_MAX_BACKOFF));
+        let other = StreamError::invalid("bad");
+        assert_eq!(write.next_wait(&other), None);
+    }
+
+    struct NoSink;
+
+    impl RunSink for NoSink {
+        fn send(&self, _: RunInput, _: Span) {}
+
+        fn closed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn manager() -> StreamManager {
+        let streams =
+            WorkerStreams::new(StreamRuntimes::default(), true, None, Box::new(|_| false));
+        StreamManager::new(
+            Arc::new(streams),
+            Handle::current(),
+            Arc::new(NoSink),
+            CancellationToken::new(),
+        )
+    }
+
+    fn stream_of(id: &str) -> StreamRef {
+        StreamRef {
+            id: id.to_string(),
+            store: "mem".to_string(),
+        }
+    }
+
+    /// A note has no outage until the write fails, says the text of its last error, and goes away
+    /// when it is cleared or dropped. A run sees the write with the lowest call id.
+    #[tokio::test]
+    async fn a_note_shows_its_outage_until_it_is_cleared_or_dropped() {
+        let manager = manager();
+        let late = manager.outage_note("run", 9, "close", &stream_of("late"));
+        let early = manager.outage_note("run", 7, "append", &stream_of("early"));
+        assert!(manager.write_outage("run").is_none());
+        late.set(&StreamError::storage_unavailable("down"));
+        early.set(&StreamError::storage_unavailable("still down"));
+        let outage = manager.write_outage("run").expect("an outage");
+        assert_eq!(
+            outage,
+            WriteOutage {
+                stream_id: "early".to_string(),
+                store: "mem".to_string(),
+                message: "StreamStoreUnavailable: append of Stream \"early\" on Store \"mem\": \
+                          stream_storage_unavailable: still down"
+                    .to_string(),
+            }
+        );
+        assert!(manager.write_outage("another run").is_none());
+        early.clear();
+        assert_eq!(manager.write_outage("run").unwrap().stream_id, "late");
+        drop(late);
+        assert!(manager.write_outage("run").is_none());
+    }
+
+    /// `cancel_run` stops a write and its note, and keeps a close. `cancel_run_with_closes` stops
+    /// the close too, and a run that asks for its outages right after finds none.
+    #[tokio::test]
+    async fn a_cancel_removes_the_notes_of_the_calls_that_it_stops() {
+        let manager = manager();
+        let down = StreamError::storage_unavailable("down");
+        for (call_id, call, outlives_run) in [(1, "append", false), (2, "close", true)] {
+            let note = manager.outage_note("run", call_id, call, &stream_of("s"));
+            note.set(&down);
+            manager.spawn("run", call_id, outlives_run, async move {
+                let _note = note;
+                std::future::pending::<()>().await;
+            });
+        }
+        manager.cancel_run("run");
+        assert!(
+            manager
+                .write_outage("run")
+                .unwrap()
+                .message
+                .contains("close of")
+        );
+        manager.cancel_run_with_closes("run");
+        assert!(manager.write_outage("run").is_none());
+        assert!(manager.tasks.lock().is_empty());
     }
 }

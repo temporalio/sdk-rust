@@ -891,6 +891,22 @@ impl ManagedRun {
         }
 
         let outcome = (|| {
+            // A forced task for a write that waits on a dead Store only adds events to History, so
+            // the task fails near its timeout and the server tries it again. The closes stop too,
+            // since each try of the task sends the recorded ones again.
+            if completing_la_heartbeat
+                && let Some(outage) = self.stream_manager.write_outage(self.run_id())
+            {
+                warn!(
+                    run_id = %self.run_id(),
+                    stream_id = %outage.stream_id,
+                    store = %outage.store,
+                    "A Stream write is in a Store outage at the heartbeat, so the task fails"
+                );
+                self.stream_manager
+                    .cancel_run_with_closes(&self.wfm.machines.run_id);
+                return Err(WFMachinesError::StreamUnavailable(outage.message));
+            }
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;

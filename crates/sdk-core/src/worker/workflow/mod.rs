@@ -1837,6 +1837,11 @@ pub(crate) enum WFMachinesError {
     /// fails only the Workflow Task, also with [WorkflowErrorType::StreamReplay].
     #[error("{0}")]
     StreamReplayUnavailable(String),
+    /// A Stream write that is in a Store outage when its Workflow Task reaches its heartbeat. It
+    /// fails only the Workflow Task, never the Workflow. The server tries the task again, and the
+    /// write runs again with the epoch of the new task.
+    #[error("{0}")]
+    StreamUnavailable(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1874,7 +1879,8 @@ impl WFMachinesError {
             WFMachinesError::Fatal(_)
             | WFMachinesError::Stream(_)
             | WFMachinesError::StreamReplay(_)
-            | WFMachinesError::StreamReplayUnavailable(_) => EvictionReason::Fatal,
+            | WFMachinesError::StreamReplayUnavailable(_)
+            | WFMachinesError::StreamUnavailable(_) => EvictionReason::Fatal,
         }
     }
 

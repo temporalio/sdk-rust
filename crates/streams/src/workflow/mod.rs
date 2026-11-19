@@ -9,7 +9,7 @@ pub use manager::{
     MAX_FAILURE_MESSAGE_BYTES, MAX_MARKER_ENTRY_BYTES, MAX_MARKER_RECORD_BYTES, MAX_READ_MIN_GAP,
     MAX_READ_PAGE_RECORDS, MAX_STORE_NAME_BYTES, RunStreams, STORE_RETRY_BOUND,
     STREAM_MARKER_DATA_KEY, STREAM_PAGE_MAX_RECORDS, STREAM_REPLAY_ERROR_TYPE, StreamManager,
-    StreamRequest, StreamResolution, StreamRuntimes, StreamTestHooks, WorkerStreams,
+    StreamRequest, StreamResolution, StreamRuntimes, StreamTestHooks, WorkerStreams, WriteOutage,
     hydrate_stream_markers, input_over_limit, is_stream_replay_error, is_stream_replay_failure,
     is_stream_replay_unavailable, needs_stream_records, stream_marker_payload_of,
 };
