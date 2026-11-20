@@ -72,6 +72,7 @@ impl From<CallError> for WFMachinesError {
             CallError::Nondeterminism(message) => WFMachinesError::Nondeterminism(message),
             CallError::Fatal(message) => WFMachinesError::Fatal(message),
             CallError::Unserved(message) => WFMachinesError::Stream(message),
+            CallError::Gone(message) => WFMachinesError::StreamReplay(message),
         }
     }
 }
