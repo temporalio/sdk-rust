@@ -587,6 +587,57 @@ while let Some(result) = stream.next().await {
 }
 ```
 
+## Transfer types
+
+Use a transfer type to give a model an application-friendly API while serializing a different
+representation. Declare one canonical transfer type and implement standard `From` or `TryFrom`
+conversions in each direction:
+
+```rust
+use temporalio_macros::TemporalTransfer;
+
+#[derive(TemporalTransfer)]
+#[temporal(transfer_type = String)]
+struct UserId(u64);
+
+impl From<&UserId> for String {
+    fn from(id: &UserId) -> Self {
+        id.0.to_string()
+    }
+}
+
+impl TryFrom<String> for UserId {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse().map(Self)
+    }
+}
+```
+
+Workflow and activity signatures can use `UserId` directly. The derive implements
+`HasTransferType`, `TemporalSerializable`, and `TemporalDeserializable`; no converter registration,
+value wrappers, or call-site hints are required. Encoding borrows the model, so the model does not
+need to implement `Clone`. Each direction can use its own error type; conversion errors must
+implement `std::error::Error + Send + Sync + 'static`.
+
+The SDK converts the model to its transfer value before passing that value to the configured
+payload serializer. Decoding reverses those steps. In this example, the default JSON serializer
+encodes `UserId(42)` as the JSON string `"42"`, not the number `42`. A transfer representation can
+also use a non-Serde serialization path, such as `ProstSerializable<Message>` for binary protobuf.
+The mapping must be deterministic, safe to call concurrently, and perform no I/O or workflow commands.
+
+Transfer conversion runs once per top-level payload value. It does not recursively inspect
+fields or collection elements, and it does not apply another transfer mapping to the intermediate
+transfer type. Each argument in `MultiArgs2` and the other multi-argument wrappers is a separate
+top-level value. Direct payload-converter access uses the same transfer behavior as the SDK.
+Codecs and external storage retain their normal processing order.
+
+Failure detail values participate in transfer conversion. Memo values do not: memos require
+native serialization support for the stored type. The model itself must not implement the
+corresponding Serde traits alongside this derive, because Serde's blanket Temporal implementations
+would conflict. The transfer type may implement Serde.
+
 ## Failure Conversion and Error Wrapping
 
 The default failure converter preserves Temporal failure types when errors cross workflow or
