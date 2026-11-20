@@ -7,6 +7,7 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
+mod streams;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;
@@ -37,6 +38,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
+            streams::Streams,
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -98,6 +100,7 @@ use temporalio_common::{
     },
     telemetry::set_trace_subscriber_for_current_thread,
 };
+use temporalio_streams::workflow::StreamResolution;
 use tokio::{
     sync::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
@@ -188,6 +191,7 @@ impl Workflows {
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
+        let streams = Arc::new(Streams::new(&basics.worker_config, local_tx.clone()));
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let max_eager_activity_reservations_per_workflow_task = basics
@@ -249,6 +253,7 @@ impl Workflows {
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
+                        streams,
                     );
 
                     while let Some(output) = stream.next().await {
@@ -380,6 +385,7 @@ impl Workflows {
                         messages,
                         query_responses,
                         force_new_wft,
+                        leaves_worker,
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
@@ -424,7 +430,7 @@ impl Workflows {
                         .workflow_task_completion_size_limit(),
                     resource_id: format!("workflow:{workflow_id}"),
                 };
-                let sticky_attrs = self.sticky_attrs.clone();
+                let sticky_attrs = self.sticky_attrs.clone().filter(|_| !leaves_worker);
                 // Do not return new WFT if we would not cache, because returned new WFTs are
                 // always partial.
                 if sticky_attrs.is_none() {
@@ -1198,6 +1204,9 @@ pub(crate) enum ActivationAction {
         messages: Vec<ProtocolMessage>,
         query_responses: Vec<QueryResult>,
         force_new_wft: bool,
+        /// True if the run leaves the Worker's cache, so the next task goes to the normal task
+        /// queue instead of the sticky one.
+        leaves_worker: bool,
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
@@ -1520,6 +1529,7 @@ impl ValidatedCompletion {
 #[derive(Debug)]
 pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
+    Stream(StreamResolution),
 }
 impl LocalResolution {
     fn is_la_cancel_confirmation(&self) -> bool {
@@ -1527,6 +1537,7 @@ impl LocalResolution {
             LocalResolution::LocalActivity(lar) => {
                 matches!(lar.result, LocalActivityExecutionResult::Cancelled(_))
             }
+            LocalResolution::Stream(_) => false,
         }
     }
 }
@@ -1623,6 +1634,10 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    StartStreamRead(StartStreamRead),
+    CloseStreamRead(CloseStreamRead),
+    AppendToStream(AppendToStream),
+    CloseStream(CloseStream),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1684,6 +1699,10 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::StartStreamRead(s) => WFCommandVariant::StartStreamRead(s),
+            workflow_command::Variant::CloseStreamRead(s) => WFCommandVariant::CloseStreamRead(s),
+            workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
+            workflow_command::Variant::CloseStream(s) => WFCommandVariant::CloseStream(s),
         };
         Ok(Self {
             variant,
@@ -1759,6 +1778,9 @@ pub(crate) enum WFMachinesError {
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
+    /// A Stream call that this Worker can't serve now. Its message says why.
+    #[error("{0}")]
+    Stream(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1793,7 +1815,7 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
         }
     }
 
