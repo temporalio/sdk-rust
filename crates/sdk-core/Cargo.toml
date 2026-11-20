@@ -50,6 +50,7 @@ test-utilities = ["dep:assert_matches", "dep:bimap"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]
 # Used by the integration-test runner to make Cloud exclusions native libtest ignores.
 cloud-test-mode = []
+exp-poller-v2 = []
 
 [dependencies]
 anyhow = "1.0"

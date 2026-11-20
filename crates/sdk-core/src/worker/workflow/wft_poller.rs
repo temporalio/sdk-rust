@@ -15,6 +15,7 @@ use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowT
 use tokio_util::sync::CancellationToken;
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
     sticky_queue_name: &Option<String>,
@@ -92,6 +93,7 @@ pub(crate) fn make_wft_poller(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn make_wft_poller_v2(
     config: &WorkerConfig,
     sticky_queue_name: &Option<String>,
@@ -244,7 +246,7 @@ fn new_wft_poller_v2(
         tonic::Status,
     >,
 > {
-    poller.filter_map(move |x| match x {
+    poller.filter_map(move |_, x| match x {
         Ok((wft, permit)) => {
             if wft == PollWorkflowTaskQueueResponse::default() {
                 // We get the default proto in the event that the long poll times out.

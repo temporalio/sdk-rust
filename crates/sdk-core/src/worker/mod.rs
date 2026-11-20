@@ -918,8 +918,11 @@ impl Worker {
         // can be resolved with knowledge of those capabilities.
         let task_subsystems_builder: Box<dyn FnOnce() -> TaskSubsystems + Send> = Box::new(
             move || {
+                #[cfg(feature = "exp-poller-v2")]
+                use crate::pollers_v2::Poller;
                 let (wft_stream, act_poller, nexus_poller) = match task_pollers {
                     TaskPollers::Real => {
+                        #[cfg(not(feature = "exp-poller-v2"))]
                         let wft_stream = if config.task_types.enable_workflows {
                             let stream = make_wft_poller(
                                 &config,
@@ -945,6 +948,35 @@ impl Worker {
                                 stream.right_stream()
                             };
                             Some(stream)
+                        } else {
+                            None
+                        };
+
+                        #[cfg(feature = "exp-poller-v2")]
+                        let wft_stream = if config.task_types.enable_workflows {
+                            let poller = workflow::wft_poller::make_wft_poller_v2(
+                                &config,
+                                &sticky_queue_name,
+                                &client,
+                                &metrics,
+                                &shutdown_token,
+                                &wft_slots,
+                                wf_poller_heartbeat.clone(),
+                                wf_sticky_poller_heartbeat.clone(),
+                                capabilities.clone(),
+                            );
+                            let poller = if !client.is_mock() {
+                                // Some replay tests combine a mock client with real pollers,
+                                // and they don't need to use the external stream
+                                crate::pollers_v2::select(
+                                    poller,
+                                    crate::pollers_v2::from_unbounded_receiver(external_wft_rx),
+                                )
+                                .boxed()
+                            } else {
+                                poller.boxed()
+                            };
+                            Some(poller)
                         } else {
                             None
                         };
@@ -994,8 +1026,18 @@ impl Worker {
                             None
                         };
 
-                        #[cfg(any(feature = "test-utilities", test))]
+                        #[cfg(all(
+                            any(feature = "test-utilities", test),
+                            not(feature = "exp-poller-v2")
+                        ))]
                         let wft_stream = wft_stream.map(|s| s.left_stream());
+
+                        #[cfg(all(
+                            any(feature = "test-utilities", test),
+                            feature = "exp-poller-v2"
+                        ))]
+                        let wft_stream = wft_stream.map(|s| s.left_poller());
+
                         (wft_stream, act_poll_buffer, nexus_poll_buffer)
                     }
                     #[cfg(any(feature = "test-utilities", test))]
@@ -1035,7 +1077,14 @@ impl Worker {
                                     s.map(|s| (s, permit))
                                 }
                             });
-                            wfs.right_stream()
+                            #[cfg(not(feature = "exp-poller-v2"))]
+                            {
+                                wfs.right_stream()
+                            }
+                            #[cfg(feature = "exp-poller-v2")]
+                            {
+                                crate::pollers_v2::from_stream(wfs).right_poller()
+                            }
                         });
                         (
                             wfs,
@@ -1081,7 +1130,12 @@ impl Worker {
                 });
 
                 let workflows = wft_stream.map(|stream| {
-                    Workflows::new(
+                    #[cfg(not(feature = "exp-poller-v2"))]
+                    let new = Workflows::new;
+                    #[cfg(feature = "exp-poller-v2")]
+                    let new = Workflows::new_v2;
+
+                    new(
                         WorkflowBasics {
                             worker_config: Arc::new(config.clone()),
                             shutdown_token: shutdown_token.child_token(),

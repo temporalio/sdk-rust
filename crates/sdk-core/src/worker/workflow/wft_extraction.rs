@@ -168,7 +168,7 @@ impl WFTExtractor {
         use pollers_v2::Poller;
 
         let fetch_client = client.clone();
-        let wft_poller = wft_poller.map(move |stream_in| {
+        let wft_poller = wft_poller.map(move |_, stream_in| {
             let client = client.clone();
             async move {
                 match stream_in {
@@ -203,7 +203,7 @@ impl WFTExtractor {
         });
 
         let fetch_poller = pollers_v2::from_unbounded_receiver_drainable(fetch_receiver).map(
-            move |fetchreq: HistoryFetchReq| {
+            move |_, fetchreq: HistoryFetchReq| {
                 let client = fetch_client.clone();
                 async move {
                     Ok(match fetchreq {

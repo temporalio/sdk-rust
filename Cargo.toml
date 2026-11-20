@@ -21,6 +21,8 @@ license-file = "LICENSE.txt"
 bon = { version = "3", default-features = false, features = ["alloc", "implied-bounds"] }
 derive_more = { version = "2.0", default-features = false, features = [
     "constructor",
+    "deref",
+    "deref_mut",
     "display",
     "from",
     "into",

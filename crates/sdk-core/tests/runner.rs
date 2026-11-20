@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long)]
     cloud: bool,
 
+    /// Extra features to enable
+    #[arg(long)]
+    features: Vec<String>,
+
     /// The rest of the arguments will be passed through to the test harness
     harness_args: Vec<String>,
 }
@@ -91,6 +95,7 @@ async fn main() -> Result<(), anyhow::Error> {
         test_executable,
         just_build,
         cloud,
+        features,
         harness_args,
     } = Cli::parse();
     if let Some(RunnerCommand::CloudNamespace { command }) = command {
@@ -123,6 +128,11 @@ async fn main() -> Result<(), anyhow::Error> {
     ]
     .into_iter()
     .map(ToString::to_string)
+    .chain(
+        features
+            .into_iter()
+            .flat_map(|f| ["--features".to_string(), f]),
+    )
     .collect::<Vec<_>>();
     if cloud {
         test_args_preamble.extend(["--features".to_owned(), "cloud-test-mode".to_owned()]);

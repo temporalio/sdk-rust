@@ -15,10 +15,17 @@ pub(crate) use driven_workflow::DrivenWorkflow;
 pub(crate) use history_update::HistoryUpdate;
 
 use crate::{
-    MetricsContext, WorkerConfig, abstractions::{
+    MetricsContext, WorkerConfig,
+    abstractions::{
         MeteredPermitDealer, TrackedOwnedMeteredSemPermit, UsedMeteredSemPermit, dbg_panic,
         take_cell::TakeCell,
-    }, internal_flags::InternalFlags, pollers::TrackedPermittedTqResp, pollers_v2::Poller, protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage}, telemetry::{VecDisplayer, metrics}, worker::{
+    },
+    internal_flags::InternalFlags,
+    pollers::TrackedPermittedTqResp,
+    pollers_v2::Poller,
+    protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage},
+    telemetry::{VecDisplayer, metrics},
+    worker::{
         ActivitySlotKind, CompleteWfError, LocalActRequest, LocalActivityExecutionResult,
         LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
         WorkflowSlotKind,
@@ -168,6 +175,7 @@ pub(crate) struct RunBasics<'a> {
 
 impl Workflows {
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
+    #[allow(dead_code)]
     pub(super) fn new(
         basics: WorkflowBasics,
         sticky_attrs: Option<StickyExecutionAttributes>,
@@ -291,6 +299,7 @@ impl Workflows {
     }
 
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
+    #[allow(dead_code)]
     pub(super) fn new_v2(
         basics: WorkflowBasics,
         sticky_attrs: Option<StickyExecutionAttributes>,
@@ -324,9 +333,11 @@ impl Workflows {
             // could only have produced in reaction to it, such as the resolution of an attempt
             // whose cancel delivery the notification announces
             crate::pollers_v2::select_biased(
-                crate::pollers_v2::from_unbounded_receiver_drainable(la_notify_rx).map(Into::into),
+                crate::pollers_v2::from_unbounded_receiver_drainable(la_notify_rx)
+                    .map(|_, n| n.into()),
                 crate::pollers_v2::from_unbounded_receiver(local_rx),
-            ).left_poller()
+            )
+            .left_poller()
         } else {
             crate::pollers_v2::from_unbounded_receiver(local_rx).right_poller()
         };

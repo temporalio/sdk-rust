@@ -89,8 +89,8 @@ impl WFStream {
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let all_inputs = crate::pollers_v2::select_biased(
-            local_poller.map(Into::into),
-            wft_poller.map(|t| ExternalPollerInputs::from(t).into()),
+            local_poller.map(|_, t| t.into()),
+            wft_poller.map(|_, t| ExternalPollerInputs::from(t).into()),
         );
         Self::build_internal_v2(all_inputs, basics, local_activity_request_sink)
     }
@@ -271,7 +271,7 @@ impl WFStream {
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
         };
         let mut poller = all_inputs
-            .map(move |action: WFStreamInput| {
+            .map(move |_, action: WFStreamInput| {
                 let span = span!(Level::DEBUG, "new_stream_input", action=?action);
                 let _span_g = span.enter();
 
@@ -393,7 +393,7 @@ impl WFStream {
                     fetch_histories: std::mem::take(&mut state.runs_needing_fetching),
                 })
             })
-            .inspect(|o| {
+            .inspect(|_, o| {
                 if let Some(e) = o.as_ref().err()
                     && !matches!(e, PollError::ShutDown)
                 {

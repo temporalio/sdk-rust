@@ -30,34 +30,28 @@ where
 /// Makes a new instance of [`ReqRespChannel`].
 pub(crate) fn channel<Req, Resp>() -> ReqRespChannel<Req, Resp, impl Poller<Item = Resp>> {
     let pending = Arc::new(AtomicIsize::new(0));
+    let pending_for_poller = pending.clone();
     let (req_sender, req_receiver) = mpsc::unbounded_channel();
     let (resp_sender, resp_receiver) = mpsc::unbounded_channel();
     let resp_poller = from_unbounded_receiver_drainable(resp_receiver)
-        .inspect({
-            let pending = pending.clone();
-            move |_| {
-                let current_pending = pending.fetch_sub(1, Ordering::AcqRel);
-                if current_pending < 0 {
-                    // First, fix the counter. If this doesn't succeed, it means another thread
-                    // fixed or will fix it in parallel - therefore we don't need to check if it
-                    // succeeded.
-                    let _ = pending.compare_exchange(
-                        current_pending,
-                        0,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
-                    // Then, panic/print error.
-                    dbg_panic!(
-                        "internal error: ReqRespChannel received more responses than requests"
-                    );
-                }
+        .with_data(|_| pending_for_poller)
+        .inspect(|pending, _| {
+            let current_pending = pending.fetch_sub(1, Ordering::AcqRel);
+            if current_pending < 0 {
+                // First, fix the counter. If this doesn't succeed, it means another thread
+                // fixed or will fix it in parallel - therefore we don't need to check if it
+                // succeeded.
+                let _ = pending.compare_exchange(
+                    current_pending,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                // Then, panic/print error.
+                dbg_panic!("internal error: ReqRespChannel received more responses than requests");
             }
         })
-        .pending_when({
-            let pending = pending.clone();
-            move || pending.load(Ordering::Acquire) > 0
-        });
+        .pending_when(|pending| pending.load(Ordering::Acquire) > 0);
 
     ReqRespChannel {
         req_sender: ReqSender {

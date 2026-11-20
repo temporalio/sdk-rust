@@ -534,7 +534,7 @@ impl<T, SK: SlotKind> LongPollBuffer<T, SK> {
         .chain(UnboundedReceiverStream::new(
             self.buffered_polls.into_inner(),
         ));
-        crate::pollers_v2::from_stream(stream).on_shutdown(async move {
+        crate::pollers_v2::from_stream(stream).on_shutdown(move |_| async move {
             self.shutdown.cancel();
             handle_task_panic(self.poller_task).await;
             Ok(())
