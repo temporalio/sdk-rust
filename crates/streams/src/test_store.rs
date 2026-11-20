@@ -1,5 +1,6 @@
 use crate::{
-    AppendError, CloseError, CreateError, DescribeError, ReadError, StreamRuntime, StreamStore,
+    AnyError, AppendError, CloseError, CreateError, DescribeError, ReadError, StreamRuntime,
+    StreamStore,
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecordsRequest, AppendRecordsResponse,
         ClientProducer, CloseStreamRequest, CloseStreamResponse, CreateStreamRequest,
@@ -12,7 +13,10 @@ use crate::{
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use prost_types::Timestamp;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Request {
@@ -35,11 +39,27 @@ pub(crate) struct Answers {
 pub(crate) struct Scripted {
     pub(crate) answers: Mutex<Answers>,
     requests: Mutex<Vec<Request>>,
+    /// While set, appends and closes get no answer.
+    pub(crate) silent: AtomicBool,
+    /// The number of appends and closes, from now on, that fail with `StorageUnavailable`.
+    pub(crate) unavailable: Mutex<usize>,
 }
 
 impl Scripted {
     pub(crate) fn requests(&self) -> Vec<Request> {
         self.requests.lock().clone()
+    }
+
+    async fn write(&self) -> Result<(), AnyError> {
+        if self.silent.load(Ordering::Acquire) {
+            std::future::pending::<()>().await;
+        }
+        let mut unavailable = self.unavailable.lock();
+        if *unavailable > 0 {
+            *unavailable -= 1;
+            return Err(AnyError::storage_unavailable("The Store is down"));
+        }
+        Ok(())
     }
 }
 
@@ -60,6 +80,7 @@ impl StreamStore for Scripted {
     ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
         Box::pin(async move {
             self.requests.lock().push(Request::Append(request));
+            self.write().await?;
             Ok(self.answers.lock().appended.clone())
         })
     }
@@ -80,6 +101,7 @@ impl StreamStore for Scripted {
     ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
         Box::pin(async move {
             self.requests.lock().push(Request::Close(request));
+            self.write().await?;
             Ok(CloseStreamResponse {})
         })
     }

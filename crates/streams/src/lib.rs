@@ -33,6 +33,8 @@ mod runtime;
 mod store;
 #[cfg(test)]
 mod test_store;
+#[cfg(feature = "workflow")]
+pub mod workflow;
 
 pub use error::{
     AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,

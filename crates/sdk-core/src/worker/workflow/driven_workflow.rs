@@ -2,7 +2,7 @@ use crate::worker::workflow::{OutgoingJob, WorkflowStartedInfo};
 use prost_types::Timestamp;
 use std::collections::HashMap;
 use temporalio_common::protos::{
-    coresdk::workflow_activation::start_workflow_from_attribs,
+    coresdk::workflow_activation::{start_workflow_from_attribs, workflow_activation_job},
     temporal::api::{
         common::v1::{Payload, SearchAttributes},
         history::v1::WorkflowExecutionStartedEventAttributes,
@@ -17,6 +17,9 @@ pub(crate) struct DrivenWorkflow {
     search_attribute_modifications: HashMap<String, Payload>,
     /// Outgoing activation jobs that need to be sent to the lang sdk
     outgoing_wf_activation_jobs: Vec<OutgoingJob>,
+    /// Set while Core holds the Workflow's last command for a Stream close. Lang then gets no job
+    /// except a query, which takes the pending-query path, so no job can keep the task open.
+    holding: bool,
 }
 
 impl DrivenWorkflow {
@@ -48,7 +51,19 @@ impl DrivenWorkflow {
 
     /// Enqueue a new job to be sent to the driven workflow
     pub(super) fn send_job(&mut self, job: OutgoingJob) {
+        if self.holding {
+            drop_in_hold(&job);
+            return;
+        }
         self.outgoing_wf_activation_jobs.push(job);
+    }
+
+    /// Drops the pending jobs, and every job that comes later.
+    pub(super) fn hold(&mut self) {
+        self.holding = true;
+        for job in std::mem::take(&mut self.outgoing_wf_activation_jobs) {
+            drop_in_hold(&job);
+        }
     }
 
     /// Observe pending jobs
@@ -83,5 +98,20 @@ impl DrivenWorkflow {
                 .map(|(a, b)| (a.clone(), b.clone())),
         );
         retme
+    }
+}
+
+fn drop_in_hold(job: &OutgoingJob) {
+    if matches!(
+        job.variant,
+        workflow_activation_job::Variant::SignalWorkflow(_)
+            | workflow_activation_job::Variant::CancelWorkflow(_)
+            | workflow_activation_job::Variant::DoUpdate(_)
+    ) {
+        warn!(%job, "Core holds the Workflow's last command while a Stream close runs, so no \
+                     Workflow code gets this job");
+    } else {
+        debug!(%job, "Core holds the Workflow's last command while a Stream close runs, so no \
+                      Workflow code gets this job");
     }
 }
