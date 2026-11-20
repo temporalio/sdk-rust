@@ -145,6 +145,11 @@ features = ["core-based-sdk"]
 path = "../macros"
 version = "~1.2.0"
 
+[dependencies.temporalio-streams]
+path = "../streams"
+version = "0.1.0"
+features = ["workflow"]
+
 [dev-dependencies]
 assert_matches = "1.5"
 bimap = "0.6.3"

@@ -8,7 +8,8 @@ use super::{
     continue_as_new_workflow_state_machine::continue_as_new,
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
+    stream_marker_state_machine::stream_marker, timer_state_machine::new_timer,
+    upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
@@ -58,21 +59,27 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::StreamMarkerData,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::{ContinueAsNewWorkflowExecution, update_response},
+            workflow_commands::{
+                CloseStreamRead, ContinueAsNewWorkflowExecution, StartStreamRead, update_response,
+            },
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{CommandType, EventType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
         },
     },
     worker::WorkerDeploymentVersion,
+};
+use temporalio_streams::workflow::{
+    Phase, Request, StreamCalls, TaskState, is_stream_marker, peeked_marker,
 };
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
@@ -187,6 +194,10 @@ pub(crate) struct WorkflowMachines {
 
     /// Contains extra local-activity related data
     local_activity_data: LocalActivityData,
+    stream_calls: StreamCalls,
+    /// The command that ends the Workflow, which Core holds while a Stream close has no result in a
+    /// marker.
+    held_terminal: Option<(NewMachineWithCommand, CommandAnnotations)>,
 
     /// The workflow that is being driven by this instance of the machines
     drive_me: DrivenWorkflow,
@@ -294,6 +305,17 @@ impl WorkflowMachines {
         if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
             observed_internal_flags.add_from_complete(attrs);
         };
+        let config = &basics.worker_config;
+        let stream_calls = StreamCalls::new(
+            &config.namespace,
+            &basics.run_id,
+            config.stream_runtimes.clone(),
+            if config.replays_only {
+                Phase::ReplayOnly
+            } else {
+                Phase::Replaying
+            },
+        );
         Self {
             last_history_from_server: basics.history,
             failed_wft_started_ids: BTreeSet::new(),
@@ -332,6 +354,8 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
+            stream_calls,
+            held_terminal: None,
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -418,6 +442,10 @@ impl WorkflowMachines {
                 }
                 self.local_activity_data.done_executing(seq);
             }
+            LocalResolution::Stream(resolution) => {
+                self.stream_calls.resolve(resolution);
+                self.continue_hold()?;
+            }
         }
         Ok(result_important)
     }
@@ -431,6 +459,43 @@ impl WorkflowMachines {
     /// Returns the number of local activities we know we need to execute but have not yet finished
     pub(crate) fn outstanding_local_activity_count(&self) -> usize {
         self.local_activity_data.outstanding_la_count()
+    }
+
+    /// Returns the number of Local Activities and live Stream calls, which hold the Workflow Task
+    /// open.
+    pub(crate) fn outstanding_local_work(&self) -> usize {
+        self.outstanding_local_activity_count() + self.stream_calls.outstanding()
+    }
+
+    pub(crate) fn set_stream_task(&mut self, state: TaskState) {
+        self.stream_calls.set_task(state);
+    }
+
+    /// Returns the Stream calls that the Worker must start or stop.
+    pub(crate) fn take_stream_requests(&mut self) -> Vec<Request> {
+        self.stream_calls.take_requests()
+    }
+
+    /// Returns true once the Stream marker of the task has no room for a result that waits.
+    pub(crate) fn stream_must_complete(&self) -> bool {
+        (self.stream_calls).must_complete(self.local_activity_data.current_activation_index())
+    }
+
+    /// Returns true while a Stream call has no result in a marker, so the run needs another task.
+    pub(crate) fn stream_needs_next_task(&self) -> bool {
+        self.stream_calls.needs_next_task()
+    }
+
+    /// Returns true if the Stream marker of the task has an entry.
+    pub(crate) fn has_stream_marker(&self) -> bool {
+        self.stream_calls.has_marker()
+    }
+
+    /// Drops the Stream calls of the run, and any terminal command it holds, so no result of those
+    /// calls reaches Workflow code.
+    pub(crate) fn stop_stream_calls(&mut self) {
+        self.stream_calls.stop();
+        self.held_terminal = None;
     }
 
     /// Returns start info for the workflow if it has started
@@ -545,7 +610,13 @@ impl WorkflowMachines {
     /// "no work" situation. Possibly, it may know about some work the machines don't, like queries.
     pub(crate) fn get_wf_activation(&mut self) -> WorkflowActivation {
         let jobs = if self.activation_needed() {
-            self.drive_me.drain_jobs()
+            let mut jobs = self.drive_me.drain_jobs();
+            if self.held_terminal.is_none() {
+                let activation = self.local_activity_data.current_activation_index();
+                let results = self.stream_calls.take_jobs(activation);
+                jobs.extend(results.into_iter().map(OutgoingJob::from));
+            }
+            jobs
         } else {
             vec![]
         };
@@ -606,7 +677,8 @@ impl WorkflowMachines {
                     job.variant,
                     workflow_activation_job::Variant::NotifyHasPatch(_)
                 )
-        })
+        }) || (self.held_terminal.is_none()
+            && (self.stream_calls).has_jobs(self.local_activity_data.current_activation_index()))
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
@@ -682,6 +754,7 @@ impl WorkflowMachines {
             });
             if accepts_update {
                 self.update_only_task = false;
+                self.stream_calls.go_live()?;
             } else if results.iter().any(|cmd| {
                 !matches!(
                     &cmd.variant,
@@ -915,6 +988,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
+            StreamMarker(StreamMarkerData),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -950,6 +1024,8 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
+            } else if let Some(data) = peeked_marker(e) {
+                delayed_actions.push(DelayedAction::StreamMarker(data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -986,9 +1062,11 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
+                DelayedAction::StreamMarker(data) => self.stream_calls.peeked(data)?,
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
+        self.continue_hold()?;
 
         let pending_jobs = self.drive_me.peek_pending_jobs();
         if !self.replaying && !pending_jobs.is_empty() {
@@ -997,6 +1075,7 @@ impl WorkflowMachines {
         // Wait until marker lookahead is applied before starting LAs without recorded results.
         // This also covers a live task whose started event was already consumed by a legacy query.
         if !self.replaying && !self.update_only_task {
+            self.stream_calls.go_live()?;
             let mut resps = vec![];
             for (k, mach) in self.all_machines.iter_mut() {
                 if let Machines::LocalActivityMachine(lam) = mach {
@@ -1130,6 +1209,16 @@ impl WorkflowMachines {
                     "Encountered local activity marker but the associated machine was of the \
                      wrong type! {event:?}"
                 ));
+            }
+        }
+
+        // A replay sends no Stream marker, so only a cached run has a command for this event.
+        if is_stream_marker(event) {
+            self.stream_calls.marker_recorded()?;
+            let sent = (self.commands.iter())
+                .any(|c| matches!(self.machine(c.machine), Machines::StreamMarkerMachine(_)));
+            if !sent {
+                return Ok(EventHandlingOutcome::Normal);
             }
         }
 
@@ -1738,6 +1827,14 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
+                WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
+                WFCommandVariant::CloseStream(attrs) => self.stream_calls.close(attrs)?,
+                WFCommandVariant::StartStreamRead(StartStreamRead { seq, .. })
+                | WFCommandVariant::CloseStreamRead(CloseStreamRead { seq }) => {
+                    return Err(WFMachinesError::Stream(format!(
+                        "Stream read {seq} needs a Core that reads Streams"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1772,12 +1869,60 @@ impl WorkflowMachines {
         machine: NewMachineWithCommand,
         annotations: CommandAnnotations,
     ) {
+        self.stream_calls.stop_for_terminal();
+        let activation = self.local_activity_data.current_activation_index();
+        self.stream_calls.take_for_hold(activation);
+        // If the Worker died, a close in History with no later task to send it would be lost. So
+        // the Workflow ends only once each close has its result in a marker.
+        if self.stream_calls.has_closes() {
+            self.local_activity_data.indicate_terminating();
+            self.drive_me.hold();
+            self.held_terminal = Some((machine, annotations));
+            return;
+        }
         let cwfm = self.add_new_command_machine(machine, annotations);
         self.workflow_end_time = Some(SystemTime::now());
         self.current_wf_task_commands.push_back(cwfm);
         // Wipe out any pending / executing local activity data since we're about to terminate
         // and there's nothing to be done with them.
         self.local_activity_data.indicate_terminating();
+    }
+
+    /// Puts the close results that came while Core holds the last command into the Stream marker,
+    /// and adds that command once no close is left.
+    fn continue_hold(&mut self) -> Result<()> {
+        let Some((machine, annotations)) = self.held_terminal.take() else {
+            return Ok(());
+        };
+        let activation = self.local_activity_data.current_activation_index();
+        self.stream_calls.take_for_hold(activation);
+        if self.stream_calls.has_closes() {
+            self.held_terminal = Some((machine, annotations));
+            return Ok(());
+        }
+        self.add_terminal_command(machine, annotations);
+        // A replay applies the next task before any activation would prepare the command.
+        self.prepare_commands()
+    }
+
+    /// Adds the Stream marker of the task to its commands. The terminal command stays last, after
+    /// the marker of a Local Activity that resolved while Core held the command.
+    fn seal_stream_marker(&mut self) {
+        let Some(data) = self.stream_calls.take_marker() else {
+            return;
+        };
+        let marker = self.add_new_command_machine(stream_marker(&data), Default::default());
+        self.machine_is_core_created.insert(marker.machine, ());
+        let responses = self
+            .machine_mut(marker.machine)
+            .handle_command(CommandType::RecordMarker)
+            .expect("A new Stream marker takes its command");
+        debug_assert!(responses.is_empty());
+        let terminal = (self.commands.iter())
+            .position(|c| is_terminal(c.command.command_type()))
+            .and_then(|at| self.commands.remove(at));
+        self.commands.push_back(marker);
+        self.commands.extend(terminal);
     }
 
     /// Add a new command/machines for that command to the current workflow task
@@ -1878,6 +2023,13 @@ impl WorkflowMachines {
                 self.apply_local_activity_peeked_resolutions(true)?;
             }
         }
+        // As with a Local Activity, a Stream result from History can be at an activation that no
+        // job of the replay reaches, such as one after a rejected Update.
+        if !self.activation_needed()
+            && let Some(activation) = self.stream_calls.next_ready_activation()
+        {
+            self.local_activity_data.advance_to_activation(activation);
+        }
         Ok(())
     }
 
@@ -1937,6 +2089,12 @@ impl MachinesWFTResponseContent<'_> {
 
     pub(crate) fn metadata_for_complete(&mut self) -> WorkflowTaskCompletedMetadata {
         self.me.get_metadata_for_wft_complete()
+    }
+
+    /// Adds the Stream marker of the task to its commands. Call it only for a completion that
+    /// goes to the server.
+    pub(crate) fn seal_stream_marker(&mut self) {
+        self.me.seal_stream_marker();
     }
 }
 
@@ -2012,6 +2170,16 @@ fn patch_marker_handling(
         // Not a patch machine or a patch event
         Ok(EventHandlingOutcome::Normal)
     }
+}
+
+fn is_terminal(command_type: CommandType) -> bool {
+    matches!(
+        command_type,
+        CommandType::CompleteWorkflowExecution
+            | CommandType::FailWorkflowExecution
+            | CommandType::CancelWorkflowExecution
+            | CommandType::ContinueAsNewWorkflowExecution
+    )
 }
 
 #[derive(derive_more::From)]
