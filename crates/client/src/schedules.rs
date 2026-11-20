@@ -566,12 +566,11 @@ impl ScheduleDescriptionStartWorkflowAction {
         match &self.input {
             Some(input) => {
                 let mut input = input.clone();
-                retrieve_external_payloads(&mut input, &self.data_converter).await?;
+                let context_data =
+                    SerializationContextData::Workflow(WorkflowSerializationContext::new());
+                retrieve_external_payloads(&mut input, &self.data_converter, &context_data).await?;
                 self.data_converter
-                    .from_payloads(
-                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-                        input.payloads,
-                    )
+                    .from_payloads(&context_data, input.payloads)
                     .await
                     .map(Some)
             }
@@ -1126,13 +1125,10 @@ where
         schedule_id: &str,
     ) -> Result<ScheduleDescription, ScheduleError> {
         if let Some(memo) = response.memo.as_mut() {
-            retrieve_external_payloads(memo, self.client.data_converter()).await?;
-            decode_payloads(
-                memo,
-                self.client.data_converter().codec(),
-                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-            )
-            .await?;
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            retrieve_external_payloads(memo, self.client.data_converter(), &context_data).await?;
+            decode_payloads(memo, self.client.data_converter().codec(), &context_data).await?;
         }
         ScheduleDescription::new(response, self.client.data_converter().clone(), schedule_id)
     }
@@ -1252,9 +1248,12 @@ where
         if let Some(action) = update.pending_action.take() {
             let mut action = action.into_proto(self.client.data_converter()).await?;
             let target = schedule_store_target(&self.namespace, &action);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
             store_external_payloads(
                 &mut action,
                 self.client.data_converter(),
+                &context_data,
                 &self.namespace,
                 target,
             )
@@ -1553,7 +1552,7 @@ impl Client {
                             .as_ref()
                             .and_then(|s| s.action.as_ref())
                             .and_then(|a| schedule_store_target(&request.namespace, a));
-                        store_external_payloads(&mut request, client.data_converter(), &client.namespace(), target)
+                        store_external_payloads(&mut request, client.data_converter(), &SerializationContextData::Workflow(WorkflowSerializationContext::new()), &client.namespace(), target)
                             .await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
@@ -1634,9 +1633,13 @@ where
                                         WorkflowService::list_schedules(&mut rpc_client, request)
                                             .await?
                                             .into_inner();
+                                    let context_data = SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    );
                                     retrieve_external_payloads(
                                         &mut response,
                                         rpc_client.data_converter(),
+                                        &context_data,
                                     )
                                     .await?;
                                     Ok(ListSchedulesPageOutput::new(
@@ -2859,9 +2862,15 @@ mod tests {
                     .unwrap(),
             ],
         };
-        store_external_payloads(&mut input, &data_converter, "", None)
-            .await
-            .unwrap();
+        store_external_payloads(
+            &mut input,
+            &data_converter,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            "",
+            None,
+        )
+        .await
+        .unwrap();
         let client = MockScheduleClient {
             describe_response: describe_response_with_start_workflow(Some(input)),
             data_converter,

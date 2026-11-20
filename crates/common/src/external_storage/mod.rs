@@ -10,12 +10,14 @@ use crate::data_converters::{
     StorageDriverActivityInfo, StorageDriverTargetInfo, StorageDriverWorkflowInfo,
 };
 use crate::{
-    data_converters::{DataConverter, PayloadConversionError},
+    data_converters::{DataConverter, PayloadConversionError, SerializationContextData},
     payload_visitor::PayloadFieldCollectable,
     protos::coresdk::common::ExternalStorageMetrics,
 };
 use std::{collections::BTreeSet, time::Instant};
 
+#[cfg(feature = "experimental")]
+mod reference_codec;
 mod references;
 #[cfg(feature = "experimental")]
 mod runner;
@@ -73,27 +75,36 @@ impl StorageOperationMetrics {
 /// metrics only when a payload was offloaded.
 ///
 /// `namespace` is the namespace of the client or worker performing the store, given to drivers and
-/// selectors. An empty string means unknown.
+/// selectors. An empty string means unknown. `context` must be the one the message's payloads were
+/// encoded with, since the references that replace them may be encoded too.
 ///
 /// On error, reported as [`PayloadConversionError::ExternalStorage`], the message is left partly
 /// processed and must not be sent.
 pub async fn store_external_payloads<M: PayloadFieldCollectable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
+    context: &SerializationContextData,
     namespace: &str,
     target: Option<StoreTarget>,
 ) -> Result<Option<StorageOperationMetrics>, PayloadConversionError> {
     #[cfg(feature = "experimental")]
-    let metrics = runner::store_in(
-        data_converter.external_storage(),
-        msg,
-        (!namespace.is_empty()).then_some(namespace),
-        target.as_ref().map(|t| &t.info),
-    )
-    .await?;
+    let metrics = {
+        let storage = data_converter.external_storage();
+        let metrics = runner::store_in(
+            storage,
+            msg,
+            (!namespace.is_empty()).then_some(namespace),
+            target.as_ref().map(|t| &t.info),
+        )
+        .await?;
+        if storage.is_some_and(|storage| storage.encodes_references()) {
+            reference_codec::encode_references_in(msg, data_converter.codec(), context).await?;
+        }
+        metrics
+    };
     #[cfg(not(feature = "experimental"))]
     let metrics = {
-        let _ = (msg, data_converter, namespace, target);
+        let _ = (msg, data_converter, context, namespace, target);
         None
     };
     Ok(metrics)
@@ -177,19 +188,41 @@ fn non_empty(value: &str) -> Option<String> {
 /// Runs before [`decode_payloads`](crate::payload_visitor::decode_payloads), since a driver returns
 /// a payload as it was before offloading. Without external storage to retrieve them, which includes
 /// every build without the `experimental` feature, a reference is an error instead. Failures are
-/// reported as [`PayloadConversionError::ExternalStorage`]. Returns metrics only when a payload was
-/// retrieved.
+/// reported as [`PayloadConversionError::ExternalStorage`], or as the codec's own error when
+/// decoding an encoded reference fails. Returns metrics only when a payload was retrieved.
+///
+/// `context` must be the one the message's payloads are decoded with, since a reference may have
+/// been encoded with the payload codec too.
 ///
 /// On error the message is left partly processed and must not be used.
 pub async fn retrieve_external_payloads<M: PayloadFieldCollectable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
+    context: &SerializationContextData,
 ) -> Result<Option<StorageOperationMetrics>, PayloadConversionError> {
     #[cfg(feature = "experimental")]
-    let metrics = runner::retrieve_in(data_converter.external_storage(), msg).await?;
+    let metrics = {
+        match data_converter.external_storage() {
+            // Retrieval fails on any reference, so decoding one first would only add codec calls.
+            None => {
+                references::reject_references_in(msg)?;
+                None
+            }
+            Some(storage) => {
+                let any_references =
+                    reference_codec::decode_references_in(msg, data_converter.codec(), context)
+                        .await?;
+                if any_references {
+                    runner::retrieve_in(Some(storage), msg).await?
+                } else {
+                    None
+                }
+            }
+        }
+    };
     #[cfg(not(feature = "experimental"))]
     let metrics = {
-        let _ = data_converter;
+        let _ = (data_converter, context);
         references::reject_references_in(msg)?;
         None
     };
@@ -203,6 +236,18 @@ mod tests {
         data_converters::ExternalStorageError, protos::temporal::api::common::v1::Payloads,
     };
     use std::{collections::HashMap, time::Duration};
+    #[cfg(feature = "experimental")]
+    use {
+        crate::{
+            data_converters::{
+                DefaultFailureConverter, ExternalStorage, PayloadCodec, PayloadConverter,
+                WorkflowSerializationContext,
+            },
+            protos::temporal::api::common::v1::Payload,
+        },
+        futures::future::{self, BoxFuture},
+        std::sync::{Arc, Mutex},
+    };
 
     #[test]
     fn merged_passes_report_the_time_they_spanned() {
@@ -236,7 +281,183 @@ mod tests {
             payloads: vec![reference],
         };
 
-        let err = retrieve_external_payloads(&mut message, &DataConverter::default())
+        let err = retrieve_external_payloads(
+            &mut message,
+            &DataConverter::default(),
+            &SerializationContextData::None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PayloadConversionError::ExternalStorage(ExternalStorageError::NotConfigured)
+        ));
+        assert!(err.to_string().contains("TMPRL1105"));
+    }
+
+    /// Reverses each payload's data, and marks it so decoding can tell what it encoded.
+    #[cfg(feature = "experimental")]
+    struct ReversingCodec;
+
+    #[cfg(feature = "experimental")]
+    impl PayloadCodec for ReversingCodec {
+        fn encode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            let encoded = payloads
+                .into_iter()
+                .map(|mut p| {
+                    p.data.reverse();
+                    p.metadata.insert("reversed".to_owned(), b"1".to_vec());
+                    p
+                })
+                .collect();
+            Box::pin(future::ready(Ok(encoded)))
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            let decoded = payloads
+                .into_iter()
+                .map(|mut p| {
+                    if p.metadata.remove("reversed").is_some() {
+                        p.data.reverse();
+                    }
+                    p
+                })
+                .collect();
+            Box::pin(future::ready(Ok(decoded)))
+        }
+    }
+
+    /// Fails the test if the payload codec is ever asked to decode.
+    #[cfg(feature = "experimental")]
+    struct NoDecodeCodec;
+
+    #[cfg(feature = "experimental")]
+    impl PayloadCodec for NoDecodeCodec {
+        fn encode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            Box::pin(future::ready(Ok(payloads)))
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            _: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            panic!("nothing in the message needed decoding");
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    fn converter_storing_everything(encode_references: bool) -> DataConverter {
+        let driver = Arc::new(runner::tests::RoundTripDriver {
+            stored: Arc::new(Mutex::new(HashMap::new())),
+        });
+        DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            ReversingCodec,
+        )
+        .with_external_storage(
+            ExternalStorage::new(driver)
+                .unwrap()
+                .with_payload_size_threshold(0)
+                .with_encoded_references(encode_references),
+        )
+    }
+
+    #[cfg(feature = "experimental")]
+    fn workflow_context() -> SerializationContextData {
+        SerializationContextData::Workflow(WorkflowSerializationContext::new())
+    }
+
+    #[cfg(feature = "experimental")]
+    async fn stored(data_converter: &DataConverter, value: &str) -> Payloads {
+        let mut message = Payloads {
+            payloads: vec![
+                data_converter
+                    .to_payload(&workflow_context(), &value.to_owned())
+                    .await
+                    .unwrap(),
+            ],
+        };
+        store_external_payloads(&mut message, data_converter, &workflow_context(), "", None)
+            .await
+            .unwrap();
+        message
+    }
+
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn references_are_written_plain_unless_encoding_them_is_enabled() {
+        let plain = stored(&converter_storing_everything(false), "value").await;
+        assert!(references::is_plain_reference(&plain.payloads[0]));
+        assert!(!references::is_marked_reference(&plain.payloads[0]));
+
+        let encoded = stored(&converter_storing_everything(true), "value").await;
+        assert!(references::is_marked_reference(&encoded.payloads[0]));
+        assert_eq!(encoded.payloads[0].metadata["reversed"], b"1");
+        let mut unreversed = encoded.payloads[0].data.clone();
+        unreversed.reverse();
+        assert_eq!(unreversed, plain.payloads[0].data);
+        assert_eq!(
+            encoded.payloads[0].external_payloads,
+            plain.payloads[0].external_payloads
+        );
+    }
+
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn encoded_references_are_read_whether_or_not_encoding_them_is_enabled() {
+        let writer = converter_storing_everything(true);
+        let mut message = stored(&writer, "value").await;
+        // The reader shares the writer's driver, but not its setting.
+        let reader = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            ReversingCodec,
+        )
+        .with_external_storage(
+            ExternalStorage::new(Arc::clone(&writer.external_storage().unwrap().drivers()[0]))
+                .unwrap(),
+        );
+
+        retrieve_external_payloads(&mut message, &reader, &workflow_context())
+            .await
+            .unwrap();
+        crate::payload_visitor::decode_payloads(&mut message, reader.codec(), &workflow_context())
+            .await
+            .unwrap();
+
+        let value: String = reader
+            .from_payload(&workflow_context(), message.payloads.remove(0))
+            .await
+            .unwrap();
+        assert_eq!(value, "value");
+    }
+
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn an_encoded_reference_with_no_storage_to_retrieve_it_is_tmprl1105() {
+        let mut message = stored(&converter_storing_everything(true), "value").await;
+        let without_storage = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            ReversingCodec,
+        );
+
+        let err = retrieve_external_payloads(&mut message, &without_storage, &workflow_context())
             .await
             .unwrap_err();
 
@@ -244,6 +465,41 @@ mod tests {
             err,
             PayloadConversionError::ExternalStorage(ExternalStorageError::NotConfigured)
         ));
-        assert!(err.to_string().contains("TMPRL1105"));
+    }
+
+    #[cfg(feature = "experimental")]
+    #[tokio::test]
+    async fn only_marked_references_reach_the_codec_on_retrieval() {
+        let writer = converter_storing_everything(false);
+        let reader = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            NoDecodeCodec,
+        )
+        .with_external_storage(
+            ExternalStorage::new(Arc::clone(&writer.external_storage().unwrap().drivers()[0]))
+                .unwrap(),
+        );
+        let ordinary = Payload {
+            data: b"inline".to_vec(),
+            ..Default::default()
+        };
+
+        let mut without_references = Payloads {
+            payloads: vec![ordinary.clone()],
+        };
+        let metrics =
+            retrieve_external_payloads(&mut without_references, &reader, &workflow_context())
+                .await
+                .unwrap();
+        assert_eq!(metrics, None);
+        assert_eq!(without_references.payloads, vec![ordinary]);
+
+        let mut plain = stored(&writer, "value").await;
+        let metrics = retrieve_external_payloads(&mut plain, &reader, &workflow_context())
+            .await
+            .unwrap();
+        assert_eq!(metrics.unwrap().into_proto().payload_count, 1);
+        assert!(!references::is_plain_reference(&plain.payloads[0]));
     }
 }

@@ -6,8 +6,8 @@
 //! visiting every payload-bearing field except search attributes, which the server has to be able
 //! to read.
 //!
-//! References are stored and read in plain form, so a reference's claim data (its driver name and
-//! claim keys) is written to history unencrypted. The payload codec is not applied to references.
+//! These passes only handle plain references. Applying the payload codec to references is done
+//! around them, by [`super::reference_codec`].
 
 use futures::{
     FutureExt,
@@ -344,7 +344,7 @@ async fn store_payloads(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         external_storage::references::create_reference_payload,
@@ -1032,8 +1032,9 @@ mod tests {
         assert_eq!(stored.lock().unwrap().len(), 2);
     }
 
-    struct RoundTripDriver {
-        stored: Arc<Mutex<HashMap<String, Payload>>>,
+    /// Holds what it stores, under the name `mem`, so it can be retrieved again.
+    pub(in crate::external_storage) struct RoundTripDriver {
+        pub(in crate::external_storage) stored: Arc<Mutex<HashMap<String, Payload>>>,
     }
 
     impl StorageDriver for RoundTripDriver {

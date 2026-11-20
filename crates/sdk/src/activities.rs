@@ -133,12 +133,11 @@ impl ActivityContextBackend {
                 client_options,
                 store_target,
             } => {
+                let context =
+                    SerializationContextData::Activity(ActivitySerializationContext::new());
                 let details = client_options
                     .data_converter
-                    .to_payloads(
-                        &SerializationContextData::Activity(ActivitySerializationContext::new()),
-                        &details,
-                    )
+                    .to_payloads(&context, &details)
                     .await?;
                 let mut heartbeat = ActivityHeartbeat {
                     task_token: task_token.to_vec(),
@@ -147,6 +146,7 @@ impl ActivityContextBackend {
                 store_external_payloads(
                     &mut heartbeat,
                     &client_options.data_converter,
+                    &context,
                     &client_options.namespace,
                     store_target.as_deref().cloned(),
                 )

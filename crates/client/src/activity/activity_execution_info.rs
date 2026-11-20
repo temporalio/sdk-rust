@@ -198,12 +198,12 @@ where
             return Err("info missing in describe response".into());
         };
         if let Some(failure) = raw_info.last_failure.as_mut() {
-            retrieve_external_payloads(failure, &data_converter).await?;
+            retrieve_external_payloads(failure, &data_converter, &serialization_context).await?;
             decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
         }
         let mut raw_outcome = response.outcome.and_then(|o| o.value);
         if let Some(ActivityExecutionOutcomeValue::Failure(failure)) = raw_outcome.as_mut() {
-            retrieve_external_payloads(failure, &data_converter).await?;
+            retrieve_external_payloads(failure, &data_converter, &serialization_context).await?;
             decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
         }
         Ok(Self {
@@ -484,7 +484,12 @@ where
         &self,
         mut payload: Payload,
     ) -> Result<T, PayloadConversionError> {
-        retrieve_external_payloads(&mut payload, &self.data_converter).await?;
+        retrieve_external_payloads(
+            &mut payload,
+            &self.data_converter,
+            &self.serialization_context,
+        )
+        .await?;
         self.data_converter
             .from_payload(&self.serialization_context, payload)
             .await
@@ -495,7 +500,12 @@ where
         payloads: &Payloads,
     ) -> Result<T, PayloadConversionError> {
         let mut payloads = payloads.clone();
-        retrieve_external_payloads(&mut payloads, &self.data_converter).await?;
+        retrieve_external_payloads(
+            &mut payloads,
+            &self.data_converter,
+            &self.serialization_context,
+        )
+        .await?;
         self.data_converter
             .from_payloads(&self.serialization_context, payloads.payloads)
             .await

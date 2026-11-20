@@ -33,23 +33,20 @@ use tonic::IntoRequest;
 async fn encode_optional_value(
     value: Option<Box<dyn TemporalClientValue>>,
     data_converter: &temporalio_common::data_converters::DataConverter,
+    context_data: &SerializationContextData,
 ) -> Result<Option<Payloads>, AsyncActivityError> {
     let Some(value) = value else {
         return Ok(None);
     };
     let unencoded_payloads = {
         let payload_converter = data_converter.payload_converter();
-        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
-        let context = SerializationContext::new(&context_data, payload_converter);
+        let context = SerializationContext::new(context_data, payload_converter);
         value.serialize_payloads(&context)?
     };
     drop(value);
     let payloads = data_converter
         .codec()
-        .encode(
-            &SerializationContextData::Activity(ActivitySerializationContext::new()),
-            unencoded_payloads,
-        )
+        .encode(context_data, unencoded_payloads)
         .await?;
     Ok(Some(Payloads { payloads }))
 }
@@ -179,7 +176,8 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 > {
                     Box::pin(async move {
                         let (identifier, result, rpc_options) = input.into_parts();
-                        let result = encode_optional_value(result, client.data_converter()).await?;
+                        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
+                        let result = encode_optional_value(result, client.data_converter(), &context_data).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskCompletedRequest {
                                 task_token: token.into_inner(),
@@ -188,7 +186,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), None).await?;
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_completed(
@@ -215,7 +213,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 &request.run_id,
                                 &request.activity_id,
                             );
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), Some(target))
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), Some(target))
                                 .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
@@ -262,9 +260,10 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                     Box::pin(async move {
                         let (identifier, application_failure, details, rpc_options) =
                             input.into_parts();
+                        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
                         let data_converter = client.data_converter().clone();
                         let mut failure = data_converter.to_failure(
-                            &SerializationContextData::Activity(ActivitySerializationContext::new()),
+                            &context_data,
                             OutgoingError::Activity(OutgoingActivityError::Application(Box::new(
                                 application_failure,
                             ))),
@@ -272,11 +271,11 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                         encode_payloads(
                             &mut failure,
                             data_converter.codec(),
-                            &SerializationContextData::Activity(ActivitySerializationContext::new()),
+                            &context_data,
                         )
                         .await?;
                         let last_heartbeat_details =
-                            encode_optional_value(details, &data_converter).await?;
+                            encode_optional_value(details, &data_converter, &context_data).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskFailedRequest {
                                 task_token: token.into_inner(),
@@ -286,7 +285,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 last_heartbeat_details,
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), None).await?;
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_failed(
@@ -315,7 +314,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 &request.run_id,
                                 &request.activity_id,
                             );
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), Some(target))
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), Some(target))
                                 .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
@@ -358,7 +357,8 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 > {
                     Box::pin(async move {
                         let (identifier, details, rpc_options) = input.into_parts();
-                        let details = encode_optional_value(details, client.data_converter()).await?;
+                        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
+                        let details = encode_optional_value(details, client.data_converter(), &context_data).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskCanceledRequest {
                                 task_token: token.into_inner(),
@@ -367,7 +367,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 ..Default::default()
                             };
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), None).await?;
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_canceled(
@@ -395,7 +395,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 &request.run_id,
                                 &request.activity_id,
                             );
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), Some(target))
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), Some(target))
                                 .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
@@ -437,7 +437,8 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 > {
                     Box::pin(async move {
                         let (identifier, details, rpc_options) = input.into_parts();
-                        let details = encode_optional_value(details, client.data_converter()).await?;
+                        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
+                        let details = encode_optional_value(details, client.data_converter(), &context_data).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RecordActivityTaskHeartbeatRequest {
                                 task_token: token.into_inner(),
@@ -446,7 +447,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 resource_id: Default::default(),
                             };
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), None).await?;
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), None).await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             let response = WorkflowService::record_activity_task_heartbeat(
@@ -475,7 +476,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 &request.run_id,
                                 &request.activity_id,
                             );
-                            store_external_payloads(&mut request, client.data_converter(), &client.namespace(), Some(target))
+                            store_external_payloads(&mut request, client.data_converter(), &context_data, &client.namespace(), Some(target))
                                 .await?;
                             let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);

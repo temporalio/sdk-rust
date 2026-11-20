@@ -10,6 +10,7 @@ use futures::{
     TryStreamExt,
     future::{self, BoxFuture},
 };
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -463,6 +464,15 @@ fn is_reference(payload: &Payload) -> bool {
     payload.metadata.get("messageType").map(Vec::as_slice) == Some(REFERENCE_MESSAGE_TYPE)
 }
 
+fn is_encoded_reference(payload: &Payload) -> bool {
+    payload
+        .metadata
+        .get("__temporal_external_storage_reference")
+        .map(Vec::as_slice)
+        == Some(b"true")
+        && payload.metadata.get("encoding").map(Vec::as_slice) == Some(WRAPPED_ENCODING)
+}
+
 async fn client_with_storage(driver: Arc<dyn StorageDriver>) -> Client {
     let storage = ExternalStorage::new(driver)
         .unwrap()
@@ -471,6 +481,291 @@ async fn client_with_storage(driver: Arc<dyn StorageDriver>) -> Client {
         .data_converter(DataConverter::default().with_external_storage(storage))
         .build();
     Client::new(get_integ_connection(None).await, client_opts).unwrap()
+}
+
+const WRAPPED_ENCODING: &[u8] = b"binary/wrapped";
+
+/// Wraps each whole payload in a new one, so an encoded reference keeps none of its metadata.
+struct WrappingCodec;
+
+impl PayloadCodec for WrappingCodec {
+    fn encode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        let encoded = payloads
+            .iter()
+            .map(|payload| Payload {
+                metadata: HashMap::from([("encoding".to_owned(), WRAPPED_ENCODING.to_vec())]),
+                data: payload.encode_to_vec(),
+                external_payloads: vec![],
+            })
+            .collect();
+        Box::pin(future::ready(Ok(encoded)))
+    }
+
+    fn decode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        let decoded = payloads
+            .into_iter()
+            .map(|payload| {
+                if payload.metadata.get("encoding").map(Vec::as_slice) == Some(WRAPPED_ENCODING) {
+                    Payload::decode(payload.data.as_slice())
+                        .map_err(|e| PayloadConversionError::EncodingError(e.into()))
+                } else {
+                    Ok(payload)
+                }
+            })
+            .collect();
+        Box::pin(future::ready(decoded))
+    }
+}
+
+/// A client whose converter applies [`WrappingCodec`], when `codec` is set, and offloads with
+/// `driver`, encoding the references it writes when `encode_references` is set.
+fn client_with_encoded_storage(
+    connection: temporalio_client::Connection,
+    driver: Arc<dyn StorageDriver>,
+    codec: bool,
+    encode_references: bool,
+) -> Client {
+    let storage = ExternalStorage::new(driver)
+        .unwrap()
+        .with_payload_size_threshold(1024)
+        .with_encoded_references(encode_references);
+    let data_converter = if codec {
+        DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter::default(),
+            WrappingCodec,
+        )
+    } else {
+        DataConverter::default()
+    };
+    let client_opts = ClientOptions::new(integ_namespace())
+        .data_converter(data_converter.with_external_storage(storage))
+        .build();
+    Client::new(connection, client_opts).unwrap()
+}
+
+#[tokio::test]
+async fn encoded_references_round_trip_and_read_where_writing_them_is_off() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let connection = get_integ_connection(None).await;
+    let writer = client_with_encoded_storage(connection.clone(), driver.clone(), true, true);
+    let reader = client_with_encoded_storage(connection, driver.clone(), true, false);
+
+    let mut starter =
+        CoreWfStarter::new_with_overrides(LargePayloadWorkflow::name(), None, Some(writer.clone()));
+    starter
+        .sdk_config
+        .register_activities(LargePayloadActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LargePayloadWorkflow>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let input = "e".repeat(10_000);
+    worker
+        .submit_workflow(
+            LargePayloadWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let result = reader
+        .get_workflow_handle::<LargePayloadWorkflow>(workflow_id)
+        .get_result(Default::default())
+        .await
+        .unwrap();
+    assert_eq!(result, input);
+
+    let history = starter.get_history().await;
+    let mut references = Vec::new();
+    for event in history.events {
+        match event.attributes {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attrs)) => {
+                references.extend(attrs.input.map(|p| p.payloads[0].clone()));
+            }
+            Some(Attributes::ActivityTaskScheduledEventAttributes(attrs)) => {
+                references.extend(attrs.input.map(|p| p.payloads[0].clone()));
+            }
+            Some(Attributes::ActivityTaskCompletedEventAttributes(attrs)) => {
+                references.extend(attrs.result.map(|p| p.payloads[0].clone()));
+            }
+            Some(Attributes::WorkflowExecutionCompletedEventAttributes(attrs)) => {
+                references.extend(attrs.result.map(|p| p.payloads[0].clone()));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(references.len(), 4);
+    for reference in references {
+        assert!(is_encoded_reference(&reference), "{reference:?}");
+        assert!(!reference.external_payloads.is_empty(), "{reference:?}");
+    }
+}
+
+#[tokio::test]
+async fn encoded_signals_queries_and_memos_are_read() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let client =
+        client_with_encoded_storage(get_integ_connection(None).await, driver.clone(), true, true);
+    let task_queue = format!("encoded_signal_{}", rand_6_chars());
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_workflow::<LargeSignalWorkflow>()
+        .unwrap()
+        .build();
+    let worker = temporalio_sdk::Worker::new(&runtime, client.clone(), worker_options).unwrap();
+
+    let value = "s".repeat(10_000);
+    let memo_value = "m".repeat(10_000);
+    let mut memo = MemoValues::new();
+    memo.insert("big", memo_value.clone());
+    worker
+        .run_until(async {
+            let handle = client
+                .start_workflow(
+                    LargeSignalWorkflow::run,
+                    (),
+                    WorkflowStartOptions::new(task_queue.clone(), task_queue.clone())
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .unwrap();
+            handle
+                .signal(
+                    LargeSignalWorkflow::deliver,
+                    value.clone(),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+            let queried = handle
+                .query(
+                    LargeSignalWorkflow::current,
+                    (),
+                    WorkflowQueryOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(queried, value);
+            assert_eq!(handle.get_result(Default::default()).await.unwrap(), value);
+        })
+        .await
+        .unwrap();
+
+    let handle = client.get_workflow_handle::<LargeSignalWorkflow>(task_queue.clone());
+    let description = handle
+        .describe(WorkflowDescribeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        description.memo().get::<String>("big").unwrap(),
+        Some(memo_value)
+    );
+
+    let events = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    let mut memo_payload = None;
+    let mut signal_input = None;
+    for event in events {
+        match event.attributes {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attrs)) => {
+                memo_payload = attrs.memo.and_then(|m| m.fields.get("big").cloned());
+            }
+            Some(Attributes::WorkflowExecutionSignaledEventAttributes(attrs)) => {
+                signal_input = attrs.input.map(|p| p.payloads[0].clone());
+            }
+            _ => {}
+        }
+    }
+    assert!(is_encoded_reference(&memo_payload.unwrap()));
+    assert!(is_encoded_reference(&signal_input.unwrap()));
+}
+
+#[tokio::test]
+async fn an_encoded_reference_reaching_a_worker_without_its_codec_fails_the_workflow_task() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let connection = get_integ_connection(None).await;
+    let client = client_with_encoded_storage(connection.clone(), driver.clone(), true, true);
+    let worker_client = client_with_encoded_storage(connection, driver, false, false);
+    let task_queue = format!("encoded_without_codec_{}", rand_6_chars());
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_workflow::<LargePayloadWorkflow>()
+        .unwrap()
+        .register_activities(LargePayloadActivities)
+        .build();
+    let worker = temporalio_sdk::Worker::new(&runtime, worker_client, worker_options).unwrap();
+
+    worker
+        .run_until(async {
+            let handle = client
+                .start_workflow(
+                    LargePayloadWorkflow::run,
+                    "n".repeat(10_000),
+                    WorkflowStartOptions::new(task_queue.clone(), task_queue.clone()).build(),
+                )
+                .await
+                .unwrap();
+            let failed = eventually(
+                || {
+                    let handle = &handle;
+                    async move {
+                        handle
+                            .fetch_history(Default::default())
+                            .into_events()
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .find_map(|event| match event.attributes {
+                                Some(Attributes::WorkflowTaskFailedEventAttributes(attrs)) => {
+                                    Some(attrs)
+                                }
+                                _ => None,
+                            })
+                            .ok_or("the workflow task has not failed")
+                    }
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert!(
+                failed
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("TMPRL1106"),
+                "{failed:?}"
+            );
+            assert_eq!(
+                failed.cause(),
+                WorkflowTaskFailedCause::ExternalStorageFailure
+            );
+            handle
+                .terminate(WorkflowTerminateOptions::default())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

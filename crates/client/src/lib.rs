@@ -1886,11 +1886,10 @@ where
                     Box::pin(async move {
                         let (workflow_type, args, options, rpc_options) = input.into_parts();
                         let data_converter = client.data_converter().clone();
+                        let context_data =
+                            SerializationContextData::Workflow(WorkflowSerializationContext::new());
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context_data = SerializationContextData::Workflow(
-                                WorkflowSerializationContext::new(),
-                            );
                             let context =
                                 SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
@@ -1899,7 +1898,7 @@ where
 
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
+                            .encode(&context_data, unencoded_payloads?)
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
@@ -1921,7 +1920,7 @@ where
                                 .as_ref()
                                 .map_or("", |workflow_type| workflow_type.name.as_str()),
                         );
-                        store_external_payloads(&mut request, &data_converter, &client.namespace(), Some(target)).await?;
+                        store_external_payloads(&mut request, &data_converter, &context_data, &client.namespace(), Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = client
@@ -2005,11 +2004,11 @@ where
                         drop(signal_args);
                         let workflow_payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), workflow_payloads?)
+                            .encode(&context_data, workflow_payloads?)
                             .await?;
                         let signal_payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), signal_payloads?)
+                            .encode(&context_data, signal_payloads?)
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
@@ -2064,7 +2063,7 @@ where
                                 .as_ref()
                                 .map_or("", |workflow_type| workflow_type.name.as_str()),
                         );
-                        store_external_payloads(&mut request, &data_converter, &client.namespace(), Some(target)).await?;
+                        store_external_payloads(&mut request, &data_converter, &context_data, &client.namespace(), Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = WorkflowService::signal_with_start_workflow_execution(
@@ -2139,11 +2138,10 @@ where
                         let (start_options, update_id, update_header) = options.into_parts();
 
                         let data_converter = client.data_converter().clone();
+                        let context_data =
+                            SerializationContextData::Workflow(WorkflowSerializationContext::new());
                         let (unencoded_workflow_payloads, unencoded_update_payloads) = {
                             let payload_converter = data_converter.payload_converter();
-                            let context_data = SerializationContextData::Workflow(
-                                WorkflowSerializationContext::new(),
-                            );
                             let context =
                                 SerializationContext::new(&context_data, payload_converter);
                             (
@@ -2156,18 +2154,12 @@ where
                         // The codec may do expensive work per call (e.g. remote encryption), so
                         // encode both payload sets concurrently.
                         let (workflow_payloads, update_payloads) = try_join(
-                            data_converter.codec().encode(
-                                &SerializationContextData::Workflow(
-                                    WorkflowSerializationContext::new(),
-                                ),
-                                unencoded_workflow_payloads?,
-                            ),
-                            data_converter.codec().encode(
-                                &SerializationContextData::Workflow(
-                                    WorkflowSerializationContext::new(),
-                                ),
-                                unencoded_update_payloads?,
-                            ),
+                            data_converter
+                                .codec()
+                                .encode(&context_data, unencoded_workflow_payloads?),
+                            data_converter
+                                .codec()
+                                .encode(&context_data, unencoded_update_payloads?),
                         )
                         .await?;
 
@@ -2226,6 +2218,7 @@ where
                         store_external_payloads(
                             &mut request,
                             &data_converter,
+                            &context_data,
                             &client.namespace(),
                             Some(target),
                         )
@@ -2239,8 +2232,12 @@ where
                                     .await
                                     .map_err(WorkflowUpdateWithStartError::from_status)?
                                     .into_inner();
-                            retrieve_external_payloads(&mut response, client.data_converter())
-                                .await?;
+                            retrieve_external_payloads(
+                                &mut response,
+                                &data_converter,
+                                &context_data,
+                            )
+                            .await?;
 
                             let [start_response, update_response]: [_; 2] =
                                 response.responses.try_into().map_err(|_| {
@@ -2415,9 +2412,13 @@ where
                                     )
                                     .await?
                                     .into_inner();
+                                    let context_data = SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    );
                                     retrieve_external_payloads(
                                         &mut response,
                                         rpc_client.data_converter(),
+                                        &context_data,
                                     )
                                     .await?;
                                     Ok(ListWorkflowsPageOutput::new(
@@ -2603,7 +2604,7 @@ where
                 .as_ref()
                 .map_or("", |activity_type| activity_type.name.as_str()),
         );
-        store_external_payloads(&mut request, dc, &client.namespace(), Some(target)).await?;
+        store_external_payloads(&mut request, dc, sc, &client.namespace(), Some(target)).await?;
         let resp = client
             .start_activity_execution(request.into_request())
             .await?

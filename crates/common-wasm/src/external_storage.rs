@@ -333,6 +333,7 @@ pub struct ExternalStorage {
     driver_selector: Arc<dyn StorageDriverSelector>,
     payload_size_threshold: usize,
     concurrency: ExternalStorageConcurrency,
+    encode_references: bool,
 }
 
 impl fmt::Debug for ExternalStorage {
@@ -389,6 +390,7 @@ impl ExternalStorage {
             driver_selector,
             payload_size_threshold: DEFAULT_PAYLOAD_SIZE_THRESHOLD,
             concurrency: ExternalStorageConcurrency::default(),
+            encode_references: false,
         })
     }
 
@@ -407,6 +409,26 @@ impl ExternalStorage {
     pub(crate) fn with_concurrency(mut self, concurrency: ExternalStorageConcurrency) -> Self {
         self.concurrency = concurrency;
         self
+    }
+
+    /// Set whether the references that replace offloaded payloads are encoded with the payload
+    /// codec. Defaults to off.
+    ///
+    /// For testing only, and may be removed without notice. Workers running a release that cannot
+    /// read encoded references fail on any reference written this way.
+    // Writing stays off until releases that can read encoded references have been out long enough
+    // for workers to upgrade, since an older worker cannot find an encoded reference at all.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_encoded_references(mut self, encode_references: bool) -> Self {
+        self.encode_references = encode_references;
+        self
+    }
+
+    /// Whether the references that replace offloaded payloads are encoded with the payload codec.
+    #[doc(hidden)]
+    pub fn encodes_references(&self) -> bool {
+        self.encode_references
     }
 
     /// The limits on how many storage requests may be in flight at once.
