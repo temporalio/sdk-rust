@@ -51,6 +51,9 @@ pub(crate) type WFTStreamIn = Result<
 pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
+    /// The task of a run new to the cache, whose Stream markers need their Records from the Store
+    /// before the run replays them.
+    StreamRecords(Box<PermittedWFT>, Arc<HistfetchRC>),
 }
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
 #[derive(Debug)]
@@ -130,6 +133,14 @@ impl WFTExtractor {
                                     auto_reply_fail: Some(fail_info),
                                 },
                             }
+                        }
+                        // Each read entry gets its own result, so the read never fails the fetch.
+                        HistoryFetchReq::StreamRecords(mut pwft, rc) => {
+                            let PermittedWFT {
+                                work, paginator, ..
+                            } = pwft.as_mut();
+                            paginator.read_stream_records(&mut work.update).await;
+                            WFTExtractorOutput::FetchResult(*pwft, rc)
                         }
                         HistoryFetchReq::NextPage(mut req, rc) => {
                             match req.paginator.extract_next_update().await {

@@ -1,6 +1,8 @@
 //! The Stream calls of Workflow code, through a Worker on a mock server. The mock server writes the
 //! History of each completion, so a replay Worker can replay it.
 
+mod reads;
+
 use super::stream_store::{MemoryStore, Op, Request};
 use crate::{
     StreamRuntimes, StreamSettings, Worker, WorkerConfig, init_replay_worker,
@@ -29,7 +31,7 @@ use temporalio_common::protos::{
         activity_result::ActivityExecutionResult,
         external_data::{
             StreamAppendOffsets, StreamAppendResult, StreamCloseIntent, StreamCloseResult,
-            StreamMarkerData, stream_append_result,
+            StreamMarkerData, StreamReadEntry, stream_append_result,
         },
         workflow_activation::{
             FireTimer, ResolveStreamAppend, ResolveStreamClose, StreamAppended, WorkflowActivation,
@@ -37,8 +39,8 @@ use temporalio_common::protos::{
         },
         workflow_commands::{
             AppendToStream, CloseStream, CompleteWorkflowExecution, QueryResult, QuerySuccess,
-            ScheduleLocalActivity, StartTimer, UpdateResponse, query_result, update_response,
-            workflow_command::Variant as Command,
+            ScheduleLocalActivity, StartStreamRead, StartTimer, UpdateResponse, query_result,
+            update_response, workflow_command::Variant as Command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
@@ -59,8 +61,9 @@ use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_streams::{
     StreamError, StreamRuntime, StreamStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, CreateStreamRequest, Producer, StreamRef,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind as ProducerKind,
+        AppendRecord, AppendRecordsRequest, ClientProducer, CreateStreamRequest, Producer,
+        StreamRecord, StreamRef, WorkflowProducer, WorkflowTaskEpoch,
+        producer::Kind as ProducerKind,
     },
     record::BatchLimits,
     workflow::marker_details,
@@ -376,6 +379,9 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             }
             Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
                 history.add_workflow_execution_completed();
+            }
+            Some(Attributes::FailWorkflowExecutionCommandAttributes(_)) => {
+                history.add_workflow_execution_failed();
             }
             // No test replays an Update.
             Some(Attributes::ProtocolMessageCommandAttributes(_)) => {}
@@ -764,6 +770,7 @@ fn fast_tries(wc: &mut WorkerConfig) {
         retry_first_wait: Duration::from_millis(10),
         retry_max_wait: Duration::from_millis(20),
         try_deadline: Duration::from_millis(50),
+        ..StreamSettings::default()
     };
 }
 
@@ -1276,6 +1283,9 @@ enum OtherTask {
     /// The cached run has no Stream call, and the marker of the other Worker is on the last of
     /// three pages of History.
     WithTheMarkerOnALaterPage,
+    /// The cached run has no Stream call, and the marker of a read of the other Worker is in the
+    /// lookahead of the update.
+    WithAReadMarkerInTheLookahead,
 }
 
 /// Waits until `done` returns true, for at most 10 seconds, so that a test fails rather than hangs.
@@ -1304,6 +1314,7 @@ async fn respond(worker: &Worker, activation: &WorkflowActivation, workflow: Wor
 #[case(OtherTask::AtTheSameStartedEventId)]
 #[case(OtherTask::AfterATimeout)]
 #[case(OtherTask::WithTheMarkerOnALaterPage)]
+#[case(OtherTask::WithAReadMarkerInTheLookahead)]
 #[tokio::test]
 async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     #[case] other_task: OtherTask,
@@ -1311,6 +1322,9 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     match other_task {
         OtherTask::AfterATimeout => return after_a_timeout().await,
         OtherTask::WithTheMarkerOnALaterPage => return with_the_marker_on_a_later_page().await,
+        OtherTask::WithAReadMarkerInTheLookahead => {
+            return reads::with_a_read_marker_in_the_lookahead().await;
+        }
         _ => {}
     }
     let store = store(&["s"]).await;
@@ -1527,7 +1541,7 @@ async fn with_the_marker_on_a_later_page() {
     let closes: Vec<_> = (store.requests().into_iter())
         .filter_map(|request| match request {
             Request::Close(close) => Some(writer(close.producer)),
-            Request::Append(_) => None,
+            _ => None,
         })
         .collect();
     let id = producer(&run_id, Default::default()).id;
@@ -1731,13 +1745,15 @@ async fn a_call_of_an_update_handler_runs_after_the_update_is_accepted(#[case] c
 }
 
 /// The activations of task 2 in which the first run got each result, by the seq of its call.
-/// Workflow code asks for the closes in task 1. It schedules the Local Activities and sends the
-/// appends at the Signal that starts task 2, which has no other job.
+/// Workflow code asks for the closes in task 1. It schedules the Local Activities, and starts the
+/// appends and the reads, at the Signal that starts task 2, which has no other job.
 #[derive(Debug)]
 struct Held {
     locals: Vec<u64>,
     appends: Vec<u64>,
     closes: Vec<u64>,
+    /// The activations of the pages of each read, each with one Record.
+    reads: Vec<Vec<u64>>,
 }
 
 impl Held {
@@ -1747,15 +1763,23 @@ impl Held {
             (0..count).map(|_| rng.random_range(first..=6)).collect()
         };
         // A result of a call that Workflow code made at the Signal comes after it.
+        let (locals, appends, closes) = (at(3, 1), at(3, 1), at(2, 0));
+        // A read gives at most one page in an activation.
+        let reads = (0..rng.random_range(0..=2))
+            .map(|_| (1..=6).filter(|_| rng.random_bool(0.3)).collect())
+            .filter(|pages: &Vec<u64>| !pages.is_empty())
+            .collect();
         Self {
-            locals: at(3, 1),
-            appends: at(3, 1),
-            closes: at(2, 0),
+            locals,
+            appends,
+            closes,
+            reads,
         }
     }
 
     fn count(&self) -> usize {
-        self.locals.len() + self.appends.len() + self.closes.len()
+        let pages: usize = self.reads.iter().map(Vec::len).sum();
+        self.locals.len() + self.appends.len() + self.closes.len() + pages
     }
 
     /// Returns the History of the first run, with chunking disabled.
@@ -1798,9 +1822,28 @@ impl Held {
             first_offset: vec![1],
             last_offset: vec![1],
         };
+        let reads = (1..).zip(&self.reads);
+        let read = |(seq, pages): (u32, &Vec<u64>)| StreamReadEntry {
+            seq,
+            stream: self.appends.len() as u32 + seq - 1,
+            page_records: vec![1; pages.len()],
+            page_activations: pages.clone(),
+            records: (1..=pages.len() as u8)
+                .map(|offset| StreamRecord {
+                    producer: Some(Producer {
+                        id: "client:test".to_string(),
+                        kind: Some(ProducerKind::Client(ClientProducer {})),
+                    }),
+                    body: Some(Payload::default()),
+                    offset: vec![offset],
+                })
+                .collect(),
+            ..Default::default()
+        };
         let data = StreamMarkerData {
-            streams: seqs(&self.appends)
-                .map(|(seq, _)| stream(&format!("a{seq}")))
+            streams: (seqs(&self.appends).map(|(seq, _)| format!("a{seq}")))
+                .chain((1..=self.reads.len()).map(|seq| format!("r{seq}")))
+                .map(|id| stream(&id))
                 .collect(),
             appends: seqs(&self.appends)
                 .map(|(seq, activation)| StreamAppendResult {
@@ -1817,9 +1860,10 @@ impl Held {
                     failure: None,
                 })
                 .collect(),
+            reads: reads.map(read).collect(),
             ..Default::default()
         };
-        if !data.appends.is_empty() || !data.closes.is_empty() {
+        if !data.appends.is_empty() || !data.closes.is_empty() || !data.reads.is_empty() {
             t.add(MarkerRecordedEventAttributes {
                 marker_name: STREAM_MARKER_NAME.to_string(),
                 details: marker_details(&data),
@@ -1839,9 +1883,13 @@ impl Held {
         };
         let mut task: BTreeMap<u64, Vec<String>> = BTreeMap::new();
         task.entry(0).or_default().push("signal".to_string());
+        let pages = (1..).zip(&self.reads).flat_map(|(seq, pages)| {
+            (pages.iter()).map(move |activation| (*activation, format!("read {seq}")))
+        });
         let results = (named("local activity", &self.locals))
             .chain(named("append", &self.appends))
-            .chain(named("close", &self.closes));
+            .chain(named("close", &self.closes))
+            .chain(pages);
         for (activation, name) in results {
             task.entry(activation).or_default().push(name);
         }
@@ -1860,12 +1908,14 @@ fn job_name(job: &Job) -> String {
         Job::ResolveActivity(result) => format!("local activity {}", result.seq),
         Job::ResolveStreamAppend(result) => format!("append {}", result.seq),
         Job::ResolveStreamClose(result) => format!("close {}", result.seq),
+        Job::ResolveStreamRead(page) => format!("read {}", page.seq),
         other => format!("{other:?}"),
     }
 }
 
-// A replay gives each result that a task holds, of a Local Activity, an append or a close, in the
-// activation in which the first run got it, when no other job of the task reaches that activation.
+// A replay gives each result that a task holds, of a Local Activity, an append, a close or a read,
+// in the activation in which the first run got it, when no other job of the task reaches that
+// activation.
 #[tokio::test]
 async fn a_replay_gives_each_held_result_in_its_activation() {
     let store = store(&[]).await;
@@ -1876,6 +1926,7 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
                 locals: vec![5],
                 appends: vec![3],
                 closes: vec![],
+                reads: vec![],
             },
             _ => Held::generate(&mut StdRng::seed_from_u64(seed)),
         };
@@ -1891,6 +1942,7 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
             count(&held.appends),
             count(&held.closes),
         );
+        let reads = 1..=held.reads.len() as u32;
         let mut left = held.count();
         let jobs = replay
             .drive(|activation| {
@@ -1903,6 +1955,15 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
                             commands.extend(locals.clone().map(local_activity));
                             let append = |seq| append(seq, &format!("a{seq}"));
                             commands.extend(appends.clone().map(append));
+                            commands.extend(reads.clone().map(|seq| {
+                                StartStreamRead {
+                                    seq,
+                                    stream: Some(stream(&format!("r{seq}"))),
+                                    records_in_history: true,
+                                    ..Default::default()
+                                }
+                                .into()
+                            }));
                         }
                         _ => left -= 1,
                     }

@@ -1,6 +1,9 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
-use super::{StreamRuntimes, StreamSettings};
+use super::{
+    StreamRuntimes, StreamSettings,
+    reader::{self, Page, ReadCall},
+};
 use crate::{
     AnyReason, StreamError, StreamRuntime,
     proto::{AppendRecordsRequest, CloseStreamRequest, StreamErrorReason},
@@ -59,6 +62,7 @@ pub struct Call {
 pub(crate) enum Op {
     Append(AppendRecordsRequest),
     Close(CloseStreamRequest),
+    Read(ReadCall),
 }
 
 /// The result of a call, for its run.
@@ -74,6 +78,8 @@ pub(crate) enum Outcome {
     Append(resolve_stream_append::Status),
     /// `None` if the Stream is closed.
     Close(Option<Failure>),
+    /// The next page of a read, which a read gives before it ends.
+    Page(Page),
 }
 
 type Sink = Arc<dyn Fn(String, StreamResolution) + Send + Sync>;
@@ -169,6 +175,7 @@ impl StreamManager {
         let stream = match &op {
             Op::Append(request) => request.r#ref.clone(),
             Op::Close(request) => request.r#ref.clone(),
+            Op::Read(read) => read.request.r#ref.clone(),
         }
         .unwrap_or_default();
         let runtime = (self.runtimes.get(&stream.store).cloned())
@@ -183,6 +190,7 @@ impl StreamManager {
                 match op {
                     Op::Append(_) => "append",
                     Op::Close(_) => "close",
+                    Op::Read(_) => "read",
                 },
                 stream.id,
                 stream.store
@@ -190,8 +198,19 @@ impl StreamManager {
         };
         let sink = self.sink.clone();
         let task = self.handle.spawn(async move {
-            let outcome = run(&runtime, op, settings, &note).await;
-            if note.end() {
+            let give = |page| {
+                let outcome = Outcome::Page(page);
+                let resolution = StreamResolution {
+                    call_id,
+                    seq,
+                    outcome,
+                };
+                sink(note.run_id.clone(), resolution);
+            };
+            let outcome = run(&runtime, op, settings, &note, give).await;
+            if note.end()
+                && let Some(outcome) = outcome
+            {
                 sink(
                     note.run_id,
                     StreamResolution {
@@ -216,21 +235,33 @@ impl Drop for StreamManager {
     }
 }
 
-async fn run(runtime: &StreamRuntime, op: Op, settings: StreamSettings, note: &Note) -> Outcome {
+/// Runs a call, and returns the outcome of an append or a close. A read gives each of its pages to
+/// `give` while it runs, and has no outcome.
+async fn run(
+    runtime: &StreamRuntime,
+    op: Op,
+    settings: StreamSettings,
+    note: &Note,
+    give: impl Fn(Page),
+) -> Option<Outcome> {
     match op {
         Op::Append(request) => {
             let answer = tries(settings, note, || runtime.append_records(request.clone())).await;
-            Outcome::Append(match answer {
+            Some(Outcome::Append(match answer {
                 Ok(appended) => resolve_stream_append::Status::Appended(StreamAppended {
                     first_offset: appended.first_offset,
                     last_offset: appended.last_offset,
                 }),
                 Err(error) => resolve_stream_append::Status::Failed(failure(&error)),
-            })
+            }))
         }
         Op::Close(request) => {
             let answer = tries(settings, note, || runtime.close_stream(request.clone())).await;
-            Outcome::Close(answer.err().map(|error| failure(&error)))
+            Some(Outcome::Close(answer.err().map(|error| failure(&error))))
+        }
+        Op::Read(read) => {
+            reader::read(runtime, read, settings, note, give).await;
+            None
         }
     }
 }
@@ -264,13 +295,13 @@ where
     }
 }
 
-struct Backoff {
+pub(super) struct Backoff {
     next: Duration,
     max: Duration,
 }
 
 impl Backoff {
-    fn new(settings: &StreamSettings) -> Self {
+    pub(super) fn new(settings: &StreamSettings) -> Self {
         Self {
             next: settings.retry_first_wait,
             max: settings.retry_max_wait,
@@ -279,7 +310,7 @@ impl Backoff {
 
     /// Returns the wait before the next try, which `jitter` from 0 to 1 picks from half to all of
     /// the backoff. The calls of many runs then don't all try again at the same moment.
-    fn next_wait(&mut self, jitter: f64) -> Duration {
+    pub(super) fn next_wait(&mut self, jitter: f64) -> Duration {
         let wait = self.next.mul_f64(0.5 + jitter / 2.0);
         self.next = (self.next * 2).min(self.max);
         wait
@@ -287,7 +318,7 @@ impl Backoff {
 }
 
 /// The handle of one call to its entry in the manager.
-struct Note {
+pub(super) struct Note {
     tasks: Tasks,
     run_id: String,
     call_id: u64,
@@ -295,7 +326,8 @@ struct Note {
 }
 
 impl Note {
-    fn set(&self, error: Option<&dyn fmt::Display>) {
+    /// Notes the failure of the last try, or clears it with `None`.
+    pub(super) fn set(&self, error: Option<&dyn fmt::Display>) {
         let mut tasks = self.tasks.lock();
         let task = tasks
             .get_mut(&self.run_id)
@@ -362,7 +394,7 @@ pub(crate) fn failure<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>)
 
 /// Cuts `text` on a character boundary to at most [`MAX_FAILURE_MESSAGE_BYTES`], with `...` at the
 /// end.
-fn cut(text: String) -> String {
+pub(super) fn cut(text: String) -> String {
     if text.len() <= MAX_FAILURE_MESSAGE_BYTES {
         return text;
     }
@@ -437,7 +469,7 @@ mod tests {
             let settings = StreamSettings {
                 retry_first_wait: Duration::from_millis(first),
                 retry_max_wait,
-                try_deadline: Duration::from_secs(5),
+                ..Default::default()
             };
             assert_eq!(settings.check(), Ok(()), "seed {seed}");
             let mut backoff = Backoff::new(&settings);

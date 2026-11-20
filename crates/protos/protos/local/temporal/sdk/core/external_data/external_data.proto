@@ -101,6 +101,10 @@ message StreamReadEntry {
   repeated temporal.api.stream.v1.StreamRecord records = 7;
   // Set in the task in which Workflow code got the end of the read.
   StreamReadEnded end = 8;
+  // The bytes of the Records that the pages of this entry gave Workflow code in this task, each as
+  // a page of a read encodes it, with the tag and the length of its field. That is the measure of
+  // the `max_bytes` of a read. It's set when `digest` is, so a replay knows how much it reads.
+  uint64 record_bytes = 9;
 }
 
 message StreamReadEnded {
