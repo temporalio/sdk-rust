@@ -363,18 +363,18 @@ impl WorkflowMachines {
         self.protocol_msgs = protocol_messages;
         self.preparing_legacy_query = preparing_legacy_query;
         self.update_only_task = false;
-        self.new_history_from_server(update)?;
+        self.new_history_from_server(update);
+        self.apply_next_wft_from_history()?;
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
+    /// Replaces the history from the server with `update`, without applying its next WFT.
+    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) {
         self.note_wft_events(update.get_events());
         update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
-        self.apply_next_wft_from_history()?;
-        Ok(())
     }
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
