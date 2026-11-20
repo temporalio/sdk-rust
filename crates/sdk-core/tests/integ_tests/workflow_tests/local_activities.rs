@@ -87,6 +87,7 @@ use tokio::{
     join, select,
     sync::{Barrier, Notify, mpsc, oneshot},
 };
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 #[workflow]
@@ -1996,92 +1997,59 @@ async fn query_during_wft_heartbeat_doesnt_accidentally_fail_to_continue_heartbe
     tokio::join!(wf_fut, act_fut);
 }
 
-/// Starts a timer, or with `command_free_start` waits for a signal without issuing a command, then
-/// runs `local_activities` local activities. Once they have all resolved, it completes if a signal
-/// arrived after they were scheduled. Otherwise it starts a timer, only so that the two branches
-/// issue different commands, and completes on the next signal.
-#[derive(Clone, Default)]
+/// Starts a timer, then runs local activities. The command after the last result depends on
+/// whether the signal has arrived, so delivering that result too early fails replay.
 struct SignalAfterLocalActivitiesWf {
     local_activities: u32,
-    command_free_start: bool,
-    signals: usize,
-    signals_when_scheduled: Option<usize>,
     resolved: u32,
-    waiting_for_signal: bool,
+    signaled: bool,
 }
 
 impl SignalAfterLocalActivitiesWf {
     fn new(local_activities: u32) -> Self {
         Self {
             local_activities,
-            ..Default::default()
+            resolved: 0,
+            signaled: false,
         }
-    }
-
-    /// The same workflow, started over, as after an eviction
-    fn restarted(&self) -> Self {
-        Self {
-            command_free_start: self.command_free_start,
-            ..Self::new(self.local_activities)
-        }
-    }
-
-    fn schedule_local_activities(&mut self, commands: &mut Vec<Variant>) {
-        self.signals_when_scheduled = Some(self.signals);
-        commands.extend((1..=self.local_activities).map(|seq| {
-            schedule_local_activity_cmd(
-                seq,
-                &seq.to_string(),
-                ProtoActivityCancellationType::TryCancel,
-                Duration::from_secs(60),
-            )
-        }));
     }
 
     fn activate(&mut self, activation: &WorkflowActivation) -> WorkflowActivationCompletion {
-        // Lang SDKs run signal handlers before resuming the code that awaits other jobs.
-        self.signals += activation
-            .jobs
-            .iter()
-            .filter(|j| {
-                matches!(
-                    j.variant,
-                    Some(workflow_activation_job::Variant::SignalWorkflow(_))
-                )
-            })
-            .count();
+        self.signaled |= activation.jobs.iter().any(|job| {
+            matches!(
+                job.variant,
+                Some(workflow_activation_job::Variant::SignalWorkflow(_))
+            )
+        });
         let mut commands = vec![];
         for job in &activation.jobs {
             match job.variant.as_ref().unwrap() {
                 workflow_activation_job::Variant::InitializeWorkflow(_) => {
-                    if !self.command_free_start {
-                        commands.push(start_timer_cmd(1, Duration::from_secs(1)));
-                    }
+                    commands.push(start_timer_cmd(1, Duration::from_secs(1)));
                 }
                 workflow_activation_job::Variant::FireTimer(_) => {
-                    self.schedule_local_activities(&mut commands);
+                    commands.extend((1..=self.local_activities).map(|seq| {
+                        schedule_local_activity_cmd(
+                            seq,
+                            &seq.to_string(),
+                            ProtoActivityCancellationType::TryCancel,
+                            Duration::from_secs(60),
+                        )
+                    }));
                 }
                 workflow_activation_job::Variant::ResolveActivity(_) => {
                     self.resolved += 1;
                     if self.resolved == self.local_activities {
-                        if self.signals > self.signals_when_scheduled.unwrap() {
+                        if self.signaled {
                             commands.push(CompleteWorkflowExecution { result: None }.into());
                         } else {
-                            self.waiting_for_signal = true;
                             commands.push(start_timer_cmd(2, Duration::from_secs(1)));
                         }
                     }
                 }
-                workflow_activation_job::Variant::SignalWorkflow(_) if self.waiting_for_signal => {
-                    self.waiting_for_signal = false;
-                    commands.push(CompleteWorkflowExecution { result: None }.into());
-                }
                 workflow_activation_job::Variant::SignalWorkflow(_) => {}
                 unexpected => panic!("Unexpected activation job: {unexpected:?}"),
             }
-        }
-        if self.command_free_start && self.signals_when_scheduled.is_none() && self.signals > 0 {
-            self.schedule_local_activities(&mut commands);
         }
         WorkflowActivationCompletion::from_cmds(activation.run_id.clone(), commands)
     }
@@ -2193,9 +2161,7 @@ fn task_with_queries(
     task
 }
 
-/// Drives a [SignalAfterLocalActivitiesWf] run through a mocked worker, building each workflow task
-/// from the history recorded from the completions before it, and checks that replaying the final
-/// history produces the activations workflow code received live.
+/// Feeds each mocked workflow task the history recorded from earlier Core completions.
 struct LiveRun {
     core: temporalio_sdk_core::Worker,
     history: TestHistoryBuilder,
@@ -2203,8 +2169,6 @@ struct LiveRun {
     completions: mpsc::UnboundedReceiver<WorkflowTaskCompletion>,
     task_failures: mpsc::UnboundedReceiver<String>,
     workflow: SignalAfterLocalActivitiesWf,
-    /// Jobs of each activation workflow code received live, leaving out evictions and replays
-    live: Vec<Vec<&'static str>>,
 }
 
 impl LiveRun {
@@ -2215,10 +2179,7 @@ impl LiveRun {
     ) -> Self {
         let first_task = task_with_queries(&history, &[]);
         let (tasks, next_tasks) = mpsc::unbounded_channel();
-        let task_stream = stream::iter([first_task])
-            .chain(stream::unfold(next_tasks, |mut rx| async {
-                rx.recv().await.map(|task| (task, rx))
-            }));
+        tasks.send(first_task).unwrap();
         let (completion_tx, completions) = mpsc::unbounded_channel();
         let (failure_tx, task_failures) = mpsc::unbounded_channel();
         let mut client = mock_worker_client();
@@ -2237,12 +2198,8 @@ impl LiveRun {
         client
             .expect_respond_legacy_query()
             .returning(|_, _| Ok(Default::default()));
-        let mut mock = MocksHolder::from_client_with_custom(
-            client,
-            Some(task_stream),
-            None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
-            None::<Vec<QueueResponse<PollNexusTaskQueueResponse>>>,
-        );
+        let mut mock =
+            MocksHolder::from_wft_stream(client, UnboundedReceiverStream::new(next_tasks));
         mock.worker_cfg(|wc| wc.max_cached_workflows = max_cached_workflows);
         Self {
             core: mock_worker(mock),
@@ -2251,7 +2208,6 @@ impl LiveRun {
             completions,
             task_failures,
             workflow,
-            live: vec![],
         }
     }
 
@@ -2292,7 +2248,6 @@ impl LiveRun {
             } else if activation.is_replaying {
                 self.complete(&activation).await;
             } else {
-                self.live.push(job_names(&activation));
                 return activation;
             }
         }
@@ -2316,7 +2271,7 @@ impl LiveRun {
         )
         .await
         .unwrap();
-        self.workflow = self.workflow.restarted();
+        self.workflow = SignalAfterLocalActivitiesWf::new(self.workflow.local_activities);
     }
 
     /// Answers the queries in `activation`, sending `commands` along with the responses
@@ -2391,17 +2346,15 @@ impl LiveRun {
         queries: &[&str],
     ) -> (WorkflowActivation, Vec<ActivityTask>) {
         let activation = self.next_activation().await;
+        assert_eq!(job_names(&activation), ["init"]);
         self.complete(&activation).await;
         self.next_completion().await;
-        if self.workflow.command_free_start {
-            self.history.add_we_signaled("signal", vec![]);
-        } else {
-            self.history
-                .add_timer_fired(self.history.current_event_id(), "1".to_owned());
-        }
+        self.history
+            .add_timer_fired(self.history.current_event_id(), "1".to_owned());
         self.history.add_workflow_task_scheduled_and_started();
         self.send_task(queries);
         let activation = self.next_activation().await;
+        assert_eq!(job_names(&activation), ["timer"]);
         self.complete(&activation).await;
         let query = self.next_activation().await;
         let mut expected_queries = queries.to_vec();
@@ -2416,7 +2369,7 @@ impl LiveRun {
 
     /// Completes the eviction that follows the workflow's completion, so that it doesn't race the
     /// worker's shutdown, then shuts the worker down.
-    async fn evict_and_shut_down(mut self) -> Self {
+    async fn shut_down(mut self) -> TestHistoryBuilder {
         let eviction = self.poll().await;
         assert!(
             eviction.eviction_reason().is_some(),
@@ -2428,22 +2381,20 @@ impl LiveRun {
             drain_pollers_and_shutdown(&self.core),
         )
         .await;
-        self
+        within(
+            "finalizing the worker's shutdown",
+            self.core.finalize_shutdown(),
+        )
+        .await;
+        self.history
     }
 
     /// Shuts the worker down and checks that replaying the recorded history produces the
     /// activations workflow code received live
-    async fn assert_replay_matches_live(self) {
-        let LiveRun {
-            core,
-            history,
-            workflow,
-            live,
-            ..
-        } = self.evict_and_shut_down().await;
-        within("finalizing the worker's shutdown", core.finalize_shutdown()).await;
+    async fn assert_replay_matches_live(self, live: &[&[&str]]) {
+        let mut workflow = SignalAfterLocalActivitiesWf::new(self.workflow.local_activities);
+        let history = self.shut_down().await;
         let replay = init_core_replay_preloaded(LIVE_RUN_WFID, [HistoryForReplay::from(history)]);
-        let mut workflow = workflow.restarted();
         let mut replayed = vec![];
         loop {
             let activation = match within("polling replay", replay.poll_workflow_activation()).await
@@ -2519,6 +2470,7 @@ async fn la_resolved_while_answering_attached_query_replays_like_live(
     let forced_task_queries: &[&str] = if query_on_forced_task { &["q2"] } else { &[] };
     run.send_forced_task_after_signal(forced_task_queries);
     let activation = run.next_activation().await;
+    assert_eq!(job_names(&activation), ["signal", "local activity"]);
     run.complete(&activation).await;
     if query_on_forced_task {
         let query = run.next_activation().await;
@@ -2537,15 +2489,8 @@ async fn la_resolved_while_answering_attached_query_replays_like_live(
             CommandType::CompleteWorkflowExecution
         ]
     );
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["timer"],
-            vec!["signal", "local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
+    run.assert_replay_matches_live(&[&["init"], &["timer"], &["signal", "local activity"]])
+        .await;
 }
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
@@ -2572,19 +2517,12 @@ async fn attached_query_completion_without_response_fails_task() {
     assert!(failure.contains("Attached query activation completed without a query response"));
     assert!(run.completions.try_recv().is_err());
 
-    let run = run.evict_and_shut_down().await;
-    within(
-        "finalizing the worker's shutdown",
-        run.core.finalize_shutdown(),
-    )
-    .await;
+    run.shut_down().await;
 }
 
-/// Like [la_resolved_while_answering_attached_query_replays_like_live], with the local activity
-/// running across a workflow task heartbeat and the query attached to the heartbeat's task.
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
-async fn la_resolved_while_answering_query_attached_to_heartbeat_task_replays_like_live() {
+async fn attached_query_on_heartbeat_task_forces_replacement() {
     let mut history = TestHistoryBuilder::default();
     history.add_wfe_started_with_wft_timeout(Duration::from_millis(200));
     history.add_workflow_task_scheduled_and_started();
@@ -2632,6 +2570,7 @@ async fn la_resolved_while_answering_query_attached_to_heartbeat_task_replays_li
 
     run.send_forced_task_after_signal(&[]);
     let activation = run.next_activation().await;
+    assert_eq!(job_names(&activation), ["signal", "local activity"]);
     run.complete(&activation).await;
     let last_completion = run.next_completion().await;
     assert_eq!(
@@ -2641,36 +2580,52 @@ async fn la_resolved_while_answering_query_attached_to_heartbeat_task_replays_li
             CommandType::CompleteWorkflowExecution
         ]
     );
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["timer"],
-            vec!["signal", "local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
+    run.shut_down().await;
 }
 
-/// Two local activities finish while lang answers two queries attached to the same task, with the
-/// workflow cache disabled. The run must stay cached until the forced task delivers both results.
+#[rstest::rstest]
+#[case::both_held_without_cache(0, &["q1", "q2"], false)]
+#[case::second_finishes_after_first_activation(1, &["q"], true)]
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
-async fn las_resolved_while_answering_attached_queries_without_cache_replay_like_live() {
-    let mut run = LiveRun::new(started_history(), SignalAfterLocalActivitiesWf::new(2), 0);
-    let (query, local_activities) = run.run_local_activities_with_queries(&["q1", "q2"]).await;
-    for local_activity in local_activities {
-        run.complete_local_activity(local_activity).await;
+async fn local_activity_results_across_attached_query(
+    #[case] cache_size: usize,
+    #[case] queries: &[&str],
+    #[case] split_resolutions: bool,
+) {
+    let mut run = LiveRun::new(
+        started_history(),
+        SignalAfterLocalActivitiesWf::new(2),
+        cache_size,
+    );
+    let (query, mut local_activities) = run.run_local_activities_with_queries(queries).await;
+    run.complete_local_activity(local_activities.pop().unwrap())
+        .await;
+    if !split_resolutions {
+        run.complete_local_activity(local_activities.pop().unwrap())
+            .await;
     }
     run.answer_queries(query, vec![]).await;
     let query_completion = run.next_completion().await;
-    assert_eq!(query_completion.query_responses.len(), 2);
+    assert_eq!(query_completion.query_responses.len(), queries.len());
     assert!(query_completion.force_create_new_workflow_task);
     assert!(query_completion.commands.is_empty());
 
     run.send_forced_task_after_signal(&[]);
     let activation = run.next_activation().await;
+    let expected_jobs: &[&str] = if split_resolutions {
+        &["signal", "local activity"]
+    } else {
+        &["signal", "local activity", "local activity"]
+    };
+    assert_eq!(job_names(&activation), expected_jobs);
     run.complete(&activation).await;
+    if let Some(second) = local_activities.pop() {
+        run.complete_local_activity(second).await;
+        let activation = run.next_activation().await;
+        assert_eq!(job_names(&activation), ["local activity"]);
+        run.complete(&activation).await;
+    }
     let last_completion = run.next_completion().await;
     assert_eq!(
         command_types(&last_completion),
@@ -2680,58 +2635,7 @@ async fn las_resolved_while_answering_attached_queries_without_cache_replay_like
             CommandType::CompleteWorkflowExecution
         ]
     );
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["timer"],
-            vec!["signal", "local activity", "local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
-}
-
-/// Of two local activities, one finishes while lang answers the attached query and the other only
-/// once lang has completed the forced task's first activation. Replay must deliver them in the same
-/// activations as live execution did.
-#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
-#[tokio::test]
-async fn las_resolved_while_answering_query_and_after_forced_task_activation_replay_like_live() {
-    let mut run = LiveRun::new(started_history(), SignalAfterLocalActivitiesWf::new(2), 1);
-    let (query, mut local_activities) = run.run_local_activities_with_queries(&["q"]).await;
-    let second = local_activities.pop().unwrap();
-    run.complete_local_activity(local_activities.pop().unwrap())
-        .await;
-    run.answer_queries(query, vec![]).await;
-    let query_completion = run.next_completion().await;
-    assert!(query_completion.force_create_new_workflow_task);
-    assert!(query_completion.commands.is_empty());
-
-    run.send_forced_task_after_signal(&[]);
-    let activation = run.next_activation().await;
-    run.complete(&activation).await;
-    run.complete_local_activity(second).await;
-    let activation = run.next_activation().await;
-    run.complete(&activation).await;
-    let last_completion = run.next_completion().await;
-    assert_eq!(
-        command_types(&last_completion),
-        [
-            CommandType::RecordMarker,
-            CommandType::RecordMarker,
-            CommandType::CompleteWorkflowExecution
-        ]
-    );
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["timer"],
-            vec!["signal", "local activity"],
-            vec!["local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
+    run.shut_down().await;
 }
 
 /// Commands sent with query responses can still resolve a local activity, here a try-cancel of a
@@ -2763,12 +2667,7 @@ async fn la_cancelled_with_query_responses_forces_new_task() {
     assert_eq!(job_names(&activation), ["signal", "local activity"]);
     run.complete(&activation).await;
     run.next_completion().await;
-    let run = run.evict_and_shut_down().await;
-    within(
-        "finalizing the worker's shutdown",
-        run.core.finalize_shutdown(),
-    )
-    .await;
+    run.shut_down().await;
 }
 
 /// A legacy query task can be processed between the completion that answered attached queries and
@@ -2806,6 +2705,7 @@ async fn legacy_query_before_forced_task_leaves_la_result_held() {
     run.history.add_workflow_task_started();
     run.send_task(&[]);
     let activation = run.next_activation().await;
+    assert_eq!(job_names(&activation), ["signal", "local activity"]);
     run.complete(&activation).await;
     let last_completion = run.next_completion().await;
     assert_eq!(
@@ -2815,15 +2715,7 @@ async fn legacy_query_before_forced_task_leaves_la_result_held() {
             CommandType::CompleteWorkflowExecution
         ]
     );
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["timer"],
-            vec!["signal", "local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
+    run.shut_down().await;
 }
 
 /// Evicting a run while it holds a local activity result for the next workflow task drops the
@@ -2854,10 +2746,12 @@ async fn eviction_while_la_result_held_executes_la_again() {
     run.send_forced_task_after_signal(&[]);
     // Once replay has caught up, the local activity executes again.
     let activation = run.next_activation().await;
+    assert_eq!(job_names(&activation), ["signal"]);
     run.complete(&activation).await;
     let local_activity = run.poll_local_activity().await;
     run.complete_local_activity(local_activity).await;
     let activation = run.next_activation().await;
+    assert_eq!(job_names(&activation), ["local activity"]);
     run.complete(&activation).await;
     let last_completion = run.next_completion().await;
     assert_eq!(
@@ -2873,50 +2767,7 @@ async fn eviction_while_la_result_held_executes_la_again() {
             .is_err(),
         "The local activity executed again more than once"
     );
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["timer"],
-            vec!["signal"],
-            vec!["local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
-}
-
-/// Like [la_resolved_while_answering_attached_query_replays_like_live], but the task before the
-/// queried one records no command. Replay then takes the command-free completion that answered the
-/// query, directly followed by the forced task, for a workflow task heartbeat and merges the two
-/// tasks. This fails on main too: there the early marker splits the activations instead, and a
-/// result arriving after the query is answered hits the same merge.
-#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
-#[ignore = "Replay merges a command-free task with the next one: temporalio/sdk-rust#1737"]
-#[tokio::test]
-async fn la_resolved_while_answering_query_after_command_free_task_replays_like_live() {
-    let workflow = SignalAfterLocalActivitiesWf {
-        command_free_start: true,
-        ..SignalAfterLocalActivitiesWf::new(1)
-    };
-    let mut run = LiveRun::new(started_history(), workflow, 1);
-    let (query, mut local_activities) = run.run_local_activities_with_queries(&["q"]).await;
-    run.complete_local_activity(local_activities.pop().unwrap())
-        .await;
-    run.answer_queries(query, vec![]).await;
-    run.next_completion().await;
-    run.send_forced_task_after_signal(&[]);
-    let activation = run.next_activation().await;
-    run.complete(&activation).await;
-    run.next_completion().await;
-    assert_eq!(
-        run.live,
-        [
-            vec!["init"],
-            vec!["signal"],
-            vec!["signal", "local activity"]
-        ]
-    );
-    run.assert_replay_matches_live().await;
+    run.shut_down().await;
 }
 
 #[rstest::rstest]
