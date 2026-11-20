@@ -41,6 +41,15 @@ relevant information.
   Stream call and its answer for a `StreamStore`, which a lang SDK implements for a Store in its
   own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
   append of client code against them with `StoreLimits::validate_append`.
+* [lang-internal] Workflow code can append to and close a Stream with the experimental
+  `AppendToStream` and `CloseStream` commands, on a Store in `WorkerConfig::stream_runtimes`. Each
+  call writes with the Producer and the attempt of its Workflow Task. Its result comes back in a
+  `ResolveStreamAppend` or `ResolveStreamClose` job and goes into a `core_stream` marker, so a
+  replay makes no Store call. A close runs once History has the task that asked for it. Core drops
+  a call that has no result when the Workflow's last command comes, as it drops a Local Activity.
+  If a call is waiting to try again at the task's heartbeat, because a try failed with
+  `StoreUnavailable`, got no answer within `try_deadline` or panicked in the code of the Store,
+  the task fails, and the message of its failure starts with `StreamStoreUnavailable:`.
 
 ## [0.12.0] - 2026-11-23
 

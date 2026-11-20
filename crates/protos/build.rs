@@ -166,6 +166,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "coresdk.external_data.LocalActivityMarkerData.backoff",
             "#[serde(with = \"sdk_helpers::opt_duration\")]",
         )
+        // A person reads a Stream marker's JSON in the web UI, so an offset is hex.
+        .field_attribute(
+            "coresdk.external_data.StreamAppendOffsets.first_offset",
+            "#[serde(with = \"sdk_helpers::hex_bytes\")]",
+        )
+        .field_attribute(
+            "coresdk.external_data.StreamAppendOffsets.last_offset",
+            "#[serde(with = \"sdk_helpers::hex_bytes\")]",
+        )
         // Few completions have Stream calls, and Core keeps the metadata of a completion inline
         // in its enums.
         .boxed(".temporal.api.sdk.v1.WorkflowTaskCompletedMetadata.stream_calls")
@@ -174,6 +183,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for prefix in SERDE_DERIVE_PREFIXES {
         builder = builder.type_attribute(*prefix, SERDE_ATTR);
     }
+    // The JSON of a Stream marker has a `oneof` under the name of its field. A serde attribute
+    // ahead of the serde derive is a compiler warning, and `SERDE_ATTR` adds that derive here.
+    builder = builder.type_attribute(
+        "coresdk.external_data.StreamAppendResult.result",
+        "#[serde(rename_all = \"snake_case\")]",
+    );
 
     #[cfg(feature = "vendored-protox")]
     {

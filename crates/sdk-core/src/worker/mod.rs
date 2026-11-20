@@ -41,6 +41,7 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+pub(crate) use workflow::streams::{self, StreamRuntimes};
 
 use crate::{
     ActivityHeartbeat,
@@ -282,6 +283,17 @@ pub struct WorkerConfig {
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
 
+    /// The Stream runtimes of this Worker, keyed by the name of the Store that each one serves,
+    /// with the settings that the Stream calls of Workflow code use. A Stream call on a Store that
+    /// has no runtime here fails the Workflow Task.
+    /// NOTE: Experimental
+    #[builder(default)]
+    pub stream_runtimes: StreamRuntimes,
+
+    /// True on a replay Worker, which makes no live Stream calls.
+    #[builder(skip)]
+    pub(crate) replays_only: bool,
+
     /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
     /// oversized payloads are still warned about, and the server still rejects them. When unset, an
     /// oversized completion is proactively failed as a WFT/activity rather than sent.
@@ -391,6 +403,7 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         {
             return Err("max_outstanding_* fields are mutually exclusive with `tuner`".to_string());
         }
+        config.stream_runtimes.settings.check()?;
 
         match &config.versioning_strategy {
             WorkerVersioningStrategy::None { .. } => {}

@@ -14,6 +14,7 @@ import "temporal/api/failure/v1/message.proto";
 import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
@@ -32,7 +33,7 @@ import "temporal/sdk/core/nexus/nexus.proto";
 // 3. random-seed-updates
 // 4. signals/updates
 // 5. all others
-// 6. local activity resolutions
+// 6. local activity resolutions, then Stream results
 // 7. queries
 // 8. evictions
 //
@@ -48,6 +49,11 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  in that same activation (prime example: cancelling not-wait-for-cancel activities). So, we do
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
+// * The results of Stream calls go after the local activity resolutions, since a replay scans
+//  ahead for their marker too. The appends come first and then the closes, each kind by `seq`. A
+//  replay that gives the results of several activations in one keeps the order of those
+//  activations among the results of Stream calls, and gives them after each local activity
+//  resolution.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -147,6 +153,10 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // An append to a Stream finished.
+        ResolveStreamAppend resolve_stream_append = 18;
+        // A close of a Stream finished.
+        ResolveStreamClose resolve_stream_close = 19;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -431,4 +441,48 @@ message RemoveFromCache {
         WORKFLOW_EXECUTION_ENDING = 10;
     }
     EvictionReason reason = 2;
+}
+
+// The result of an `AppendToStream`. Core gives each result in the next activation after it comes,
+// so each result can cost an activation.
+//
+// A replay gives a result in the activation in which the first run gave it only if History has
+// the flag that turns workflow task chunking off. Without that flag a replay gives the results of
+// a task in the order of the first run, and it gives a result in another activation in two cases:
+// * A Workflow Task completes with no command, and the first activation of the next task has a
+//   result. A replay takes the two tasks as one, and can give the results of the first two
+//   activations of the second task in one.
+// * A Workflow Task starts with an Update that Workflow code rejects, which leaves no event. A
+//   replay with no job to give then gives the results of History in the order of the first run,
+//   up to the first one whose call Workflow code hasn't made, in one activation.
+// A task with only Stream calls replays in the activations of the same task with Local
+// Activities. In a task with both, a result waits for each result of the other kind that the
+// first run gave before it, so its activations can differ from those of Local Activities alone.
+message ResolveStreamAppend {
+    // The `seq` of the `AppendToStream`.
+    uint32 seq = 1;
+    oneof status {
+        StreamAppended appended = 2;
+        // The failure of the append, with these parts:
+        // * an `ApplicationFailureInfo` whose type is `stream_` and the reason of the Stream error
+        //   in snake case, such as `stream_closed`, and whose `non_retryable` is set
+        // * in its details, one `binary/protobuf` payload of a
+        //   `temporal.api.stream.v1.StreamErrorDetails`
+        // * a message of at most 4096 bytes
+        temporal.api.failure.v1.Failure failed = 3;
+    }
+}
+
+message StreamAppended {
+    bytes first_offset = 1;
+    bytes last_offset = 2;
+}
+
+// The result of a `CloseStream`. What `ResolveStreamAppend` says of its activation holds for it.
+message ResolveStreamClose {
+    // The `seq` of the `CloseStream`.
+    uint32 seq = 1;
+    // Unset if the Stream is closed, even if it was already closed before. If set, it has the parts
+    // of the `failed` of a `ResolveStreamAppend`.
+    temporal.api.failure.v1.Failure failed = 2;
 }

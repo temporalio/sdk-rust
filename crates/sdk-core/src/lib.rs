@@ -39,6 +39,7 @@ pub use crate::worker::client::{
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
 pub use url::Url;
+pub use worker::streams::{StreamRuntimes, StreamSettings};
 pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
     FixedSizeSlotSupplier, LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError,

@@ -330,6 +330,9 @@ impl WorkflowFuture {
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }
+                Variant::ResolveStreamAppend(_) | Variant::ResolveStreamClose(_) => {
+                    bail!("This SDK sends no Stream command")
+                }
             }
         }
 

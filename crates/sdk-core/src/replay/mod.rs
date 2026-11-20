@@ -80,6 +80,7 @@ where
         self.config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
         self.config.task_types = WorkerTaskTypes::workflow_only();
         self.config.skip_client_worker_set_check = true;
+        self.config.replays_only = true;
         let historator = Historator::new(self.history_stream);
         let post_activate = historator.get_post_activate_hook();
         let shutdown_tok = historator.get_shutdown_setter();
