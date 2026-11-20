@@ -11,6 +11,7 @@ use crate::{
     },
 };
 use futures_util::stream;
+use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -120,6 +121,96 @@ async fn legacy_query(#[case] include_history: bool) {
         clear_eviction().await;
         first_wft().await;
     }
+
+    let task = worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::FireTimer(_)),
+        }]
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            task.run_id,
+            vec![CompleteWorkflowExecution { result: None }.into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+/// A cached run can be queried after it reports a lang flag but before history containing that
+/// task's completion arrives. The query runs against state the flag already shaped, so it must
+/// still see the flag.
+#[tokio::test]
+async fn cached_legacy_query_sees_lang_flags_not_yet_in_history() {
+    let wfid = "fake_wf_id";
+    let lang_flag = 2;
+    let t = canned_histories::single_timer("1");
+    let first_task = hist_to_poll_resp(&t, wfid.to_owned(), 1.into());
+    // A direct query on the sticky queue has no history and no started event of its own, and names
+    // the task the run last completed as the previous one
+    let mut query_task = hist_to_poll_resp(&t, wfid.to_owned(), 1.into());
+    query_task.previous_started_event_id = first_task.started_event_id;
+    query_task.started_event_id = 0;
+    query_task.query = Some(WorkflowQuery {
+        query_type: "query-type".to_string(),
+        ..Default::default()
+    });
+    query_task.history = Some(History { events: vec![] });
+    let tasks = [
+        first_task,
+        query_task,
+        hist_to_poll_resp(&t, wfid.to_owned(), 2.into()),
+    ];
+    let sent_lang_flags = Arc::new(Mutex::new(vec![]));
+    let sent_lang_flags_c = sent_lang_flags.clone();
+    let mut mock = MockPollCfg::from_resp_batches(wfid, t, tasks, mock_worker_client());
+    mock.num_expected_legacy_query_resps = 1;
+    mock.completion_mock_fn = Some(Box::new(move |c| {
+        sent_lang_flags_c
+            .lock()
+            .push(c.sdk_metadata.lang_used_flags.clone());
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(mock);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
+    let worker = mock_worker(mock);
+
+    let task = worker.poll_workflow_activation().await.unwrap();
+    let mut completion = WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    );
+    completion.add_internal_flags(lang_flag);
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    assert_eq!(sent_lang_flags.lock().as_slice(), &[vec![lang_flag]]);
+
+    let task = worker.poll_workflow_activation().await.unwrap();
+    let query = assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+        }] => q
+    );
+    assert!(task.is_replaying);
+    assert!(
+        task.available_internal_flags.contains(&lang_flag),
+        "Query activation must see the lang flag the run already reported. Got: {:?}",
+        task.available_internal_flags
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            task.run_id,
+            query_ok(&query.query_id, "response"),
+        ))
+        .await
+        .unwrap();
+    // Answering the query must not produce a workflow task completion
+    assert_eq!(sent_lang_flags.lock().len(), 1);
 
     let task = worker.poll_workflow_activation().await.unwrap();
     assert_matches!(

@@ -158,8 +158,20 @@ impl InternalFlags {
         }
     }
 
+    /// Lang flags recorded in history
     pub(crate) fn all_lang(&self) -> impl Iterator<Item = u32> + '_ {
         self.lang.iter().copied()
+    }
+
+    /// Lang flags live and query activations may rely on. Includes flags lang already reported for
+    /// this run that history has not confirmed yet, because the run's in-memory state was already
+    /// shaped by them and activations like queries can arrive before the completion that records
+    /// them is seen.
+    pub(crate) fn all_lang_for_activation(&self) -> impl Iterator<Item = u32> + use<> {
+        self.all_lang()
+            .chain(self.lang_since_last_complete.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
     }
 
     pub(crate) fn last_sdk_version(&self) -> Option<&str> {
@@ -235,6 +247,7 @@ mod tests {
         let gathered = f.gather_for_wft_complete();
         assert_matches!(gathered.core_used_flags.as_slice(), &[]);
         assert_matches!(gathered.lang_used_flags.as_slice(), &[]);
+        assert_eq!(f.all_lang_for_activation().count(), 0);
     }
 
     #[test]
@@ -271,6 +284,8 @@ mod tests {
         assert_matches!(gathered.lang_used_flags.as_slice(), &[1]);
         assert!(!f.try_use(CoreInternalFlags::IdAndTypeDeterminismChecks, false));
         assert_eq!(f.all_lang().count(), 0);
+        // Activations still see what lang already relied on
+        assert!(f.all_lang_for_activation().eq([1]));
 
         // History recorded flag 2 but not the flag 1 that was sent
         f.add_from_complete(&WorkflowTaskCompletedEventAttributes {
@@ -291,6 +306,7 @@ mod tests {
         assert!(gathered.sdk_version.is_empty());
         assert!(f.try_use(CoreInternalFlags::UpsertSearchAttributeOnPatch, false));
         assert!(f.all_lang().eq([2]));
+        assert!(f.all_lang_for_activation().eq([1, 2]));
 
         f.add_from_complete(&WorkflowTaskCompletedEventAttributes {
             sdk_metadata: Some(WorkflowTaskCompletedMetadata {

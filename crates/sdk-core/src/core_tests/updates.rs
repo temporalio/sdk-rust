@@ -750,9 +750,10 @@ async fn patch_after_discarded_first_task_rejection_replays() {
 
 /// Decides whether a lang SDK uses a default-enabled lang flag on an activation, returning whether
 /// the flag is used and whether it must be reported to Core. A flag listed in
-/// `available_internal_flags` is used whether or not the activation is replaying, and needs no
-/// report since history already has it. A flag missing from that list is used and reported only
-/// when not replaying, because history that never recorded it must keep the old behavior.
+/// `available_internal_flags` is used whether or not the activation is replaying. Lang does not
+/// report it again, because Core already tracks it and keeps sending it with workflow task
+/// completions until history records it. A flag missing from that list keeps the old behavior
+/// when replaying, since history never recorded it, and is used and reported when live.
 fn default_enabled_lang_flag(act: &WorkflowActivation, flag: u32) -> (bool, bool) {
     if act.available_internal_flags.contains(&flag) {
         (true, false)
@@ -765,9 +766,9 @@ fn default_enabled_lang_flag(act: &WorkflowActivation, flag: u32) -> (bool, bool
 
 /// Lang flags sent with a dropped first-task rejection are not in history either. A lang SDK that
 /// does not report flags already listed in `available_internal_flags` must still make the same
-/// flag-dependent choice when the next persisted task replays from scratch as it made live, even
-/// though the flag may be listed on replay but not live. This checks flag availability and
-/// selection, not lang's resulting commands.
+/// flag-dependent choice when the next persisted task replays from scratch as it made live, so the
+/// persisted completion has to carry the flag whether or not lang reports it again. This checks
+/// flag availability and selection, not lang's resulting commands.
 #[tokio::test]
 async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay() {
     let lang_flag = 2;
@@ -834,5 +835,184 @@ async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay
         update_metadata.lang_used_flags.contains(&lang_flag),
         "The persisted update completion must record lang flag {lang_flag}. \
          Got: {update_metadata:?}"
+    );
+}
+
+/// Lang's handling of a signal that starts a timer only when lang flag `flag` is not in effect
+fn signal_cmds_unless_flag(act: &WorkflowActivation, flag: u32) -> Vec<workflow_command::Variant> {
+    if act.available_internal_flags.contains(&flag) {
+        vec![]
+    } else {
+        vec![
+            StartTimer {
+                seq: 1,
+                start_to_fire_timeout: Some(prost_dur!(from_secs(1))),
+            }
+            .into(),
+        ]
+    }
+}
+
+/// A lang flag sent with a discarded rejection completion is not in history, so another worker
+/// can complete later tasks without it. A cached run that later replays those tasks must make the
+/// same flag-dependent choice as that worker and as a cold replay, or it fails with a
+/// nondeterminism error that a fresh worker would not hit.
+#[tokio::test]
+async fn cached_replay_of_other_workers_task_ignores_discarded_lang_flags() {
+    let lang_flag = 2;
+    let mut prefix = TestHistoryBuilder::default();
+    prefix.add_by_type(EventType::WorkflowExecutionStarted);
+    prefix.add_full_wf_task();
+    if let Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) =
+        prefix.last_event().and_then(|e| e.attributes.as_mut())
+    {
+        a.sdk_metadata = Some(WorkflowTaskCompletedMetadata {
+            core_used_flags: vec![1, 2, 3, 4],
+            ..Default::default()
+        });
+    }
+    let mut speculative = prefix.clone();
+    speculative.add_workflow_task_scheduled_and_started();
+    let mut speculative_task =
+        hist_to_poll_resp(&speculative, "fakeid", ResponseType::AllHistory).resp;
+    speculative_task.add_update_request(REJECTED_UPDATE_ID, 5);
+    // Another worker handled the signal without the flag and so started the timer
+    let mut persisted = prefix;
+    persisted.add_we_signaled("sig", vec![]);
+    persisted.add_full_wf_task();
+    let timer_started_event_id = persisted.add_timer_started("1".to_string());
+    persisted.add_workflow_task_scheduled_and_started();
+    let tasks = [
+        hist_to_poll_resp(&persisted, "fakeid", ResponseType::ToTaskNum(1)).resp,
+        speculative_task,
+        hist_to_poll_resp(&persisted, "fakeid", ResponseType::AllHistory).resp,
+    ];
+
+    let completions = Arc::new(Mutex::new(vec![]));
+    let completions_c = completions.clone();
+    let mut mh =
+        MockPollCfg::from_resp_batches("fakeid", persisted.clone(), tasks, mock_worker_client());
+    mh.completion_mock_fn = Some(Box::new(move |c| {
+        let mut completions = completions_c.lock();
+        completions.push((c.commands.clone(), c.sdk_metadata.clone()));
+        // The server discards the speculative task's rejection
+        let reset_history_event_id = if completions.len() == 2 { 3 } else { 0 };
+        Ok(RespondWorkflowTaskCompletedResponse {
+            reset_history_event_id,
+            ..Default::default()
+        })
+    }));
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    let run_id = act.run_id.clone();
+    assert_matches!(
+        act.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert!(!act.is_replaying);
+    assert_matches!(
+        act.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::DoUpdate(_)),
+        }]
+    );
+    let mut completion = WorkflowActivationCompletion::from_cmd(act.run_id, reject_update());
+    completion.add_internal_flags(lang_flag);
+    core.complete_workflow_activation(completion).await.unwrap();
+
+    // Only the signal job (no initialization or eviction) shows the run stayed cached
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(act.run_id, run_id);
+    assert!(act.is_replaying);
+    assert_matches!(
+        act.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+        }]
+    );
+    let cached_available = act.available_internal_flags.clone();
+    let cmds = signal_cmds_unless_flag(&act, lang_flag);
+    // A nondeterminism error here would fail the task, which the mock client does not expect
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(act.run_id, cmds))
+        .await
+        .unwrap();
+    core.drain_pollers_and_shutdown().await;
+
+    let completions = completions.lock().clone();
+    assert_eq!(completions.len(), 3, "Completions: {completions:?}");
+    assert!(
+        completions[1].1.lang_used_flags.contains(&lang_flag),
+        "The discarded rejection completion must have sent lang flag {lang_flag}. \
+         Got: {:?}",
+        completions[1].1
+    );
+    assert!(
+        !cached_available.contains(&lang_flag),
+        "Cached replay must not offer lang flag {lang_flag}, which history never recorded. \
+         Got: {cached_available:?}"
+    );
+    // The timer matched TimerStarted from history, so it is not sent again
+    assert!(
+        completions[2].0.is_empty(),
+        "Cached replay must match the timer to event {timer_started_event_id}. Got: {:?}",
+        completions[2].0
+    );
+    assert!(
+        completions[2].1.lang_used_flags.contains(&lang_flag),
+        "History still lacks lang flag {lang_flag}, so it must be sent again. Got: {:?}",
+        completions[2].1
+    );
+
+    let replay_worker = init_replay_worker(ReplayWorkerInput::new(
+        test_worker_cfg().build().unwrap(),
+        stream::iter([HistoryForReplay::from(persisted)]),
+    ))
+    .unwrap();
+    let mut signal_activations = vec![];
+    let mut evictions = vec![];
+    loop {
+        let act = match replay_worker.poll_workflow_activation().await {
+            Ok(act) => act,
+            Err(PollError::ShutDown) => break,
+            Err(e) => panic!("Unexpected replay poll error: {e:?}"),
+        };
+        let mut cmds = vec![];
+        for job in &act.jobs {
+            match job.variant.as_ref() {
+                Some(workflow_activation_job::Variant::SignalWorkflow(_)) => {
+                    signal_activations.push(act.clone());
+                    cmds = signal_cmds_unless_flag(&act, lang_flag);
+                }
+                Some(workflow_activation_job::Variant::RemoveFromCache(r)) => {
+                    evictions.push((r.reason(), r.message.clone(), signal_activations.len()));
+                }
+                _ => {}
+            }
+        }
+        replay_worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(act.run_id, cmds))
+            .await
+            .unwrap();
+    }
+    assert_eq!(signal_activations.len(), 1);
+    assert_eq!(
+        signal_activations[0].available_internal_flags, cached_available,
+        "Cold replay must offer the same lang flags as the cached replay"
+    );
+    // The replay worker evicts after replay finishes; any other eviction means replay failed
+    assert_matches!(
+        evictions.as_slice(),
+        [(EvictionReason::LangRequested, _, 1)],
+        "Evictions: {evictions:?}"
     );
 }

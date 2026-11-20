@@ -561,6 +561,17 @@ impl WorkflowMachines {
             self.local_activity_data.activation_dispatched();
         }
         let is_replaying = self.replaying || all_query;
+        // Replayed history may have been produced by a worker that never saw lang flags from one of
+        // this run's discarded completions, so replay must offer only what history recorded, as a
+        // cold replay would. Queries never reach history and see the run as lang left it.
+        let available_internal_flags = {
+            let flags = (*self.observed_internal_flags).borrow();
+            if self.replaying && !all_query {
+                flags.all_lang().collect()
+            } else {
+                flags.all_lang_for_activation().collect()
+            }
+        };
         let deployment_version_for_current_task = if is_replaying {
             self.current_wft_deployment_info.clone()
         } else {
@@ -573,10 +584,7 @@ impl WorkflowMachines {
             run_id: self.run_id.clone(),
             history_length: self.last_processed_event as u32,
             jobs: jobs.into_iter().map(Into::into).collect(),
-            available_internal_flags: (*self.observed_internal_flags)
-                .borrow()
-                .all_lang()
-                .collect(),
+            available_internal_flags,
             history_size_bytes: self.history_size_bytes,
             continue_as_new_suggested: self.continue_as_new_suggested,
             deployment_version_for_current_task: deployment_version_for_current_task
