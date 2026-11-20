@@ -92,6 +92,18 @@ jobs:
           name: state-machine-coverage
           path: machine_coverage/
 
+  test-all-features:
+    name: Unit tests (all features, Linux x64)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
+        with:
+          mise-install-args: protoc
+          rust-cache-key: all-features
+      - run: cargo test --workspace --all-features --lib -- --include-ignored --nocapture
+
   msrv:
     name: "Verify MSRV (${{ matrix.group }})"
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 20 || 15 }}
@@ -177,6 +189,19 @@ jobs:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - run: cargo integ-test
+
+  integ-tests-all-features:
+    name: Integ tests (all features, Linux x64)
+    timeout-minutes: ${{ github.ref == 'refs/heads/main' && 35 || 30 }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
+        with:
+          mise-install-args: protoc
+          rust-cache-key: all-features
+      # cloud-test-mode is included in all features; the default jobs cover its excluded tests.
+      - run: cargo integ-test -c=--all-features
 
   wasm-workflow-tests:
     name: WASM workflow tests
@@ -395,7 +420,9 @@ jobs:
     needs:
       - build-and-lint
       - test
+      - test-all-features
       - integ-tests
+      - integ-tests-all-features
       - c-bridge-static-link-test
       - cloud-tests
       - heavy-tests

@@ -1,12 +1,6 @@
-use crate::{
-    telemetry::VecDisplayer,
-    worker::workflow::{OutgoingJob, WFCommand, WorkflowStartedInfo},
-};
+use crate::worker::workflow::{OutgoingJob, WorkflowStartedInfo};
 use prost_types::Timestamp;
-use std::{
-    collections::HashMap,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use std::collections::HashMap;
 use temporalio_common::protos::{
     coresdk::workflow_activation::start_workflow_from_attribs,
     temporal::api::{
@@ -16,29 +10,16 @@ use temporalio_common::protos::{
     utilities::TryIntoOrNone,
 };
 
-/// Represents a connection to a lang side workflow that can have activations fed into it and
-/// command responses pulled out.
+/// Tracks workflow information and queues jobs for the next language SDK activation.
+#[derive(Default)]
 pub(crate) struct DrivenWorkflow {
     started_attrs: Option<WorkflowStartedInfo>,
     search_attribute_modifications: HashMap<String, Payload>,
-    incoming_commands: Receiver<Vec<WFCommand>>,
     /// Outgoing activation jobs that need to be sent to the lang sdk
     outgoing_wf_activation_jobs: Vec<OutgoingJob>,
 }
 
 impl DrivenWorkflow {
-    pub(super) fn new() -> (Self, Sender<Vec<WFCommand>>) {
-        let (tx, rx) = mpsc::channel();
-        (
-            Self {
-                started_attrs: None,
-                search_attribute_modifications: Default::default(),
-                incoming_commands: rx,
-                outgoing_wf_activation_jobs: vec![],
-            },
-            tx,
-        )
-    }
     /// Start the workflow
     pub(super) fn start(
         &mut self,
@@ -78,16 +59,6 @@ impl DrivenWorkflow {
     /// Drain all pending jobs, so that they may be sent to the driven workflow
     pub(super) fn drain_jobs(&mut self) -> Vec<OutgoingJob> {
         std::mem::take(&mut self.outgoing_wf_activation_jobs)
-    }
-
-    /// Obtain any output from the workflow's recent execution(s). Because the lang sdk is
-    /// responsible for calling workflow code as a result of receiving tasks from
-    /// [crate::Core::poll_task], we cannot directly iterate it here. Commands are simply pulled
-    /// from a buffer that the language side sinks into when it calls [crate::Core::complete_task]
-    pub(super) fn fetch_workflow_iteration_output(&mut self) -> Vec<WFCommand> {
-        let in_cmds = self.incoming_commands.try_recv().unwrap_or_default();
-        debug!(in_cmds = %in_cmds.display(), "wf bridge iteration fetch");
-        in_cmds
     }
 
     /// Lang sent us an SA upsert command - use it to update our current view of search attributes.
