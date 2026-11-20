@@ -758,7 +758,9 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                         attrs: RequestCancelExternalWorkflowExecutionCommandAttributes {
                             namespace: self.shared_state.namespace.clone(),
                             workflow_id: self.shared_state.workflow_id.clone(),
-                            run_id: self.shared_state.run_id.clone(),
+                            // Left empty so the server cancels the child's latest run: the run
+                            // recorded at start is stale if the child continued-as-new.
+                            run_id: String::new(),
                             child_workflow_only: true,
                             reason,
                             ..Default::default()
@@ -995,6 +997,43 @@ mod test {
         assert_eq!(failure.workflow_id, "child-id");
         assert_eq!(failure.workflow_type, "child-type");
         assert_eq!(failure.cause(), lang_cause);
+    }
+
+    #[test]
+    fn cancel_after_started_targets_latest_run() {
+        // The run id recorded at start may be stale after the child continues-as-new, so the
+        // cancel request must not pin it.
+        let mut machine = ChildWorkflowMachine::from_parts(
+            Started {}.into(),
+            SharedState {
+                initiated_event_id: 10,
+                started_event_id: 11,
+                lang_sequence_number: 7,
+                namespace: "namespace".into(),
+                workflow_id: "child-id".into(),
+                run_id: "first-run-id".into(),
+                workflow_type: "child-type".into(),
+                cancelled_before_sent: false,
+                cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
+                internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                annotations: Default::default(),
+            },
+        );
+        let responses = machine
+            .cancel("cancel reason".to_string(), Default::default())
+            .unwrap();
+        let [MachineResponse::NewCoreOriginatedCommand { attrs, .. }] = responses.as_slice()
+        else {
+            panic!("Expected a single cancel command");
+        };
+        let command::Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(attrs) =
+            attrs
+        else {
+            panic!("Expected request cancel external command");
+        };
+        assert_eq!(attrs.workflow_id, "child-id");
+        assert!(attrs.child_workflow_only);
+        assert_eq!(attrs.run_id, "");
     }
 
     #[test]
