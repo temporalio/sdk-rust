@@ -1,6 +1,8 @@
 //! The Stream calls of Workflow code, through a Worker on a mock server. The mock server writes the
 //! History of each completion, so a replay Worker can replay it.
 
+mod reads;
+
 use super::stream_store::{MemoryStore, Op, Request};
 use crate::{
     StreamRuntimes, StreamSettings, Worker, WorkerConfig, init_replay_worker,
@@ -372,6 +374,9 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             }
             Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
                 history.add_workflow_execution_completed();
+            }
+            Some(Attributes::FailWorkflowExecutionCommandAttributes(_)) => {
+                history.add_workflow_execution_failed();
             }
             // No test replays an Update.
             Some(Attributes::ProtocolMessageCommandAttributes(_)) => {}
@@ -754,6 +759,7 @@ fn fast_tries(wc: &mut WorkerConfig) {
         retry_first_wait: Duration::from_millis(10),
         retry_max_wait: Duration::from_millis(20),
         try_deadline: Duration::from_millis(50),
+        ..StreamSettings::default()
     };
 }
 
@@ -1266,6 +1272,9 @@ enum OtherTask {
     /// The cached run has no Stream call, and the marker of the other Worker is on the last of
     /// three pages of History.
     WithTheMarkerOnALaterPage,
+    /// The cached run has no Stream call, and the marker of a read of the other Worker is in the
+    /// lookahead of the update.
+    WithAReadMarkerInTheLookahead,
 }
 
 /// Waits until `done` returns true, for at most 10 seconds, so that a test fails rather than hangs.
@@ -1294,6 +1303,7 @@ async fn respond(worker: &Worker, activation: &WorkflowActivation, workflow: Wor
 #[case(OtherTask::AtTheSameStartedEventId)]
 #[case(OtherTask::AfterATimeout)]
 #[case(OtherTask::WithTheMarkerOnALaterPage)]
+#[case(OtherTask::WithAReadMarkerInTheLookahead)]
 #[tokio::test]
 async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     #[case] other_task: OtherTask,
@@ -1301,6 +1311,9 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     match other_task {
         OtherTask::AfterATimeout => return after_a_timeout().await,
         OtherTask::WithTheMarkerOnALaterPage => return with_the_marker_on_a_later_page().await,
+        OtherTask::WithAReadMarkerInTheLookahead => {
+            return reads::with_a_read_marker_in_the_lookahead().await;
+        }
         _ => {}
     }
     let store = store(&["s"]).await;
@@ -1517,7 +1530,7 @@ async fn with_the_marker_on_a_later_page() {
     let closes: Vec<_> = (store.requests().into_iter())
         .filter_map(|request| match request {
             Request::Close(close) => Some(writer(close.producer)),
-            Request::Append(_) => None,
+            _ => None,
         })
         .collect();
     let id = producer(&run_id, Default::default()).id;

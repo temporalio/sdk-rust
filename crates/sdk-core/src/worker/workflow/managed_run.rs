@@ -15,6 +15,7 @@ use crate::{
             WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
+            is_stream_replay_failure,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             streams::{Streams, task_epoch},
         },
@@ -665,18 +666,32 @@ impl ManagedRun {
             WftFailureKind::LegacyQuery
         };
 
+        // A lang failure of the type of a Stream replay error doesn't count as one.
+        let error_type = if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError) {
+            Some(WorkflowErrorType::Nondeterminism)
+        } else if is_auto_fail && is_stream_replay_failure(&failure) {
+            Some(WorkflowErrorType::StreamReplay)
+        } else {
+            None
+        };
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
         // Only done on the first attempt: if that attempt's completion didn't reach the server,
         // later attempts fall through to the normal task failure path, which won't re-report.
         if kind == WftFailureKind::Task
             && attempt <= 1
-            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-            && self.config.should_fail_workflow(
-                &self.wfm.machines.workflow_type,
-                &WorkflowErrorType::Nondeterminism,
-            )
+            && let Some(error_type) = error_type
+            && self
+                .config
+                .should_fail_workflow(&self.wfm.machines.workflow_type, &error_type)
         {
-            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            match error_type {
+                WorkflowErrorType::Nondeterminism => {
+                    warn!(failure=?failure, "Failing workflow due to nondeterminism error")
+                }
+                WorkflowErrorType::StreamReplay => {
+                    warn!(failure=?failure, "Failing workflow due to a Stream replay error")
+                }
+            }
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -846,8 +861,14 @@ impl ManagedRun {
                 if let Some(wola) = self.waiting_on_la.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
-                let must_complete = self.wfm.machines.stream_must_complete();
-                if completing_la_heartbeat || !data.query_responses.is_empty() || must_complete {
+                let early = (self.wfm.machines.stream_must_complete())
+                    .then_some(EarlyCompletion::MarkerFull)
+                    .or((self.wfm.machines.must_complete_before_stream_reads())
+                        .then_some(EarlyCompletion::ForServer));
+                if early.is_some() {
+                    self.complete_stream_task();
+                }
+                if completing_la_heartbeat || !data.query_responses.is_empty() || early.is_some() {
                     // Reporting a query while an LA is still running must request another WFT;
                     // otherwise the LA could resolve without a task on which to deliver its job.
                     let hb_timeout_handle = sink_heartbeat_timeout_start(
@@ -866,7 +887,8 @@ impl ManagedRun {
                         // needs to be honored after those jobs are processed.
                         completion_pending: completion_pending
                             .or(completing_heartbeat_autocomplete
-                                .then_some(EarlyCompletion::Heartbeat)),
+                                .then_some(EarlyCompletion::Heartbeat))
+                            .or(early),
                     });
                     Ok(Some(self.prepare_complete_resp(
                         completion.resp_chan,
@@ -1020,6 +1042,26 @@ impl ManagedRun {
             || update.has_stream_markers();
         (replaces_held_task && (has_stream_work || !self.config.stream_runtimes.is_empty()))
             || (after_other_tasks && has_stream_work)
+    }
+
+    /// Completes a Workflow Task that only Stream reads hold open, at a graceful shutdown, which
+    /// would wait for them otherwise. The reads stop with no end, and another Worker goes on with
+    /// each from History.
+    pub(super) fn end_reads_for_shutdown(&mut self) -> RunUpdateAct {
+        if self.activation.is_some()
+            || self.wft.is_none()
+            || self.trying_to_evict.is_some()
+            || !self.wfm.machines.holds_only_stream_reads()
+        {
+            return None;
+        }
+        if let Some(waiting) = self.waiting_on_la.take() {
+            waiting.hb_timeout_handle.abort();
+        }
+        self.wfm.machines.park_stream_reads();
+        self.dispatch_stream_calls();
+        let run_id = self.run_id().to_string();
+        self.update_to_acts(Ok(Some(ActivationOrAuto::Autocomplete { run_id }).into()))
     }
 
     /// Stops the Stream calls of the run, and evicts it. The run that replaces it takes `work`,
@@ -1276,8 +1318,10 @@ impl ManagedRun {
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         let stream_calls_open = self.wfm.machines.stream_needs_next_task();
         // An evicted run with an open Stream call completes its task now, not at its timeout. The
-        // next task skips the sticky queue, since this Worker no longer has the run.
-        let leaves_worker = can_report_eviction && stream_calls_open;
+        // next task skips the sticky queue, since this Worker no longer has the run. A read that a
+        // shutdown stopped goes on on another Worker too.
+        let leaves_worker = (can_report_eviction && stream_calls_open)
+            || self.wfm.machines.has_parked_stream_reads();
         let has_stream_marker = self.wfm.machines.has_stream_marker();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
@@ -1599,8 +1643,11 @@ struct WaitingOnLAs {
 enum EarlyCompletion {
     /// The heartbeat of the task fired.
     Heartbeat,
-    /// The Stream marker of the task has no room for the next result.
+    /// The Stream marker of the task, or its room for Records, has no space for the next result.
     MarkerFull,
+    /// Only Stream reads hold the task, and it has a command, a message or a close intent for the
+    /// server, which must not wait for a read.
+    ForServer,
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {

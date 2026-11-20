@@ -1781,7 +1781,13 @@ pub(crate) enum WFMachinesError {
     /// A Stream call that this Worker can't serve now. Its message says why.
     #[error("{0}")]
     Stream(String),
+    /// A replay whose Store no longer has the Records of a read as the first run read them.
+    #[error("{0}")]
+    StreamReplay(String),
 }
+
+/// The type of the failure of a [`WFMachinesError::StreamReplay`], which can fail the Workflow.
+const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
 
 /// Helper macro to create Nondeterminism errors
 ///
@@ -1815,12 +1821,14 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_)
+            | WFMachinesError::Stream(_)
+            | WFMachinesError::StreamReplay(_) => EvictionReason::Fatal,
         }
     }
 
     fn as_failure(&self) -> Failure {
-        Failure {
+        let mut failure = Failure {
             failure: Some(
                 temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
                     self.to_string(),
@@ -1828,8 +1836,22 @@ impl WFMachinesError {
                 ),
             ),
             force_cause: WorkflowTaskFailedCause::from(self.evict_reason()) as i32,
+        };
+        if let WFMachinesError::StreamReplay(_) = self
+            && let Some(FailureInfo::ApplicationFailureInfo(info)) =
+                (failure.failure.as_mut()).and_then(|failure| failure.failure_info.as_mut())
+        {
+            info.r#type = STREAM_REPLAY_ERROR_TYPE.to_string();
         }
+        failure
     }
+}
+
+/// Returns true for the failure of a [`WFMachinesError::StreamReplay`].
+fn is_stream_replay_failure(failure: &Failure) -> bool {
+    let info = (failure.failure.as_ref()).and_then(|failure| failure.failure_info.as_ref());
+    matches!(info, Some(FailureInfo::ApplicationFailureInfo(info))
+        if info.r#type == STREAM_REPLAY_ERROR_TYPE)
 }
 
 impl From<MachineError<WFMachinesError>> for WFMachinesError {
