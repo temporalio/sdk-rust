@@ -56,6 +56,14 @@ relevant information.
 * Workflows no longer get stuck failing workflow tasks when an activity cancelled with the
   `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
   late completions of abandoned activities already were.
+* Core and lang SDK flags sent with a workflow task completion that the server discards, such as
+  an update rejected on the first task of a workflow started with a start delay, are no longer
+  treated as recorded. Core keeps sending them with later completions until history records them.
+  On a cached run, live and query activations still list lang flags that lang already reported in
+  `available_internal_flags`, even before history records them, while activations that replay
+  history list only the lang flags history has recorded, as a fresh replay would. Previously, a
+  later `patched` call could fail replay with a nondeterminism error, and lang flags used afterward
+  could be missing from history so that replay selected different flag-dependent behavior.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
 * Downloading an ephemeral dev or test server binary retries a transfer that breaks while the
   archive streams in, such as a reset connection, instead of failing the server start.
