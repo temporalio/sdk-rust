@@ -150,6 +150,10 @@ impl LocalActivityData {
         }
     }
 
+    pub(super) fn advance_to_activation(&mut self, activation_index: u64) {
+        self.activation_index = self.activation_index.max(activation_index);
+    }
+
     pub(super) fn current_activation_index(&self) -> u64 {
         self.activation_index
     }
