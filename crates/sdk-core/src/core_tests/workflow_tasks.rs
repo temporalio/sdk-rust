@@ -45,7 +45,8 @@ use temporalio_common::{
             common::{VersioningIntent, extract_local_activity_marker_details},
             workflow_activation::{
                 FireTimer, InitializeWorkflow, ResolveActivity, UpdateRandomSeed,
-                WorkflowActivationJob, remove_from_cache::EvictionReason, workflow_activation_job,
+                WorkflowActivation, WorkflowActivationJob, remove_from_cache::EvictionReason,
+                workflow_activation_job,
             },
             workflow_commands::{
                 ActivityCancellationType, CancelTimer, CompleteWorkflowExecution,
@@ -62,12 +63,13 @@ use temporalio_common::{
             enums::v1::{CommandType, EventType, RetryState, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
-                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes,
-                TimerFiredEventAttributes, WorkflowPropertiesModifiedExternallyEventAttributes,
-                history_event,
+                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes, History,
+                HistoryEvent, TimerFiredEventAttributes,
+                WorkflowPropertiesModifiedExternallyEventAttributes, history_event,
             },
             workflowservice::v1::{
-                GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
+                GetWorkflowExecutionHistoryResponse, PollWorkflowTaskQueueResponse,
+                RespondWorkflowTaskCompletedResponse,
             },
         },
     },
@@ -3343,6 +3345,220 @@ async fn fetching_to_continue_replay_works() {
             variant: Some(workflow_activation_job::Variant::FireTimer(_)),
         }]
     );
+}
+
+/// What the third Workflow Task of the History in [history_with_third_task] records in its
+/// completion before timer 3.
+#[derive(Clone, Copy, Debug)]
+enum ThirdTask {
+    /// The result of Local Activity 1. The Workflow starts timer 3 once it resolves.
+    LocalActivity,
+    /// The marker of patch `p`.
+    Patch,
+    /// The acceptance of Update `upd1`, whose handler starts timer 3.
+    Update,
+}
+
+/// Returns a History of five Workflow Tasks. Task 1 starts timer 1, task 2 completes with no
+/// command, and a signal schedules task 3. Task 3 does what `third` says and starts timer 3, task
+/// 4 starts timer 4, and the firing of timer 4 schedules task 5. The completion of each task has a
+/// lang flag with the number of the task, and the first one also has `core` flags.
+fn history_with_third_task(third: ThirdTask, core: &[CoreInternalFlags]) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut accepted = None;
+    for task in 1..=4 {
+        t.add_full_wf_task();
+        t.set_flags_last_wft(if task == 1 { core } else { &[] }, &[task]);
+        match (task, third) {
+            (2, _) => {
+                t.add_we_signaled("go", vec![]);
+                continue;
+            }
+            (3, ThirdTask::LocalActivity) => {
+                t.add_local_activity_result_marker(1, "1", Payload::default())
+            }
+            (3, ThirdTask::Patch) => t.add_has_change_marker("p", false),
+            (3, ThirdTask::Update) => accepted = Some(t.add_update_accepted("upd1", "update")),
+            (4, ThirdTask::Update) => t.add_update_completed(accepted.unwrap()),
+            _ => {}
+        }
+        let timer = t.add_timer_started(task.to_string());
+        t.add_timer_fired(timer, task.to_string());
+    }
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// Returns the commands of the Workflow of [history_with_third_task] for `activation`.
+fn third_task_commands(
+    third: ThirdTask,
+    activation: &WorkflowActivation,
+) -> Vec<workflow_command::Variant> {
+    use workflow_activation_job::Variant;
+    let jobs: Vec<_> = activation
+        .jobs
+        .iter()
+        .filter_map(|job| job.variant.as_ref())
+        .collect();
+    let fired = |seq| {
+        jobs.iter()
+            .any(|job| matches!(job, Variant::FireTimer(f) if f.seq == seq))
+    };
+    let has = |wanted: fn(&Variant) -> bool| jobs.iter().any(|job| wanted(job));
+    let timer = |seq| start_timer_cmd(seq, Duration::from_secs(1));
+    let respond = |response| {
+        UpdateResponse {
+            protocol_instance_id: "upd1".to_string(),
+            response: Some(response),
+        }
+        .into()
+    };
+    if has(|job| matches!(job, Variant::InitializeWorkflow(_))) {
+        vec![timer(1)]
+    } else if fired(1) {
+        vec![]
+    } else if fired(4) {
+        vec![CompleteWorkflowExecution { result: None }.into()]
+    } else if fired(3) {
+        match third {
+            ThirdTask::Update => vec![respond(Response::Completed(Payload::default())), timer(4)],
+            _ => vec![timer(4)],
+        }
+    } else if has(|job| matches!(job, Variant::DoUpdate(_))) {
+        vec![respond(Response::Accepted(())), timer(3)]
+    } else if has(|job| matches!(job, Variant::ResolveActivity(_))) {
+        vec![timer(3)]
+    } else if has(|job| matches!(job, Variant::SignalWorkflow(_))) {
+        let patched = has(|job| matches!(job, Variant::NotifyHasPatch(_)));
+        match third {
+            ThirdTask::LocalActivity => vec![schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::TryCancel,
+                Duration::from_secs(60),
+            )],
+            ThirdTask::Patch if patched => vec![
+                SetPatchMarker {
+                    patch_id: "p".to_string(),
+                    deprecated: false,
+                }
+                .into(),
+                timer(3),
+            ],
+            ThirdTask::Patch => vec![timer(3)],
+            ThirdTask::Update => vec![],
+        }
+    } else {
+        vec![]
+    }
+}
+
+/// Replays `t` from the poll `task`, with the rest of its History on `pages`. Returns the jobs and
+/// the lang flags of each activation.
+async fn replay_in_pages(
+    t: &TestHistoryBuilder,
+    task: &PollWorkflowTaskQueueResponse,
+    pages: Vec<GetWorkflowExecutionHistoryResponse>,
+    workflow: impl Fn(&WorkflowActivation) -> Vec<workflow_command::Variant>,
+) -> Vec<(Vec<workflow_activation_job::Variant>, Vec<u32>)> {
+    let starts: Vec<_> = pages
+        .iter()
+        .map(|page| {
+            page.history
+                .as_ref()
+                .unwrap()
+                .events
+                .first()
+                .map(|e| e.event_id)
+        })
+        .collect();
+    let mut client = mock_worker_client();
+    for page in pages {
+        client
+            .expect_get_workflow_execution_history()
+            .times(1)
+            .returning(move |_, _, _| Ok(page.clone()));
+    }
+    let responses = [ResponseType::Raw(task.clone())];
+    let mut cfg = MockPollCfg::from_resp_batches("wfid", t.clone(), responses, client);
+    cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        panic!("pages from events {starts:?}: {cause:?} {failure:?}")
+    });
+    let mut mock = build_mock_pollers(cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let worker = mock_worker(mock);
+    let mut jobs = vec![];
+    loop {
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        if activation.is_only_eviction() {
+            let empty = WorkflowActivationCompletion::empty(activation.run_id);
+            worker.complete_workflow_activation(empty).await.unwrap();
+            break;
+        }
+        let variants = activation
+            .jobs
+            .iter()
+            .map(|job| job.variant.clone().unwrap());
+        jobs.push((
+            variants.collect(),
+            activation.available_internal_flags.clone(),
+        ));
+        let commands = workflow(&activation);
+        let completes = commands
+            .iter()
+            .any(|c| matches!(c, workflow_command::Variant::CompleteWorkflowExecution(_)));
+        let completion = WorkflowActivationCompletion::from_cmds(activation.run_id, commands);
+        worker
+            .complete_workflow_activation(completion)
+            .await
+            .unwrap();
+        if completes {
+            break;
+        }
+    }
+    worker.drain_pollers_and_shutdown().await;
+    jobs
+}
+
+// The completion of the task before a page end can be on the next page, with the Local Activity
+// result, patch or Update that the task's activations depend on.
+#[rstest]
+#[case(ThirdTask::LocalActivity)]
+#[case(ThirdTask::Patch)]
+#[case(ThirdTask::Update)]
+#[tokio::test]
+async fn a_replay_gives_the_same_jobs_wherever_a_page_ends(
+    #[case] third: ThirdTask,
+    #[values(&[][..], &[CoreInternalFlags::DisableWorkflowTaskChunking][..])]
+    core: &[CoreInternalFlags],
+) {
+    let t = history_with_third_task(third, core);
+    let workflow = |activation: &WorkflowActivation| third_task_commands(third, activation);
+    // The poll is for task 2, and the History goes on past it, so a page can end mid-replay.
+    let mut task = hist_to_poll_resp(&t, "wfid", ResponseType::ToTaskNum(2)).resp;
+    let polled = task.history.as_ref().unwrap().events.len();
+    task.next_page_token = vec![1];
+    let events = t.get_full_history_info().unwrap().into_events();
+    let page = |events: &[HistoryEvent], token: Vec<u8>| GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: events.to_vec(),
+        }),
+        next_page_token: token,
+        ..Default::default()
+    };
+    let whole = replay_in_pages(&t, &task, vec![page(&events[polled..], vec![])], workflow).await;
+    let last = (vec![FireTimer { seq: 4 }.into()], vec![1, 2, 3, 4]);
+    assert_eq!(whole.last(), Some(&last), "{whole:?}");
+    // The last cut leaves the second page with no events.
+    for cut in polled + 1..=events.len() {
+        let pages = vec![
+            page(&events[polled..cut], vec![2]),
+            page(&events[cut..], vec![]),
+        ];
+        let paged = replay_in_pages(&t, &task, pages, workflow).await;
+        assert_eq!(paged, whole, "cut {cut}");
+    }
 }
 
 #[tokio::test]

@@ -48,6 +48,10 @@ pub(crate) struct HistoryUpdate {
     has_last_wft: bool,
     wft_count: usize,
     pub(super) chunking_disabled: bool,
+    /// The WFT sequence after the last one in `events`, when this update isn't the last one of
+    /// history. The machines peek its markers while they apply the task before it, and the next
+    /// update starts with it.
+    lookahead: Vec<HistoryEvent>,
 }
 
 impl Debug for HistoryUpdate {
@@ -175,6 +179,8 @@ impl HistoryPaginator {
         mut req: Box<CacheMissFetchReq>,
         client: Arc<dyn WorkerClient>,
     ) -> Result<PermittedWFT, tonic::Status> {
+        let original = &mut req.original_wft.work.update;
+        original.events.append(&mut original.lookahead);
         let mut paginator = Self {
             wf_id: req.original_wft.work.execution.workflow_id.clone(),
             run_id: req.original_wft.work.execution.run_id.clone(),
@@ -290,7 +296,7 @@ impl HistoryPaginator {
             // We only *really* have the last WFT if the events go all the way up to at least the
             // WFT started event id. Otherwise we somehow still have partial history.
             let no_more = matches!(self.next_page_token, NextPageToken::Done) && seen_enough_events;
-            let (update, extra) = HistoryUpdate::from_events(
+            let (mut update, extra) = HistoryUpdate::from_events(
                 current_events,
                 self.previous_wft_started_id,
                 self.wft_started_event_id,
@@ -323,6 +329,12 @@ impl HistoryPaginator {
                 update.events.last().map(|e| e.event_id);
             #[cfg(debug_assertions)]
             update.assert_contiguous();
+            // The completion of the last task, with its markers, can be on the next page.
+            if !no_more {
+                update.keep_last_wft_as_lookahead();
+                let queued = mem::take(&mut self.event_queue);
+                self.event_queue = update.lookahead.iter().cloned().chain(queued).collect();
+            }
             return Ok(update);
         }
     }
@@ -451,6 +463,7 @@ impl HistoryUpdate {
             has_last_wft: false,
             wft_count: 0,
             chunking_disabled: false,
+            lookahead: vec![],
         }
     }
 
@@ -511,6 +524,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 1,
                         chunking_disabled,
+                        lookahead: vec![],
                     },
                     vec![],
                 )
@@ -523,6 +537,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 0,
                         chunking_disabled,
+                        lookahead: vec![],
                     },
                     all_events,
                 )
@@ -562,6 +577,7 @@ impl HistoryUpdate {
                 has_last_wft,
                 wft_count,
                 chunking_disabled,
+                lookahead: vec![],
             },
             remaining_events,
         )
@@ -629,14 +645,14 @@ impl HistoryUpdate {
     /// Lets the caller peek ahead at the next WFT sequence that will be returned by
     /// [take_next_wft_sequence]. Will always return the first available WFT sequence if that has
     /// not been called first. May also return an empty iterator or incomplete sequence if we are at
-    /// the end of history.
+    /// the end of history. Once no sequence is left to take, returns the lookahead.
     pub(crate) fn peek_next_wft_sequence(&self, from_wft_started_id: i64) -> &[HistoryEvent] {
         let ix_first_relevant = self
             .starting_index_after_skipping(from_wft_started_id)
             .unwrap_or_default();
         let relevant_events = &self.events[ix_first_relevant..];
         if relevant_events.is_empty() {
-            return relevant_events;
+            return &self.lookahead;
         }
         let ix_end = find_end_index_of_next_wft_seq(
             relevant_events,
@@ -673,11 +689,38 @@ impl HistoryUpdate {
     ) -> Option<&WorkflowTaskCompletedEventAttributes> {
         self.events
             .iter()
+            .chain(&self.lookahead)
             .skip_while(|e| e.event_id < from_id)
             .find_map(|e| match &e.attributes {
                 Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some(a),
                 _ => None,
             })
+    }
+
+    /// Moves the last WFT sequence of `events` into the lookahead. The machines take it only from
+    /// the next update, which has the events after it.
+    fn keep_last_wft_as_lookahead(&mut self) {
+        let last = self.events.last().map_or(0, |event| event.event_id);
+        self.lookahead = self.events.split_off(self.start_of_wft_with(last));
+    }
+
+    /// Returns the index in `events` of the first event of the WFT sequence with the event
+    /// `event_id`, or the length of `events` if none of its sequences has that event. The sequences
+    /// are the ones that [Self::take_next_wft_sequence] gives.
+    fn start_of_wft_with(&self, event_id: i64) -> usize {
+        let mut start = 0;
+        let mut from = 0;
+        while let NextWFTSeqEndIndex::Complete(end) = find_end_index_of_next_wft_seq(
+            &self.events[start..],
+            from,
+            self.has_last_wft || self.ends_at_known_boundary(),
+            self.chunking_disabled,
+        ) && self.events[start + end].event_id < event_id
+        {
+            from = self.events[start + end].event_id;
+            start += end + 1;
+        }
+        start
     }
 
     fn ends_at_known_boundary(&self) -> bool {
@@ -863,7 +906,9 @@ fn find_end_index_of_next_wft_seq_chunked(
                         continue;
                     }
                 }
-            } else if !has_last_wft && !saw_command_or_started {
+            } else if has_last_wft {
+                return NextWFTSeqEndIndex::Complete(ix);
+            } else if !saw_command_or_started {
                 // Don't have enough events to look ahead of the WorkflowTaskStarted. Need to fetch
                 // more.
                 continue;
