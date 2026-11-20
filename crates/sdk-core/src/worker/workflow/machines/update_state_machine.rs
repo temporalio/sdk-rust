@@ -195,6 +195,8 @@ impl UpdateMachine {
     }
 }
 
+pub(super) const REJECTION_TYPE_URL: &str = "type.googleapis.com/temporal.api.update.v1.Rejection";
+
 #[allow(clippy::large_enum_variant)]
 enum UpdateMsg {
     Accept(Acceptance),
@@ -208,10 +210,7 @@ impl UpdateMsg {
                 "type.googleapis.com/temporal.api.update.v1.Acceptance".to_string(),
                 &m,
             ),
-            UpdateMsg::Reject(m) => pack_any(
-                "type.googleapis.com/temporal.api.update.v1.Rejection".to_string(),
-                &m,
-            ),
+            UpdateMsg::Reject(m) => pack_any(REJECTION_TYPE_URL.to_string(), &m),
             UpdateMsg::Response(m) => pack_any(
                 "type.googleapis.com/temporal.api.update.v1.Response".to_string(),
                 &m,

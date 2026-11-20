@@ -8,7 +8,7 @@ use futures_util::{StreamExt, future, future::join_all, stream};
 use std::{
     cell::Cell,
     sync::{
-        LazyLock,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -28,20 +28,23 @@ use temporalio_common::{
             ActivityTaskCompletion,
             activity_result::ActivityExecutionResult,
             workflow_activation::{
-                WorkflowActivationJob, remove_from_cache::EvictionReason, workflow_activation_job,
+                WorkflowActivation, WorkflowActivationJob, remove_from_cache::EvictionReason,
+                workflow_activation_job,
             },
             workflow_commands::{
                 CompleteWorkflowExecution, ScheduleLocalActivity, UpdateResponse, update_response,
+                workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            common::v1::WorkflowExecution,
+            common::v1::{WorkflowExecution, WorkflowType},
             enums::v1::{CommandType, EventType, ResetReapplyType},
+            taskqueue::v1::TaskQueue,
             workflowservice::v1::{
                 PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
                 ResetStickyTaskQueueRequest, ResetWorkflowExecutionRequest,
-                RespondWorkflowTaskCompletedResponse,
+                RespondWorkflowTaskCompletedResponse, StartWorkflowExecutionRequest,
             },
         },
     },
@@ -54,7 +57,8 @@ use temporalio_sdk::{
     activities::{ActivityContext, ActivityError},
 };
 use temporalio_sdk_core::{
-    Worker, prost_dur,
+    SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierPermit, TunerBuilder, Worker, WorkflowSlotKind, prost_dur,
     replay::{HistoryForReplay, TestHistoryBuilder, default_wes_attribs},
     test_help::{
         MocksHolder, PollWFTRespExt, QueueResponse, ResponseType, WorkerExt, WorkerTestHelpers,
@@ -63,7 +67,7 @@ use temporalio_sdk_core::{
 };
 use tokio::{
     join, select,
-    sync::{Barrier, oneshot},
+    sync::{Barrier, Semaphore, oneshot},
 };
 use tonic::IntoRequest;
 use uuid::Uuid;
@@ -2051,4 +2055,242 @@ async fn update_with_start(#[case] scenario: UpdateWithStartScenario) {
         worker.inner_mut().run().await.unwrap();
     };
     join!(interactions, run);
+}
+/// Hands out workflow task slots only against tickets the test grants, so a worker can be kept
+/// from polling (without being shut down and losing its cache) while another worker takes a task.
+/// Released slots do not return tickets, which keeps a poll that was already in flight when the
+/// test stopped granting from taking a task the test wants another worker to get.
+struct TicketedWftSlots {
+    nonsticky: Semaphore,
+    sticky: Semaphore,
+}
+
+impl TicketedWftSlots {
+    fn tickets(&self, ctx: &dyn SlotReservationContext) -> &Semaphore {
+        if ctx.is_sticky() {
+            &self.sticky
+        } else {
+            &self.nonsticky
+        }
+    }
+
+    fn grant_all(&self) {
+        self.nonsticky.add_permits(1000);
+        self.sticky.add_permits(1000);
+    }
+}
+
+#[async_trait::async_trait]
+impl SlotSupplier for TicketedWftSlots {
+    type SlotKind = WorkflowSlotKind;
+
+    async fn reserve_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
+        self.tickets(ctx).acquire().await.unwrap().forget();
+        SlotSupplierPermit::with_user_data(())
+    }
+
+    fn try_reserve_slot(&self, ctx: &dyn SlotReservationContext) -> Option<SlotSupplierPermit> {
+        self.tickets(ctx).try_acquire().ok().map(|p| {
+            p.forget();
+            SlotSupplierPermit::with_user_data(())
+        })
+    }
+
+    fn mark_slot_used(&self, _ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {}
+
+    fn release_slot(&self, _ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {}
+}
+
+/// A workflow started with a start delay gets its first task speculatively when an update arrives
+/// during the delay, and the server discards that task's completion when the update is rejected.
+/// The worker that handled it keeps the run cached, with initialization already run under any
+/// default-enabled lang flags it used, though history never records them. If another worker that
+/// lacks the flag (ex: an older SDK version mid-deploy) runs the first persisted task, and the
+/// cached worker later receives the full history from the normal queue, it must replay that
+/// history the same way a cold replay does.
+#[tokio::test]
+async fn cached_run_replays_other_workers_first_task_after_discarded_first_task() {
+    let lang_flag = 2;
+    let mut starter = CoreWfStarter::new("cached_run_after_discarded_first_task");
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
+    let mut other_starter = starter.clone_no_worker();
+    other_starter.set_core_cfg_mutator(|c| c.max_cached_workflows = 0);
+
+    let slots = Arc::new(TicketedWftSlots {
+        nonsticky: Semaphore::new(1),
+        sticky: Semaphore::new(0),
+    });
+    let mut tb = TunerBuilder::default();
+    tb.workflow_slot_supplier(slots.clone());
+    starter.set_core_tuner(Arc::new(tb.build()));
+    starter.set_core_cfg_mutator(|c| {
+        c.max_cached_workflows = 10;
+        c.sticky_queue_schedule_to_start_timeout = Duration::from_secs(1);
+    });
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
+    let workflow_id = starter.get_task_queue().to_string();
+    client
+        .clone()
+        .start_workflow_execution(
+            StartWorkflowExecutionRequest {
+                namespace: client.namespace(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: Some(WorkflowType {
+                    name: "delayed".to_owned(),
+                }),
+                task_queue: Some(TaskQueue {
+                    name: workflow_id.clone(),
+                    ..Default::default()
+                }),
+                request_id: Uuid::new_v4().to_string(),
+                workflow_start_delay: Some(prost_dur!(from_secs(2))),
+                ..Default::default()
+            }
+            .into_request(),
+        )
+        .await
+        .unwrap();
+    let handle = client.get_workflow_handle::<UntypedWorkflow>(workflow_id);
+
+    // Lang uses the default-enabled flag whenever it is listed, or when running live
+    let init_cmds = |act: &WorkflowActivation| -> Vec<workflow_command::Variant> {
+        if act.available_internal_flags.contains(&lang_flag) || !act.is_replaying {
+            vec![]
+        } else {
+            vec![start_timer_cmd(1, Duration::from_secs(60 * 60))]
+        }
+    };
+
+    let update_task = async {
+        handle
+            .execute_update(
+                UntypedUpdate::new("upd"),
+                RawValue::empty(),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+    };
+    let reject_task = async {
+        let act = core.poll_workflow_activation().await.unwrap();
+        assert!(!act.is_replaying);
+        let pid = assert_matches!(
+            act.jobs.as_slice(),
+            [
+                WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+                },
+                WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::DoUpdate(d)),
+                },
+            ] => d.protocol_instance_id.clone()
+        );
+        let mut cmds = init_cmds(&act);
+        cmds.push(
+            UpdateResponse {
+                protocol_instance_id: pid,
+                response: Some(update_response::Response::Rejected("nope".into())),
+            }
+            .into(),
+        );
+        let mut completion = WorkflowActivationCompletion::from_cmds(act.run_id, cmds);
+        completion.add_internal_flags(lang_flag);
+        core.complete_workflow_activation(completion).await.unwrap();
+    };
+    let (update_res, ()) = join!(update_task, reject_task);
+    assert!(update_res.is_err(), "Update must be rejected");
+
+    // The other worker, which lacks the flag, runs the first task that the server persists
+    let other_core = other_starter.get_core_worker().await;
+    let act = other_core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        act.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    other_core
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            act.run_id,
+            start_timer_cmd(1, Duration::from_secs(60 * 60)),
+        ))
+        .await
+        .unwrap();
+    other_core.initiate_shutdown();
+    // The other worker does not cache, so it evicts the run after completing the task
+    while let Ok(act) = other_core.poll_workflow_activation().await {
+        other_core
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+            .await
+            .unwrap();
+    }
+    other_core.shutdown().await;
+
+    handle
+        .signal(
+            UntypedSignal::new("sig"),
+            RawValue::empty(),
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .unwrap();
+    slots.grant_all();
+
+    let mut evictions = vec![];
+    loop {
+        let act = core.poll_workflow_activation().await.unwrap();
+        let mut cmds = vec![];
+        let mut signaled = false;
+        for job in &act.jobs {
+            match job.variant.as_ref() {
+                Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+                    cmds.extend(init_cmds(&act))
+                }
+                Some(workflow_activation_job::Variant::SignalWorkflow(_)) => signaled = true,
+                Some(workflow_activation_job::Variant::RemoveFromCache(r)) => {
+                    evictions.push((r.reason(), r.message.clone()))
+                }
+                _ => {}
+            }
+        }
+        if signaled {
+            cmds.push(CompleteWorkflowExecution { result: None }.into());
+        }
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            act.run_id, cmds,
+        ))
+        .await
+        .unwrap();
+        if signaled {
+            break;
+        }
+    }
+    let history = starter.get_history().await;
+    let event_types: Vec<_> = history.events.iter().map(|e| e.event_type()).collect();
+
+    let replay_worker = init_core_replay_preloaded(
+        "cached_run_after_discarded_first_task_replay",
+        [HistoryForReplay::new(history, "fake".to_owned())],
+    );
+    let act = replay_worker.poll_workflow_activation().await.unwrap();
+    assert!(act.is_replaying);
+    let cmds = init_cmds(&act);
+    replay_worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(act.run_id, cmds))
+        .await
+        .unwrap();
+    let act = replay_worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        act.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+        }],
+        "Cold replay must reach the signal. History: {event_types:?}"
+    );
+
+    assert!(
+        !event_types.contains(&EventType::WorkflowTaskFailed),
+        "Cached run must replay like a cold replay. Evictions: {evictions:?}, \
+         history: {event_types:?}"
+    );
 }

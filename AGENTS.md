@@ -29,6 +29,8 @@ document as your quick reference when submitting pull requests.
 - Use custom error types leveraging `thiserror` for any public facing error types
 - Don't add pro-forma unit tests that simply check values are passed through some very obviously
   correct machinery, or that defaults equal the same hardcoded values in the test, etc.
+- Do not start the temporal dev server by hand, rely on `cargo integ-test` instead. Only run it by
+  hand if there is a specific reason doing so is necessary.
 
 
 ## Repo Specific Utilities
@@ -96,6 +98,8 @@ Documentation can be generated with `cargo doc`.
   describe Core internals or bridge-only APIs, and the sdk-core changelog should not name Rust
   identifiers its readers cannot call. The fragment guide lists SDK categories; the comment at the
   top of the Core changelog lists its headings.
+- When making a PR, respect the org level PR template. Keep the descriptions brief and focused on
+  the semantics and the consequences of the changes.
 
 ## Review Checklist
 
