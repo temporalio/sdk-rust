@@ -1,0 +1,5 @@
+@startuml
+Created -[#blue]-> CommandSent: CommandRecordMarker
+CommandSent -[#blue]-> Recorded: MarkerRecorded
+Recorded --> [*]
+@enduml

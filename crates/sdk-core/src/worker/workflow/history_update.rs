@@ -25,6 +25,7 @@ use temporalio_common::protos::temporal::api::{
         History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
     },
 };
+use temporalio_streams::workflow::is_stream_marker;
 use tracing::Instrument;
 
 static EMPTY_FETCH_ERR: LazyLock<tonic::Status> =
@@ -77,6 +78,11 @@ impl Debug for HistoryUpdate {
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         self.events.as_slice()
+    }
+
+    /// Returns true if these events, or the lookahead, have a Stream marker.
+    pub(crate) fn has_stream_markers(&self) -> bool {
+        (self.get_events().iter().chain(&self.lookahead)).any(is_stream_marker)
     }
 }
 

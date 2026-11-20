@@ -4574,6 +4574,7 @@ dependencies = [
  "temporalio-common",
  "temporalio-macros",
  "temporalio-sdk",
+ "temporalio-streams",
  "temporalio-workflow",
  "thiserror 2.0.21",
  "tokio",
@@ -4626,8 +4627,10 @@ dependencies = [
  "parking_lot",
  "prost",
  "prost-wkt-types",
+ "rand 0.10.3",
  "temporalio-common",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
