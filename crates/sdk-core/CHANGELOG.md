@@ -63,6 +63,8 @@ relevant information.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
 * Downloading an ephemeral dev or test server binary retries a transfer that breaks while the
   archive streams in, such as a reset connection, instead of failing the server start.
+* A replay no longer fails when a History page ends before a task's Local Activity, patch or
+  Update. Core applies the last task of a page only once it has the next page.
 ### Changed
 * [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
   compatible with current nexgen default expressions and workflow-target generation.

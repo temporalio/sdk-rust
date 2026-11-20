@@ -782,7 +782,7 @@ impl ManagedRun {
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;
             if let Some(update) = update_from_new_page {
-                self.wfm.feed_history_from_new_page(update)?;
+                self.wfm.feed_history_from_new_page(update);
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
             // or are otherwise broken.
@@ -1537,8 +1537,9 @@ impl WorkflowManager {
     }
 
     /// Update the machines with some events from fetching another page of history. Does *not*
-    /// attempt to pull the next activation, unlike [Self::new_work_from_server].
-    fn feed_history_from_new_page(&mut self, update: HistoryUpdate) -> Result<()> {
+    /// attempt to pull the next activation, unlike [Self::new_work_from_server]. The caller
+    /// applies the next WFT once the current one needs no more activations.
+    fn feed_history_from_new_page(&mut self, update: HistoryUpdate) {
         self.machines.new_history_from_server(update)
     }
 
