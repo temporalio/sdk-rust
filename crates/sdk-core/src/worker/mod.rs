@@ -1856,6 +1856,11 @@ pub enum CompleteNexusError {
 pub enum WorkflowErrorType {
     /// A nondeterminism error
     Nondeterminism,
+    /// A replay whose Store no longer has the Records that a Stream read of the Workflow got, or
+    /// has other ones. A Store that gives no answer, or a Worker with no runtime for the Store,
+    /// fails only the Workflow Task.
+    /// NOTE: Experimental
+    StreamReplay,
 }
 
 /// This trait allows users to customize the performance characteristics of workers dynamically.

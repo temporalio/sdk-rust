@@ -2,6 +2,7 @@ use crate::{
     internal_flags::CoreInternalFlags,
     protosext::ValidPollWFTQResponse,
     worker::{
+        WorkerConfig,
         client::WorkerClient,
         workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
     },
@@ -24,6 +25,7 @@ use temporalio_common::protos::temporal::api::{
         History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
     },
 };
+use temporalio_streams::workflow::{MarkerReads, ReplayReader, ReplayReads, is_stream_marker};
 use tracing::Instrument;
 
 static EMPTY_FETCH_ERR: LazyLock<tonic::Status> =
@@ -52,6 +54,9 @@ pub(crate) struct HistoryUpdate {
     /// history. The machines peek its markers while they apply the task before it, and the next
     /// update starts with it.
     lookahead: Vec<HistoryEvent>,
+    /// The Records that a run new to the cache read for the Stream markers of these events, or
+    /// `None` if it read none.
+    stream_reads: Option<ReplayReads>,
 }
 
 impl Debug for HistoryUpdate {
@@ -75,6 +80,35 @@ impl Debug for HistoryUpdate {
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
+    }
+
+    /// Returns true if a run new to the cache must read the Records of the Stream markers in these
+    /// events, or in the lookahead, before it replays them.
+    pub(crate) fn needs_stream_records(&self) -> bool {
+        self.stream_reads.is_none()
+            && (self.events.iter().chain(&self.lookahead)).any(is_stream_marker)
+    }
+
+    /// Takes the Records that were read for the Stream marker event `event_id`.
+    pub(crate) fn take_stream_reads(&mut self, event_id: i64) -> MarkerReads {
+        (self.stream_reads.as_mut()).map_or_else(Vec::new, |reads| reads.take(event_id))
+    }
+
+    /// Ends the update before the WFT sequence with the event `event_id`, and returns the events
+    /// that the next update starts with. The sequence before it becomes the lookahead.
+    fn end_before_wft_with(&mut self, event_id: i64) -> Vec<HistoryEvent> {
+        let mut rest = self.events.split_off(self.start_of_wft_with(event_id));
+        self.keep_last_wft_as_lookahead();
+        // An update's first sequence has no marker left to read, and a completion has one, so the
+        // sequence with the event is the third or later, and a sequence is left to take.
+        debug_assert!(
+            !self.events.is_empty(),
+            "A cut left no WFT sequence to take"
+        );
+        self.has_last_wft = false;
+        let mut next = self.lookahead.clone();
+        next.append(&mut rest);
+        next
     }
 }
 
@@ -101,6 +135,12 @@ pub(crate) struct HistoryPaginator {
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
     chunking_disabled: bool,
+    /// Set for a run new to the cache, which reads the Records of the Stream markers of each
+    /// update that it replays.
+    stream_reader: Option<ReplayReader>,
+    /// The id of the last event that a read of Stream Records covered. The next update starts
+    /// with the lookahead of the last one, whose markers it must not read again.
+    stream_records_read_to: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +235,8 @@ impl HistoryPaginator {
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
             chunking_disabled: false,
+            stream_reader: req.original_wft.paginator.stream_reader.take(),
+            stream_records_read_to: 0,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -229,7 +271,36 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             chunking_disabled: false,
+            stream_reader: None,
+            stream_records_read_to: 0,
         }
+    }
+
+    /// Makes each later update read the Records of its Stream markers, for a run new to the
+    /// cache.
+    pub(super) fn read_stream_records_with(&mut self, config: &WorkerConfig) {
+        let runtimes = config.stream_runtimes.clone();
+        self.stream_reader = Some(ReplayReader::new(runtimes, config.namespace.clone()));
+    }
+
+    /// Reads the Records of the Stream markers of `update`, for a run new to the cache. Once the
+    /// Records read reach their bound, the update ends before the WFT sequence of the first marker
+    /// left, and the events from the sequence before it on go back to the queue.
+    pub(super) async fn read_stream_records(&mut self, update: &mut HistoryUpdate) {
+        let Some(reader) = &self.stream_reader else {
+            return;
+        };
+        let events = update.events.iter().chain(&update.lookahead);
+        let reads = reader.read(events, self.stream_records_read_to).await;
+        if let Some(unread) = reads.unread() {
+            let next = update.end_before_wft_with(unread);
+            let queued = mem::take(&mut self.event_queue);
+            self.event_queue = next.into_iter().chain(queued).collect();
+        }
+        if let Some(last) = update.lookahead.last().or(update.events.last()) {
+            self.stream_records_read_to = last.event_id;
+        }
+        update.stream_reads = Some(reads);
     }
 
     /// Return at least the next two WFT sequences (as determined by the passed-in ID) as a
@@ -335,6 +406,7 @@ impl HistoryPaginator {
                 let queued = mem::take(&mut self.event_queue);
                 self.event_queue = update.lookahead.iter().cloned().chain(queued).collect();
             }
+            self.read_stream_records(&mut update).await;
             return Ok(update);
         }
     }
@@ -464,6 +536,7 @@ impl HistoryUpdate {
             wft_count: 0,
             chunking_disabled: false,
             lookahead: vec![],
+            stream_reads: None,
         }
     }
 
@@ -525,6 +598,7 @@ impl HistoryUpdate {
                         wft_count: 1,
                         chunking_disabled,
                         lookahead: vec![],
+                        stream_reads: None,
                     },
                     vec![],
                 )
@@ -538,6 +612,7 @@ impl HistoryUpdate {
                         wft_count: 0,
                         chunking_disabled,
                         lookahead: vec![],
+                        stream_reads: None,
                     },
                     all_events,
                 )
@@ -578,6 +653,7 @@ impl HistoryUpdate {
                 wft_count,
                 chunking_disabled,
                 lookahead: vec![],
+                stream_reads: None,
             },
             remaining_events,
         )
@@ -1957,5 +2033,49 @@ mod tests {
         assert_eq!(seq.len(), 3);
         let seq = next_check_peek(&mut update, 3);
         assert_eq!(seq.len(), 3);
+    }
+
+    // An update that ends before the WFT sequence of an event keeps the sequence before it as the
+    // lookahead, and gives back the events from that sequence on, whether the event is in the
+    // events of the update or in its lookahead. The machines take the sequences left, peek the
+    // lookahead, and then need the next update.
+    #[rstest::rstest]
+    fn an_update_ends_before_the_wft_sequence_of_an_event(
+        #[values(false, true)] in_lookahead: bool,
+    ) {
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        for _ in 0..3 {
+            t.add_by_type(EventType::TimerStarted);
+            t.add_full_wf_task();
+        }
+        t.add_workflow_task_scheduled_and_started();
+        // The sequences are 1 to 3, 4 to 7, 8 to 11, 12 to 15, and 16 to 18, the lookahead.
+        let events = t.get_full_history_info().unwrap().into_events();
+        let (mut update, _) = HistoryUpdate::from_events(events, 0, 18, true, false);
+        update.keep_last_wft_as_lookahead();
+        let (event_id, kept, lookahead) = match in_lookahead {
+            true => (17, 11, 12..=15),
+            false => (9, 3, 4..=7),
+        };
+        let next = update.end_before_wft_with(event_id);
+        let ids = |events: &[HistoryEvent]| events.iter().map(|e| e.event_id).collect::<Vec<_>>();
+        assert_eq!(ids(&update.events), (1..=kept).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&update.lookahead),
+            lookahead.clone().collect::<Vec<_>>()
+        );
+        assert_eq!(ids(&next), (*lookahead.start()..=15).collect::<Vec<_>>());
+        let mut from = 0;
+        while let NextWFT::WFT(events, _) = update.take_next_wft_sequence(from) {
+            from = events.last().unwrap().event_id;
+        }
+        assert_eq!(from, kept);
+        assert_eq!(
+            ids(update.peek_next_wft_sequence(from)),
+            ids(&update.lookahead)
+        );
+        assert_matches!(update.take_next_wft_sequence(from), NextWFT::NeedFetch);
     }
 }

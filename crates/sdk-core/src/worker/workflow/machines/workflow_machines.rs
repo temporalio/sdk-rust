@@ -63,9 +63,7 @@ use temporalio_common::{
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::{
-                CloseStreamRead, ContinueAsNewWorkflowExecution, StartStreamRead, update_response,
-            },
+            workflow_commands::{ContinueAsNewWorkflowExecution, update_response},
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
@@ -489,6 +487,33 @@ impl WorkflowMachines {
     /// Returns true if the Stream marker of the task has an entry.
     pub(crate) fn has_stream_marker(&self) -> bool {
         self.stream_calls.has_marker()
+    }
+
+    /// Returns true if only Stream reads hold the Workflow Task open.
+    pub(crate) fn holds_only_stream_reads(&self) -> bool {
+        self.outstanding_local_activity_count() == 0 && self.stream_calls.holds_only_reads()
+    }
+
+    /// Returns true if only Stream reads hold the task while it has a command, a message or a
+    /// close intent for the server, which must not wait for a read.
+    pub(crate) fn must_complete_before_stream_reads(&self) -> bool {
+        // A marker asks the server for nothing.
+        let has_command = (self.commands.iter()).any(|c| {
+            !self.machine(c.machine).is_final_state()
+                && c.command.command_type() != CommandType::RecordMarker
+        });
+        self.holds_only_stream_reads()
+            && (has_command || !self.message_outbox.is_empty() || self.stream_calls.has_intents())
+    }
+
+    /// Stops the Stream reads with no end, at a graceful shutdown.
+    pub(crate) fn park_stream_reads(&mut self) {
+        self.stream_calls.park_reads();
+    }
+
+    /// Returns true while a Stream read that a shutdown stopped waits for another Worker.
+    pub(crate) fn has_parked_stream_reads(&self) -> bool {
+        self.stream_calls.has_parked_reads()
     }
 
     /// Drops the Stream calls of the run, and any terminal command it holds, so no result of those
@@ -989,7 +1014,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamMarker(StreamMarkerData),
+            StreamMarker(i64, StreamMarkerData),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -1026,7 +1051,7 @@ impl WorkflowMachines {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
             } else if let Some(data) = peeked_marker(e) {
-                delayed_actions.push(DelayedAction::StreamMarker(data?));
+                delayed_actions.push(DelayedAction::StreamMarker(e.event_id, data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -1063,7 +1088,10 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
-                DelayedAction::StreamMarker(data) => self.stream_calls.peeked(data)?,
+                DelayedAction::StreamMarker(event_id, data) => {
+                    let records = self.last_history_from_server.take_stream_reads(event_id);
+                    self.stream_calls.peeked(data, records)?;
+                }
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -1668,10 +1696,10 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::CompleteWorkflow(attrs) => {
-                    self.add_terminal_command(complete_workflow(attrs), annotations);
+                    self.add_terminal_command(complete_workflow(attrs), annotations)?;
                 }
                 WFCommandVariant::FailWorkflow(attrs) => {
-                    self.add_terminal_command(fail_workflow(attrs), annotations);
+                    self.add_terminal_command(fail_workflow(attrs), annotations)?;
                 }
                 WFCommandVariant::ContinueAsNew(attrs) => {
                     let attrs = self.augment_continue_as_new_with_current_values(attrs);
@@ -1679,10 +1707,10 @@ impl WorkflowMachines {
                         attrs.versioning_intent(),
                         &attrs.task_queue,
                     );
-                    self.add_terminal_command(continue_as_new(attrs, use_compat), annotations);
+                    self.add_terminal_command(continue_as_new(attrs, use_compat), annotations)?;
                 }
                 WFCommandVariant::CancelWorkflow(attrs) => {
-                    self.add_terminal_command(cancel_workflow(attrs), annotations);
+                    self.add_terminal_command(cancel_workflow(attrs), annotations)?;
                 }
                 WFCommandVariant::SetPatchMarker(attrs) => {
                     // Do not create commands for change IDs that we have already created commands
@@ -1830,12 +1858,8 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
                 WFCommandVariant::CloseStream(attrs) => self.stream_calls.close(attrs)?,
-                WFCommandVariant::StartStreamRead(StartStreamRead { seq, .. })
-                | WFCommandVariant::CloseStreamRead(CloseStreamRead { seq }) => {
-                    return Err(WFMachinesError::Stream(format!(
-                        "Stream read {seq} needs a Core that reads Streams"
-                    )));
-                }
+                WFCommandVariant::StartStreamRead(attrs) => self.stream_calls.start_read(attrs)?,
+                WFCommandVariant::CloseStreamRead(attrs) => self.stream_calls.close_read(attrs)?,
             }
         }
         Ok(())
@@ -1869,8 +1893,8 @@ impl WorkflowMachines {
         &mut self,
         machine: NewMachineWithCommand,
         annotations: CommandAnnotations,
-    ) {
-        self.stream_calls.stop_for_terminal();
+    ) -> Result<()> {
+        self.stream_calls.stop_for_terminal()?;
         let activation = self.local_activity_data.current_activation_index();
         self.stream_calls.take_for_hold(activation);
         // If the Worker died, a close in History with no later task to send it would be lost. So
@@ -1879,7 +1903,7 @@ impl WorkflowMachines {
             self.local_activity_data.indicate_terminating();
             self.drive_me.hold();
             self.held_terminal = Some((machine, annotations));
-            return;
+            return Ok(());
         }
         let cwfm = self.add_new_command_machine(machine, annotations);
         self.workflow_end_time = Some(SystemTime::now());
@@ -1887,6 +1911,7 @@ impl WorkflowMachines {
         // Wipe out any pending / executing local activity data since we're about to terminate
         // and there's nothing to be done with them.
         self.local_activity_data.indicate_terminating();
+        Ok(())
     }
 
     /// Puts the close results that came while Core holds the last command into the Stream marker,
@@ -1901,7 +1926,7 @@ impl WorkflowMachines {
             self.held_terminal = Some((machine, annotations));
             return Ok(());
         }
-        self.add_terminal_command(machine, annotations);
+        self.add_terminal_command(machine, annotations)?;
         // A replay applies the next task before any activation would prepare the command.
         self.prepare_commands()
     }

@@ -1,6 +1,8 @@
 //! The Stream calls of Workflow code, through a Worker on a mock server. The mock server writes the
 //! History of each completion, so a replay Worker can replay it.
 
+mod reads;
+
 use super::stream_store::{MemoryStore, Op, Request};
 use crate::{
     StreamRuntimes, StreamSettings, Worker, WorkerConfig, init_replay_worker,
@@ -372,6 +374,9 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             }
             Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
                 history.add_workflow_execution_completed();
+            }
+            Some(Attributes::FailWorkflowExecutionCommandAttributes(_)) => {
+                history.add_workflow_execution_failed();
             }
             // No test replays an Update.
             Some(Attributes::ProtocolMessageCommandAttributes(_)) => {}
@@ -754,6 +759,7 @@ fn fast_tries(wc: &mut WorkerConfig) {
         retry_first_wait: Duration::from_millis(10),
         retry_max_wait: Duration::from_millis(20),
         try_deadline: Duration::from_millis(50),
+        ..StreamSettings::default()
     };
 }
 
@@ -1517,7 +1523,7 @@ async fn with_the_marker_on_a_later_page() {
     let closes: Vec<_> = (store.requests().into_iter())
         .filter_map(|request| match request {
             Request::Close(close) => Some(writer(close.producer)),
-            Request::Append(_) => None,
+            _ => None,
         })
         .collect();
     let id = producer(&run_id, Default::default()).id;

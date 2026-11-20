@@ -51,8 +51,17 @@ relevant information.
   replay makes no Store call. A close runs once History has the task that asked for it, and the
   Workflow's last command waits until each close has its result in a marker. If a call is waiting
   to try again at the task's heartbeat, because a try failed with `StorageUnavailable` or got no
-  answer within `try_deadline`, the task fails with `StreamStoreUnavailable`. The Stream read
-  commands fail the Workflow Task for now.
+  answer within `try_deadline`, the task fails with `StreamStoreUnavailable`.
+* [lang-internal] Workflow code can read a Stream with the experimental `StartStreamRead` command,
+  and stop the read with `CloseStreamRead`. Core holds one page of each read, asks for no more than
+  `read_ahead_bytes` and the room left in the task, and gives the Records in `ResolveStreamRead`
+  jobs. A task gives at most 16 MiB of Records. Its marker holds a digest of the Records that each
+  read gave in the task, or the Records with `records_in_history`. A replay reads digested Records
+  again, about two tasks of them at a time, and tries a Store in an outage for at most
+  `replay_retry_bound`, 3 s by default. If the Store doesn't have the same Records, the task fails,
+  or the Workflow with the new `WorkflowErrorType::StreamReplay` variant in
+  `workflow_failure_errors`. A command, a message or a close intent completes a task while its
+  reads wait, and so does a graceful shutdown.
 
 ### Fixed
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or

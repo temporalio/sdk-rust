@@ -36,6 +36,7 @@ pub(super) struct WFStream {
 
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
+    worker_config: Arc<WorkerConfig>,
 
     metrics: MetricsContext,
 }
@@ -90,6 +91,7 @@ impl WFStream {
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
+            worker_config: basics.worker_config.clone(),
             runs: RunCache::new(
                 basics.worker_config.clone(),
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
@@ -210,6 +212,15 @@ impl WFStream {
 
                 activations.extend(maybe_act);
                 activations.extend(state.reconcile_buffered());
+                let streams = &state.worker_config.stream_runtimes;
+                if state.shutdown_token.is_cancelled() && !streams.is_empty() {
+                    activations.extend(
+                        state
+                            .runs
+                            .handles_mut()
+                            .filter_map(|run| run.end_reads_for_shutdown()),
+                    );
+                }
                 actions.extend(
                     activations
                         .into_iter()
@@ -260,7 +271,7 @@ impl WFStream {
     ) -> Result<RunUpdateAct, HistoryFetchReq> {
         // If the run already exists, possibly buffer the work and return early if we can't handle
         // it yet.
-        let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
+        let mut pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
             if rh.has_foreign_stream_events(&pwft.work) {
                 return Ok(rh.evict_for_foreign_task(pwft));
             }
@@ -281,6 +292,11 @@ impl WFStream {
             return Ok(None);
         }
 
+        // A run new to the cache replays its History, so it reads the Records of its Stream
+        // markers. A cached run already gave Workflow code each Record of its markers.
+        if !self.runs.has_run(&run_id) {
+            pwft.paginator.read_stream_records_with(&self.worker_config);
+        }
         // This check can't really be lifted up higher since we could EX: See it's in the cache,
         // not fetch more history, send the task, see cache is full, buffer it, then evict that
         // run, and now we still have a cache miss.
@@ -290,6 +306,12 @@ impl WFStream {
             self.metrics.sticky_cache_miss();
             return Err(HistoryFetchReq::Full(
                 Box::new(CacheMissFetchReq { original_wft: pwft }),
+                self.history_fetch_refcounter.clone(),
+            ));
+        }
+        if !self.runs.has_run(&run_id) && pwft.work.update.needs_stream_records() {
+            return Err(HistoryFetchReq::StreamRecords(
+                Box::new(pwft),
                 self.history_fetch_refcounter.clone(),
             ));
         }
