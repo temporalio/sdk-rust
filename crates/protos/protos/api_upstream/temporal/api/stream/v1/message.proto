@@ -29,13 +29,14 @@ message StreamRef {
 
 // Experimental. Might change in the future.
 // One Workflow Task attempt of a run. It orders by started_event_id, then attempt, then
-// started_time. An epoch orders the attempts of one Producer only, and a Producer belongs to one
-// run. So a reset run and the next run of a chain have other Producers, and their epochs start
-// again.
-message WorkflowTaskEpoch {
+// started_time. The order holds among the attempts of one Producer only, and a Producer belongs
+// to one run. So a reset run and the next run of a chain have other Producers, and their
+// attempts have no order with these.
+message WorkflowTaskAttempt {
     // Required.
     int64 started_event_id = 1;
-    // Required. 1 or more.
+    // Required. The attempt number of the task, 1 or more. Each task starts at 1 again, so the
+    // number alone doesn't order the writes of a run.
     int32 attempt = 2;
     // Tells a reused started event id apart, for example after a dropped speculative task. Core
     // leaves it empty when the server gave the task no started time.
@@ -43,36 +44,36 @@ message WorkflowTaskEpoch {
 }
 
 // Experimental. Might change in the future.
-// The attempt of a Local Activity. It orders by task, then attempt, so the same call in a later
-// Workflow Task is a higher epoch. The Producer carries the run. Records of two runs have no
-// order by epoch, only their order in the Stream.
-message LocalActivityEpoch {
+// One attempt of a Local Activity. It orders by task, then attempt, so the same call in a later
+// Workflow Task is a later attempt. The Producer carries the run. Records of two runs have no
+// order by attempt, only their order in the Stream.
+message LocalActivityAttempt {
     // Required. The Workflow Task attempt that dispatched the Local Activity.
-    WorkflowTaskEpoch task = 1;
-    // Required. The Local Activity's own attempt in that Workflow Task, 1 or more.
+    WorkflowTaskAttempt task = 1;
+    // Required. The Local Activity's own attempt number in that Workflow Task, 1 or more.
     int32 attempt = 2;
 }
 
 // Experimental. Might change in the future.
-// The attempt of an Activity. It orders by attempt_scheduled_time, then attempt.
-message ActivityEpoch {
-    // Required. When the server scheduled this attempt. An Activity reset starts the attempt count
-    // again, so only this time orders the attempts across a reset.
+// One attempt of an Activity. It orders by attempt_scheduled_time, then attempt.
+message ActivityAttempt {
+    // Required. When the server scheduled this attempt. An Activity reset starts the attempt
+    // number at 1 again, so only this time orders the attempts across a reset.
     google.protobuf.Timestamp attempt_scheduled_time = 1;
-    // Required. 1 or more.
+    // Required. The attempt number, 1 or more.
     int32 attempt = 2;
 }
 
 // Experimental. Might change in the future.
 // A Workflow run Producer. Workflow code that writes in its Workflow Task writes as this
-// Producer, with that task as the epoch. A write that it makes through a Local Activity has a
+// Producer, with the attempt of that task. A write that it makes through a Local Activity has a
 // Local Activity Producer.
 message WorkflowProducer {
     // Required. The run id of the Workflow run, not of its chain. Each run is its own Producer.
     string run_id = 1;
-    // The Workflow Task of the write. Workflow code leaves it empty, and the SDK sets it before
-    // the write goes to the Store.
-    WorkflowTaskEpoch epoch = 2;
+    // The Workflow Task attempt of the write. Workflow code leaves it empty, and the SDK sets it
+    // before the write goes to the Store.
+    WorkflowTaskAttempt attempt = 2;
 }
 
 // Experimental. Might change in the future.
@@ -81,7 +82,7 @@ message LocalActivityProducer {
     // Required. The run id of the Workflow run.
     string run_id = 1;
     // Required.
-    LocalActivityEpoch epoch = 2;
+    LocalActivityAttempt attempt = 2;
 }
 
 // Experimental. Might change in the future.
@@ -91,24 +92,24 @@ message ActivityProducer {
     // Activity, whose own run id is in the Producer id.
     string run_id = 1;
     // Required.
-    ActivityEpoch epoch = 2;
+    ActivityAttempt attempt = 2;
 }
 
 // Experimental. Might change in the future.
-// A client Producer. A client has no run and no epoch. So nothing fences a client's writes, and a
-// reader never hides them.
+// A client Producer. A client has no run and no attempt. So nothing fences a client's writes,
+// and a reader never hides them.
 message ClientProducer {
 }
 
 // Experimental. Might change in the future.
 // The code that wrote a batch, which is one unit of work. Its id stays the same across attempts,
-// and an epoch is one attempt. The kind's case orders its epochs. A Store can fence. Then, after a
-// write of a higher epoch, a write of a lower epoch of the same Producer fails with FENCED. A
-// Store that doesn't fence takes both writes. Each Record has its Producer and its epoch either
-// way, so a reader may hide the Records of the lower epoch. The rule is the same for every kind
-// that has an epoch. A client has none. The epochs of two Producers never compare. A new run has
-// new Producers, so no write fences or supersedes the Records of an earlier run, such as the base
-// run of a reset.
+// and each write carries the attempt that made it. The kind's case orders its attempts. A Store
+// can fence. Then, after a write of a later attempt, a write of an earlier attempt of the same
+// Producer fails with FENCED. A Store that doesn't fence takes both writes. Each Record has its
+// Producer and its attempt either way, so a reader may hide the Records of the earlier attempt.
+// The rule is the same for every kind that has an attempt. A client has none. The attempts of
+// two Producers never compare. A new run has new Producers, so no write fences or supersedes the
+// Records of an earlier run, such as the base run of a reset.
 message Producer {
     // Required. Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
     // It is unique in one Stream. The id of a run-based kind has its run id, so it stays unique
@@ -120,7 +121,7 @@ message Producer {
         LocalActivityProducer local_activity = 3;
         // An Activity that a Workflow scheduled.
         ActivityProducer workflow_activity = 4;
-        // An Activity with no Workflow. Both Activity cases order their epochs the same way. The
+        // An Activity with no Workflow. Both Activity cases order their attempts the same way. The
         // case tells which identity the Producer has, since only the first has a Workflow run.
         ActivityProducer standalone_activity = 5;
         ClientProducer client = 6;

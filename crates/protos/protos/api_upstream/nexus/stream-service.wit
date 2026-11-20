@@ -45,30 +45,30 @@ interface stream-service {
   }
 
   /// @nexus.doc "A Workflow Task attempt of the run."
-  /// @nexus.proto "temporal.api.stream.v1.WorkflowTaskEpoch"
-  record workflow-task-epoch {
+  /// @nexus.proto "temporal.api.stream.v1.WorkflowTaskAttempt"
+  record workflow-task-attempt {
     started-event-id: s64,
-    /// @nexus.doc "1 or more."
+    /// @nexus.doc "The attempt number of the task, 1 or more. Each task starts at 1 again."
     attempt: s32,
     /// @nexus.doc "When the Workflow Task attempt started. It tells a reused started id apart."
     started-time: option<timestamp>,
   }
 
   /// @nexus.doc "A Local Activity attempt. Its Workflow Task orders it first."
-  /// @nexus.proto "temporal.api.stream.v1.LocalActivityEpoch"
-  record local-activity-epoch {
+  /// @nexus.proto "temporal.api.stream.v1.LocalActivityAttempt"
+  record local-activity-attempt {
     /// @nexus.doc "The Workflow Task attempt that dispatched the Local Activity."
-    task: workflow-task-epoch,
-    /// @nexus.doc "The Local Activity's own attempt in that Workflow Task, 1 or more."
+    task: workflow-task-attempt,
+    /// @nexus.doc "The Local Activity's own attempt number in that Workflow Task, 1 or more."
     attempt: s32,
   }
 
   /// @nexus.doc "An Activity or Standalone Activity attempt."
-  /// @nexus.proto "temporal.api.stream.v1.ActivityEpoch"
-  record activity-epoch {
+  /// @nexus.proto "temporal.api.stream.v1.ActivityAttempt"
+  record activity-attempt {
     /// @nexus.doc "When the server scheduled this attempt. A reset makes it later."
     attempt-scheduled-time: timestamp,
-    /// @nexus.doc "1 or more."
+    /// @nexus.doc "The attempt number, 1 or more. A reset starts it at 1 again."
     attempt: s32,
   }
 
@@ -77,15 +77,15 @@ interface stream-service {
   record workflow-producer {
     /// @nexus.doc "The run id of the Workflow run, not of its chain."
     run-id: string,
-    // The Workflow Task of the write.
-    epoch: option<workflow-task-epoch>,
+    // The Workflow Task attempt of the write.
+    attempt: option<workflow-task-attempt>,
   }
 
   /// @nexus.doc "A Local Activity Producer."
   /// @nexus.proto "temporal.api.stream.v1.LocalActivityProducer"
   record local-activity-producer {
     run-id: string,
-    epoch: local-activity-epoch,
+    attempt: local-activity-attempt,
   }
 
   /// @nexus.doc "An Activity Producer."
@@ -93,16 +93,16 @@ interface stream-service {
   record activity-producer {
     /// @nexus.doc "The run of the Workflow that scheduled the Activity. Empty when standalone."
     run-id: option<string>,
-    epoch: activity-epoch,
+    attempt: activity-attempt,
   }
 
-  /// @nexus.doc "A client Producer. It has no run and no epoch, so nothing fences it."
+  /// @nexus.doc "A client Producer. It has no run and no attempt."
   /// @nexus.proto "temporal.api.stream.v1.ClientProducer"
   record client-producer {
   }
 
   // The case is the kind of the Producer, so a kind sets only its own fields.
-  /// @nexus.doc "The kind of a Producer, with its run and epoch."
+  /// @nexus.doc "The kind of a Producer, with its run and attempt."
   /// @nexus.proto "temporal.api.stream.v1.Producer.kind"
   variant producer-kind {
     workflow(workflow-producer),
@@ -112,7 +112,7 @@ interface stream-service {
     client(client-producer),
   }
 
-  /// @nexus.doc "The code that wrote a batch. A higher epoch supersedes a lower one."
+  /// @nexus.doc "The code that wrote a batch. A later attempt supersedes an earlier one."
   /// @nexus.proto "temporal.api.stream.v1.Producer"
   record producer {
     /// @nexus.doc "Stable across attempts, such as wf:<run id> for a Workflow run."
@@ -183,7 +183,7 @@ interface stream-service {
   }
 
   /// @nexus.doc
-  ///   "Append one batch. The Store keeps a resent batch once, by Producer, epoch and sequence."
+  ///   "Append one batch. The Store keeps a resent batch once, by Producer, attempt and sequence."
   /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsRequest"
   record append-records-request {
     ref: stream-ref,
@@ -199,7 +199,7 @@ interface stream-service {
     // A call that passes no sequence sends none. The Store then numbers the batch, so nothing
     // dedupes it.
     /// @nexus.doc
-    ///   "The batch number in this epoch. Empty takes the next one, and a retry writes it again."
+    ///   "The batch number in this attempt. Empty takes the next one, and a retry writes it again."
     sequence: option<s64>,
     // Native only. The SDK sets it, and the SDK Stores don't read it.
     /// @nexus.omit

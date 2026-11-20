@@ -51,7 +51,7 @@ message CreateStreamResponse {
 
 // Experimental. Might change in the future.
 // Appends one batch of Records as one Producer. The Store writes a resent batch, with the same
-// Producer, epoch and sequence, only once.
+// Producer, attempt and sequence, only once.
 message AppendRecordsRequest {
     // The caller's namespace. Only read by the server. The SDK sets it, and the SDK Stores don't
     // read it.
@@ -61,8 +61,9 @@ message AppendRecordsRequest {
     // Required. The Producer of the batch. An append and a close of one Producer carry the same
     // Producer, so the Store orders each write the same way.
     temporal.api.stream.v1.Producer producer = 3;
-    // The batch number in this epoch. With the Producer and epoch it is the dedupe key. Zero takes
-    // the next number of the epoch. Such a batch has no dedupe, so a retry writes it again.
+    // The batch number in this attempt. With the Producer and the attempt it is the dedupe key.
+    // Zero takes the next number of the attempt. Such a batch has no dedupe, so a retry writes it
+    // again.
     int64 sequence = 4;
     repeated temporal.api.stream.v1.AppendRecord records = 5;
 }
