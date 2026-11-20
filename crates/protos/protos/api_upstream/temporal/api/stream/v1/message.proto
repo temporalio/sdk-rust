@@ -102,11 +102,13 @@ message ClientProducer {
 
 // Experimental. Might change in the future.
 // The code that wrote a batch, which is one unit of work. Its id stays the same across attempts,
-// and an epoch is one attempt. The kind's case orders its epochs. After a write of a higher epoch,
-// a write of a lower epoch of the same Producer fails with FENCED, and a reader may hide the
-// Records of the lower epoch. The rule is the same for every kind that has an epoch. A client has
-// none. The epochs of two Producers never compare. A new run has new Producers, so no write
-// fences or supersedes the Records of an earlier run, such as the base run of a reset.
+// and an epoch is one attempt. The kind's case orders its epochs. A Store can fence. Then, after a
+// write of a higher epoch, a write of a lower epoch of the same Producer fails with FENCED. A
+// Store that doesn't fence takes both writes. Each Record has its Producer and its epoch either
+// way, so a reader may hide the Records of the lower epoch. The rule is the same for every kind
+// that has an epoch. A client has none. The epochs of two Producers never compare. A new run has
+// new Producers, so no write fences or supersedes the Records of an earlier run, such as the base
+// run of a reset.
 message Producer {
     // Required. Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
     // It is unique in one Stream. The id of a run-based kind has its run id, so it stays unique

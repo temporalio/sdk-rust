@@ -42,7 +42,7 @@ enum StreamErrorReason {
     STREAM_ERROR_REASON_EXPIRED = 2;
     // The Stream is closed. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_CLOSED = 3;
-    // The Producer's epoch is lower than the newest one. FAILED_PRECONDITION.
+    // The Producer's epoch is lower than the newest one, and the Store fences. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_FENCED = 4;
     // The batch has a lower `sequence` than the last one of its epoch. FAILED_PRECONDITION.
     STREAM_ERROR_REASON_SEQUENCE_TOO_LOW = 5;
