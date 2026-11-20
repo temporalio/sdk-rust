@@ -1230,7 +1230,18 @@ impl ManagedRun {
             force_new_wft = true;
         }
 
+        let mut evict_after_report = false;
         let outcome = if should_respond || has_query_responses {
+            // The server may discard a completion that only rejects updates, without persisting it
+            // or reporting a reset point when it is for the first task (ex: an update rejected
+            // during a start delay). On the first task, workflow initialization still ran, so the
+            // cached state can diverge from whatever history the server goes on to record.
+            evict_after_report = !data.activation_was_eviction
+                && self
+                    .wft
+                    .as_ref()
+                    .is_some_and(|t| t.info.previous_started_event_id == 0)
+                && machines_wft_response.only_rejects_updates();
             // Broken evictions cannot pass should_respond or contain query responses. Keep this
             // fallback to avoid sending buffered output if those invariants regress.
             let (commands, messages) = if self.am_broken && data.activation_was_eviction {
@@ -1264,6 +1275,18 @@ impl ManagedRun {
         let replaying = machines_wft_response.replaying;
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
             self.wfm.wft_completion_reported();
+        }
+        if evict_after_report {
+            // The activation is still outstanding, so the eviction is only issued once the
+            // completion has been reported.
+            let _ = self.request_eviction(RequestEvictMsg {
+                run_id: self.run_id().to_string(),
+                message: "First workflow task completion only rejected updates, so the server \
+                          may have discarded it"
+                    .to_string(),
+                reason: EvictionReason::Unspecified,
+                auto_reply_fail: None,
+            });
         }
         FulfillableActivationComplete {
             result: ActivationCompleteResult { outcome, replaying },

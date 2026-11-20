@@ -67,6 +67,12 @@ relevant information.
 * Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
 * Downloading an ephemeral dev or test server binary retries a transfer that breaks while the
   archive streams in, such as a reset connection, instead of failing the server start.
+* A workflow whose first workflow task completion only rejects updates, such as an update rejected
+  during a start delay, is now evicted from the cache afterward (reason `UNSPECIFIED`), because the
+  server may discard that completion without recording it. Previously the cached workflow kept state
+  from initialization that history never recorded, so it could fail a later task with a
+  nondeterminism error when another worker had handled the first recorded task.
+
 ### Changed
 * [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
   compatible with current nexgen default expressions and workflow-target generation.
