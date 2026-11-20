@@ -4628,6 +4628,7 @@ dependencies = [
  "prost",
  "prost-wkt-types",
  "rand 0.10.3",
+ "sha2 0.11.1",
  "temporalio-common",
  "thiserror 2.0.21",
  "tokio",
