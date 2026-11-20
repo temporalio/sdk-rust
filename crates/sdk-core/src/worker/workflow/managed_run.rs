@@ -467,6 +467,21 @@ impl ManagedRun {
             return Ok(None);
         };
 
+        // A synthetic FailWorkflow completion intentionally replaces any SDK query response.
+        if !is_forced_failure
+            && matches!(self.activation, Some(OutstandingActivation::AttachedQueries))
+            && !commands.iter().any(|cmd| {
+                matches!(&cmd.variant, WFCommandVariant::QueryResponse(q) if q.query_id != LEGACY_QUERY_ID)
+            })
+        {
+            return Ok(self.update_to_acts(Err(RunUpdateErr {
+                source: WFMachinesError::Fatal(
+                    "Attached query activation completed without a query response".to_owned(),
+                ),
+                complete_resp_chan: resp_chan,
+            })));
+        }
+
         // If the only command from the activation is a legacy query response, that means we need
         // to respond differently than a typical activation.
         if matches!(&commands.as_slice(),
@@ -784,13 +799,6 @@ impl ManagedRun {
         }
 
         let outcome = (|| {
-            // A completion with query responses is always reported as this WFT's completion, so LA
-            // results that arrived while lang answered the queries must wait for the next WFT, as
-            // they would after any other completion. Mark it before pushing lang's commands, which
-            // would otherwise apply those results and put their markers in this completion.
-            if !data.query_responses.is_empty() {
-                self.wfm.wft_completion_reported();
-            }
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;
@@ -1078,9 +1086,7 @@ impl ManagedRun {
                     }
                     Some(ActivationOrAuto::ReadyForQueries(mut act)) => {
                         if let Some(wft) = self.wft.as_mut() {
-                            if put_queries_in_act(&mut act, wft) == DispatchedQueries::Attached {
-                                self.wfm.attached_queries_dispatched();
-                            }
+                            put_queries_in_act(&mut act, wft);
                             Some(ActivationOrAuto::LangActivation(act))
                         } else {
                             dbg_panic!("Ready for queries but no WFT!");
@@ -1195,6 +1201,16 @@ impl ManagedRun {
                     OutstandingActivation::Eviction
                 } else if act.is_legacy_query() {
                     OutstandingActivation::LegacyQuery
+                } else if act.jobs.iter().any(|job| {
+                    matches!(
+                        job.variant,
+                        Some(workflow_activation_job::Variant::QueryWorkflow(_))
+                    )
+                }) {
+                    // Answering the queries completes this task. Hold external LA results now so
+                    // their markers are recorded by the task that actually delivers the results.
+                    self.wfm.hold_local_resolutions_until_next_wft();
+                    OutstandingActivation::AttachedQueries
                 } else {
                     OutstandingActivation::Normal
                 }
@@ -1286,7 +1302,7 @@ impl ManagedRun {
         };
         let replaying = machines_wft_response.replaying;
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
-            self.wfm.wft_completion_reported();
+            self.wfm.hold_local_resolutions_until_next_wft();
         }
         FulfillableActivationComplete {
             result: ActivationCompleteResult { outcome, replaying },
@@ -1454,30 +1470,18 @@ fn preprocess_command_sequence_old_behavior(
     (commands, query_results)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum DispatchedQueries {
-    None,
-    /// Queries that came with a WFT, whose responses complete it
-    Attached,
-    /// A legacy query, answered through the query API without touching the workflow machines
-    Legacy,
-}
-
 /// Drains pending queries from the workflow task and appends them to the activation's jobs
-fn put_queries_in_act(
-    act: &mut WorkflowActivation,
-    wft: &mut OutstandingTask,
-) -> DispatchedQueries {
+fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
     // Nothing to do if there are no pending queries
     if wft.pending_queries.is_empty() {
-        return DispatchedQueries::None;
+        return;
     }
 
     let has_legacy = wft.has_pending_legacy_query();
     // Cannot dispatch legacy query if there are any other jobs - which can happen if, ex, a local
     // activity resolves while we've gotten a legacy query after heartbeating.
     if has_legacy && !act.jobs.is_empty() {
-        return DispatchedQueries::None;
+        return;
     }
 
     debug!(queries=?wft.pending_queries, "Dispatching queries");
@@ -1486,11 +1490,6 @@ fn put_queries_in_act(
         .drain(..)
         .map(|q| workflow_activation_job::Variant::QueryWorkflow(q).into());
     act.jobs.extend(query_jobs);
-    if has_legacy {
-        DispatchedQueries::Legacy
-    } else {
-        DispatchedQueries::Attached
-    }
 }
 fn sink_heartbeat_timeout_start(
     run_id: String,
@@ -1678,22 +1677,8 @@ impl WorkflowManager {
         self.apply_deferred_local_resolutions()
     }
 
-    /// Must be called once the current WFT's completion has been, or is certain to be, reported to
-    /// server (completions with query responses always are).
-    fn wft_completion_reported(&mut self) {
+    fn hold_local_resolutions_until_next_wft(&mut self) {
         self.awaiting_next_wft = true;
-    }
-
-    /// Must be called when lang is sent the queries that came with the current WFT. Their
-    /// responses complete the WFT, so LA results arriving before lang answers them are deferred,
-    /// as during any other activation. Otherwise their markers would be recorded in this WFT while
-    /// lang only receives them in the next one, alongside that WFT's own jobs, which is not where
-    /// replay delivers them.
-    ///
-    /// Not called for legacy queries: their responses don't go through the machines, so nothing
-    /// would clear the flag, and they can't carry commands that results would need to follow.
-    fn attached_queries_dispatched(&mut self) {
-        self.awaiting_activation_completion = true;
     }
 
     fn apply_deferred_local_resolutions(&mut self) -> Result<()> {
@@ -2289,7 +2274,7 @@ mod tests {
             )])
             .unwrap();
             live.drain_queued_local_activities();
-            live.wft_completion_reported();
+            live.hold_local_resolutions_until_next_wft();
             let mut result = Some(LocalResolution::LocalActivity(LocalActivityResolution {
                 seq: 1,
                 result: LocalActivityExecutionResult::Completed(Success {
@@ -2640,7 +2625,7 @@ mod tests {
                     }
                     Step::CompleteWft => {
                         record_wft_completion(&mut history, &live);
-                        live.wft_completion_reported();
+                        live.hold_local_resolutions_until_next_wft();
                         continue;
                     }
                     Step::NextWft { signal } => {

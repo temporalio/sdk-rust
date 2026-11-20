@@ -92,6 +92,8 @@ relevant information.
   (with the workflow cache disabled, the task after the forced one; otherwise after an eviction or
   restart). Queried tasks after one that recorded no commands remain subject to
   [#1737](https://github.com/temporalio/sdk-rust/issues/1737).
+* [lang-internal] A successful activation completion for attached queries must include a query
+  response. Core fails the workflow task if the SDK sends a success without one.
 
 ### Added
 * The C bridge's shared dev and test server options accept a startup timeout in milliseconds,

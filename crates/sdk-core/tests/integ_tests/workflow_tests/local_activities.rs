@@ -2548,6 +2548,38 @@ async fn la_resolved_while_answering_attached_query_replays_like_live(
     run.assert_replay_matches_live().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn attached_query_completion_without_response_fails_task() {
+    let mut run = LiveRun::new(started_history(), SignalAfterLocalActivitiesWf::new(1), 1);
+    let (query, mut local_activities) = run.run_local_activities_with_queries(&["q"]).await;
+    run.complete_local_activity(local_activities.pop().unwrap())
+        .await;
+    within(
+        "completing the activation without a query response",
+        run.core
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(query.run_id)),
+    )
+    .await
+    .unwrap();
+
+    let failure = within(
+        "waiting for workflow task failure",
+        run.task_failures.recv(),
+    )
+    .await
+    .unwrap();
+    assert!(failure.contains("Attached query activation completed without a query response"));
+    assert!(run.completions.try_recv().is_err());
+
+    let run = run.evict_and_shut_down().await;
+    within(
+        "finalizing the worker's shutdown",
+        run.core.finalize_shutdown(),
+    )
+    .await;
+}
+
 /// Like [la_resolved_while_answering_attached_query_replays_like_live], with the local activity
 /// running across a workflow task heartbeat and the query attached to the heartbeat's task.
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]

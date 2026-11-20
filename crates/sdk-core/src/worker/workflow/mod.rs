@@ -1078,6 +1078,8 @@ impl OutstandingTask {
 pub(crate) enum OutstandingActivation {
     /// A normal activation with a joblist
     Normal,
+    /// Queries whose responses complete the current workflow task
+    AttachedQueries,
     /// An eviction job
     Eviction,
     /// An activation for a legacy query
