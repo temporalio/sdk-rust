@@ -215,6 +215,7 @@ enum ActivityTaskSource {
 impl WorkerActivityTasks {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        namespace: String,
         semaphore: MeteredPermitDealer<ActivitySlotKind>,
         poller: BoxedActPoller,
         client: Arc<dyn WorkerClient>,
@@ -240,7 +241,7 @@ impl WorkerActivityTasks {
         );
         let (cancels_tx, cancels_rx) = unbounded_channel();
         let external_cancels_tx = cancels_tx.clone();
-        let heartbeat_manager = ActivityHeartbeatManager::new(client, cancels_tx.clone());
+        let heartbeat_manager = ActivityHeartbeatManager::new(client.clone(), cancels_tx.clone());
         let (completions_in_flight, completions_in_flight_rx) = watch::channel(0);
         let source_stream = stream::select_with_strategy(
             UnboundedReceiverStream::new(cancels_rx).map(ActivityTaskSource::from),
@@ -249,6 +250,8 @@ impl WorkerActivityTasks {
         );
 
         let activity_task_stream = ActivityTaskStream {
+            client,
+            namespace,
             source_stream,
             outstanding_tasks: outstanding_activity_tasks.clone(),
             start_tasks_stream_complete,
@@ -660,6 +663,8 @@ impl WorkerActivityTasks {
 }
 
 struct ActivityTaskStream<SrcStrm> {
+    client: Arc<dyn WorkerClient>,
+    namespace: String,
     source_stream: SrcStrm,
     outstanding_tasks: OutstandingActMap,
     start_tasks_stream_complete: CancellationToken,
@@ -746,15 +751,35 @@ where
                             };
 
                             let tt: TaskToken = task.resp.task_token.clone().into();
-                            self.outstanding_tasks.lock().insert(
-                                tt.clone(),
-                                RemoteInFlightActInfo::new(
-                                    &task.resp,
-                                    task.permit.into_used(ActivitySlotInfo {
-                                        activity_type: activity_type_name.to_string(),
-                                    }),
-                                ),
-                            );
+                            let mut activity_info = Some(RemoteInFlightActInfo::new(
+                                &task.resp,
+                                task.permit.into_used(ActivitySlotInfo {
+                                    activity_type: activity_type_name.to_string(),
+                                }),
+                            ));
+                            let mut register = || {
+                                self.outstanding_tasks.lock().insert(
+                                    tt.clone(),
+                                    activity_info.take().expect("activity registered exactly once"),
+                                );
+                            };
+                            let pending_cancel = match self.client.workers().worker_command_cache(&self.namespace) {
+                                Some(cache) => cache.register_activity(&tt, &mut register),
+                                None => {
+                                    register();
+                                    false
+                                }
+                            };
+                            if pending_cancel {
+                                let _ = cancels_tx.send(PendingActivityCancel::new(
+                                    tt.clone(),
+                                    ActivityCancelReason::Cancelled,
+                                    ActivityCancellationDetails {
+                                        is_cancelled: true,
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
 
                             // If we have already waited the grace period and issued cancels,
                             // this will have been set true, indicating anything that happened
@@ -1079,6 +1104,7 @@ mod tests {
             Arc::new(NamespaceCapabilities::default()),
         );
         WorkerActivityTasks::new(
+            "test-namespace".to_owned(),
             sem,
             Box::new(ap),
             mock_client,
@@ -1166,6 +1192,7 @@ mod tests {
             Arc::new(NamespaceCapabilities::default()),
         );
         let atm = WorkerActivityTasks::new(
+            "test-namespace".to_owned(),
             sem.clone(),
             Box::new(ap),
             mock_client.clone(),
