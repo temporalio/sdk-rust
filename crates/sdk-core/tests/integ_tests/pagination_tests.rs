@@ -126,7 +126,6 @@ async fn weird_pagination_doesnt_drop_wft_events() {
         mh,
         |cfg| {
             cfg.max_cached_workflows = 2;
-            cfg.ignore_evicts_on_shutdown = false;
         },
         |options| {
             options
@@ -279,7 +278,6 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
         mh,
         |cfg| {
             cfg.max_cached_workflows = 2;
-            cfg.ignore_evicts_on_shutdown = false;
         },
         |options| {
             options

@@ -72,7 +72,10 @@ Good pull requests are focused and easy to review:
   different interaction with the server. Because the Rust SDK runs on Core too, a
   user-observable change in Core behavior normally belongs in both files; an internal Rust
   API change that a language SDK absorbs inside its own bridge is invisible to its users
-  and belongs in neither. Write each entry from the perspective of the file's audience,
+  and belongs in neither as a user-facing entry. If language SDK maintainers need to know
+  about it (for example, a breaking change to a Rust API a bridge calls), start its Core
+  entry with `[lang-internal]`; such entries are not imported into language SDK changelogs
+  or release notes. Write each entry from the perspective of the file's audience,
   wording a change that goes in both changelogs separately for each. See
   [the fragment guide](changelog/README.md) for SDK categories and the comment at the
   top of the Core changelog for its headings.

@@ -7,10 +7,10 @@ use crate::{
         CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt,
         WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
-        build_fake_worker, build_mock_pollers, build_multihist_mock_sg, drain_pollers_and_shutdown,
-        fanout_tasks, gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker,
-        poll_and_reply, poll_and_reply_clears_outstanding_evicts, schedule_local_activity_cmd,
-        single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
+        build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
+        gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
+        poll_and_reply_clears_outstanding_evicts, schedule_local_activity_cmd, single_hist_mock_sg,
+        start_timer_cmd, test_worker_cfg,
     },
     worker::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
@@ -59,9 +59,10 @@ use temporalio_common::{
         temporal::api::{
             command::v1::command::Attributes,
             common::v1::{Payload, RetryPolicy},
-            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+            enums::v1::{CommandType, EventType, RetryState, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
+                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes,
                 TimerFiredEventAttributes, WorkflowPropertiesModifiedExternallyEventAttributes,
                 history_event,
             },
@@ -474,6 +475,133 @@ async fn started_activity_cancellation_abandon(hist_batches: &'static [usize]) {
     verify_activity_cancellation(&core, activity_id, ActivityCancellationType::Abandon).await;
 }
 
+#[derive(Clone, Copy)]
+enum LateActivityEvent {
+    Started,
+    Completed,
+    Failed,
+    TimedOut,
+}
+
+// The server keeps running an abandoned activity, so whatever eventually happens to it still lands
+// in history after the workflow was told the activity was cancelled.
+#[rstest]
+#[case::scheduled_then_completed(false, &[LateActivityEvent::Started, LateActivityEvent::Completed])]
+#[case::scheduled_then_failed(false, &[LateActivityEvent::Started, LateActivityEvent::Failed])]
+#[case::scheduled_then_timed_out(false, &[LateActivityEvent::Started, LateActivityEvent::TimedOut])]
+#[case::scheduled_then_timed_out_unstarted(false, &[LateActivityEvent::TimedOut])]
+#[case::started_then_completed(true, &[LateActivityEvent::Completed])]
+#[case::started_then_failed(true, &[LateActivityEvent::Failed])]
+#[case::started_then_timed_out(true, &[LateActivityEvent::TimedOut])]
+#[tokio::test]
+async fn abandoned_activity_ignores_late_events(
+    #[case] started_before_abandon: bool,
+    #[case] late_events: &[LateActivityEvent],
+    #[values(false, true)] replay: bool,
+) {
+    let activity_seq = 1;
+    let timer_seq = 1;
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled_event_id = t.add_activity_task_scheduled(activity_seq.to_string());
+    let mut started_event_id = if started_before_abandon {
+        t.add_activity_task_started(scheduled_event_id)
+    } else {
+        0
+    };
+    t.add_we_signaled("abandon", vec![]);
+    t.add_full_wf_task();
+    let timer_started_event_id = t.add_timer_started(timer_seq.to_string());
+    for event in late_events {
+        match event {
+            LateActivityEvent::Started => {
+                started_event_id = t.add_activity_task_started(scheduled_event_id);
+            }
+            LateActivityEvent::Completed => {
+                t.add_activity_task_completed(
+                    scheduled_event_id,
+                    started_event_id,
+                    Default::default(),
+                );
+            }
+            LateActivityEvent::Failed => {
+                t.add(ActivityTaskFailedEventAttributes {
+                    scheduled_event_id,
+                    started_event_id,
+                    failure: Some(Failure {
+                        message: "failed after being abandoned".to_string(),
+                        ..Default::default()
+                    }),
+                    retry_state: RetryState::MaximumAttemptsReached.into(),
+                    ..Default::default()
+                });
+            }
+            LateActivityEvent::TimedOut => {
+                t.add(ActivityTaskTimedOutEventAttributes {
+                    scheduled_event_id,
+                    started_event_id,
+                    retry_state: RetryState::Timeout.into(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    t.add_full_wf_task();
+    t.add_timer_fired(timer_started_event_id, timer_seq.to_string());
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let response_batches = if replay {
+        vec![ResponseType::AllHistory]
+    } else {
+        vec![1.into(), 2.into(), 3.into(), 4.into()]
+    };
+    let core = build_fake_worker("fake_wf_id", t, response_batches);
+
+    poll_and_reply(
+        &core,
+        NonSticky,
+        &[
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::InitializeWorkflow(_)),
+                vec![
+                    ScheduleActivity {
+                        seq: activity_seq,
+                        activity_id: activity_seq.to_string(),
+                        cancellation_type: ActivityCancellationType::Abandon as i32,
+                        ..default_act_sched()
+                    }
+                    .into(),
+                ],
+            ),
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::SignalWorkflow(_)),
+                vec![RequestCancelActivity { seq: activity_seq }.into()],
+            ),
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::ResolveActivity(
+                    ResolveActivity {
+                        result: Some(ActivityResolution {
+                            status: Some(activity_resolution::Status::Cancelled(..)),
+                        }),
+                        ..
+                    }
+                )),
+                vec![start_timer_cmd(timer_seq, Duration::from_secs(1))],
+            ),
+            // The activity was already resolved as cancelled, so the late events must not resolve
+            // it again.
+            gen_assert_and_reply(
+                &job_assert!(workflow_activation_job::Variant::FireTimer(_)),
+                vec![CompleteWorkflowExecution { result: None }.into()],
+            ),
+        ],
+    )
+    .await;
+}
+
 #[rstest(hist_batches, case::incremental(&[1, 3]), case::replay(&[3]))]
 #[tokio::test]
 async fn scheduled_activity_cancellation_try_cancel_task_canceled(hist_batches: &'static [usize]) {
@@ -756,7 +884,7 @@ async fn complete_activation_with_failure(
         ],
     )
     .await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
@@ -1058,7 +1186,7 @@ async fn lots_of_workflows() {
         }
     });
     join!(killer, poller);
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
@@ -1136,7 +1264,7 @@ async fn complete_after_eviction() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1162,7 +1290,68 @@ async fn sends_appropriate_sticky_task_queue_responses() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn completions_carry_workflow_resource_id() {
+    let t = canned_histories::single_timer("1");
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("resource-wf", t, [1, 2], mock_worker_client());
+    mock_cfg.num_expected_completions = Some(2.into());
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts
+            .then(|wft| assert_eq!(wft.resource_id, "workflow:resource-wf"))
+            .then(|wft| assert_eq!(wft.resource_id, "workflow:resource-wf"));
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        CompleteWorkflowExecution { result: None }.into(),
+    ))
+    .await
+    .unwrap();
+    core.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn task_failures_carry_workflow_resource_id() {
+    let t = canned_histories::single_timer("1");
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_fail_workflow_task()
+        .times(1)
+        .returning(|task, _, _| {
+            assert_eq!(task.resource_id, "workflow:resource-wf");
+            Ok(Default::default())
+        });
+    let mock_cfg =
+        MockPollCfg::from_resp_batches("resource-wf", t, [ResponseType::AllHistory], mock_client);
+    let core = mock_worker(build_mock_pollers(mock_cfg));
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        activation.run_id,
+        Failure {
+            message: "Simulated workflow task failure".to_string(),
+            ..Default::default()
+        },
+        None,
+    ))
+    .await
+    .unwrap();
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1250,6 +1439,7 @@ async fn buffered_work_drained_on_shutdown() {
         ))
         .await
         .unwrap();
+        core.drain_workflow_poller().await;
     };
     let complete_first = async move {
         // If the first complete is sent too fast, we may not have had a chance to buffer work.
@@ -1323,7 +1513,7 @@ async fn fail_wft_then_recover() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1357,7 +1547,7 @@ async fn default_wft_fail_cause_is_worker_unhandled() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1447,7 +1637,7 @@ async fn lang_slower_than_wft_timeouts() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1590,7 +1780,7 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 fn la_cancel_mock_cfg() -> MockPollCfg {
@@ -1681,7 +1871,7 @@ async fn la_cancel_delivered_before_eviction_activation() {
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest::rstest]
@@ -1804,7 +1994,7 @@ async fn eviction_requested_during_activation_cancels_la_before_evicting(
         advance_fut!(wf_poll);
     }
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -1926,7 +2116,7 @@ async fn abandoned_la_cancel_delivered_before_workflow_completion_eviction() {
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[rstest]
@@ -2035,7 +2225,7 @@ async fn la_results_during_withheld_eviction_do_not_surface(
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2082,7 +2272,7 @@ async fn la_result_before_its_cancel_is_polled_releases_withheld_eviction() {
     // Core's local-activity polling discards the stale cancellation without returning it to lang.
     // The drain helper verifies this implicitly by requiring the next activity poll to return
     // PollError::ShutDown.
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[rstest]
@@ -2155,7 +2345,7 @@ async fn la_success_after_its_cancel_is_polled_does_not_surface(
         advance_fut!(wf_poll);
     }
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2208,7 +2398,7 @@ async fn queued_la_cancelled_by_eviction_does_not_surface() {
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -2265,7 +2455,7 @@ async fn backing_off_la_cancelled_by_eviction_does_not_surface() {
         .await
         .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2332,7 +2522,7 @@ async fn queued_la_cancelled_by_workflow_completion_does_not_surface() {
         .await
         .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2385,7 +2575,7 @@ async fn tries_cancel_of_completed_activity() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2438,7 +2628,7 @@ async fn failing_wft_doesnt_eat_permit_forever() {
         ))
         .await
         .unwrap();
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown_ref().await;
     assert_eq!(worker.available_wft_permits(), Some(2));
 }
 
@@ -2529,7 +2719,7 @@ async fn cache_miss_will_fetch_history() {
         .await
         .unwrap();
     assert_eq!(worker.outstanding_workflow_tasks().await, 0);
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2618,7 +2808,7 @@ async fn tasks_from_completion_are_delivered() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2671,7 +2861,7 @@ async fn pagination_works_with_tasks_from_completion() {
     ))
     .await
     .unwrap();
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2852,7 +3042,7 @@ async fn eviction_waits_until_replay_finished() {
     .await
     .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2918,7 +3108,7 @@ async fn autocompletes_wft_no_work() {
         PollError::ShutDown
     );
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -2948,15 +3138,11 @@ async fn no_race_acquiring_permits() {
         .returning(|_, _| async move { Ok(Default::default()) }.boxed());
 
     let worker = Worker::new_test(
-        {
-            let mut cfg = test_worker_cfg()
-                .max_outstanding_workflow_tasks(2_usize)
-                .max_cached_workflows(0_usize)
-                .build()
-                .unwrap();
-            cfg.ignore_evicts_on_shutdown = false;
-            cfg
-        },
+        test_worker_cfg()
+            .max_outstanding_workflow_tasks(2_usize)
+            .max_cached_workflows(0_usize)
+            .build()
+            .unwrap(),
         mock_client,
     );
 
@@ -2993,9 +3179,6 @@ async fn no_race_acquiring_permits() {
     join!(poll_1_f, poll_2_f, other_f);
     // Deal with eviction due to cache being full
     worker.handle_eviction().await;
-    // Complete workflow (otherwise, this test can encounter a rare shutdown-related race that is
-    // only possible with the `ignore_evicts_on_shutdown` flag set true, as it is to make tests
-    // more convenient).
     let r = worker.poll_workflow_activation().await.unwrap();
     worker
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
@@ -3057,7 +3240,7 @@ async fn continue_as_new_preserves_some_values() {
         ))
         .await
         .unwrap();
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[rstest]
@@ -3245,7 +3428,10 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         })
         .times(1);
     mock.expect_fail_workflow_task()
-        .returning(|_, _, _| Ok(Default::default()))
+        .returning(|task, _, _| {
+            assert_eq!(task.resource_id, "workflow:fake_wf_id");
+            Ok(Default::default())
+        })
         .times(1);
 
     let mut mock = single_hist_mock_sg(wfid, t, [ResponseType::Raw(first_poll)], mock, true);
@@ -3266,8 +3452,11 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
             variant: Some(workflow_activation_job::Variant::RemoveFromCache(c)),
         }] if c.message.contains("Fetching history")
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
+        .await
+        .unwrap();
 
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -3311,7 +3500,7 @@ async fn lang_internal_flags() {
     let act = core.poll_workflow_activation().await.unwrap();
     assert_matches!(act.available_internal_flags.as_slice(), [1, 2]);
     core.complete_execution(&act.run_id).await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -3405,7 +3594,7 @@ async fn core_internal_flags() {
 
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -3510,10 +3699,7 @@ async fn _do_post_terminal_commands_test(
     .await
     .unwrap();
 
-    core.initiate_shutdown();
-    let act = core.poll_workflow_activation().await;
-    assert_matches!(act.unwrap_err(), PollError::ShutDown);
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 // Lang expects to always see jobs in this order:
@@ -3763,7 +3949,7 @@ async fn use_compatible_version_flag(
         .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(r.run_id, cmd))
         .await
         .unwrap();
-    worker.shutdown().await;
+    worker.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -4192,7 +4378,7 @@ async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
         core.poll_workflow_activation().await.unwrap_err(),
         PollError::ShutDown
     );
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(
@@ -4268,7 +4454,7 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
             .await
             .unwrap();
     }
-    core.shutdown().await;
+    core.drain_pollers_and_shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
     assert_eq!(
         meter.counter_total(

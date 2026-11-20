@@ -821,7 +821,7 @@ where
                                 "",
                             )
                         });
-                        store_external_payloads(&mut request, &data_converter, target).await?;
+                        store_external_payloads(&mut request, &data_converter, &client.namespace(), target).await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         WorkflowService::signal_workflow_execution(&mut client, request)
@@ -903,7 +903,7 @@ where
                                 "",
                             )
                         });
-                        store_external_payloads(&mut request, &data_converter, target).await?;
+                        store_external_payloads(&mut request, &data_converter, &client.namespace(), target).await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         let mut response = client
@@ -1061,7 +1061,13 @@ where
                                     "",
                                 )
                             });
-                            store_external_payloads(&mut request, &data_converter, target).await?;
+                            store_external_payloads(
+                                &mut request,
+                                &data_converter,
+                                &client.namespace(),
+                                target,
+                            )
+                            .await?;
                             let mut response = loop {
                                 let mut rpc_request = request.clone().into_request();
                                 options.rpc_options.apply_to(&mut rpc_request);
@@ -1230,7 +1236,7 @@ where
                                 "",
                             )
                         });
-                        store_external_payloads(&mut request, client.data_converter(), target)
+                        store_external_payloads(&mut request, client.data_converter(), &client.namespace(), target)
                             .await?;
                         let mut request = request.into_request();
                         input.options.rpc_options.apply_to(&mut request);

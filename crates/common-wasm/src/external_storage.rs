@@ -184,6 +184,8 @@ pub struct StorageDriverStoreContext {
     /// The execution the payloads are being stored on behalf of. `None` when the SDK cannot tell,
     /// such as when an activity is completed through the client by its task token.
     pub target: Option<StorageDriverTargetInfo>,
+    /// The namespace of the client or worker performing the store. `None` when it is not known.
+    pub namespace: Option<String>,
     /// Limiter for this driver's store requests.
     pub limiter: Arc<dyn StorageDriverLimiter<Payload>>,
 }
@@ -192,6 +194,7 @@ impl fmt::Debug for StorageDriverStoreContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StorageDriverStoreContext")
             .field("target", &self.target)
+            .field("namespace", &self.namespace)
             .finish_non_exhaustive()
     }
 }
@@ -204,6 +207,8 @@ pub struct StorageDriverSelectContext {
     /// The execution the payload is being stored on behalf of. `None` when the SDK cannot tell,
     /// such as when an activity is completed through the client by its task token.
     pub target: Option<StorageDriverTargetInfo>,
+    /// The namespace of the client or worker performing the store. `None` when it is not known.
+    pub namespace: Option<String>,
 }
 
 /// Context given to [`StorageDriver::retrieve`].

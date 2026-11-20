@@ -40,11 +40,12 @@ use crate::{
 pub(crate) async fn store_in<M: PayloadFieldCollectable + Send>(
     storage: Option<&ExternalStorage>,
     message: &mut M,
+    namespace: Option<&str>,
     target: Option<&StorageDriverTargetInfo>,
 ) -> Result<Option<StorageOperationMetrics>, ExternalStorageError> {
     match storage {
         Some(storage) => {
-            ExternalStorageRunner::new(storage)
+            ExternalStorageRunner::new(storage, namespace)
                 .store_in(message, target)
                 .await
         }
@@ -63,7 +64,7 @@ pub(crate) async fn retrieve_in<M: PayloadFieldCollectable + Send>(
 ) -> Result<Option<StorageOperationMetrics>, ExternalStorageError> {
     match storage {
         Some(storage) => {
-            ExternalStorageRunner::new(storage)
+            ExternalStorageRunner::new(storage, None)
                 .retrieve_in(message)
                 .await
         }
@@ -101,14 +102,16 @@ impl<Item: Sync> StorageDriverLimiter<Item> for UnboundedLimiter {
 /// uniform message, such as a client request, is a single call.
 pub(crate) struct ExternalStorageRunner<'a> {
     storage: &'a ExternalStorage,
+    namespace: Option<&'a str>,
     store_limiter: Arc<dyn StorageDriverLimiter<Payload>>,
     retrieve_limiter: Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
 }
 
 impl<'a> ExternalStorageRunner<'a> {
-    pub(crate) fn new(storage: &'a ExternalStorage) -> Self {
+    pub(crate) fn new(storage: &'a ExternalStorage, namespace: Option<&'a str>) -> Self {
         Self {
             storage,
+            namespace,
             store_limiter: Arc::new(UnboundedLimiter),
             retrieve_limiter: Arc::new(UnboundedLimiter),
         }
@@ -131,6 +134,7 @@ impl<'a> ExternalStorageRunner<'a> {
                 store_payloads(
                     field.into_payloads_mut(),
                     self.storage,
+                    self.namespace,
                     target,
                     &self.store_limiter,
                 )
@@ -246,11 +250,13 @@ type DriverGroup = (Arc<dyn StorageDriver>, Vec<(usize, i64)>);
 async fn store_payloads(
     payloads: &mut [Payload],
     storage: &ExternalStorage,
+    namespace: Option<&str>,
     target: Option<&StorageDriverTargetInfo>,
     limiter: &Arc<dyn StorageDriverLimiter<Payload>>,
 ) -> Result<StorageOperationTotals, ExternalStorageError> {
     let select_context = StorageDriverSelectContext::builder()
         .maybe_target(target.cloned())
+        .maybe_namespace(namespace.map(str::to_owned))
         .build();
 
     let mut by_driver: HashMap<String, DriverGroup> = HashMap::new();
@@ -304,6 +310,7 @@ async fn store_payloads(
                 .collect();
             let context = StorageDriverStoreContext::builder()
                 .maybe_target(target.cloned())
+                .maybe_namespace(namespace.map(str::to_owned))
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
@@ -510,7 +517,7 @@ mod tests {
             .unwrap()
             .with_payload_size_threshold(0);
         let limit = storage.max_operations_per_message();
-        let runner = ExternalStorageRunner::new(&storage);
+        let runner = ExternalStorageRunner::new(&storage, None);
         // Each memo entry is its own field.
         let mut memo = Memo {
             fields: (0..limit + 2).map(|i| (i.to_string(), sized(1))).collect(),
@@ -772,7 +779,7 @@ mod tests {
         let storage = storage_with_threshold(threshold, Arc::clone(&stored));
         let mut payloads = vec![small.clone(), at_threshold.clone()];
 
-        store_payloads(&mut payloads, &storage, None, &store_limiter())
+        store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap();
 
@@ -793,7 +800,7 @@ mod tests {
         let size = payload.encoded_len() as i64;
         let mut payloads = vec![payload];
 
-        store_payloads(&mut payloads, &storage, None, &store_limiter())
+        store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap();
 
@@ -818,7 +825,7 @@ mod tests {
                 .with_payload_size_threshold(1);
         let mut payloads = vec![sized(50)];
 
-        let err = store_payloads(&mut payloads, &storage, None, &store_limiter())
+        let err = store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap_err();
 
@@ -839,7 +846,7 @@ mod tests {
         .with_payload_size_threshold(1);
         let mut payloads = vec![sized(50)];
 
-        let err = store_payloads(&mut payloads, &storage, None, &store_limiter())
+        let err = store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap_err();
 
@@ -859,7 +866,7 @@ mod tests {
             .unwrap()
             .with_payload_size_threshold(1);
 
-        let store_err = store_payloads(&mut [sized(50)], &storage, None, &store_limiter())
+        let store_err = store_payloads(&mut [sized(50)], &storage, None, None, &store_limiter())
             .await
             .unwrap_err();
         let retrieve_err = retrieve_payloads(&mut [reference("mem", "a")], &storage, &limiter())
@@ -910,7 +917,7 @@ mod tests {
         let declined = filled(b'z', 50);
         let mut payloads = vec![filled(b'a', 50), declined.clone()];
 
-        store_payloads(&mut payloads, &storage, None, &store_limiter())
+        store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap();
 
@@ -935,7 +942,7 @@ mod tests {
         )
         .unwrap()
         .with_payload_size_threshold(size);
-        let runner = ExternalStorageRunner::new(&storage);
+        let runner = ExternalStorageRunner::new(&storage, None);
         let mut message = Payloads {
             payloads: vec![
                 filled(b'a', 50),
@@ -992,7 +999,7 @@ mod tests {
             filled(b'b', 50),
         ];
 
-        store_payloads(&mut payloads, &storage, None, &store_limiter())
+        store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap();
 
@@ -1016,7 +1023,7 @@ mod tests {
         let storage = storage_with_threshold(0, Arc::clone(&stored));
         let mut payloads = vec![sized(1), sized(8)];
 
-        store_payloads(&mut payloads, &storage, None, &store_limiter())
+        store_payloads(&mut payloads, &storage, None, None, &store_limiter())
             .await
             .unwrap();
 
@@ -1086,7 +1093,7 @@ mod tests {
         )
         .unwrap()
         .with_payload_size_threshold(1);
-        let runner = ExternalStorageRunner::new(&storage);
+        let runner = ExternalStorageRunner::new(&storage, None);
         let mut request = request_with_large_payloads();
         let before = request.clone();
 
@@ -1105,7 +1112,7 @@ mod tests {
     async fn the_runner_reports_a_driver_it_does_not_know() {
         let batches = Arc::new(Mutex::new(vec![]));
         let storage = storage("mem", Arc::clone(&batches));
-        let runner = ExternalStorageRunner::new(&storage);
+        let runner = ExternalStorageRunner::new(&storage, None);
         // A reference to the registered driver sits beside the unknown one.
         let mut request = SignalWithStartWorkflowExecutionRequest {
             input: Some(Payloads {
@@ -1176,7 +1183,7 @@ mod tests {
         stored: Arc<Mutex<Vec<Payload>>>,
     ) {
         let storage = storage_with_threshold(1, stored);
-        let runner = ExternalStorageRunner::new(&storage);
+        let runner = ExternalStorageRunner::new(&storage, None);
         runner.store_in(request, None).await.unwrap();
     }
 
@@ -1207,7 +1214,7 @@ mod tests {
     async fn every_other_payload_bearing_field_is_retrieved() {
         let batches = Arc::new(Mutex::new(vec![]));
         let storage = storage("mem", Arc::clone(&batches));
-        let runner = ExternalStorageRunner::new(&storage);
+        let runner = ExternalStorageRunner::new(&storage, None);
         let mut request = request_with_references();
         let search_attributes = request.search_attributes.clone();
 
@@ -1238,7 +1245,7 @@ mod tests {
         let mut request = request_with_large_payloads();
         let before = request.clone();
 
-        store_in(None, &mut request, None).await.unwrap();
+        store_in(None, &mut request, None, None).await.unwrap();
         retrieve_in(None, &mut request).await.unwrap();
 
         assert_eq!(request, before);

@@ -1,1 +1,0 @@
-OpenTelemetry client tracing can opt into encoding its own headers with the configured client codec using `OpenTelemetryPlugin::builder().encode_client_headers(true)`. User-provided client headers are unchanged.

@@ -25,7 +25,7 @@ another crate on top of `core` which brings in these language-specific helpers t
 that language in an ergonomic manner.
 
 Other SDKs (ex: .NET) directly use C bindings available in this repo
-at [core-c-bridge](./core-c-bridge).
+at [sdk-core-c-bridge](./crates/sdk-core-c-bridge).
 
 ### Glossary of terms
 

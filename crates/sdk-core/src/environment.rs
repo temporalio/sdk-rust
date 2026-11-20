@@ -120,6 +120,10 @@ fn has_any_env(names: &[&str]) -> bool {
     names.iter().any(|name| has_env(name))
 }
 
+#[allow(
+    clippy::needless_bool,
+    reason = "Linux performs another detection step after the Unix check"
+)]
 fn is_docker() -> bool {
     #[cfg(unix)]
     if Path::new("/.dockerenv").exists() {

@@ -44,8 +44,8 @@ This repo is composed of multiple crates:
 
 - temporalio-client `./crates/client` - Defines client(s) for interacting with the Temporal gRPC service.
 - temporalio-common `./crates/common` - Common code & protobuf definitions
-- temporalio-sdk-core `./crates/core` - The Core implementation.
-- temporalio-sdk-core-c-bridge `./crates/core-c-bridge` - Provides C bindings for Core.
+- temporalio-sdk-core `./crates/sdk-core` - The Core implementation.
+- temporalio-sdk-core-c-bridge `./crates/sdk-core-c-bridge` - Provides C bindings for Core.
 - temporalio-macros `./crates/macros` - Implements procedural macros used by core and the SDK.
 - temporalio-sdk `./crates/sdk` - A Rust SDK built on top of Core.
 

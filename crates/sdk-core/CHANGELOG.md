@@ -13,7 +13,10 @@ The Rust SDK runs on Core too, so a user-observable change in Core behavior norm
 belongs in the root changelog as well, worded for each audience. What belongs only here is
 what only the other SDKs' users can see — a Core capability the Rust SDK does not surface,
 or a C-bridge change. A Rust-level API change that a language SDK absorbs inside its own
-bridge, without its users noticing, belongs in neither file.
+bridge, without its users noticing, belongs in neither file as a user-facing entry. If
+language SDK maintainers still need to know about it (for example, a breaking change to a
+Rust API their bridge calls), start the entry with `[lang-internal]`. Language SDKs do not
+import those entries into their changelogs or release notes.
 
 When your PR includes a user-facing change, add an entry below under the
 appropriate heading (create the heading if it does not yet exist) in the
@@ -32,6 +35,56 @@ relevant information.
 # Changelog
 
 ## Unreleased
+
+### Added
+* Low-level Operator Service calls support namespace soft deletion, restoration, and restore
+  progress queries.
+* Cloud API bindings support v0.27.0, including user group memberships, projects,
+  project-scoped custom roles, and caller rate limit operations.
+
+### Fixed
+* Nexus operations cancelled or timed out before starting retain their cancellation or timeout
+  failure type even when the corresponding history event omits its failure.
+* A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
+  times out no longer fails workflow tasks with a nondeterminism error.
+* Cancelling a Nexus operation with `ABANDON` or `TRY_CANCEL` before it starts now resolves it with
+  a failed `ResolveNexusOperationStart` carrying a cancelled failure, instead of a
+  `ResolveNexusOperation`. Core no longer sends a second resolution when the server later records
+  the operation's start or outcome, which lang SDKs rejected as an unknown sequence number.
+* With `WAIT_CANCELLATION_REQUESTED`, an operation whose cancel request fails is no longer resolved
+  a second time when it later finishes.
+* Workflows no longer get stuck failing workflow tasks when an activity cancelled with the
+  `ABANDON` cancellation type later fails or times out. Those late outcomes are now ignored, as
+  late completions of abandoned activities already were.
+* Core and lang SDK flags sent with a workflow task completion that the server discards, such as
+  an update rejected on the first task of a workflow started with a start delay, are no longer
+  treated as recorded. Core keeps sending them with later completions until history records them.
+  On a cached run, live and query activations still list lang flags that lang already reported in
+  `available_internal_flags`, even before history records them, while activations that replay
+  history list only the lang flags history has recorded, as a fresh replay would. Previously, a
+  later `patched` call could fail replay with a nondeterminism error, and lang flags used afterward
+  could be missing from history so that replay selected different flag-dependent behavior.
+* Draining a metrics buffer after it has overflowed no longer panics with "You must initialize the reference before using it" (Python: `MetricBuffer.retrieve_updates`). Core already drops an instrument or attribute set when the buffer cannot accept its creation, and now also drops later recordings that depend on that dropped creation, so the next drain keeps working.
+* Downloading an ephemeral dev or test server binary retries a transfer that breaks while the
+  archive streams in, such as a reset connection, instead of failing the server start.
+* A local activity that finishes while the SDK answers a query attached to a workflow task now
+  records its result on the task that delivers it. This prevents replay nondeterminism when a
+  signal or other event arrives before that task. Command-free task coalescing remains subject
+  to [#1737](https://github.com/temporalio/sdk-rust/issues/1737).
+
+### Changed
+* [lang-internal] A successful activation completion for attached queries must include a query
+  response. Core fails the workflow task if the SDK sends a success without one.
+* [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
+  compatible with current nexgen default expressions and workflow-target generation.
+* Workflow task completions and failures set `resource_id` to `workflow:<workflow_id>`, on every
+  page of a paginated completion. Activity task completions, failures, cancellations, and
+  heartbeats set it to `workflow:<workflow_id>`, or `activity:<activity_id>` for a standalone
+  activity. Worker heartbeats set it to `worker:<worker_grouping_key>`, the grouping key each
+  heartbeat already reports in its host info. Proxies can identify the workflow, activity, or
+  worker without decoding task tokens or heartbeat contents.
+
+## [0.11.0] - 2026-11-09
 
 ### Added
 * A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
@@ -53,11 +106,14 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Slot gauges now reflect the current number of used and available slots after concurrent worker updates.
 * A workflow task failure reported with the cause `WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE`
   is now counted on `workflow_task_execution_failed` with `failure_reason="ExternalStorageError"`,
   matching activity failures with the storage cause. It was previously counted as `WorkflowError`.
 * Ephemeral dev and test servers now complete the automatic port reservation handshake on Linux
   and macOS before starting, preventing intermittent address-in-use errors during TCP teardown.
+* Downloading an ephemeral dev or test server binary now retries transient HTTP failures, such as a
+  `503` returned while a release is rolling out, with backoff instead of failing on the first attempt.
 * Resource-based worker tuners now read CPU usage and quotas from standard cgroup v1 mounts. Workers
   on cgroup v1 systems no longer fall back to host CPU usage and admit work based on understated
   container load.
@@ -86,16 +142,12 @@ relevant information.
   and could leave the workflow stuck on a nondeterminism error.
 * Workers now replay workflows paused before a scheduled task starts, allowing those workflows to
   make progress after unpause.
-* A local activity finishing while the SDK answers a query attached to the current workflow task
-  can no longer fail workflow tasks with `[TMPRL1100]` when any events, such as a signal, arrived
-  before the forced next task, leaving the workflow stuck. The failure came on the next full replay
-  (with the workflow cache disabled, the task after the forced one; otherwise after an eviction or
-  restart). Queried tasks after one that recorded no commands remain subject to
-  [#1737](https://github.com/temporalio/sdk-rust/issues/1737).
-* [lang-internal] A successful activation completion for attached queries must include a query
-  response. Core fails the workflow task if the SDK sends a success without one.
 
 ### Added
+* Client environment config profiles include the raw TOML tables under `profile.<name>.ext`,
+  keyed by extension name, for SDK envconfig extensions. Strict mode accepts any content under
+  `ext`. The C bridge's profile JSON includes them as an `ext` object, with TOML datetimes as
+  strings.
 * The C bridge's shared dev and test server options accept a startup timeout in milliseconds,
   with zero selecting the five-second default.
 * The OTLP metrics exporter can export histograms as OpenTelemetry exponential histograms, which
@@ -104,6 +156,12 @@ relevant information.
   each series with a suffix, `_native` by default, so it never shares a name with the fixed-bucket
   series it replaces. It cannot be combined with histogram bucket overrides. Explicit buckets
   remain the default.
+
+### Changed
+* Poller pools now report their poller target to the server on each poll and in the worker
+  heartbeat: the current target for autoscaling pools, the configured maximum for fixed-size
+  pools. (We'll use this count on the server side for now for load balancing pollers between
+  workers, and for creating a per-worker poller count metric.)
 
 ## [0.10.0] - 2026-10-06
 

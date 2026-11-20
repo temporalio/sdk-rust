@@ -325,6 +325,10 @@ pub enum MetricAttributes {
 
 /// Options that are attached to metrics on a per-call basis
 #[derive(Clone, Debug, Default, derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub struct NewAttributes {
     /// The key-value pairs for this attribute set.
     pub attributes: Vec<MetricKeyValue>,
@@ -1354,6 +1358,10 @@ impl From<NewAttributes> for OrderedPromLabelSet {
 }
 
 #[derive(Debug, derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub(crate) struct PrefixedMetricsMeter<CM> {
     prefix: String,
     meter: CM,

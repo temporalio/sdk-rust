@@ -4,6 +4,7 @@ members = [
     "crates/client",
     "crates/common",
     "crates/common-wasm",
+    "crates/aws-s3driver",
     "crates/protos",
     "crates/macros",
     "crates/sdk",
@@ -14,7 +15,6 @@ members = [
 resolver = "3"
 
 [workspace.package]
-license = "MIT"
 license-file = "LICENSE.txt"
 
 [workspace.dependencies]
@@ -37,6 +37,7 @@ prost-types = { version = "0.7", package = "prost-wkt-types" }
 pbjson = "0.9"
 pbjson-build = "0.9"
 serde_json = "1.0"
+nexus-rpc = "0.1.0"
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

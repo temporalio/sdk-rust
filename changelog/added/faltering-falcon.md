@@ -1,1 +1,0 @@
-Workflow and activity tasks that fail because of an external storage error report the `EXTERNAL_STORAGE_FAILURE` task failure cause, and are counted with `failure_reason="ExternalStorageError"` on the task failure metrics.

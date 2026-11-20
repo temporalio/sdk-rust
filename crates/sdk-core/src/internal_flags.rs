@@ -126,6 +126,8 @@ impl InternalFlags {
         if !self.can_write_sdk_metadata {
             return WorkflowTaskCompletedMetadata::default();
         }
+        // Flags only count as recorded once seen in history, since the server may discard this
+        // completion (ex: a rejected update on a speculative task) without persisting it.
         let core_newly_used: Vec<_> = self
             .core_since_last_complete
             .iter()
@@ -138,8 +140,6 @@ impl InternalFlags {
             .filter(|f| !self.lang.contains(f))
             .copied()
             .collect();
-        self.core.extend(self.core_since_last_complete.iter());
-        self.lang.extend(self.lang_since_last_complete.iter());
         let sdk_name = if self.last_sdk_name != self.sdk_name {
             self.sdk_name.clone()
         } else {
@@ -158,8 +158,20 @@ impl InternalFlags {
         }
     }
 
+    /// Lang flags recorded in history
     pub(crate) fn all_lang(&self) -> impl Iterator<Item = u32> + '_ {
         self.lang.iter().copied()
+    }
+
+    /// Lang flags live and query activations may rely on. Includes flags lang already reported for
+    /// this run that history has not confirmed yet, because the run's in-memory state was already
+    /// shaped by them and activations like queries can arrive before the completion that records
+    /// them is seen.
+    pub(crate) fn all_lang_for_activation(&self) -> impl Iterator<Item = u32> + use<> {
+        self.all_lang()
+            .chain(self.lang_since_last_complete.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
     }
 
     pub(crate) fn last_sdk_version(&self) -> Option<&str> {
@@ -235,6 +247,7 @@ mod tests {
         let gathered = f.gather_for_wft_complete();
         assert_matches!(gathered.core_used_flags.as_slice(), &[]);
         assert_matches!(gathered.lang_used_flags.as_slice(), &[]);
+        assert_eq!(f.all_lang_for_activation().count(), 0);
     }
 
     #[test]
@@ -264,6 +277,17 @@ mod tests {
         assert_matches!(gathered.sdk_name.as_str(), "name");
         assert_matches!(gathered.sdk_version.as_str(), "ver");
 
+        // The previous completion may have been discarded, so its flags are still owed and must not
+        // look established to replay
+        let gathered = f.gather_for_wft_complete();
+        assert_matches!(gathered.core_used_flags.as_slice(), &[1]);
+        assert_matches!(gathered.lang_used_flags.as_slice(), &[1]);
+        assert!(!f.try_use(CoreInternalFlags::IdAndTypeDeterminismChecks, false));
+        assert_eq!(f.all_lang().count(), 0);
+        // Activations still see what lang already relied on
+        assert!(f.all_lang_for_activation().eq([1]));
+
+        // History recorded flag 2 but not the flag 1 that was sent
         f.add_from_complete(&WorkflowTaskCompletedEventAttributes {
             sdk_metadata: Some(WorkflowTaskCompletedMetadata {
                 core_used_flags: vec![2],
@@ -276,10 +300,27 @@ mod tests {
         f.add_lang_used([2]);
         f.try_use(CoreInternalFlags::UpsertSearchAttributeOnPatch, true);
         let gathered = f.gather_for_wft_complete();
-        assert_matches!(gathered.core_used_flags.as_slice(), &[]);
-        assert_matches!(gathered.lang_used_flags.as_slice(), &[]);
+        assert_matches!(gathered.core_used_flags.as_slice(), &[1]);
+        assert_matches!(gathered.lang_used_flags.as_slice(), &[1]);
         assert!(gathered.sdk_name.is_empty());
         assert!(gathered.sdk_version.is_empty());
+        assert!(f.try_use(CoreInternalFlags::UpsertSearchAttributeOnPatch, false));
+        assert!(f.all_lang().eq([2]));
+        assert!(f.all_lang_for_activation().eq([1, 2]));
+
+        f.add_from_complete(&WorkflowTaskCompletedEventAttributes {
+            sdk_metadata: Some(WorkflowTaskCompletedMetadata {
+                core_used_flags: vec![1],
+                lang_used_flags: vec![1],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let gathered = f.gather_for_wft_complete();
+        assert_matches!(gathered.core_used_flags.as_slice(), &[]);
+        assert_matches!(gathered.lang_used_flags.as_slice(), &[]);
+        assert!(f.try_use(CoreInternalFlags::IdAndTypeDeterminismChecks, false));
+        assert!(f.all_lang().eq([1, 2]));
 
         f.add_from_complete(&WorkflowTaskCompletedEventAttributes {
             sdk_metadata: Some(WorkflowTaskCompletedMetadata::default()),

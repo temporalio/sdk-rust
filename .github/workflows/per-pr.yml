@@ -54,7 +54,7 @@ jobs:
             runsOn: ubuntu-24.04-arm64-2-core
             timeoutMinutes: 30
           - os: macos-arm
-            runsOn: macos-14
+            runsOn: macos-15
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -101,9 +101,12 @@ jobs:
       matrix:
         include:
           - group: rust-1.88
-            crates: client common common-wasm macros protos sdk-core workflow
+            crates: aws-s3driver client common common-wasm macros protos sdk-core workflow
+            feature-args: --all-features
           - group: rust-1.92
             crates: sdk
+            # Wasmtime raises the MSRV only for the experimental wasm-workflows feature.
+            feature-args: --features experimental,otel,opentelemetry,examples,wasm-examples,dynamic-tls,testing
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup
@@ -111,10 +114,13 @@ jobs:
           mise-install-args: protoc cargo:cargo-msrv
           rust-cache-key: msrv-${{ matrix.group }}
       - name: Verify crate MSRVs
+        env:
+          FEATURE_ARGS: ${{ matrix.feature-args }}
         run: |
           read -ra crates <<< "${{ matrix.crates }}"
+          read -ra feature_args <<< "$FEATURE_ARGS"
           for crate in "${crates[@]}"; do
-            cargo msrv verify --all-features --path "crates/$crate"
+            cargo msrv verify "${feature_args[@]}" --path "crates/$crate"
           done
 
   cgroup-tests:
@@ -123,7 +129,12 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu
-      options: --cpus=1 --memory=512m
+      # The memory test reads anonymous memory in RAM, and swapped-out pages are not part of it.
+      # The page cache of the test binary can fill the container up to its memory limit. When the
+      # test then allocates its buffer, the kernel reclaims memory, and with swap it can swap out
+      # a part of the buffer. Then the test reads too little. A swap limit equal to the memory
+      # limit gives the container no swap, so the buffer stays in RAM.
+      options: --cpus=1 --memory=512m --memory-swap=512m
     env:
       CGROUP_TESTS_ENABLED: true
     steps:
@@ -149,7 +160,7 @@ jobs:
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
           - os: macos-arm
-            runsOn: macos-14
+            runsOn: macos-15
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -275,15 +286,16 @@ jobs:
           TMPDIR: ${{ runner.temp }}
       - name: Verify worker environment detection inside Docker
         run: |
+          # Ask Cargo for artifact paths so this works across build-directory layouts.
+          artifacts="$RUNNER_TEMP/docker-integ-artifacts.json"
+          cargo build --package temporalio-sdk-core --test integ_tests --test integ_runner \
+            --features temporalio-common/serde_serialize,test-utilities,ephemeral-server,temporalio-sdk/experimental,otel \
+            --message-format=json > "$artifacts"
           integ_test_binary="$(
-            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
-              -name 'integ_tests-*' -perm -111 \
-              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+            jq -ers 'map(select(.reason == "compiler-artifact" and .target.name == "integ_tests" and .executable != null)) | .[0].executable' "$artifacts"
           )"
           integ_runner_binary="$(
-            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
-              -name 'integ_runner-*' -perm -111 \
-              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+            jq -ers 'map(select(.reason == "compiler-artifact" and .target.name == "integ_runner" and .executable != null)) | .[0].executable' "$artifacts"
           )"
           test -x "$integ_test_binary"
           test -x "$integ_runner_binary"
@@ -319,7 +331,9 @@ jobs:
         with:
           mise-install-args: protoc github:temporalio/cli
       - name: Build examples
-        run: cargo build --examples -p temporalio-sdk --features examples
+        run: |
+          cargo build --examples -p temporalio-sdk --features examples
+          cargo build --examples -p temporalio-aws-s3driver
       - name: Start Temporal dev server
         run: |
           temporal server start-dev --headless &
@@ -339,10 +353,21 @@ jobs:
           mise-install-args: protoc
 
       - name: Build crate as static library
-        run: cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static -- --crate-type=staticlib
+        id: static-library
+        run: |
+          cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static \
+            --crate-type=staticlib --message-format=json > "$RUNNER_TEMP/static-library-artifacts.json"
+          library="$(
+            jq -ers '[.[] | select(.reason == "compiler-artifact" and .target.name == "temporalio_sdk_core_c_bridge") | .filenames[] | select(endswith(".a"))] | .[0]' \
+              "$RUNNER_TEMP/static-library-artifacts.json"
+          )"
+          test -f "$library"
+          echo "path=$library" >> "$GITHUB_OUTPUT"
 
       - name: Build C test program
-        run: gcc -I./crates/sdk-core-c-bridge/include crates/sdk-core/tests/c_bridge_smoke_test.c target/debug/deps/libtemporalio_sdk_core_c_bridge.a -lpthread -ldl -lm -o test
+        env:
+          STATIC_LIBRARY: ${{ steps.static-library.outputs.path }}
+        run: gcc -I./crates/sdk-core-c-bridge/include crates/sdk-core/tests/c_bridge_smoke_test.c "$STATIC_LIBRARY" -lpthread -ldl -lm -o test
 
       - name: Run C test program
         run: ./test

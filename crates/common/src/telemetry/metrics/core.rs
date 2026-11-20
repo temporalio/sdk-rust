@@ -4,7 +4,10 @@ use crate::telemetry::metrics::{MetricKeyValue, MetricParameters};
 use std::{
     any::Any,
     fmt::Debug,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -96,19 +99,48 @@ pub type BufferAttributes = LazyRef<Arc<dyn CustomMetricAttributes + 'static>>;
 /// implement this marker trait
 pub trait BufferInstrumentRef {}
 /// A lazy reference to a metrics buffer instrument
-pub type LazyBufferInstrument<T> = LazyRef<Arc<T>>;
+pub type LazyBufferInstrument<T> = LazyRef<T>;
 
-/// A shared, lazily-initialized reference. Created as an empty "hole" and filled later via [`set`](Self::set).
-#[derive(Debug, Clone)]
-pub struct LazyRef<T> {
-    to_be_initted: Arc<OnceLock<T>>,
+/// A shared, lazily-initialized reference. Created as an empty "hole" via
+/// [`LazyRef::hole`] and filled later via [`set`](Self::set). Cloning is cheap and all clones
+/// share the same underlying slot.
+#[derive(Debug)]
+pub struct LazyRef<T>(Arc<LazyRefInner<T>>);
+
+impl<T> Clone for LazyRef<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
+
+#[derive(Debug)]
+struct LazyRefInner<T> {
+    to_be_initted: OnceLock<T>,
+    /// Whether the buffer accepted the event that asks lang to call [`LazyRef::set`].
+    /// Lang never initializes a hole whose create was dropped, so a later recording that
+    /// still referenced it would panic in [`LazyRef::get`] on the next drain.
+    create_queued: AtomicBool,
+}
+
 impl<T> LazyRef<T> {
     /// Create an uninitialized hole that must be filled with [`set`](Self::set) before use.
     pub fn hole() -> Self {
-        Self {
-            to_be_initted: Arc::new(OnceLock::new()),
-        }
+        Self(Arc::new(LazyRefInner {
+            to_be_initted: OnceLock::new(),
+            create_queued: AtomicBool::new(false),
+        }))
+    }
+
+    /// Record that the create event for this hole was accepted into the buffer.
+    pub fn mark_create_queued(&self) {
+        self.0.create_queued.store(true, Ordering::Release);
+    }
+
+    /// Whether lang will initialize this hole.
+    ///
+    /// False when the create event was dropped because the buffer was full.
+    pub fn create_was_queued(&self) -> bool {
+        self.0.create_queued.load(Ordering::Acquire)
     }
 
     /// Get the reference you previously initialized
@@ -116,7 +148,8 @@ impl<T> LazyRef<T> {
     /// # Panics
     /// If `set` has not already been called. You must set the reference before using it.
     pub fn get(&self) -> &T {
-        self.to_be_initted
+        self.0
+            .to_be_initted
             .get()
             .expect("You must initialize the reference before using it")
     }
@@ -124,6 +157,6 @@ impl<T> LazyRef<T> {
     /// Assigns a value to fill this reference.
     /// Returns according to semantics of [OnceLock].
     pub fn set(&self, val: T) -> Result<(), T> {
-        self.to_be_initted.set(val)
+        self.0.to_be_initted.set(val)
     }
 }

@@ -30,8 +30,8 @@ use crate::{
         WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
         client::{
-            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
-            payload_limit_violation_from,
+            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, TaskInfo, WorkerClient,
+            WorkflowTaskCompletion, payload_limit_violation_from,
         },
         workflow::{
             history_update::HistoryPaginator,
@@ -373,6 +373,7 @@ impl Workflows {
         match report {
             ServerCommandsWithWorkflowInfo {
                 task_token,
+                workflow_id,
                 action:
                     ActivationAction::WftComplete {
                         mut commands,
@@ -421,6 +422,7 @@ impl Workflows {
                     wft_completion_size_limit: self
                         .namespace_capabilities
                         .workflow_task_completion_size_limit(),
+                    resource_id: format!("workflow:{workflow_id}"),
                 };
                 let sticky_attrs = self.sticky_attrs.clone();
                 // Do not return new WFT if we would not cache, because returned new WFTs are
@@ -482,6 +484,7 @@ impl Workflows {
                                     completion_time,
                                     FailedActivationWFTReport::new(
                                         task_token,
+                                        workflow_id,
                                         attempt,
                                         cause,
                                         failure,
@@ -530,6 +533,7 @@ impl Workflows {
     ) -> WFTReportStatus {
         let FailedActivationWFTReport {
             task_token,
+            workflow_id,
             attempt,
             cause,
             failure,
@@ -555,7 +559,14 @@ impl Workflows {
                 warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
                 self.handle_wft_reporting_errs(run_id, || async {
                     self.client
-                        .fail_workflow_task(task_token, cause, failure.failure)
+                        .fail_workflow_task(
+                            TaskInfo {
+                                task_token,
+                                resource_id: format!("workflow:{workflow_id}"),
+                            },
+                            cause,
+                            failure.failure,
+                        )
                         .await
                 })
                 .await;
@@ -1048,9 +1059,9 @@ impl PreparedWFT {
         format!(
             "WFT events: [{}], messages: {:?}, legacy_query: {:?}, queries: {:?}",
             self.update.get_events().iter().format(", "),
-            &self.messages,
-            &self.legacy_query,
-            &self.query_requests
+            self.messages,
+            self.legacy_query,
+            self.query_requests
         )
     }
 }
@@ -1112,6 +1123,7 @@ struct WorkflowTaskInfo {
 #[derive(Debug)]
 struct FailedActivationWFTReport {
     task_token: TaskToken,
+    workflow_id: String,
     attempt: u32,
     cause: WorkflowTaskFailedCause,
     failure: Failure,
@@ -1121,6 +1133,7 @@ impl FailedActivationWFTReport {
     /// Records the task-failed metric as part of constructing the report.
     fn new(
         task_token: TaskToken,
+        workflow_id: String,
         attempt: u32,
         cause: WorkflowTaskFailedCause,
         failure: Failure,
@@ -1132,6 +1145,7 @@ impl FailedActivationWFTReport {
             .wf_task_failed();
         Self {
             task_token,
+            workflow_id,
             attempt,
             cause,
             failure,
@@ -1157,12 +1171,14 @@ enum WftFailureKind {
 #[derive(Debug, Clone)]
 struct UnstoredWftFailInfo {
     task_token: TaskToken,
+    workflow_id: String,
     attempt: u32,
     workflow_type: String,
 }
 
 struct ServerCommandsWithWorkflowInfo {
     task_token: TaskToken,
+    workflow_id: String,
     action: ActivationAction,
     metrics: MetricsContext,
 }
@@ -1170,6 +1186,7 @@ impl Debug for ServerCommandsWithWorkflowInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerCommandsWithWorkflowInfo")
             .field("task_token", &self.task_token)
+            .field("workflow_id", &self.workflow_id)
             .field("action", &self.action)
             .finish()
     }
@@ -1833,6 +1850,10 @@ pub(crate) trait LocalActivityRequestSink: Send + Sync + 'static {
 }
 
 #[derive(derive_more::Constructor)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more::Constructor generates explicit field initializers"
+)]
 pub(super) struct LAReqSink {
     lam: Arc<LocalActivityManager>,
 }

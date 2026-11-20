@@ -77,7 +77,7 @@ impl DrivenWorkflow {
 
     /// Drain all pending jobs, so that they may be sent to the driven workflow
     pub(super) fn drain_jobs(&mut self) -> Vec<OutgoingJob> {
-        self.outgoing_wf_activation_jobs.drain(..).collect()
+        std::mem::take(&mut self.outgoing_wf_activation_jobs)
     }
 
     /// Obtain any output from the workflow's recent execution(s). Because the lang sdk is

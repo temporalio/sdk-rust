@@ -23,13 +23,17 @@ Commands:
   without its source list marker and prefixed with `Core: ` to distinguish it
   from language SDK changes. Inline Markdown is preserved; unsupported block
   Markdown and unknown categories cause an error before the checkout changes.
+  Core entries beginning with `[lang-internal]` (after the list marker) are meant
+  only for language SDK maintainers and are skipped; `core-notes` and the
+  `changelog-release-notes` range interface skip them as well.
   Review and commit the pin and generated fragments together. The command does
   not stage, commit, update language lockfiles, or resolve bridge compatibility.
   Import failures remove newly created files and restore the original checkout;
   any rollback failures are reported for manual recovery.
 
-* `check [--fragments changelog] [--base <sha> --head HEAD --require-new]`
-  validates fragments. With Git revisions, it requires an added fragment rather
+* `check [--changelog CHANGELOG.md] [--fragments changelog] [--base <sha> --head HEAD --require-new]`
+  validates changelog fragments and (if provided) the changelog itself.
+  With Git revisions, it requires an added fragment rather
   than only edits or deletions. The checkout must match `--head`. The calling
   workflow handles override labels and checks out the PR's synthetic merge result.
 * `prepare --version <version> --date YYYY-MM-DD [--changelog CHANGELOG.md]
@@ -38,13 +42,12 @@ Commands:
   removes the consumed fragments. Empty releases are allowed; duplicate versions
   are always rejected. Validation failures leave the
   changelog and fragments intact.
-* `notes --version <version> [--changelog CHANGELOG.md]` prints that dated release's
-  body as Markdown, excluding the version heading. Empty release sections produce
-  no output; missing release sections are errors.
-* `release-notes --version <version> [--submodule <path>] [--changelog CHANGELOG.md]
+* `release-notes --version <version> [--date YYYY-MM-DD] [--submodule <path>] [--changelog CHANGELOG.md]
   [--from <ref>] [--to <ref>] [--output <file>]` generates publishing notes.
   It extracts the body of `## [<version>]` from the SDK changelog and places it
-  under `## Notable Changes` in the generated output.
+  under `## Notable Changes` in the generated output. It rejects Unreleased sections,
+  duplicate release sections, and missing release sections; `--date` also verifies
+  the selected release date.
 
   With `--submodule`, `--from` and `--to` identify revisions in the SDK repository.
   The command reads the Core submodule pins at those revisions and appends Core

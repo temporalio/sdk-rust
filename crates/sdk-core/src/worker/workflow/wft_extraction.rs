@@ -73,6 +73,7 @@ impl WFTExtractor {
                             let run_id = wft.workflow_execution.run_id.clone();
                             let fail_info = UnstoredWftFailInfo {
                                 task_token: wft.task_token.clone(),
+                                workflow_id: wft.workflow_execution.workflow_id.clone(),
                                 attempt: wft.attempt,
                                 workflow_type: wft.workflow_type.clone(),
                             };
@@ -117,6 +118,7 @@ impl WFTExtractor {
                             let run_id = req.original_wft.work.execution.run_id.clone();
                             let fail_info = UnstoredWftFailInfo {
                                 task_token: req.original_wft.work.task_token.clone(),
+                                workflow_id: req.original_wft.work.execution.workflow_id.clone(),
                                 attempt: req.original_wft.work.attempt,
                                 workflow_type: req.original_wft.work.workflow_type.clone(),
                             };

@@ -687,6 +687,7 @@ impl PendingCommandId {
 struct WorkflowRuntimeState {
     host: Rc<dyn WorkflowHost>,
     pending_unblocks: RefCell<HashMap<PendingCommandId, oneshot::Sender<UnblockEvent>>>,
+    locally_cancelled_timers: RefCell<HashSet<u32>>,
     forced_wft_failure: RefCell<Option<Box<dyn std::error::Error + Send + Sync>>>,
     progress_made: Cell<bool>,
 }
@@ -696,6 +697,7 @@ impl WorkflowRuntimeState {
         Self {
             host,
             pending_unblocks: RefCell::new(HashMap::new()),
+            locally_cancelled_timers: RefCell::new(HashSet::new()),
             forced_wft_failure: RefCell::new(None),
             progress_made: Cell::new(false),
         }
@@ -706,6 +708,12 @@ impl WorkflowRuntimeState {
     }
 
     fn unblock(&self, event: UnblockEvent) -> Result<(), anyhow::Error> {
+        // Cancellation resolves timers locally, but a firing already in the activation still arrives.
+        if let UnblockEvent::Timer(seq, TimerResult::Fired) = &event
+            && self.locally_cancelled_timers.borrow_mut().remove(seq)
+        {
+            return Ok(());
+        }
         let id = PendingCommandId::from_unblock_event(&event);
         let unblocker = self
             .pending_unblocks
@@ -723,6 +731,9 @@ impl WorkflowRuntimeState {
         let Some(unblocker) = self.pending_unblocks.borrow_mut().remove(&id) else {
             return false;
         };
+        if let UnblockEvent::Timer(seq, TimerResult::Cancelled) = &event {
+            self.locally_cancelled_timers.borrow_mut().insert(*seq);
+        }
         self.progress_made.set(true);
         let _guard = SdkWakeGuard::new();
         let _ = unblocker.send(event);
@@ -4091,6 +4102,51 @@ mod tests {
 
     fn test_context() -> WorkflowContext<TestWorkflow> {
         test_context_with_seed(0)
+    }
+
+    #[test]
+    fn cancelled_timer_accepts_only_one_late_fire() {
+        let runtime = WorkflowRuntimeState::new(Rc::new(NoopHost));
+        let (sender, receiver) = oneshot::channel();
+        runtime.register_unblocker(PendingCommandId::Timer(1), sender);
+        assert!(runtime.maybe_unblock(UnblockEvent::Timer(1, TimerResult::Cancelled)));
+        assert!(matches!(
+            receiver.now_or_never(),
+            Some(Ok(UnblockEvent::Timer(1, TimerResult::Cancelled)))
+        ));
+        assert!(
+            runtime
+                .unblock(UnblockEvent::Timer(2, TimerResult::Fired))
+                .is_err()
+        );
+        runtime
+            .unblock(UnblockEvent::Timer(1, TimerResult::Fired))
+            .unwrap();
+        assert!(
+            runtime
+                .unblock(UnblockEvent::Timer(1, TimerResult::Fired))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fired_timer_does_not_accept_another_fire_after_cancel() {
+        let runtime = WorkflowRuntimeState::new(Rc::new(NoopHost));
+        let (sender, receiver) = oneshot::channel();
+        runtime.register_unblocker(PendingCommandId::Timer(1), sender);
+        runtime
+            .unblock(UnblockEvent::Timer(1, TimerResult::Fired))
+            .unwrap();
+        assert!(!runtime.maybe_unblock(UnblockEvent::Timer(1, TimerResult::Cancelled)));
+        assert!(matches!(
+            receiver.now_or_never(),
+            Some(Ok(UnblockEvent::Timer(1, TimerResult::Fired)))
+        ));
+        assert!(
+            runtime
+                .unblock(UnblockEvent::Timer(1, TimerResult::Fired))
+                .is_err()
+        );
     }
 
     fn test_context_with_seed(randomness_seed: u64) -> WorkflowContext<TestWorkflow> {

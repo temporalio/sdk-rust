@@ -40,7 +40,7 @@ use temporalio_sdk_core::{
     CoreRuntime, RuntimeOptions, TunerHolder,
     ephemeral_server::{TemporalDevServerConfig, default_cached_download},
     init_worker, prost_dur,
-    test_help::{NAMESPACE, WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd},
+    test_help::{NAMESPACE, WorkerExt, WorkerTestHelpers, schedule_activity_cmd},
 };
 use tokio::{sync::Notify, time::timeout};
 use tracing::info;
@@ -238,7 +238,7 @@ async fn switching_worker_client_changes_poll() {
             .unwrap();
 
         // Shutdown workers and servers
-        drain_pollers_and_shutdown(&worker).await;
+        worker.drain_pollers_and_shutdown().await;
     })
     .catch_unwind()
     .await;

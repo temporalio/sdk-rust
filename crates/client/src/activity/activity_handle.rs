@@ -77,6 +77,10 @@ where
 {
     /// Wait for the activity to complete and fetch its result. If the activity was not successful
     /// (e.g. failed, canceled, timed out), this method returns [`ActivityResultError::ActivityFailed`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the existing public error type without introducing boxing for a lint"
+    )]
     pub async fn result(&self) -> Result<ActivityT::Output, ActivityResultError> {
         let mut client = self.client.clone();
         loop {

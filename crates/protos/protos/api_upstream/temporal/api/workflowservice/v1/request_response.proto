@@ -217,12 +217,14 @@ message StartWorkflowExecutionRequest {
     // Deployment Options of the worker who will process the eager task. Passed when `request_eager_execution=true`.
     temporal.api.deployment.v1.WorkerDeploymentOptions eager_worker_deployment_options = 28;
 
+    // Experimental.
     // Time-skipping configuration. If not set, time skipping is disabled.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 29;
 
     // Serialization context propagated from the Nexus caller that started this workflow.
     temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 30;
 
+    // Experimental.
     // Time-skipping state propagated by the execution that started this workflow.
     // This field is intended for use by the Temporal server, for example when a schedule
     // starts a workflow, and is not intended to be set by external clients.
@@ -319,6 +321,9 @@ message PollWorkflowTaskQueueRequest {
     temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 5 [deprecated = true];
     // Worker deployment options that user has set in the worker.
     temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
+
+    // Worker-reported poller pool state. Optional.
+    temporal.api.taskqueue.v1.PollerPoolInfo poller_pool_info = 11;
 
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
@@ -549,6 +554,9 @@ message PollActivityTaskQueueRequest {
     temporal.api.common.v1.WorkerVersionCapabilities worker_version_capabilities = 5 [deprecated = true];
     // Worker deployment options that user has set in the worker.
     temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
+
+    // Worker-reported poller pool state. Optional.
+    temporal.api.taskqueue.v1.PollerPoolInfo poller_pool_info = 11;
 
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
@@ -956,6 +964,7 @@ message SignalWithStartWorkflowExecutionRequest {
     temporal.api.workflow.v1.VersioningOverride versioning_override = 25;
     // Priority metadata
     temporal.api.common.v1.Priority priority = 26;
+    // Experimental.
     // Time-skipping configuration. If not set, time skipping is disabled.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 27;
 }
@@ -2055,6 +2064,9 @@ message PollNexusTaskQueueRequest {
 
     // Worker info to be sent to the server.
     repeated temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat = 7;
+
+    // Worker-reported poller pool state. Optional.
+    temporal.api.taskqueue.v1.PollerPoolInfo poller_pool_info = 10;
 }
 
 message PollNexusTaskQueueResponse {
@@ -2488,12 +2500,9 @@ message UpdateWorkflowExecutionOptionsResponse {
     // Workflow Execution options after update.
     temporal.api.workflow.v1.WorkflowExecutionOptions workflow_execution_options = 1;
 
-    // The Workflow Execution time when the options were updated. When time skipping is
-    // enabled, this is the workflow's virtual time rather than wall-clock time.
-    //
-    // This timestamp cannot be used for time-skipping fast-forward verification,
+    // Deprecated. Not populated by the server; for time-skipping fast-forward verification,
     // use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
-    google.protobuf.Timestamp update_time = 2;
+    google.protobuf.Timestamp update_time = 2 [deprecated = true];
 }
 
 // [cleanup-wv-pre-release] Pre-release deployment APIs, clean up later
@@ -3070,9 +3079,16 @@ message ListWorkersResponse {
 
 message UpdateTaskQueueConfigRequest {
     message RateLimitUpdate {
-        // Rate Limit to be updated
+        // Rate limit to be updated
         temporal.api.taskqueue.v1.RateLimit rate_limit = 1;
-        // Reason for why the rate limit was set.
+        // Reason why the rate limit was updated
+        string reason = 2;
+    }
+
+    message ConcurrencyLimitUpdate {
+        // Limit to be updated
+        temporal.api.taskqueue.v1.ConcurrencyLimit concurrency_limit = 1;
+        // Reason why the limit was updated
         string reason = 2;
     }
 
@@ -3097,6 +3113,10 @@ message UpdateTaskQueueConfigRequest {
     // Fairness weights for corresponding keys fall back to the values set during task creation (if any),
     // or to the default weight of 1.0.
     repeated string unset_fairness_weight_overrides = 8;
+    // Update queue-wide concurrency limit.
+    // If not set, this configuration is unchanged.
+    // If the `concurrency_limit` field in the `ConcurrencyLimitUpdate` is missing, remove the existing limit.
+    ConcurrencyLimitUpdate update_queue_concurrency_limit = 9;
 }
 
 message UpdateTaskQueueConfigResponse {
@@ -3715,6 +3735,7 @@ message DeleteNexusOperationExecutionResponse {
 // execution. Currently the only supported policy is waiting for completion of the fast-forward
 // identified by `fast_forward_id`; the poll also returns once anything else settles that outcome
 // (e.g. the execution ends or time skipping is disabled).
+// Experimental. Might change in the future.
 message PollWorkflowExecutionTimeSkippingRequest {
   string namespace = 1;
   temporal.api.common.v1.WorkflowExecution workflow_execution = 2;
@@ -3723,6 +3744,8 @@ message PollWorkflowExecutionTimeSkippingRequest {
   string fast_forward_id = 3;
 }
 
+// Result of polling a workflow execution's time-skipping fast-forward.
+// Experimental. Might change in the future.
 message PollWorkflowExecutionTimeSkippingResponse {
   // The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`.
   temporal.api.enums.v1.FastForwardPollingResult fast_forward_polling_result = 1;

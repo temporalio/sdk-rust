@@ -63,6 +63,18 @@ const REFERENCE_MESSAGE_TYPE: &[u8] = b"temporal.api.sdk.v1.ExternalStorageRefer
 struct InMemoryDriver {
     stored: Mutex<HashMap<String, Payload>>,
     targets: Mutex<Vec<Option<StorageDriverTargetInfo>>>,
+    namespaces: Mutex<Vec<Option<String>>>,
+}
+
+impl InMemoryDriver {
+    fn assert_every_store_had_namespace(&self, namespace: &str) {
+        let namespaces = self.namespaces.lock().unwrap();
+        assert!(!namespaces.is_empty(), "nothing was stored");
+        assert!(
+            namespaces.iter().all(|ns| ns.as_deref() == Some(namespace)),
+            "{namespaces:?}"
+        );
+    }
 }
 
 impl StorageDriver for InMemoryDriver {
@@ -80,6 +92,10 @@ impl StorageDriver for InMemoryDriver {
         payloads: Vec<Payload>,
     ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
         self.targets.lock().unwrap().push(context.target.clone());
+        self.namespaces
+            .lock()
+            .unwrap()
+            .push(context.namespace.clone());
         let mut stored = self.stored.lock().unwrap();
         let claims = payloads
             .into_iter()
@@ -749,6 +765,32 @@ async fn schedule_arguments_round_trip_through_external_storage() {
         .expect("input should be present");
     assert_eq!(stored, input);
 
+    handle
+        .update(
+            |update| {
+                update.set_note("updated");
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    handle
+        .send_update(description.into_update(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(driver.stored.lock().unwrap().len(), 1);
+
+    let description = handle.describe(Default::default()).await.unwrap();
+    let ScheduleDescriptionAction::StartWorkflow(action) = description.action() else {
+        panic!("expected a start workflow action");
+    };
+    let stored: String = action
+        .args()
+        .await
+        .unwrap()
+        .expect("input should be present");
+    assert_eq!(stored, input);
+
     handle.delete(Default::default()).await.unwrap();
 }
 
@@ -803,6 +845,7 @@ async fn async_activity_results_round_trip_through_external_storage() {
         _ => None,
     });
     assert!(is_reference(&activity_result.unwrap()));
+    driver.assert_every_store_had_namespace(&integ_namespace());
 }
 
 type RecordedStorageMetrics = Vec<(
@@ -1064,6 +1107,7 @@ async fn drivers_are_told_which_workflow_a_payload_is_stored_for() {
             workflow(&workflow_id, Some(&last_run_id), parent_type),
         ],
     );
+    driver.assert_every_store_had_namespace(&integ_namespace());
 }
 
 #[tokio::test]

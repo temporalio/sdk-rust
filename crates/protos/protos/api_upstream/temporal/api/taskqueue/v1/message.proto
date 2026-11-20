@@ -33,6 +33,13 @@ message TaskQueueMetadata {
     google.protobuf.DoubleValue max_tasks_per_second = 1;
 }
 
+// Worker-reported state about the poller pool issuing a poll.
+message PollerPoolInfo {
+    // Number of pollers this worker is targeting for this task queue and task type.
+    // 0 if unknown, such as a poller pool of fixed size.
+    int32 target_pollers = 1;
+}
+
 message TaskQueueVersioningInfo {
     // Specifies which Deployment Version should receive new workflow executions and tasks of
     // existing unversioned or AutoUpgrade workflows.
@@ -337,9 +344,19 @@ message PollerScalingDecision {
   int32 poll_request_delta_suggestion = 1;
 }
 
-message RateLimit { 
+message RateLimit {
     // Zero is a valid rate limit.
     float requests_per_second = 1;
+}
+
+message ConcurrencyLimit {
+    // Maximum number of concurrent tasks that may be running at a time across the scope of the
+    // limit. e.g. in TaskQueueConfig, the scope is the whole task queue.
+    //
+    // Note that in situations like network partitions, the server's idea of what is running on
+    // workers may be out of date, and this limit could be exceeded from the point of view of
+    // workers.
+    int32 concurrent_tasks = 1;
 }
 
 message ConfigMetadata {
@@ -349,21 +366,28 @@ message ConfigMetadata {
     // Identity of the last updater.
     // Set by the request's identity field.
     string update_identity = 2;
-    
+
     // Time of the last update.
     google.protobuf.Timestamp update_time = 3;
 }
 
-message RateLimitConfig { 
-    RateLimit rate_limit = 1;    
+message RateLimitConfig {
+    RateLimit rate_limit = 1;
+    ConfigMetadata metadata = 2;
+}
+
+message ConcurrencyLimitConfig {
+    ConcurrencyLimit concurrency_limit = 1;
     ConfigMetadata metadata = 2;
 }
 
 message TaskQueueConfig {
-    // Unless modified, this is the system-defined rate limit.
+    // Rate limit for the whole queue.
     RateLimitConfig queue_rate_limit = 1;
     // If set, each individual fairness key will be limited to this rate, scaled by the weight of the fairness key.
     RateLimitConfig fairness_keys_rate_limit_default = 2;
     // If set, overrides the fairness weights for the corresponding fairness keys.
     map<string, float> fairness_weight_overrides = 3;
+    // Concurrency limit for the whole queue.
+    ConcurrencyLimitConfig queue_concurrency_limit = 4;
 }

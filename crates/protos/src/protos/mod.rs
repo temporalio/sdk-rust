@@ -283,7 +283,7 @@ pub mod coresdk {
                 write!(
                     f,
                     "WorkflowActivationCompletion(run_id: {}, status: ",
-                    &self.run_id
+                    self.run_id
                 )?;
                 match &self.status {
                     None => write!(f, "empty")?,
@@ -2075,6 +2075,11 @@ pub mod temporal {
             pub mod operation {
                 pub mod v1 {
                     tonic::include_proto!("temporal.api.cloud.operation.v1");
+                }
+            }
+            pub mod project {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.cloud.project.v1");
                 }
             }
             pub mod region {

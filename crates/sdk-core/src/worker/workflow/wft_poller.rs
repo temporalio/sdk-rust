@@ -2,16 +2,15 @@ use crate::{
     MetricsContext, WorkerConfig,
     abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit},
     pollers::{
-        BoxedWFPoller, LongPollBuffer, Poller, StickyPollerShared, StickyTaskPoller,
-        WorkflowTaskOptions, sticky_poller_behavior,
+        BoxedWFPoller, LongPollBuffer, Poller, PollerHeartbeatState, StickyPollerShared,
+        StickyTaskPoller, WorkflowTaskOptions, sticky_poller_behavior,
     },
     protosext::ValidPollWFTQResponse,
     telemetry::metrics::{workflow_poller, workflow_sticky_poller},
     worker::{NamespaceCapabilities, WorkflowSlotKind, client::WorkerClient},
 };
-use crossbeam_utils::atomic::AtomicCell;
 use futures_util::{Stream, stream};
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
 use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse;
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +22,8 @@ pub(crate) fn make_wft_poller(
     metrics: &MetricsContext,
     shutdown_token: &CancellationToken,
     wft_slots: &MeteredPermitDealer<WorkflowSlotKind>,
-    last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
-    sticky_last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    heartbeat_state: PollerHeartbeatState,
+    sticky_heartbeat_state: PollerHeartbeatState,
     capabilities: Arc<NamespaceCapabilities>,
 ) -> impl Stream<
     Item = Result<
@@ -65,7 +64,7 @@ pub(crate) fn make_wft_poller(
         WorkflowTaskOptions {
             wft_poller_shared: wft_poller_shared.clone(),
         },
-        last_successful_poll_time,
+        heartbeat_state,
         capabilities.clone(),
     );
     let sticky_queue_poller = sticky_queue_name.as_ref().map(|sqn| {
@@ -81,7 +80,7 @@ pub(crate) fn make_wft_poller(
                 sticky_metrics.record_num_pollers(np);
             }),
             WorkflowTaskOptions { wft_poller_shared },
-            sticky_last_successful_poll_time,
+            sticky_heartbeat_state,
             capabilities,
         )
     });
@@ -319,8 +318,8 @@ mod tests {
             &MetricsContext::no_op(),
             &CancellationToken::new(),
             &wft_slots,
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(AtomicCell::new(None)),
+            PollerHeartbeatState::default(),
+            PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
         );
         pin_mut!(stream);

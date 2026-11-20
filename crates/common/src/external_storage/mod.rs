@@ -72,23 +72,28 @@ impl StorageOperationMetrics {
 /// threshold applies to encoded payloads. Does nothing without the `experimental` feature. Returns
 /// metrics only when a payload was offloaded.
 ///
+/// `namespace` is the namespace of the client or worker performing the store, given to drivers and
+/// selectors. An empty string means unknown.
+///
 /// On error, reported as [`PayloadConversionError::ExternalStorage`], the message is left partly
 /// processed and must not be sent.
 pub async fn store_external_payloads<M: PayloadFieldCollectable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
+    namespace: &str,
     target: Option<StoreTarget>,
 ) -> Result<Option<StorageOperationMetrics>, PayloadConversionError> {
     #[cfg(feature = "experimental")]
     let metrics = runner::store_in(
         data_converter.external_storage(),
         msg,
+        (!namespace.is_empty()).then_some(namespace),
         target.as_ref().map(|t| &t.info),
     )
     .await?;
     #[cfg(not(feature = "experimental"))]
     let metrics = {
-        let _ = (msg, data_converter, target);
+        let _ = (msg, data_converter, namespace, target);
         None
     };
     Ok(metrics)

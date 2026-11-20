@@ -57,9 +57,8 @@ use temporalio_sdk_core::{
     Worker, prost_dur,
     replay::{HistoryForReplay, TestHistoryBuilder, default_wes_attribs},
     test_help::{
-        MocksHolder, PollWFTRespExt, QueueResponse, ResponseType, WorkerTestHelpers,
-        drain_pollers_and_shutdown, hist_to_poll_resp, mock_worker, mock_worker_client,
-        start_timer_cmd,
+        MocksHolder, PollWFTRespExt, QueueResponse, ResponseType, WorkerExt, WorkerTestHelpers,
+        hist_to_poll_resp, mock_worker, mock_worker_client, start_timer_cmd,
     },
 };
 use tokio::{
@@ -202,7 +201,7 @@ async fn reapplied_updates_due_to_reset() {
     // Then the client sent a second update; we handled it and completed the workflow.
     handle_update(FailUpdate::No, CompleteWorkflow::Yes, &replay_worker, 0).await;
 
-    drain_pollers_and_shutdown(&replay_worker).await;
+    replay_worker.drain_pollers_and_shutdown().await;
 }
 
 // Start a workflow, send an update, accept the update, complete the update, complete the workflow.
@@ -895,7 +894,7 @@ async fn update_validation_gates_local_activity_dispatch(
         }] if result.is_local
     );
     core.complete_execution(&activation.run_id).await;
-    drain_pollers_and_shutdown(&core).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]

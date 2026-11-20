@@ -26,8 +26,9 @@ note: `first_workflow::Run` is defined in module `crate::first_workflow` of the 
 note: required by a bound in `temporalio_client::Client::signal_with_start_workflow`
   --> src/lib.rs
    |
+   | impl Client {
+...
    |     pub async fn signal_with_start_workflow<W, S>(
-   |                  -------------------------- required by a bound in this associated function
 ...
    |         S: SignalDefinition<Workflow = W::Run>,
    |                             ^^^^^^^^^^^^^^^^^ required by this bound in `Client::signal_with_start_workflow`

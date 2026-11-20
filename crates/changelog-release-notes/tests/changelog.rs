@@ -5,7 +5,7 @@ use std::{
 };
 
 use changelog_release_notes::{
-    ReleaseOptions, assemble_release, check_fragments, collect_fragments, core_notes, git,
+    ReleaseOptions, assemble_release, check_fragments, collect_fragments, core_notes, git, notes,
     prepare_release, previous_release_tag, published_changelog_release_notes,
     published_release_notes, release_section, update_core,
 };
@@ -67,7 +67,8 @@ fn publishing_notes_use_completed_release_and_keep_late_fragments_pending() {
     repo.write("changelog/fixed/dancing-duck.md", "A later fix.\n");
     repo.commit();
     let notes =
-        published_changelog_release_notes(&repo.root, Path::new("CHANGELOG.md"), "1.1.0").unwrap();
+        published_changelog_release_notes(&repo.root, Path::new("CHANGELOG.md"), "1.1.0", None)
+            .unwrap();
     assert!(notes.starts_with(
         "## Notable Changes\n\n### Stabilized\n\n- Stable feature.\n- Second entry.\n"
     ));
@@ -77,7 +78,8 @@ fn publishing_notes_use_completed_release_and_keep_late_fragments_pending() {
     assert!(!notes.contains("SDK Core Commits"));
     assert!(repo.root.join("changelog/fixed/dancing-duck.md").exists());
     assert!(
-        published_changelog_release_notes(&repo.root, Path::new("CHANGELOG.md"), "9.9.9").is_err()
+        published_changelog_release_notes(&repo.root, Path::new("CHANGELOG.md"), "9.9.9", None)
+            .is_err()
     );
     let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
         .args(["release-notes", "--repo"])
@@ -132,9 +134,9 @@ fn core_update_through_preparation_and_publishing() {
     let parent = core_parent(&core, &old);
     git(&parent.root, &["tag", "-d", "1.0.0"]).unwrap();
     git(&parent.root, &["tag", "v1.0.0"]).unwrap();
-    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
+    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n- [lang-internal] A bridge-only breaking change.\n");
     core.commit();
-    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
+    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n- [lang-internal] A bridge-only breaking change.\n");
     let new = core.commit();
     assert_eq!(
         update_core(
@@ -189,6 +191,7 @@ fn core_update_through_preparation_and_publishing() {
         Path::new("CHANGELOG.md"),
         Path::new("core"),
         "1.1.0",
+        Some(options().date),
         None,
         "HEAD",
     )
@@ -210,6 +213,8 @@ fn core_update_through_preparation_and_publishing() {
             "core",
             "--version",
             "1.1.0",
+            "--date",
+            "2026-10-02",
             "--output",
             "notes.md",
         ])
@@ -404,6 +409,7 @@ fn empty_release_omits_unchanged_core_and_supports_explicit_tags() {
             Path::new("core"),
             "1.1.0",
             None,
+            None,
             "HEAD"
         )
         .unwrap(),
@@ -417,6 +423,7 @@ fn empty_release_omits_unchanged_core_and_supports_explicit_tags() {
             Path::new("core"),
             "1.1.0",
             None,
+            None,
             "HEAD"
         )
         .is_err()
@@ -427,6 +434,7 @@ fn empty_release_omits_unchanged_core_and_supports_explicit_tags() {
             Path::new("CHANGELOG.md"),
             Path::new("core"),
             "1.1.0",
+            None,
             Some("HEAD~"),
             "HEAD"
         )
@@ -534,6 +542,141 @@ fn options() -> ReleaseOptions<'static> {
         version: "1.1.0",
         date: NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
     }
+}
+
+#[test]
+fn validates_completed_release_without_consuming_pending_notes() {
+    let valid = "# Changelog\n\n## [1.1.0] - 2026-10-02\n\n```md\n## [Unreleased]\n## [1.1.0] - example\n```\n\n## [1.0.0] - 2026-01-01\n";
+    let expected = "```md\n## [Unreleased]\n## [1.1.0] - example\n```\n";
+    assert_eq!(
+        notes(valid, "1.1.0", Some(options().date)).unwrap(),
+        expected
+    );
+    assert_eq!(notes(valid, "1.1.0", None).unwrap(), expected);
+    assert_eq!(
+        notes(
+            "# Changelog\n\n## [1.1.0] - 2026-10-02\n",
+            "1.1.0",
+            Some(options().date)
+        )
+        .unwrap(),
+        ""
+    );
+    for invalid in [
+        "# Changelog\n",
+        "## [1.1.0]\n",
+        "## [1.1.0] - 2026-10-01\n",
+        "## [Unreleased]\n\n## [1.1.0] - 2026-10-02\n",
+        "## Unreleased\n\n## [1.1.0] - 2026-10-02\n",
+        "## [1.1.0] - 2026-10-02\n\n## [1.1.0] - 2026-10-02\n",
+        "## [1.1.0] - 2026-10-02\n\n## [1.0.0]\n\n## [1.0.0]\n",
+    ] {
+        assert!(
+            notes(invalid, "1.1.0", Some(options().date)).is_err(),
+            "{invalid}"
+        );
+        let repo = Repo::new();
+        repo.write("CHANGELOG.md", invalid);
+        let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+            .args(["release-notes", "--repo"])
+            .arg(&repo.root)
+            .args(["--version", "1.1.0", "--date", "2026-10-02"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{invalid}");
+        assert!(output.stdout.is_empty());
+    }
+    let repo = Repo::new();
+    repo.write("CHANGELOG.md", valid);
+    repo.write("changelog/fixed/late-llama.md", "A later fix.\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["release-notes", "--repo"])
+        .arg(&repo.root)
+        .args(["--version", "1.1.0", "--date", "2026-10-02"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("## Notable Changes\n\n{expected}")
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("CHANGELOG.md")).unwrap(),
+        valid
+    );
+    assert!(repo.root.join("changelog/fixed/late-llama.md").exists());
+}
+
+#[test]
+fn check_validates_the_selected_changelog_without_changing_files() {
+    let repo = Repo::new();
+    repo.write("CHANGELOG.md", "## [Unreleased]\n");
+    repo.write(
+        "contrib/example/changelog/fixed/dancing-duck.md",
+        "A fix.\n",
+    );
+    for (text, valid) in [
+        ("# Changelog\n\n## [Unreleased]\n", false),
+        ("# Changelog\n\n## Unreleased\n", false),
+        ("# Changelog\n\n## [1.0.0]\n\n## [1.0.0]\n", false),
+        (
+            "# Changelog\n\n```md\n## [Unreleased]\n```\n\n## [1.0.0] - 2026-01-01\n",
+            true,
+        ),
+    ] {
+        repo.write("contrib/example/CHANGELOG.md", text);
+        let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+            .args(["check", "--repo"])
+            .arg(&repo.root)
+            .args([
+                "--changelog",
+                "contrib/example/CHANGELOG.md",
+                "--fragments",
+                "contrib/example/changelog",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(repo.root.join("contrib/example/CHANGELOG.md")).unwrap(),
+            text
+        );
+        assert_eq!(
+            fs::read_to_string(
+                repo.root
+                    .join("contrib/example/changelog/fixed/dancing-duck.md")
+            )
+            .unwrap(),
+            "A fix.\n"
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["check", "--repo"])
+        .arg(&repo.root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["check", "--repo"])
+        .arg(&repo.root)
+        .args(["--changelog", "CHANGELOG.md"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Unreleased"));
 }
 
 #[test]
@@ -759,7 +902,7 @@ fn resolves_core_range_from_parent_tags_and_gitlinks() {
     let old = core.commit();
     core.write(
         "crates/sdk-core/CHANGELOG.md",
-        "# Changelog\n\n## Unreleased\n\n### Fixed\n- Core fix.\n",
+        "# Changelog\n\n## Unreleased\n\n### Fixed\n- Core fix.\n\n### Changed\n* [lang-internal] Internal change.\n",
     );
     let new = core.commit();
     let parent = Repo::new();
@@ -794,6 +937,8 @@ fn resolves_core_range_from_parent_tags_and_gitlinks() {
     assert!(status.success());
     let notes = core_notes(&parent.root, Path::new("core"), "1.1.0", None, "HEAD").unwrap();
     assert!(notes.contains("- Core fix."));
+    assert!(!notes.contains("Internal change."));
+    assert!(!notes.contains("#### Changed"));
     assert!(
         core_notes(
             &parent.root,
@@ -887,12 +1032,15 @@ fn cli_prepares_and_extracts_an_empty_release() {
     assert!(text.contains("## [1.1.0] - 2026-10-05\n\n"));
     assert!(text.ends_with(history));
     let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
-        .args(["notes", "--repo"])
+        .args(["release-notes", "--repo"])
         .arg(&repo.root)
         .args(["--version", "1.1.0"])
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "## Notable Changes\n\n"
+    );
     assert!(release_section(&text, "2.0.0").is_err());
 }

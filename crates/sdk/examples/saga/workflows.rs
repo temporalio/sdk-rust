@@ -29,6 +29,10 @@ impl SagaWorkflow {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Use the SDK's activity error directly in the example"
+    )]
     async fn book_trip(
         saga: &mut Saga,
         trip_id: String,
@@ -74,6 +78,10 @@ impl Saga {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Use the SDK's activity error directly in the example"
+    )]
     async fn step<Step, Compensation>(
         &mut self,
         forward: Step,

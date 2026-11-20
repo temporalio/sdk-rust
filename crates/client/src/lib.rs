@@ -1921,7 +1921,7 @@ where
                                 .as_ref()
                                 .map_or("", |workflow_type| workflow_type.name.as_str()),
                         );
-                        store_external_payloads(&mut request, &data_converter, Some(target)).await?;
+                        store_external_payloads(&mut request, &data_converter, &client.namespace(), Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = client
@@ -2064,7 +2064,7 @@ where
                                 .as_ref()
                                 .map_or("", |workflow_type| workflow_type.name.as_str()),
                         );
-                        store_external_payloads(&mut request, &data_converter, Some(target)).await?;
+                        store_external_payloads(&mut request, &data_converter, &client.namespace(), Some(target)).await?;
                         let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = WorkflowService::signal_with_start_workflow_execution(
@@ -2223,8 +2223,13 @@ where
                             ],
                             resource_id: workflow_id.clone(),
                         };
-                        store_external_payloads(&mut request, &data_converter, Some(target))
-                            .await?;
+                        store_external_payloads(
+                            &mut request,
+                            &data_converter,
+                            &client.namespace(),
+                            Some(target),
+                        )
+                        .await?;
 
                         let (start_response, update_response) = loop {
                             let mut rpc_request = request.clone().into_request();
@@ -2598,7 +2603,7 @@ where
                 .as_ref()
                 .map_or("", |activity_type| activity_type.name.as_str()),
         );
-        store_external_payloads(&mut request, dc, Some(target)).await?;
+        store_external_payloads(&mut request, dc, &client.namespace(), Some(target)).await?;
         let resp = client
             .start_activity_execution(request.into_request())
             .await?

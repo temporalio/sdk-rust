@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use temporalio_common::envconfig::{
     self, ClientConfig as CoreClientConfig, ClientConfigCodec as CoreClientConfigCodec,
     ClientConfigProfile as CoreClientConfigProfile, ClientConfigTLS as CoreClientConfigTLS,
-    DataSource as CoreDataSource, LoadClientConfigOptions, LoadClientConfigProfileOptions,
+    DataSource as CoreDataSource, LoadClientConfigOptions, LoadClientConfigProfileOptions, toml,
 };
 
 /// OrFail result for client config loading operations.
@@ -84,6 +84,8 @@ struct ClientEnvConfigProfile {
     codec: Option<ClientEnvConfigCodec>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     grpc_meta: HashMap<String, String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    ext: HashMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 impl TryFrom<CoreClientConfigProfile> for ClientEnvConfigProfile {
@@ -97,7 +99,35 @@ impl TryFrom<CoreClientConfigProfile> for ClientEnvConfigProfile {
             tls: c.tls.map(TryInto::try_into).transpose()?,
             codec: c.codec.map(Into::into),
             grpc_meta: c.grpc_meta,
+            ext: c
+                .ext
+                .into_iter()
+                .map(|(name, table)| (name, toml_table_to_json(table)))
+                .collect(),
         })
+    }
+}
+
+fn toml_table_to_json(table: toml::Table) -> serde_json::Map<String, serde_json::Value> {
+    table
+        .into_iter()
+        .map(|(k, v)| (k, toml_value_to_json(v)))
+        .collect()
+}
+
+// Serde would serialize TOML datetimes as `{"$__toml_private_datetime": "..."}`, a wrapper the toml crate uses
+// internally, so values are converted explicitly. JSON has no datetime type, so datetimes become ISO 8601 strings
+// (e.g. `1979-05-27T07:32:00Z`, or `1979-05-27` for a local date).
+fn toml_value_to_json(value: toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => s.into(),
+        toml::Value::Integer(i) => i.into(),
+        // Non-finite floats have no JSON representation and become null
+        toml::Value::Float(f) => f.into(),
+        toml::Value::Boolean(b) => b.into(),
+        toml::Value::Datetime(dt) => dt.to_string().into(),
+        toml::Value::Array(a) => a.into_iter().map(toml_value_to_json).collect(),
+        toml::Value::Table(t) => toml_table_to_json(t).into(),
     }
 }
 
@@ -323,5 +353,61 @@ pub extern "C" fn temporal_core_client_env_config_profile_load(
                 fail: err.into_raw(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_ext_serializes_to_json() {
+        let toml_str = r#"
+[profile.default]
+address = "localhost:7233"
+
+[profile.default.ext.my_ext]
+str = "value"
+int = 5
+float = 1.5
+bool = true
+datetime = 1979-05-27T07:32:00Z
+local_date = 1979-05-27
+array = [1, "two"]
+nested = { key = "nested_value" }
+"#;
+        let profile = envconfig::load_client_config_profile(
+            LoadClientConfigProfileOptions::builder()
+                .config_source(CoreDataSource::Data(toml_str.as_bytes().to_vec()))
+                .disable_env(true)
+                .build(),
+            None,
+        )
+        .unwrap();
+        let json =
+            serde_json::to_value(ClientEnvConfigProfile::try_from(profile).unwrap()).unwrap();
+        assert_eq!(
+            json["ext"],
+            serde_json::json!({
+                "my_ext": {
+                    "str": "value",
+                    "int": 5,
+                    "float": 1.5,
+                    "bool": true,
+                    "datetime": "1979-05-27T07:32:00Z",
+                    "local_date": "1979-05-27",
+                    "array": [1, "two"],
+                    "nested": { "key": "nested_value" },
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn profile_without_ext_omits_field() {
+        let profile = CoreClientConfigProfile::default();
+        let json =
+            serde_json::to_value(ClientEnvConfigProfile::try_from(profile).unwrap()).unwrap();
+        assert!(json.get("ext").is_none());
     }
 }

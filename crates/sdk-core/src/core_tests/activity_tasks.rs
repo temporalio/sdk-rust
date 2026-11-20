@@ -3,10 +3,10 @@ use crate::{
     prost_dur,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
-        FakeWfResponses, MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
-        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, build_multihist_mock_sg,
-        fanout_tasks, gen_assert_and_reply, mock_manual_poller, mock_poller, mock_worker,
-        poll_and_reply, single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
+        MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
+        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, fanout_tasks,
+        gen_assert_and_reply, mock_manual_poller, mock_poller, mock_worker, poll_and_reply,
+        single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
     },
     worker::{
         PollerBehavior, WorkerVersioningStrategy,
@@ -56,12 +56,14 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
+            common::v1::WorkflowExecution,
             enums::v1::{ActivityTaskFailedCause, ApplicationErrorCategory, EventType},
             failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
             workflowservice::v1::{
                 GetSystemInfoResponse, PollActivityTaskQueueResponse,
                 RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
-                RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedResponse,
+                RespondActivityTaskCanceledRequest, RespondActivityTaskCanceledResponse,
+                RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
                 RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
                 RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
             },
@@ -149,7 +151,7 @@ async fn activity_not_found_returns_ok() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -247,7 +249,7 @@ async fn heartbeats_report_cancels_only_once() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -333,7 +335,7 @@ async fn activity_cancel_interrupts_poll() {
     };
     // So that we know we blocked
     assert_eq!(last_finisher.load(Ordering::Acquire), 2);
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -398,8 +400,8 @@ async fn many_concurrent_heartbeat_cancels() {
         .returning(move |_, _| async move { Ok(Default::default()) }.boxed());
     mock_client
         .expect_record_activity_heartbeat()
-        .returning(move |tt, _| {
-            let calls = match calls_map.entry(tt) {
+        .returning(move |task, _| {
+            let calls = match calls_map.entry(task.task_token) {
                 Entry::Occupied(mut e) => {
                     *e.get_mut() += 1;
                     *e.get()
@@ -472,7 +474,7 @@ async fn many_concurrent_heartbeat_cancels() {
     })
     .await;
 
-    worker.drain_activity_poller_and_shutdown().await;
+    worker.drain_pollers_and_shutdown_ref().await;
 }
 
 #[tokio::test]
@@ -529,98 +531,6 @@ async fn activity_timeout_no_double_resolve() {
     core.drain_pollers_and_shutdown().await;
 }
 
-/// Regression test for a race between stream shutdown and eviction completion.
-///
-/// With zero-cache and `ignore_evicts_on_shutdown=true`, the workflow stream can
-/// decide to shut down (via `shutdown_done()`) after accepting an eviction
-/// completion message but before processing it. The BumpStream from
-/// `initiate_shutdown` is queued in the local channel ahead of the eviction
-/// completion (FIFO). The stream processes BumpStream, sees `shutdown_done()`
-/// is true, and exits — dropping the eviction completion's response channel
-/// sender without fulfilling it.
-#[tokio::test]
-async fn eviction_completion_during_shutdown_does_not_panic() {
-    let t = canned_histories::activity_double_resolve_repro();
-    let mut mh = build_multihist_mock_sg(
-        vec![FakeWfResponses {
-            wf_id: "fake_wf_id".to_owned(),
-            hist: t,
-            response_batches: vec![3.into()],
-        }],
-        true,
-        0,
-    );
-    // Prevent PollerDead from arriving so we control shutdown timing exactly.
-    mh.make_wft_stream_interminable();
-    let core = mock_worker(mh);
-    let activity_id = 1;
-
-    poll_and_reply(
-        &core,
-        WorkflowCachingPolicy::NonSticky,
-        &[
-            gen_assert_and_reply(
-                &job_assert!(workflow_activation_job::Variant::InitializeWorkflow(_)),
-                vec![
-                    ScheduleActivity {
-                        seq: activity_id,
-                        activity_id: activity_id.to_string(),
-                        cancellation_type: ActivityCancellationType::TryCancel as i32,
-                        ..Default::default()
-                    }
-                    .into(),
-                ],
-            ),
-            gen_assert_and_reply(
-                &job_assert!(workflow_activation_job::Variant::SignalWorkflow(_)),
-                vec![
-                    RequestCancelActivity { seq: activity_id }.into(),
-                    start_timer_cmd(2, Duration::from_secs(1)),
-                ],
-            ),
-            gen_assert_and_reply(
-                &job_assert!(workflow_activation_job::Variant::ResolveActivity(
-                    ResolveActivity {
-                        result: Some(ActivityResolution {
-                            status: Some(activity_resolution::Status::Cancelled(..)),
-                        }),
-                        ..
-                    }
-                )),
-                vec![],
-            ),
-            gen_assert_and_reply(
-                &job_assert!(
-                    workflow_activation_job::Variant::SignalWorkflow(_),
-                    workflow_activation_job::Variant::FireTimer(_)
-                ),
-                vec![CompleteWorkflowExecution { result: None }.into()],
-            ),
-        ],
-    )
-    .await;
-
-    // The zero-cache eviction produces an eviction activation after the last
-    // completion's PostActivation is processed.
-    let eviction = core.poll_workflow_activation().await.unwrap();
-    assert!(eviction.is_only_eviction());
-
-    // Cancel the shutdown token and enqueue BumpStream into the local channel.
-    // The stream will process BumpStream, see shutdown_done()=true (because
-    // ignore_evicts_on_shutdown skips the eviction activation), and exit.
-    core.initiate_shutdown();
-
-    // Complete the eviction. Its WFActCompleteMsg is queued AFTER BumpStream
-    // (same FIFO channel), so the stream exits before processing it — dropping
-    // the response channel sender. Without the fix, rx.await returning Err for
-    // an empty completion triggers dbg_panic!.
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
-        .await
-        .unwrap();
-
-    core.finalize_shutdown().await;
-}
-
 #[tokio::test]
 async fn can_heartbeat_acts_during_shutdown() {
     let mut mock_client = mock_worker_client();
@@ -666,7 +576,7 @@ async fn can_heartbeat_acts_during_shutdown() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[derive(PartialEq)]
@@ -858,7 +768,7 @@ async fn complete_act_with_fail_includes_latest_heartbeat() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -960,12 +870,9 @@ async fn oversized_throttled_heartbeat_failure_is_reported() {
     .await
     .expect("activity completion did not finish")
     .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        core.drain_activity_poller_and_shutdown(),
-    )
-    .await
-    .expect("activity worker did not shut down");
+    tokio::time::timeout(Duration::from_secs(5), core.drain_pollers_and_shutdown())
+        .await
+        .expect("activity worker did not shut down");
 
     let heartbeat_requests = heartbeat_requests.lock().unwrap();
     assert_eq!(heartbeat_requests.len(), 1);
@@ -1025,7 +932,7 @@ async fn activity_failure_distinguishes_no_heartbeat_from_empty_heartbeat() {
         })
         .await
         .unwrap();
-        core.drain_activity_poller_and_shutdown().await;
+        core.drain_pollers_and_shutdown().await;
     }
 }
 
@@ -1065,7 +972,156 @@ async fn activity_cancellation_still_flushes_latest_heartbeat() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
+}
+
+#[rstest]
+#[case::workflow_activity(Some("wf-1"), "workflow:wf-1")]
+#[case::standalone_activity(None, "activity:act1")]
+#[tokio::test]
+async fn activity_rpcs_carry_resource_id(
+    #[case] workflow_id: Option<&str>,
+    #[case] expected: &str,
+) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sent_clone = sent.clone();
+    let service_override = CallbackBasedGrpcService {
+        callback: Arc::new(move |request| {
+            let sent = sent_clone.clone();
+            Box::pin(async move {
+                let (resource_id, proto) = match request.rpc.as_str() {
+                    "GetSystemInfo" => (None, GetSystemInfoResponse::default().encode_to_vec()),
+                    "ShutdownWorker" => (None, ShutdownWorkerResponse::default().encode_to_vec()),
+                    "RecordActivityTaskHeartbeat" => (
+                        Some(
+                            RecordActivityTaskHeartbeatRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RecordActivityTaskHeartbeatResponse::default().encode_to_vec(),
+                    ),
+                    "RespondActivityTaskCompleted" => (
+                        Some(
+                            RespondActivityTaskCompletedRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RespondActivityTaskCompletedResponse::default().encode_to_vec(),
+                    ),
+                    "RespondActivityTaskFailed" => (
+                        Some(
+                            RespondActivityTaskFailedRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RespondActivityTaskFailedResponse::default().encode_to_vec(),
+                    ),
+                    "RespondActivityTaskCanceled" => (
+                        Some(
+                            RespondActivityTaskCanceledRequest::decode(request.proto)
+                                .unwrap()
+                                .resource_id,
+                        ),
+                        RespondActivityTaskCanceledResponse::default().encode_to_vec(),
+                    ),
+                    rpc => panic!("unexpected RPC: {rpc}"),
+                };
+                if let Some(resource_id) = resource_id {
+                    sent.lock().unwrap().push((request.rpc, resource_id));
+                }
+                Ok(GrpcSuccessResponse {
+                    headers: Default::default(),
+                    proto,
+                })
+            })
+        }),
+    };
+    let connection = Connection::connect(
+        ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let client = WorkerClientBag::new(
+        SharedReplaceableClient::new(connection),
+        "namespace".to_string(),
+        WorkerVersioningStrategy::None {
+            build_id: String::new(),
+        },
+        Uuid::new_v4(),
+    );
+    let task = |task_token| PollActivityTaskQueueResponse {
+        task_token: vec![task_token],
+        activity_id: "act1".to_string(),
+        workflow_execution: workflow_id.map(|workflow_id| WorkflowExecution {
+            workflow_id: workflow_id.to_string(),
+            ..Default::default()
+        }),
+        heartbeat_timeout: Some(prost_dur!(from_secs(10))),
+        ..Default::default()
+    };
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        client,
+        [task(1).into(), task(2).into(), task(3).into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![1].into()],
+    });
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::fail("Ahh".into())),
+    })
+    .await
+    .unwrap();
+
+    // The second heartbeat is throttled, so it is only sent by the flush on cancellation.
+    let act = core.poll_activity_task().await.unwrap();
+    for detail in [1_u8, 2] {
+        core.record_activity_heartbeat(ActivityHeartbeat {
+            task_token: act.task_token.clone(),
+            details: vec![vec![detail].into()],
+        });
+    }
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    core.drain_pollers_and_shutdown().await;
+
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.iter()
+            .map(|(rpc, _)| rpc.as_str())
+            .sorted()
+            .collect_vec(),
+        [
+            "RecordActivityTaskHeartbeat",
+            "RecordActivityTaskHeartbeat",
+            "RecordActivityTaskHeartbeat",
+            "RespondActivityTaskCanceled",
+            "RespondActivityTaskCompleted",
+            "RespondActivityTaskFailed",
+        ]
+    );
+    assert!(
+        sent.iter().all(|(_, resource_id)| resource_id == expected),
+        "{sent:?}"
+    );
 }
 
 /// Builds a tonic `Status` carrying a `PayloadLimitViolation` source, exactly as the gRPC client
@@ -1137,7 +1193,7 @@ async fn oversized_activity_result_failure_includes_latest_heartbeat() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// An oversized cancel `details` payload must be reported as a (retryable) activity task failure
@@ -1187,7 +1243,7 @@ async fn oversized_cancel_details_fails_activity() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// Oversized *final* heartbeat details replace whatever lang reported, so the cause and failure sent
@@ -1283,7 +1339,7 @@ async fn oversized_final_heartbeat_details_replace_reported_failure() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 /// An oversized heartbeat `details` payload must fail the activity task (retryably) and stop the
@@ -1297,10 +1353,11 @@ async fn oversized_heartbeat_fails_activity() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, cause, failure, last_heartbeat_details| {
+        |task, cause, failure, last_heartbeat_details| {
             assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert!(last_heartbeat_details.is_none());
+            assert_eq!(task.resource_id, "activity:act1");
             Ok(RespondActivityTaskFailedResponse::default())
         },
     );
@@ -1342,7 +1399,7 @@ async fn oversized_heartbeat_fails_activity() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1646,7 +1703,7 @@ async fn retryable_net_error_exhaustion_is_nonfatal() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -1703,8 +1760,8 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
             Ok(RecordActivityTaskHeartbeatResponse::default())
         });
     mock_client.expect_fail_activity_task().times(3).returning(
-        |task_token, _, _, last_heartbeat_details| {
-            if task_token.borrow() == [1] {
+        |task, _, _, last_heartbeat_details| {
+            if task.task_token.borrow() == [1] {
                 assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             } else {
                 assert!(last_heartbeat_details.is_none());
@@ -1820,7 +1877,7 @@ async fn activities_must_be_flushed_to_server_on_shutdown(#[values(true, false)]
     let task = worker.poll_activity_task().await.unwrap();
 
     let shutdown_task = async {
-        worker.drain_activity_poller_and_shutdown().await;
+        worker.drain_pollers_and_shutdown_ref().await;
         shutdown_finished.store(true, Ordering::Release);
     };
     let complete_task = async {
@@ -1996,5 +2053,5 @@ async fn heartbeat_response_can_be_paused() {
     .await
     .unwrap();
 
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 }

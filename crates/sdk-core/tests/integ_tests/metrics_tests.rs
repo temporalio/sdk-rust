@@ -2200,7 +2200,7 @@ async fn lang_reported_activity_failure_cause_reaches_metric() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 
     let metric_line = eventually(
         || {
@@ -2348,7 +2348,7 @@ async fn payloads_too_large_activity_failure_reaches_metric() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    core.drain_pollers_and_shutdown().await;
 
     let metric_line = eventually(
         || {
