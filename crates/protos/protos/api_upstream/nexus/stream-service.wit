@@ -112,7 +112,7 @@ interface stream-service {
     client(client-producer),
   }
 
-  /// @nexus.doc "The code that wrote a batch. A higher epoch fences and supersedes a lower one."
+  /// @nexus.doc "The code that wrote a batch. A higher epoch supersedes a lower one."
   /// @nexus.proto "temporal.api.stream.v1.Producer"
   record producer {
     /// @nexus.doc "Stable across attempts, such as wf:<run id> for a Workflow run."
@@ -240,9 +240,9 @@ interface stream-service {
     // To read only new Records, a caller gets last-offset from a describe and reads after it.
     /// @nexus.doc "Read after this offset. Empty is the beginning. A too high offset fails."
     from-offset: option<list<u8>>,
-    /// @nexus.doc "About this many Records per page, 1 to 1000."
+    /// @nexus.doc "About this many Records per page."
     max-records: option<s32>,
-    /// @nexus.doc "How long to wait for a new Record before an empty answer. At most 60 s."
+    /// @nexus.doc "How long to wait for a new Record before an empty answer."
     wait: option<duration>,
     /// @nexus.doc "The maximum Record bytes in a page. A larger Record is still returned alone."
     max-bytes: option<s64>,
@@ -319,7 +319,7 @@ interface stream-service {
   /// @nexus.operation name="CreateStream"
   create-stream: func(request: create-stream-request) -> create-stream-result;
 
-  /// @nexus.doc "Append one batch. For Workflow code, Core or a Local Activity makes the call."
+  /// @nexus.doc "Append one batch. For Workflow code, Core makes the call."
   /// @nexus.operation name="AppendRecords"
   /// @nexus.api-omit
   append-records: func(request: append-records-request) -> append-records-response;

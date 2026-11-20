@@ -107,10 +107,10 @@ message ReadRecordsRequest {
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
     bytes from_offset = 3;
-    // The most Records in one page. Zero is 1000.
+    // The most Records in one page. Zero is no cap.
     int32 max_records = 4;
     // How long the read waits for a new Record before it answers with an empty page. Empty answers
-    // at once, and a wait longer than 60 s waits 60 s.
+    // immediately.
     google.protobuf.Duration wait = 5;
     // The most Record bytes in one page, so a page fits the caller's limit, such as a History
     // marker. A larger Record still comes alone, so the read always moves on. Zero is no cap.
