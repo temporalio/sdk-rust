@@ -22,14 +22,10 @@ use temporalio_common::{
                 QueryResult, QuerySuccess, UpdateResponse, WorkflowCommand, query_result,
                 update_response, workflow_command,
             },
-            workflow_completion::{
-                self, WorkflowActivationCompletion, workflow_activation_completion,
-            },
+            workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion},
         },
         temporal::api::{
-            common::v1::Payload,
-            enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
-            failure::v1::Failure,
+            common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
         },
     },
 };
@@ -230,11 +226,7 @@ impl WorkflowFuture {
             .send(WorkflowActivationCompletion {
                 run_id,
                 status: Some(workflow_activation_completion::Status::Successful(
-                    workflow_completion::Success {
-                        commands: activation_cmds,
-                        used_internal_flags: vec![],
-                        versioning_behavior: VersioningBehavior::Unspecified.into(),
-                    },
+                    activation_cmds.into(),
                 )),
                 ..Default::default()
             })
