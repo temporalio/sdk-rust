@@ -124,14 +124,22 @@ interface stream-service {
 
   // Each kind is a separate case, so it has only its own ids. Two Producers are the same when
   // they have the same case and the same ids. The attempt isn't part of that.
-  /// @nexus.doc "The writer of a batch. A later attempt supersedes an earlier one."
+  /// @nexus.doc "The kind of a Producer, with its ids and its attempt."
   /// @nexus.proto "temporal.api.stream.v1.Producer.kind"
-  variant producer {
+  variant producer-kind {
     workflow(workflow-producer),
     local-activity(local-activity-producer),
     workflow-activity(workflow-activity-producer),
     standalone-activity(standalone-activity-producer),
     client(client-producer),
+  }
+
+  /// @nexus.doc "The writer of a batch. A later attempt supersedes an earlier one."
+  /// @nexus.proto "temporal.api.stream.v1.Producer"
+  record producer {
+    // A newer server can send a kind that this SDK doesn't know. Then the kind is empty.
+    /// @nexus.doc "Required. The kind of the Producer."
+    kind: option<producer-kind>,
   }
 
   /// @nexus.doc "One Record to append."
