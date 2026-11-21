@@ -68,6 +68,8 @@ relevant information.
   activity. Worker heartbeats set it to `worker:<worker_grouping_key>`, the grouping key each
   heartbeat already reports in its host info. Proxies can identify the workflow, activity, or
   worker without decoding task tokens or heartbeat contents.
+* Workflow Task SDK metadata can record the digests of content-addressed WASM
+  subroutines and return them during replay.
 
 ## [0.11.0] - 2026-11-09
 

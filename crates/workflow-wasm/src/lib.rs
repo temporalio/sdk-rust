@@ -6,6 +6,7 @@ use wasmtime::{
 };
 
 pub mod activation;
+mod addressable;
 pub use wasmtime;
 
 const FUEL_PER_CALL: u64 = 250_000_000;
@@ -42,17 +43,23 @@ impl CompiledComponent {
         Store::new(&self.engine, state)
     }
 
-    fn bounded_store(&self) -> anyhow::Result<Store<StoreLimits>> {
-        let mut store = self.store(
-            StoreLimitsBuilder::new()
+    fn bounded_store<T>(&self, data: T) -> anyhow::Result<Store<BoundedStore<T>>> {
+        let mut store = self.store(BoundedStore {
+            limits: StoreLimitsBuilder::new()
                 .memory_size(MEMORY_BYTES)
                 .memories(4)
                 .table_elements(100_000)
                 .trap_on_grow_failure(true)
                 .build(),
-        );
-        store.limiter(|limits| limits);
+            data,
+        });
+        store.limiter(|state| &mut state.limits);
         store.set_fuel(FUEL_PER_CALL)?;
         Ok(store)
     }
+}
+
+struct BoundedStore<T> {
+    limits: StoreLimits,
+    data: T,
 }

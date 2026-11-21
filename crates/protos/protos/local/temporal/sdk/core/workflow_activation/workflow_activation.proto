@@ -104,6 +104,8 @@ message WorkflowActivation {
     // the workflow is Pinned.
     // Experimental.
     bool target_worker_deployment_version_changed = 12;
+    // Recorded content-addressed bindings for the historical Workflow Task being replayed.
+    map<string, bytes> wasm_function_bindings = 13;
 }
 
 message WorkflowActivationJob {

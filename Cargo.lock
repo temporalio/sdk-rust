@@ -4647,6 +4647,10 @@ name = "temporalio-workflow-wasm"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "wasmparser 0.254.2",
  "wasmtime",
 ]
 
