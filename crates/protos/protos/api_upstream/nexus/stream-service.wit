@@ -137,8 +137,8 @@ interface stream-service {
   /// @nexus.doc "The writer of a batch. A later attempt supersedes an earlier one."
   /// @nexus.proto "temporal.api.stream.v1.Producer"
   record producer {
-    // A newer server can send a kind that this SDK doesn't know. Then the kind is empty.
-    /// @nexus.doc "Required. The kind of the Producer."
+    // A newer writer can use a kind that this SDK doesn't know. A read then gives no kind.
+    /// @nexus.doc "The kind of the Producer. A write must set it."
     kind: option<producer-kind>,
   }
 
@@ -269,14 +269,14 @@ interface stream-service {
     max-records: option<s32>,
     /// @nexus.doc "The maximum bytes of Records in a page. A larger Record is returned alone."
     max-bytes: option<s64>,
-    /// @nexus.doc "How long to wait for a new Record before the read returns an empty page."
+    /// @nexus.doc "How long the read waits for a new Record or a close before an empty page."
     wait: option<duration>,
   }
 
   /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsResponse"
   record read-records-response {
     records: list<stream-record>,
-    /// @nexus.doc "The offset of the last Record in this page. The next read starts after it."
+    /// @nexus.doc "Where the next read goes on. It is never before the last Record in this page."
     last-offset: option<list<u8>>,
     /// @nexus.doc "True when the Stream is closed and this page has its last Record."
     done: bool,
@@ -294,7 +294,7 @@ interface stream-service {
   /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamResponse"
   record describe-stream-response {
     status: option<stream-status>,
-    /// @nexus.doc "The offset of the newest Record. Empty when the Stream has none."
+    /// @nexus.doc "The newest offset. A read from it gives only later Records. Empty with none."
     last-offset: option<list<u8>>,
   }
 

@@ -29,8 +29,9 @@ import "temporal/api/stream/v1/message.proto";
 // (-- api-linter: core::0133=disabled
 //     aip.dev/not-precedent: The request identifies a Stream by its id. --)
 message CreateStreamRequest {
-    // Required. The id of the Stream to create. Callers treat it as opaque. An id is never used
-    // for a second Stream, so a create for a closed or expired Stream fails.
+    // Required. The id of the Stream to create. Callers treat it as opaque. A create for a closed
+    // or expired Stream fails. A Store can forget an expired Stream after a time of its choice,
+    // and a create for its id succeeds after that.
     string stream_id = 1;
     // What the create does if the Stream already exists. Unspecified means `FAIL`.
     temporal.api.enums.v1.StreamIdConflictPolicy id_conflict_policy = 2;
@@ -63,6 +64,7 @@ message AppendRecordsRequest {
     // arrives after more batches than that is written again. When it's empty, a retry is written
     // again.
     string request_id = 3;
+    // Required. A batch has at least one Record.
     repeated temporal.api.stream.v1.AppendRecord records = 4;
 }
 
@@ -91,7 +93,7 @@ message CloseStreamResponse {
 
 // Experimental. Might change in the future.
 // Reads one page of Records after an offset. When no Record is left, the read waits for a new
-// one, so a reader long-polls.
+// one or for the close of the Stream, so a reader long-polls.
 message ReadRecordsRequest {
     // Required.
     string stream_id = 1;
@@ -108,8 +110,9 @@ message ReadRecordsRequest {
     // this is still returned, alone in its page, so a read always makes progress. Zero means no
     // limit.
     int64 max_bytes = 4;
-    // How long the read waits for a new Record before it returns an empty page. When it's unset,
-    // the read returns immediately. The deadline of the request must be longer than this wait.
+    // How long the read waits for a new Record, or for the close of the Stream, before it returns
+    // an empty page. When it's unset, the read returns immediately. The deadline of the request
+    // must be longer than this wait.
     google.protobuf.Duration wait = 5;
 }
 
@@ -117,9 +120,10 @@ message ReadRecordsRequest {
 // One page of a read.
 message ReadRecordsResponse {
     repeated temporal.api.stream.v1.StreamRecord records = 1;
-    // The offset of the last Record in this page. The next read passes it as `from_offset`. For
-    // an empty page it's the `from_offset` of the request, so it's empty only when the request
-    // had none, and the next read then starts where this one did.
+    // Where the next read goes on. The next read passes it as `from_offset`. It's never before
+    // the last Record in this page, and it never skips a Record, but it can be after entries of
+    // the Store that aren't Records. For an empty page it can be the `from_offset` of the
+    // request, which is empty when the request had none.
     bytes last_offset = 2;
     // True when the Stream is closed and this page has its last Record. A read has no other sign
     // of a close, because a close stores no Record. A read of a closed Stream with no Record left
@@ -139,6 +143,7 @@ message DescribeStreamRequest {
 // of one Stream.
 message DescribeStreamResponse {
     temporal.api.enums.v1.StreamStatus status = 1;
-    // The offset of the newest Record. It's empty when the Stream has no Record.
+    // The offset of the newest Record, or an offset after it that skips no Record. A read from it
+    // returns only the Records that come later. It's empty when the Stream has no Record.
     bytes last_offset = 2;
 }
