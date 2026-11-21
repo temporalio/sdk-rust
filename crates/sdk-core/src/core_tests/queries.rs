@@ -1075,9 +1075,12 @@ async fn build_id_set_properly_on_query_on_first_task() {
             .build_id,
         "1.0"
     );
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
-        .await
-        .unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        query_ok("q".to_string(), "answer"),
+    ))
+    .await
+    .unwrap();
     core.drain_pollers_and_shutdown().await;
 }
 
