@@ -68,43 +68,79 @@ message ActivityAttempt {
 // closes in a Workflow Task. A write from one of its Local Activities uses a
 // `LocalActivityProducer`.
 message WorkflowProducer {
+    // Required.
+    string namespace = 1;
+    // Required.
+    string workflow_id = 2;
     // Required. The id of this run, not the first run id of its chain. Each run is a separate
     // Producer.
-    string run_id = 1;
+    string run_id = 3;
     // The Workflow Task attempt that makes the write. Workflow code leaves it empty, and the SDK
     // sets it before it sends the write to the Store.
-    WorkflowTaskAttempt attempt = 2;
+    WorkflowTaskAttempt attempt = 4;
 }
 
 // Experimental. Might change in the future.
-// The Producer of one Local Activity call of a Workflow run.
+// The Producer of one Local Activity of a Workflow run.
 message LocalActivityProducer {
-    // Required. The id of the Workflow run that made the call.
-    string run_id = 1;
+    // Required. The namespace of the Workflow that made the call.
+    string namespace = 1;
     // Required.
-    LocalActivityAttempt attempt = 2;
+    string workflow_id = 2;
+    // Required.
+    string run_id = 3;
+    // Required.
+    string activity_id = 4;
+    // Required.
+    LocalActivityAttempt attempt = 5;
 }
 
 // Experimental. Might change in the future.
-// The Producer of an Activity that a Workflow scheduled, or of a Standalone Activity.
-message ActivityProducer {
-    // The id of the Workflow run that scheduled the Activity. It's empty for a Standalone
-    // Activity, whose own run id is part of the Producer id.
-    string run_id = 1;
+// The Producer of one Activity that a Workflow scheduled.
+message WorkflowActivityProducer {
+    // Required. The namespace of the Workflow that scheduled the Activity.
+    string namespace = 1;
     // Required.
-    ActivityAttempt attempt = 2;
+    string workflow_id = 2;
+    // Required.
+    string run_id = 3;
+    // Required. A run can use an Activity id again after the first Activity ended. The second
+    // Activity is then a later attempt of the same Producer.
+    string activity_id = 4;
+    // Required.
+    ActivityAttempt attempt = 5;
+}
+
+// Experimental. Might change in the future.
+// The Producer of a Standalone Activity. Its attempts compare as those of a Workflow's Activity
+// do.
+message StandaloneActivityProducer {
+    // Required.
+    string namespace = 1;
+    // Required.
+    string activity_id = 2;
+    // Required. The run id of the Activity itself.
+    string run_id = 3;
+    // Required.
+    ActivityAttempt attempt = 4;
 }
 
 // Experimental. Might change in the future.
 // The Producer of a client. A client has no run and no attempt, so a Store never fences its
 // writes and a reader never hides them.
 message ClientProducer {
+    // Required.
+    string namespace = 1;
+    // Required. The caller can set it, for example to the id of the Nexus operation that
+    // writes. Without one, the SDK makes an id for each client object.
+    string id = 2;
 }
 
 // Experimental. Might change in the future.
 // The writer of a batch of Records. A Producer is one unit of work, such as one Activity or one
-// Workflow run. Its `id` is the same on every attempt, and every kind except a client also has
-// the attempt that made the write.
+// Workflow run. Two Producers are the same when they have the same kind and the same ids.
+// Every kind except a client also has the attempt that made the write, and the attempt is not
+// part of what identifies the Producer.
 //
 // A Store that fences fails a write with `FENCED` when a later attempt of the same Producer has
 // already written. A Store that doesn't fence accepts the write. Each Record has its Producer
@@ -113,20 +149,13 @@ message ClientProducer {
 // Attempts of different Producers have no order. A new run has new Producers, so no write fences
 // or supersedes the Records of an earlier run, such as the base run of a reset.
 message Producer {
-    // Required. The same on every attempt, for example `wf:<run id>` for the Producer of a
-    // Workflow run. It's unique within one Stream. The id of a kind with a run contains the run
-    // id, so it stays unique when Producers from several namespaces write to one Stream.
-    string id = 1;
     // Required. The kind of the Producer.
     oneof kind {
-        WorkflowProducer workflow = 2;
-        LocalActivityProducer local_activity = 3;
-        // An Activity that a Workflow scheduled.
-        ActivityProducer workflow_activity = 4;
-        // A Standalone Activity. Its attempts compare as those of a Workflow's Activity do. It's a
-        // separate case because it has no Workflow run.
-        ActivityProducer standalone_activity = 5;
-        ClientProducer client = 6;
+        WorkflowProducer workflow = 1;
+        LocalActivityProducer local_activity = 2;
+        WorkflowActivityProducer workflow_activity = 3;
+        StandaloneActivityProducer standalone_activity = 4;
+        ClientProducer client = 5;
     }
 }
 

@@ -76,51 +76,62 @@ interface stream-service {
   /// @nexus.doc "The Producer of a Workflow run."
   /// @nexus.proto "temporal.api.stream.v1.WorkflowProducer"
   record workflow-producer {
+    namespace: string,
+    workflow-id: string,
     /// @nexus.doc "The id of this run, not the first run id of its chain."
     run-id: string,
     // The Workflow Task attempt that makes the write.
     attempt: option<workflow-task-attempt>,
   }
 
-  /// @nexus.doc "The Producer of one Local Activity call."
+  /// @nexus.doc "The Producer of one Local Activity of a Workflow run."
   /// @nexus.proto "temporal.api.stream.v1.LocalActivityProducer"
   record local-activity-producer {
+    namespace: string,
+    workflow-id: string,
     run-id: string,
+    activity-id: string,
     attempt: local-activity-attempt,
   }
 
-  /// @nexus.doc "The Producer of an Activity."
-  /// @nexus.proto "temporal.api.stream.v1.ActivityProducer"
-  record activity-producer {
-    /// @nexus.doc "The Workflow run that scheduled the Activity. Empty for a Standalone Activity."
-    run-id: option<string>,
+  /// @nexus.doc "The Producer of one Activity that a Workflow scheduled."
+  /// @nexus.proto "temporal.api.stream.v1.WorkflowActivityProducer"
+  record workflow-activity-producer {
+    namespace: string,
+    workflow-id: string,
+    run-id: string,
+    activity-id: string,
+    attempt: activity-attempt,
+  }
+
+  /// @nexus.doc "The Producer of a Standalone Activity."
+  /// @nexus.proto "temporal.api.stream.v1.StandaloneActivityProducer"
+  record standalone-activity-producer {
+    namespace: string,
+    activity-id: string,
+    /// @nexus.doc "The run id of the Activity itself."
+    run-id: string,
     attempt: activity-attempt,
   }
 
   /// @nexus.doc "The Producer of a client. It has no run and no attempt."
   /// @nexus.proto "temporal.api.stream.v1.ClientProducer"
   record client-producer {
+    namespace: string,
+    /// @nexus.doc "The id of the client as a writer. The SDK makes one for each client object."
+    id: string,
   }
 
-  // Each kind is a separate case, so it has only its own fields.
-  /// @nexus.doc "The kind of a Producer, with its run and attempt."
+  // Each kind is a separate case, so it has only its own ids. Two Producers are the same when
+  // they have the same case and the same ids. The attempt isn't part of that.
+  /// @nexus.doc "The writer of a batch. A later attempt supersedes an earlier one."
   /// @nexus.proto "temporal.api.stream.v1.Producer.kind"
-  variant producer-kind {
+  variant producer {
     workflow(workflow-producer),
     local-activity(local-activity-producer),
-    workflow-activity(activity-producer),
-    standalone-activity(activity-producer),
+    workflow-activity(workflow-activity-producer),
+    standalone-activity(standalone-activity-producer),
     client(client-producer),
-  }
-
-  /// @nexus.doc "The writer of a batch. A later attempt supersedes an earlier one."
-  /// @nexus.proto "temporal.api.stream.v1.Producer"
-  record producer {
-    /// @nexus.doc "The same on every attempt, such as wf:<run id> for a Workflow run."
-    id: string,
-    // A newer server can send a kind that this SDK doesn't know. Then the kind is empty.
-    /// @nexus.doc "Required. The kind of the Producer."
-    kind: option<producer-kind>,
   }
 
   /// @nexus.doc "One Record to append."
