@@ -54,7 +54,7 @@ use itertools::Itertools;
 use prost_types::TimestampError;
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     future::Future,
     ops::DerefMut,
@@ -1458,6 +1458,7 @@ fn validate_completion(
                 run_id: completion.run_id,
                 commands,
                 used_flags: success.used_internal_flags,
+                wasm_function_bindings: success.wasm_function_bindings,
                 versioning_behavior: success.versioning_behavior.try_into().unwrap_or_default(),
             })
         }
@@ -1482,6 +1483,7 @@ enum ValidatedCompletion {
         run_id: String,
         commands: Vec<WFCommand>,
         used_flags: Vec<u32>,
+        wasm_function_bindings: HashMap<String, Vec<u8>>,
         versioning_behavior: VersioningBehavior,
     },
     Fail {

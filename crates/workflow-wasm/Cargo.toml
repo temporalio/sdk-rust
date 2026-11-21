@@ -12,6 +12,10 @@ rust-sdk = ["wasmtime/default"]
 
 [dependencies]
 anyhow = "1.0"
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+wasmparser = "0.254"
 wasmtime = { version = "48.0.7", default-features = false, features = [
     "anyhow",
     "component-model",

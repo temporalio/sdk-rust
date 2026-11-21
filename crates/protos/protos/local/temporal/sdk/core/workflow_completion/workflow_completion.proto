@@ -33,6 +33,8 @@ message Success {
     repeated uint32 used_internal_flags = 6;
     // The versioning behavior this workflow is currently using
     temporal.api.enums.v1.VersioningBehavior versioning_behavior = 7;
+    // Content-addressed bindings used by this live workflow activation.
+    map<string, bytes> wasm_function_bindings = 8;
 }
 
 // Failure to activate or execute a workflow

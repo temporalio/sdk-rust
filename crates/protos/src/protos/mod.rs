@@ -81,6 +81,7 @@ pub mod coresdk {
                     commands: v,
                     used_internal_flags: vec![],
                     versioning_behavior: VersioningBehavior::Unspecified.into(),
+                    ..Default::default()
                 }
             }
         }

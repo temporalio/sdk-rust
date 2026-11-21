@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Workflow Task SDK metadata can record the digests of content-addressed WASM
+  subroutines and return them during replay.
+
 ## [0.11.0] - 2026-11-09
 
 ### Added

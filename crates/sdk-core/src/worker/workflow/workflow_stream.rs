@@ -305,11 +305,13 @@ impl WFStream {
                 ValidatedCompletion::Success {
                     commands,
                     used_flags,
+                    wasm_function_bindings,
                     versioning_behavior,
                     ..
                 } => match rh.successful_completion(
                     commands,
                     used_flags,
+                    wasm_function_bindings,
                     versioning_behavior,
                     complete.response_tx,
                     false,

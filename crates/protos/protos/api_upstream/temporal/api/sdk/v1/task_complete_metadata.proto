@@ -51,4 +51,8 @@ message WorkflowTaskCompletedMetadata {
   // usually the same as client-version gRPC header. This should only be set if its value changed
   // since the last time recorded on the workflow (or be set on the first task).
   string sdk_version = 4;
+
+  // Experimental content-addressed WASM function bindings used by this task.
+  // Keys are stable dispatch slots and values are SHA-256 digests.
+  map<string, bytes> wasm_function_bindings = 5;
 }

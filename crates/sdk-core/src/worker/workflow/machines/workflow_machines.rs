@@ -158,6 +158,9 @@ pub(crate) struct WorkflowMachines {
     /// Set if the current WFT is already complete and that completion event had legacy build-id
     /// or a deployment version in it. Will use an empty deployment name if it's legacy build-id.
     current_wft_deployment_info: Option<WorkerDeploymentVersion>,
+    supports_sdk_metadata: bool,
+    recorded_wasm_function_bindings: HashMap<String, Vec<u8>>,
+    pending_wasm_function_bindings: HashMap<String, Vec<u8>>,
 
     all_machines: SlotMap<MachineKey, Machines>,
     /// If a machine key is in this map, that machine was created internally by core, not as a
@@ -322,6 +325,9 @@ impl WorkflowMachines {
             suggest_continue_as_new_reasons: Default::default(),
             target_worker_deployment_version_changed: false,
             current_wft_deployment_info: None,
+            supports_sdk_metadata: basics.capabilities.sdk_metadata,
+            recorded_wasm_function_bindings: HashMap::new(),
+            pending_wasm_function_bindings: HashMap::new(),
             all_machines: Default::default(),
             machine_is_core_created: Default::default(),
             machines_by_event_id: Default::default(),
@@ -588,6 +594,11 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
+            wasm_function_bindings: if self.replaying && !all_query {
+                self.recorded_wasm_function_bindings.clone()
+            } else {
+                HashMap::new()
+            },
         }
     }
 
@@ -614,9 +625,43 @@ impl WorkflowMachines {
         // current build ID, so that if we get a query before any new history, we properly can
         // report that our ID was the one used for the completion.
         self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
-        (*self.observed_internal_flags)
+        let mut metadata = self
+            .observed_internal_flags
             .borrow_mut()
-            .gather_for_wft_complete()
+            .gather_for_wft_complete();
+        metadata.wasm_function_bindings = std::mem::take(&mut self.pending_wasm_function_bindings);
+        metadata
+    }
+
+    pub(crate) fn add_wasm_function_bindings(
+        &mut self,
+        bindings: HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        if !bindings.is_empty() && !self.supports_sdk_metadata {
+            return Err(fatal!("Server does not support Workflow Task SDK metadata"));
+        }
+        for (slot, digest) in bindings {
+            if slot.is_empty() || slot.len() > 128 || digest.len() != 32 {
+                return Err(fatal!(
+                    "Invalid content-addressed function binding for {slot:?}"
+                ));
+            }
+            let binding = self
+                .pending_wasm_function_bindings
+                .entry(slot)
+                .or_insert_with(|| digest.clone());
+            if *binding != digest {
+                return Err(fatal!(
+                    "Content-addressed function binding changed during a Workflow Task"
+                ));
+            }
+        }
+        if self.pending_wasm_function_bindings.len() > 1024 {
+            return Err(fatal!(
+                "Too many content-addressed function bindings in a Workflow Task"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn add_lang_used_flags(&self, flags: Vec<u32>) {
@@ -636,6 +681,8 @@ impl WorkflowMachines {
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
+        self.pending_wasm_function_bindings.clear();
+        self.recorded_wasm_function_bindings.clear();
         // We must reset the last event we "processed" to be after the last WFT we really completed
         // + any command events (since the SDK "processed" those when it emitted the commands). This
         // is also equal to what we just processed in the speculative task, minus two, since we
@@ -1455,6 +1502,15 @@ impl WorkflowMachines {
     /// of the current started event as well as workflow time properly.
     fn task_started(&mut self, task_started_event_id: i64, time: SystemTime) {
         self.current_started_event_id = task_started_event_id;
+        self.pending_wasm_function_bindings.clear();
+        // Look ahead only to the completion of this task, even if a later task completed.
+        self.recorded_wasm_function_bindings = self
+            .last_history_from_server
+            .peek_next_wft_completed(task_started_event_id)
+            .filter(|completed| completed.started_event_id == task_started_event_id)
+            .and_then(|completed| completed.sdk_metadata.as_ref())
+            .map(|metadata| metadata.wasm_function_bindings.clone())
+            .unwrap_or_default();
         self.wft_start_time = Some(time);
         self.set_current_time(time);
     }

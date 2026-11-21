@@ -21,7 +21,7 @@ use crate::{
 };
 use futures_util::future::AbortHandle;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     mem,
     ops::{Add, Sub},
     rc::Rc,
@@ -423,6 +423,7 @@ impl ManagedRun {
         &mut self,
         mut commands: Vec<WFCommand>,
         used_flags: Vec<u32>,
+        wasm_function_bindings: HashMap<String, Vec<u8>>,
         versioning_behavior: VersioningBehavior,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
         is_forced_failure: bool,
@@ -502,6 +503,7 @@ impl ManagedRun {
                 has_pending_query,
                 query_responses,
                 used_flags,
+                wasm_function_bindings,
                 resp_chan,
                 is_forced_failure,
                 versioning_behavior,
@@ -671,6 +673,7 @@ impl ManagedRun {
                         },
                     ))],
                     vec![],
+                    HashMap::new(),
                     VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
                     resp_chan,
                     true,
@@ -778,6 +781,9 @@ impl ManagedRun {
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
+            self.wfm
+                .machines
+                .add_wasm_function_bindings(completion.wasm_function_bindings)?;
             self.wfm.push_commands_and_iterate(completion.commands)?;
             if let Some(update) = update_from_new_page {
                 self.wfm.feed_history_from_new_page(update)?;
@@ -1670,6 +1676,7 @@ struct RunActivationCompletion {
     has_pending_query: bool,
     query_responses: Vec<QueryResult>,
     used_flags: Vec<u32>,
+    wasm_function_bindings: HashMap<String, Vec<u8>>,
     is_forced_failure: bool,
     /// Used to notify the worker when the completion is done processing and the completion can
     /// unblock. Must always be `Some` when initialized.

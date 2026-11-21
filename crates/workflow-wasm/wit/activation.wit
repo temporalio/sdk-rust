@@ -23,3 +23,8 @@ interface guest {
 world activation-workflow-module {
   export guest;
 }
+
+world addressable-workflow-module {
+  include activation-workflow-module;
+  import resolve-addressable: func(slot: string) -> tuple<list<u8>, list<u8>>;
+}
