@@ -21,12 +21,16 @@ pub struct CompiledComponent {
 
 impl CompiledComponent {
     pub fn new(bytes: &[u8], bounded: bool) -> anyhow::Result<Self> {
+        Self::with_max_bytes(bytes, bounded, MAX_COMPONENT_BYTES)
+    }
+
+    fn with_max_bytes(bytes: &[u8], bounded: bool, max_bytes: usize) -> anyhow::Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         if bounded {
             anyhow::ensure!(
-                bytes.len() <= MAX_COMPONENT_BYTES,
-                "WASM workflow component exceeds {MAX_COMPONENT_BYTES} bytes"
+                bytes.len() <= max_bytes,
+                "WASM workflow component exceeds {max_bytes} bytes"
             );
             // Python bundles carry the whole interpreter. Keep compilation affordable per worker.
             config.cranelift_opt_level(OptLevel::None);

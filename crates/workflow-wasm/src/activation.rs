@@ -1,15 +1,17 @@
 //! Hosts a guest that produces a complete Core Workflow Activation Completion.
 
-use anyhow::anyhow;
-use std::{path::Path, sync::Arc};
+use anyhow::{anyhow, ensure};
+use std::{collections::HashMap, path::Path, sync::Arc};
 use wasmtime::{
     Store, StoreContextMut,
     component::{Linker, ResourceAny},
     error::Context,
 };
 
+use wasmparser::{Parser, Payload};
+
 use crate::{
-    BoundedStore, CompiledComponent, FUEL_PER_CALL,
+    BoundedStore, CompiledComponent, FUEL_PER_CALL, MAX_COMPONENT_BYTES,
     addressable::{ActivationBindings, AddressableState, Bindings, ContentStore},
 };
 
@@ -18,6 +20,8 @@ wasmtime::component::bindgen!({
     world: "activation-workflow-module",
 });
 pub use exports::temporal::workflow_activation::guest::LocalActivities;
+
+const MAX_PYTHON_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Compiled activation component and its startup-validated workflow names.
 pub struct ActivationComponent {
@@ -33,8 +37,14 @@ impl ActivationComponent {
     }
 
     pub fn with_addressable_store(bytes: &[u8], path: Option<&Path>) -> anyhow::Result<Self> {
+        ensure!(
+            bytes.len() <= MAX_COMPONENT_BYTES + MAX_PYTHON_SOURCE_BYTES,
+            "WASM workflow bundle exceeds the combined component and Python source limit"
+        );
+        let (sources, source_bytes) = python_sources(bytes)?;
         let addressable_store = path.map(ContentStore::open).transpose()?.map(Arc::new);
-        let component = CompiledComponent::new(bytes, true)?;
+        let component =
+            CompiledComponent::with_max_bytes(bytes, true, MAX_COMPONENT_BYTES + source_bytes)?;
         let mut linker = Linker::new(&component.engine);
         if addressable_store.is_some() {
             linker.root().func_wrap(
@@ -48,6 +58,13 @@ impl ActivationComponent {
                         .map(|body| (body,))
                         .map_err(wasmtime::Error::from_anyhow)
                 },
+            )?;
+        }
+        if let Some(sources) = sources {
+            linker.root().func_wrap(
+                "read-python-source",
+                move |_caller: StoreContextMut<'_, BoundedStore<AddressableState>>,
+                      (path,): (String,)| { Ok((sources.get(&path).cloned(),)) },
             )?;
         }
         let pre = ActivationWorkflowModulePre::new(
@@ -154,4 +171,49 @@ impl ActivationInstance {
             .used;
         Ok((output?.map_err(|err| anyhow!(err))?, used))
     }
+}
+
+type PythonSources = HashMap<String, Vec<u8>>;
+
+fn python_sources(bytes: &[u8]) -> anyhow::Result<(Option<PythonSources>, usize)> {
+    let mut depth = 0;
+    let mut sources = None;
+    let mut source_bytes = 0;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::Version { .. } => depth += 1,
+            Payload::End(_) => depth -= 1,
+            Payload::CustomSection(section)
+                if depth == 1 && section.name() == "temporal-python-sources-v1" =>
+            {
+                ensure!(sources.is_none(), "duplicate WASM Python sources section");
+                let mut data = section.data();
+                source_bytes = data.len();
+                ensure!(
+                    source_bytes <= MAX_PYTHON_SOURCE_BYTES,
+                    "WASM Python sources exceed {MAX_PYTHON_SOURCE_BYTES} bytes"
+                );
+                let mut entries = HashMap::new();
+                while !data.is_empty() {
+                    let name = std::str::from_utf8(source_field(&mut data)?)?;
+                    let source = source_field(&mut data)?;
+                    entries.insert(name.to_owned(), source.to_vec());
+                }
+                sources = Some(entries);
+            }
+            _ => {}
+        }
+    }
+    Ok((sources, source_bytes))
+}
+
+fn source_field<'a>(data: &mut &'a [u8]) -> anyhow::Result<&'a [u8]> {
+    let (length, remaining) = data
+        .split_first_chunk::<4>()
+        .ok_or_else(|| anyhow!("truncated WASM Python source field length"))?;
+    let (field, remaining) = remaining
+        .split_at_checked(u32::from_le_bytes(*length) as usize)
+        .ok_or_else(|| anyhow!("truncated WASM Python source field"))?;
+    *data = remaining;
+    Ok(field)
 }
