@@ -28,3 +28,13 @@ world addressable-workflow-module {
   include activation-workflow-module;
   import resolve-addressable: func(slot: string) -> tuple<list<u8>, list<u8>>;
 }
+
+world shared-source-workflow-module {
+  include activation-workflow-module;
+  import read-python-source: func(path: string) -> option<list<u8>>;
+}
+
+world shared-source-addressable-workflow-module {
+  include shared-source-workflow-module;
+  import resolve-addressable: func(slot: string) -> tuple<list<u8>, list<u8>>;
+}
