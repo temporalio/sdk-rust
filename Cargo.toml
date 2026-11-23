@@ -8,6 +8,7 @@ members = [
     "crates/protos",
     "crates/macros",
     "crates/sdk",
+    "crates/sdk-aws-lambda",
     "crates/workflow",
     "crates/sdk-core-c-bridge",
     "crates/changelog-release-notes",
