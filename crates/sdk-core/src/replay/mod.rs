@@ -84,6 +84,11 @@ where
         let post_activate = historator.get_post_activate_hook();
         let shutdown_tok = historator.get_shutdown_setter();
         // Create a mock client which can be used by a replay worker to serve up canned histories.
+        // It returns each entire History in one workflow task, and returns the next one only after
+        // the one before it reports back. It does not send a History again after its workflow
+        // task fails.
+        //
+        // When no Histories are left, it ends the worker and returns an empty response.
         let mut client = if let Some(c) = self.client_override {
             c
         } else {
@@ -144,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn hands_out_a_history_only_after_the_one_before_reports_back() {
+    fn delivers_a_history_only_after_the_one_before_reports_back() {
         // The same History three times, so run ids can't tell the Histories apart.
         let history = HistoryForReplay::from(canned_histories::single_timer("1"));
         let mut historator = Historator::new(stream::iter(vec![history; 3]));
@@ -245,8 +250,9 @@ pub(crate) struct Historator {
     worker_closer: Arc<OnceLock<CancellationToken>>,
     dat: Arc<Mutex<HistoratorDat>>,
     replay_done_tx: UnboundedSender<TaskToken>,
-    /// The task token of the History handed out last, which it reports back with.
-    handed_out: Option<TaskToken>,
+    /// The task token of the History delivered last. That History's reports carry this token,
+    /// which tells them apart from the reports of earlier Histories.
+    last_delivered: Option<TaskToken>,
 }
 impl Historator {
     pub(crate) fn new(histories: impl Stream<Item = HistoryForReplay> + Send + 'static) -> Self {
@@ -258,18 +264,18 @@ impl Historator {
             worker_closer: Arc::new(OnceLock::new()),
             dat,
             replay_done_tx,
-            handed_out: None,
+            last_delivered: None,
         }
     }
 
-    /// Hands out the next History once the one before it has reported back, or ends the worker
+    /// Delivers the next History once the one before it has reported back, or ends the worker
     /// when none are left.
     async fn next_poll_response(&mut self) -> PollWorkflowTaskQueueResponse {
         // Earlier Histories can report back again. Only a report from the last one shows Core took
         // it from the poll buffer, and ending the worker before that drops it.
-        if let Some(handed_out) = &self.handed_out {
+        if let Some(last_delivered) = &self.last_delivered {
             while let Some(report) = self.allow_stream.next().await {
-                if report == *handed_out {
+                if report == *last_delivered {
                     break;
                 }
             }
@@ -283,7 +289,7 @@ impl Historator {
             };
             let mut resp = hist_info.into_poll_wft_response();
             resp.workflow_execution = Some(execution);
-            self.handed_out = Some(resp.task_token.clone().into());
+            self.last_delivered = Some(resp.task_token.clone().into());
             resp
         } else {
             if let Some(wc) = self.worker_closer.get() {
@@ -294,7 +300,7 @@ impl Historator {
     }
 
     /// Returns the post-activation hook. Its reports tell the poll when Core holds the History it
-    /// handed out last.
+    /// delivered last.
     pub(crate) fn get_post_activate_hook(
         &self,
     ) -> impl Fn(&Worker, PostActivateHookData) + Send + Sync + use<> {

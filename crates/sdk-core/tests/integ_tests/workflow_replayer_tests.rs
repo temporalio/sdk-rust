@@ -378,18 +378,35 @@ async fn workflow_replayer_returns_ordered_results_for_multiple_histories() {
     ));
 }
 
+/// The outcome of the replay of one History. A case lists its Histories by the outcome that they
+/// must give.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Success,
+    Nondeterminism,
+}
+
 #[rstest::rstest]
-#[case::histories_sharing_a_run_id("SNNN", false)]
-#[case::nondeterminism_failing_the_workflow("N", true)]
-#[case::nondeterminism_failing_the_workflow_first("NS", true)]
+#[case::histories_sharing_a_run_id(
+    &[Outcome::Success, Outcome::Nondeterminism, Outcome::Nondeterminism, Outcome::Nondeterminism],
+    false
+)]
+#[case::nondeterminism_failing_the_workflow(&[Outcome::Nondeterminism], true)]
+#[case::nondeterminism_failing_the_workflow_first(
+    &[Outcome::Nondeterminism, Outcome::Success],
+    true
+)]
 #[tokio::test]
 async fn workflow_replayer_returns_every_outcome_in_order(
-    #[case] shape: &str,
+    #[case] outcomes: &[Outcome],
     #[case] nondeterminism_fails_workflow: bool,
 ) {
+    let nondeterministic_count = (outcomes.iter())
+        .filter(|outcome| **outcome == Outcome::Nondeterminism)
+        .count();
     let (successful, nondeterministic) = successful_and_nondeterministic_runs(
-        &format!("workflow_replayer_returns_every_outcome_in_order_{shape}"),
-        shape.matches('N').count() - 1,
+        "workflow_replayer_returns_every_outcome_in_order",
+        nondeterministic_count - 1,
     )
     .await;
     // The replay worker takes the original run id as the run id, and a reset run keeps it.
@@ -399,10 +416,10 @@ async fn workflow_replayer_returns_every_outcome_in_order(
         .collect();
     assert_eq!(run_ids.len(), 1);
     let mut nondeterministic = nondeterministic.into_iter();
-    let histories: Vec<WorkflowHistory> = (shape.chars())
-        .map(|kind| match kind {
-            'S' => successful.clone(),
-            _ => nondeterministic.next().unwrap(),
+    let histories: Vec<WorkflowHistory> = (outcomes.iter())
+        .map(|outcome| match outcome {
+            Outcome::Success => successful.clone(),
+            Outcome::Nondeterminism => nondeterministic.next().unwrap(),
         })
         .map(|events| History { events }.into())
         .collect();
@@ -422,14 +439,14 @@ async fn workflow_replayer_returns_every_outcome_in_order(
     .await
     .expect("replay finishes")
     .unwrap();
-    let outcomes: String = (results.iter())
-        .map(|result| match result.replay_failure {
-            None => 'S',
-            Some(WorkflowReplayFailure::Nondeterminism { .. }) => 'N',
-            Some(_) => '?',
+    let replayed: Vec<_> = (results.iter())
+        .map(|result| match &result.replay_failure {
+            None => Outcome::Success,
+            Some(WorkflowReplayFailure::Nondeterminism { .. }) => Outcome::Nondeterminism,
+            Some(failure) => panic!("unexpected replay failure: {failure}"),
         })
         .collect();
-    assert_eq!(outcomes, shape);
+    assert_eq!(replayed, outcomes);
 }
 
 /// Runs a workflow that replays and one that is nondeterministic on replay, resets the second one
