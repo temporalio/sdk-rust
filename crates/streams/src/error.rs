@@ -12,7 +12,7 @@ pub enum AnyReason {
     /// The Store failed or didn't respond. A retry may succeed.
     StoreUnavailable,
     /// The Store returned invalid data, and a retry would read the same data again. The runtime
-    /// returns it for an answer that breaks the rules of [`StreamStore`](crate::StreamStore). An
+    /// returns it for an answer that breaks the contract of [`StreamStore`](crate::StreamStore). An
     /// append or a create that fails this way may still have taken effect.
     StoreCorrupt,
     /// The Store doesn't support something that the call needs. The runtime returns it for a

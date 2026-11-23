@@ -13,8 +13,8 @@ use prost::Message;
 use std::{fmt, sync::Arc};
 
 /// Wraps a [`StreamStore`] and checks each call. It validates the request before the Store gets
-/// it, and the response before the caller gets it. The [`StreamStore`] docs list the rules that it
-/// checks. It has no timeout of its own, so a Store that never responds blocks the call.
+/// it, and the response before the caller gets it. The [`StreamStore`] docs describe the contract
+/// that it checks. It has no timeout of its own, so a Store that never responds blocks the call.
 ///
 /// The runtime refuses a batch over its [`StoreLimits`], and fails a read that gives a Record over
 /// their Record size. The limits are the caller's. An SDK builds the runtime of each Store with

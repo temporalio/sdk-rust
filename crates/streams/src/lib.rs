@@ -3,7 +3,7 @@
 //! Experimental. Contains the Stream runtime, and shared definitions for Temporal Stream Store
 //! implementations.
 //!
-//! A Store implements [`StreamStore`], whose docs have the rules of a Store. [`StreamRuntime`]
+//! A Store implements [`StreamStore`], whose docs have the contract of a Store. [`StreamRuntime`]
 //! wraps a Store and validates every request before the Store sees it, and every response on the
 //! way back. So every Store gets the same valid requests, and no caller gets a malformed response.
 //! Each operation fails with its own error type, such as [`AppendError`], which has only the
