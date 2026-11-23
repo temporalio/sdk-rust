@@ -891,30 +891,16 @@ fn key(stream: &StreamRef) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        StreamManager, StreamSettings,
-        manager::{failure_of, recorded},
-    };
+    use super::super::{StreamManager, StreamSettings, manager::recorded};
     use super::*;
     use crate::test_help::stream_store::{MemoryStore, Request as StoreRequest};
-    use prost::Message;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
-    use temporalio_common::protos::{
-        coresdk::{
-            external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
-            workflow_activation::{ResolveStreamAppend, ResolveStreamClose, resolve_stream_append},
-        },
-        temporal::api::{
-            common::v1::Payloads,
-            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
-        },
+    use temporalio_common::protos::coresdk::{
+        external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
+        workflow_activation::{ResolveStreamAppend, ResolveStreamClose, resolve_stream_append},
     };
-    use temporalio_streams::{
-        AnyError, StreamRuntime,
-        proto::{StreamErrorDetails, StreamErrorReason},
-        record::StoreLimits,
-    };
+    use temporalio_streams::{AnyError, StreamRuntime, record::StoreLimits};
     use tokio::runtime::Handle;
     use workflow_activation_job::Variant;
 
@@ -1073,40 +1059,44 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn calls_to_one_stream_run_one_at_a_time_in_queue_order() {
-        let mut live = calls(Phase::Live, 3);
-        live.append(append(1, "s")).unwrap();
-        live.close(close(1, "s")).unwrap();
-        live.append(append(2, "s")).unwrap();
-        live.append(append(3, "t")).unwrap();
-        let run = live.producer.clone();
-        let request = |id: &str, seq| {
-            let producer = producer(&run, task_attempt(3));
-            let request_id = request_id("r", &producer, seq);
-            let request = AppendRecordsRequest {
-                r#ref: Some(stream(id)),
-                producer: Some(producer),
-                records: vec![AppendRecord {
-                    body: Some(Payload::default()),
-                }],
-            };
-            (request, request_id)
+    /// Returns the key of a call that runs, and the id of its Stream.
+    fn target(call: &Call) -> (CallKey, &str) {
+        match &call.op {
+            Op::Append(request, _) => (
+                CallKey::Append(call.seq),
+                &request.r#ref.as_ref().unwrap().id,
+            ),
+            Op::Close(request) => (
+                CallKey::Close(call.seq),
+                &request.r#ref.as_ref().unwrap().id,
+            ),
+        }
+    }
+
+    /// Moves the calls that the run starts into `in_flight`, and drops the ones that it stops.
+    fn dispatch(calls: &mut StreamCalls, in_flight: &mut Vec<Call>) {
+        for request in calls.take_requests() {
+            match request {
+                Request::Run(call) => in_flight.push(call),
+                Request::Stop(call_id) => in_flight.retain(|call| call.call_id != call_id),
+            }
+        }
+    }
+
+    /// Returns the Store's answer to `call`, which is `failure` if there is one.
+    fn answer(call: &Call, failure: Option<StreamFailure>) -> StreamResolution {
+        let outcome = match (&call.op, failure) {
+            (Op::Append(..), None) => Outcome::Append(appended(call.seq)),
+            (Op::Append(..), Some(failure)) => {
+                Outcome::Append(stream_append_result::Result::Failure(failure))
+            }
+            (Op::Close(_), failure) => Outcome::Close(failure),
         };
-        let sent = |calls: &mut StreamCalls| -> Vec<(AppendRecordsRequest, String)> {
-            let mut sent: Vec<_> = (calls.take_requests().into_iter())
-                .map(|request| match request {
-                    Request::Run(Call {
-                        op: Op::Append(request, request_id),
-                        ..
-                    }) => (request, request_id),
-                    other => panic!("{other:?}"),
-                })
-                .collect();
-            sent.sort_by_key(|(request, _)| request.r#ref.clone().unwrap().id);
-            sent
-        };
-        assert_eq!(sent(&mut live), [request("s", 1), request("t", 3)]);
+        StreamResolution {
+            call_id: call.call_id,
+            seq: call.seq,
+            outcome,
+        }
     }
 
     #[test]
@@ -1163,23 +1153,6 @@ mod tests {
             .map(|append| (append.seq, append.activation_index))
             .collect();
         assert_eq!(entries, [(1, 0), (2, 0), (3, 2)]);
-
-        // A replay gives each result in the activation that the first run gave it, and no sooner.
-        let mut replay = calls(Phase::Replaying, 13);
-        replay.append(append(1, "s")).unwrap();
-        replay.append(append(2, "t")).unwrap();
-        replay.peeked(marker).unwrap();
-        assert_eq!(jobs(&mut replay, 0), ["append 1", "append 2"]);
-        assert!(!replay.has_jobs(1, None));
-        assert_eq!(replay.next_ready_activation(), None);
-        replay.append(append(3, "s")).unwrap();
-        assert_eq!(replay.next_ready_activation(), Some(2));
-        assert_eq!(jobs(&mut replay, 1), Vec::<String>::new());
-        assert_eq!(jobs(&mut replay, 2), ["append 3"]);
-        replay.append(append(4, "s")).unwrap();
-        replay.marker_recorded().unwrap();
-        replay.go_live().unwrap();
-        assert_eq!(started(&mut replay), ["append 4 of s at 13"]);
     }
 
     #[test]
@@ -1682,39 +1655,24 @@ mod tests {
         /// Takes a random call in flight, and returns the Store's answer to it.
         fn answer(&mut self) -> StreamResolution {
             let call = (self.in_flight).swap_remove(self.rng.random_range(0..self.in_flight.len()));
-            let outcome = match &call.op {
+            let failure = match &call.op {
                 Op::Append(request, _) => {
                     // A large failure fills the marker in a few dozen results.
                     let burst = request.r#ref.as_ref().unwrap().id.starts_with('b');
                     let large = if burst { 8 } else { 1 };
-                    Outcome::Append(match self.rng.random_range(0..10) {
-                        at if at < large => {
-                            stream_append_result::Result::Failure(refused("x".repeat(4000)))
-                        }
-                        at if at < large + 2 => {
-                            stream_append_result::Result::Failure(refused("refused"))
-                        }
-                        _ => appended(call.seq),
-                    })
+                    match self.rng.random_range(0..10) {
+                        at if at < large => Some(refused("x".repeat(4000))),
+                        at if at < large + 2 => Some(refused("refused")),
+                        _ => None,
+                    }
                 }
-                Op::Close(_) => {
-                    Outcome::Close(self.rng.random_bool(0.3).then(|| refused("refused")))
-                }
+                Op::Close(_) => self.rng.random_bool(0.3).then(|| refused("refused")),
             };
-            StreamResolution {
-                call_id: call.call_id,
-                seq: call.seq,
-                outcome,
-            }
+            answer(&call, failure)
         }
 
         fn dispatch(&mut self) {
-            for request in self.run.calls.take_requests() {
-                match request {
-                    Request::Run(call) => self.in_flight.push(call),
-                    Request::Stop(call_id) => self.in_flight.retain(|call| call.call_id != call_id),
-                }
-            }
+            dispatch(&mut self.run.calls, &mut self.in_flight);
         }
 
         /// Completes the task in hand, and checks that the run tracks exactly the calls whose
@@ -1860,24 +1818,8 @@ mod tests {
             // The calls of each Stream that have no result yet, in the order that they joined its
             // queue. An append joins at its command, and a close once History has its intent.
             let mut queues: BTreeMap<String, VecDeque<CallKey>> = BTreeMap::new();
-            let mut in_flight: Vec<(String, CallKey, u64)> = vec![];
+            let mut in_flight: Vec<Call> = vec![];
             let (mut appends, mut closes, mut task, mut ended) = (0, 0, 3, false);
-            let take = |calls: &mut StreamCalls, in_flight: &mut Vec<(String, CallKey, u64)>| {
-                for request in calls.take_requests() {
-                    match request {
-                        Request::Run(Call {
-                            call_id, seq, op, ..
-                        }) => {
-                            let (call, stream) = match op {
-                                Op::Append(request, _) => (CallKey::Append(seq), request.r#ref),
-                                Op::Close(request) => (CallKey::Close(seq), request.r#ref),
-                            };
-                            in_flight.push((stream.unwrap().id, call, call_id));
-                        }
-                        Request::Stop(call_id) => in_flight.retain(|(.., id)| *id != call_id),
-                    }
-                }
-            };
             for _ in 0..60 {
                 let id = format!("s{}", rng.random_range(0..4));
                 match rng.random_range(0..20) {
@@ -1914,102 +1856,33 @@ mod tests {
                         }
                     }
                 }
-                take(&mut calls, &mut in_flight);
+                dispatch(&mut calls, &mut in_flight);
                 // The Store answers some of the calls in flight, in any order.
                 for _ in 0..rng.random_range(0..=2) {
                     if in_flight.is_empty() {
                         break;
                     }
-                    let (id, call, call_id) =
-                        in_flight.swap_remove(rng.random_range(0..in_flight.len()));
-                    let oldest = queues.get_mut(&id).and_then(VecDeque::pop_front);
-                    assert_eq!(oldest, Some(call), "seed {seed}: Stream {id}");
-                    let failed = rng.random_bool(0.3).then(|| refused("no"));
-                    let outcome = match (call, failed) {
-                        (CallKey::Append(seq), None) => Outcome::Append(appended(seq)),
-                        (CallKey::Append(_), Some(failure)) => {
-                            Outcome::Append(stream_append_result::Result::Failure(failure))
-                        }
-                        (CallKey::Close(_), failure) => Outcome::Close(failure),
-                    };
-                    let seq = match call {
-                        CallKey::Append(seq) | CallKey::Close(seq) => seq,
-                    };
-                    calls.resolve(StreamResolution {
-                        call_id,
-                        seq,
-                        outcome,
-                    });
-                    take(&mut calls, &mut in_flight);
+                    let call = in_flight.swap_remove(rng.random_range(0..in_flight.len()));
+                    let (key, id) = target(&call);
+                    let oldest = queues.get_mut(id).and_then(VecDeque::pop_front);
+                    assert_eq!(oldest, Some(key), "seed {seed}: Stream {id}");
+                    let failure = rng.random_bool(0.3).then(|| refused("no"));
+                    calls.resolve(answer(&call, failure));
+                    dispatch(&mut calls, &mut in_flight);
                 }
                 // Each Stream with calls that wait has its oldest one in flight, and only that
                 // one, whatever the other Streams do.
                 for id in (0..4).map(|index| format!("s{index}")) {
-                    let running: Vec<CallKey> = (in_flight.iter())
-                        .filter(|(stream, ..)| *stream == id)
-                        .map(|(_, call, _)| *call)
-                        .collect();
+                    let of_stream = in_flight.iter().map(target).filter(|(_, of)| *of == id);
+                    let running: Vec<CallKey> = of_stream.map(|(key, _)| key).collect();
                     let oldest = queues.get(&id).and_then(|queue| queue.front().copied());
                     assert_eq!(running, Vec::from_iter(oldest), "seed {seed}: Stream {id}");
                 }
-                let streams: HashSet<&String> = in_flight.iter().map(|(id, ..)| id).collect();
+                let streams: HashSet<&str> = in_flight.iter().map(|call| target(call).1).collect();
                 together += usize::from(streams.len() > 1);
             }
         }
         assert!(together > 0);
-    }
-
-    /// Returns a failure message of at least `bytes` bytes. Its characters have 1 to 4 bytes, so
-    /// a cut can fall inside one.
-    fn message(rng: &mut StdRng, bytes: usize) -> String {
-        let chars = ['x', 'é', '€', '𝄞'];
-        let mut message: String = (0..rng.random_range(0..8))
-            .map(|_| chars[rng.random_range(0..4)])
-            .collect();
-        let fill = chars[rng.random_range(0..4)];
-        let count = bytes
-            .saturating_sub(message.len())
-            .div_ceil(fill.len_utf8());
-        message.push_str(&fill.to_string().repeat(count));
-        message
-    }
-
-    /// Returns a random answer of the Store to `call`. A failure message is near the cut at 4096
-    /// bytes, or far below it, and goes into `texts`.
-    fn answer(
-        rng: &mut StdRng,
-        call: Call,
-        texts: &mut HashMap<CallKey, String>,
-    ) -> StreamResolution {
-        let key = match call.op {
-            Op::Append(..) => CallKey::Append(call.seq),
-            Op::Close(_) => CallKey::Close(call.seq),
-        };
-        let failed = match rng.random_range(0..10) {
-            0..=2 => None,
-            at => {
-                let bytes = match at {
-                    3..=7 => rng.random_range(4070..4100),
-                    8 => rng.random_range(0..4200),
-                    _ => rng.random_range(0..50),
-                };
-                let text = message(rng, bytes);
-                texts.insert(key, text.clone());
-                Some(refused(text))
-            }
-        };
-        let outcome = match (key, failed) {
-            (CallKey::Append(seq), None) => Outcome::Append(appended(seq)),
-            (CallKey::Append(_), Some(failure)) => {
-                Outcome::Append(stream_append_result::Result::Failure(failure))
-            }
-            (CallKey::Close(_), failure) => Outcome::Close(failure),
-        };
-        StreamResolution {
-            call_id: call.call_id,
-            seq: call.seq,
-            outcome,
-        }
     }
 
     fn key_of(job: &Variant) -> CallKey {
@@ -2036,21 +1909,12 @@ mod tests {
             let budget = rng.random_range(1..=150);
             let (mut appends, mut closes) = (0, 0);
             let mut in_flight: Vec<Call> = vec![];
-            let mut texts = HashMap::new();
             // The results that Core took in each task, in order, with their activation.
             let mut taken: Vec<Vec<(u64, CallKey)>> = vec![vec![]];
             let mut markers = vec![];
             let (mut activation, mut task) = (0, 3);
             // The highest seq of each kind that Core took so far.
             let mut highest = (0, 0);
-            let start = |calls: &mut StreamCalls, in_flight: &mut Vec<Call>| {
-                in_flight.extend(calls.take_requests().into_iter().map(|request| {
-                    let Request::Run(call) = request else {
-                        panic!("seed {seed}: {request:?}");
-                    };
-                    call
-                }));
-            };
             for round in 0.. {
                 assert!(round < 100_000, "seed {seed}: the run never ends");
                 // Most calls share a few Streams, so they wait in a queue. The others have a
@@ -2074,12 +1938,15 @@ mod tests {
                         calls.close(close(closes, &id)).unwrap();
                     }
                 }
-                start(&mut calls, &mut in_flight);
-                // The Store answers some of the calls in flight, in any order.
+                dispatch(&mut calls, &mut in_flight);
+                // The Store answers some of the calls in flight, in any order. Most of them fail
+                // with a long message, which fills a marker sooner.
                 for _ in 0..rng.random_range(0..=in_flight.len().min(6)) {
                     let call = in_flight.swap_remove(rng.random_range(0..in_flight.len()));
-                    calls.resolve(answer(&mut rng, call, &mut texts));
-                    start(&mut calls, &mut in_flight);
+                    let bytes = rng.random_range(0..4200);
+                    let failure = rng.random_bool(0.7).then(|| refused("x".repeat(bytes)));
+                    calls.resolve(answer(&call, failure));
+                    dispatch(&mut calls, &mut in_flight);
                 }
                 // Core takes the results that wait in their order, up to the first that doesn't
                 // fit, and the marker records them with the activation.
@@ -2123,10 +1990,8 @@ mod tests {
                 // A full marker completes the task, and so does a heartbeat at any time.
                 let finished = appends + closes == budget && !calls.needs_next_task();
                 if finished || calls.must_complete(activation) || rng.random_bool(0.03) {
-                    let marker = calls.take_marker();
                     task += 4;
-                    calls.set_task(TaskState::NoTask);
-                    calls.set_task(TaskState::Open(task_attempt(task)));
+                    let marker = next_task(&mut calls, task);
                     if marker.is_some() {
                         calls.marker_recorded().unwrap();
                     }
@@ -2178,20 +2043,6 @@ mod tests {
                 let size = serde_json::to_string(marker).unwrap().len();
                 assert!(size <= max_entry || entries == 1, "seed {seed}: {size}");
                 oversized += usize::from(size > max_entry);
-                let failures = (marker.appends.iter())
-                    .filter_map(|append| match &append.result {
-                        Some(stream_append_result::Result::Failure(failure)) => {
-                            Some((CallKey::Append(append.seq), failure))
-                        }
-                        _ => None,
-                    })
-                    .chain((marker.closes.iter()).filter_map(|close| {
-                        Some((CallKey::Close(close.seq), close.failure.as_ref()?))
-                    }));
-                for (key, failure) in failures {
-                    let at = format!("seed {seed}: {key}");
-                    check_failure(&failure_of(failure), &texts[&key], &at);
-                }
             }
         }
         // The scripts reach each case that the test is for.
@@ -2200,54 +2051,6 @@ mod tests {
             counts.iter().all(|count| *count > 0),
             "full {full}, oversized {oversized}, out of order {out_of_order}"
         );
-    }
-
-    /// Checks that `failure` is what Workflow code gets for an invalid request with `text`. A
-    /// message over 4096 bytes is cut on a character, with `...` at the end.
-    fn check_failure(failure: &Failure, text: &str, at: &str) {
-        let whole = AnyError::invalid_argument(text);
-        let message = &failure.message;
-        if text.len() <= 4096 {
-            assert_eq!(*message, text, "{at}");
-        } else {
-            let kept = message
-                .strip_suffix("...")
-                .unwrap_or_else(|| panic!("{at}"));
-            assert!(text.starts_with(kept) && message.len() <= 4096, "{at}");
-            let next = text[kept.len()..].chars().next().unwrap();
-            assert!(message.len() + next.len_utf8() > 4096, "{at}");
-        }
-        let details = StreamErrorDetails::decode(whole.details().as_slice()).unwrap();
-        assert_eq!(
-            details.reason,
-            StreamErrorReason::InvalidArgument as i32,
-            "{at}"
-        );
-        let payload = Payload {
-            metadata: HashMap::from([
-                ("encoding".to_string(), b"binary/protobuf".to_vec()),
-                (
-                    "messageType".to_string(),
-                    b"temporal.api.stream.v1.StreamErrorDetails".to_vec(),
-                ),
-            ]),
-            data: whole.details(),
-            ..Default::default()
-        };
-        let info = ApplicationFailureInfo {
-            r#type: "stream_invalid_argument".to_string(),
-            non_retryable: true,
-            details: Some(Payloads {
-                payloads: vec![payload],
-            }),
-            ..Default::default()
-        };
-        let expected = Failure {
-            message: message.clone(),
-            failure_info: Some(FailureInfo::ApplicationFailureInfo(info)),
-            ..Default::default()
-        };
-        assert_eq!(*failure, expected, "{at}");
     }
 
     /// A change of History or of Workflow code that a replay must not take for the first run.

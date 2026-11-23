@@ -412,13 +412,14 @@ fn cut(text: String) -> String {
 mod tests {
     use super::*;
     use crate::test_help::stream_store::{MemoryStore, Op as StoreOp};
+    use prost::Message;
     use prost_types::Timestamp;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use temporalio_streams::{
         AnyError, StreamStore,
         proto::{
-            AppendRecord, CreateStreamRequest, Producer, StreamRef, WorkflowProducer,
-            WorkflowTaskAttempt, producer::Kind,
+            AppendRecord, CreateStreamRequest, Producer, StreamErrorDetails, StreamRef,
+            WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
         },
         record::StoreLimits,
     };
@@ -494,27 +495,39 @@ mod tests {
         })
     }
 
+    // A try that gets no answer by its deadline, or that ends in a panic of the Store's code, is
+    // a failed try in an outage, as one that the Store fails with `StoreUnavailable`.
+    #[rstest::rstest]
+    #[case::by_its_deadline(false)]
+    #[case::for_a_panic(true)]
     #[tokio::test(start_paused = true)]
-    async fn a_try_with_no_answer_by_its_deadline_is_an_outage() {
+    async fn a_try_with_no_answer_is_an_outage(#[case] panics: bool) {
         let (store, manager, mut results) = manager().await;
-        store.hold(StoreOp::Append);
+        let error = if panics {
+            store.panic(StoreOp::Append);
+            "The Store panicked: The Store has a bug"
+        } else {
+            store.hold(StoreOp::Append);
+            "The Store gave no answer in 5s"
+        };
         manager.dispatch("r", vec![append(1)]);
         tokio::time::sleep(Duration::from_millis(5010)).await;
-        assert_eq!(
-            manager.outage("r").as_deref(),
-            Some(
-                "StreamStoreUnavailable: append of Stream \"s\" on Store \"mem\": \
-                 stream_store_unavailable: The Store gave no answer in 5s"
-            )
+        let outage = format!(
+            "StreamStoreUnavailable: append of Stream \"s\" on Store \"mem\": \
+             stream_store_unavailable: {error}"
         );
-        store.release();
-        let (run_id, resolution) = results.recv().await.unwrap();
-        assert_eq!(run_id, "r");
-        assert!(matches!(
-            resolution.outcome,
-            Outcome::Append(stream_append_result::Result::Appended(_))
-        ));
-        assert_eq!(manager.outage("r"), None);
+        assert_eq!(manager.outage("r"), Some(outage));
+        // The Store that panics never stops, so only the other one ends its call.
+        if !panics {
+            store.release();
+            let (run_id, resolution) = results.recv().await.unwrap();
+            assert_eq!(run_id, "r");
+            assert!(matches!(
+                resolution.outcome,
+                Outcome::Append(stream_append_result::Result::Appended(_))
+            ));
+            assert_eq!(manager.outage("r"), None);
+        }
         let tries = store.requests();
         assert!(tries.len() >= 2, "{tries:?}");
         assert!(tries.windows(2).all(|pair| pair[0] == pair[1]));
@@ -545,8 +558,24 @@ mod tests {
         assert_eq!(store.requests().len(), after);
     }
 
+    /// Returns a failure message of at least `bytes` bytes. Its characters have 1 to 4 bytes, so
+    /// a cut can fall inside one.
+    fn message(rng: &mut StdRng, bytes: usize) -> String {
+        let chars = ['x', 'é', '€', '𝄞'];
+        let mut message: String = (0..rng.random_range(0..8))
+            .map(|_| chars[rng.random_range(0..4)])
+            .collect();
+        let fill = chars[rng.random_range(0..4)];
+        let count = bytes
+            .saturating_sub(message.len())
+            .div_ceil(fill.len_utf8());
+        message.push_str(&fill.to_string().repeat(count));
+        message
+    }
+
     // Workflow code gets the failure of a call from the reason and the message that a marker
-    // records, in the first run and in a replay.
+    // records, in the first run and in a replay. A message over 4096 bytes is cut on a character,
+    // with `...` at the end.
     #[test]
     fn a_failure_reads_back_as_the_failure_of_its_call() {
         let reasons: Vec<StreamErrorReason> = (0..)
@@ -555,13 +584,60 @@ mod tests {
         for seed in 0..300 {
             let mut rng = StdRng::seed_from_u64(seed);
             let reason = reasons[rng.random_range(0..reasons.len())];
-            // Many messages are over the cut at 4096 bytes, which can fall inside a character.
-            let message: String = (0..rng.random_range(0..2500))
-                .map(|_| ['x', 'é', '€', '𝄞'][rng.random_range(0..4)])
-                .collect();
-            let error = StreamError { reason, message };
+            // Most messages are near the cut, and the others far below or above it.
+            let bytes = match rng.random_range(0..10) {
+                0..=5 => rng.random_range(4070..4100),
+                6..=7 => rng.random_range(0..50),
+                _ => rng.random_range(0..10_000),
+            };
+            let text = message(&mut rng, bytes);
+            let error = StreamError {
+                reason,
+                message: text.clone(),
+            };
             let read_back = failure_of(&recorded(&error));
             assert_eq!(read_back, failure(&error), "seed {seed}: {reason:?}");
+            let kept = &read_back.message;
+            if text.len() <= 4096 {
+                assert_eq!(*kept, text, "seed {seed}");
+            } else {
+                let start = kept.strip_suffix("...");
+                let start = start.unwrap_or_else(|| panic!("seed {seed}: no `...`"));
+                assert!(text.starts_with(start) && kept.len() <= 4096, "seed {seed}");
+                let next = text[start.len()..].chars().next().unwrap();
+                assert!(kept.len() + next.len_utf8() > 4096, "seed {seed}");
+            }
+            // The type of the failure is the token of the reason, its details hold the reason,
+            // and only an outage may be tried again.
+            let details = StreamErrorDetails {
+                reason: reason as i32,
+            };
+            let payload = Payload {
+                metadata: HashMap::from([
+                    ("encoding".to_string(), b"binary/protobuf".to_vec()),
+                    (
+                        "messageType".to_string(),
+                        b"temporal.api.stream.v1.StreamErrorDetails".to_vec(),
+                    ),
+                ]),
+                data: details.encode_to_vec(),
+                ..Default::default()
+            };
+            let name = reason.as_str_name().strip_prefix("STREAM_ERROR_REASON_");
+            let info = ApplicationFailureInfo {
+                r#type: format!("stream_{}", name.unwrap().to_ascii_lowercase()),
+                non_retryable: reason != StreamErrorReason::StoreUnavailable,
+                details: Some(Payloads {
+                    payloads: vec![payload],
+                }),
+                ..Default::default()
+            };
+            let expected = Failure {
+                message: kept.clone(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(info)),
+                ..Default::default()
+            };
+            assert_eq!(read_back, expected, "seed {seed}: {reason:?}");
         }
     }
 }
