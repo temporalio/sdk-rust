@@ -1083,7 +1083,7 @@ pub mod coresdk {
                 }
             }
 
-            // An offset is opaque bytes, which a person can only compare. Hex keeps the order of
+            // An offset is opaque bytes, which can only be compared. Hex keeps the order of
             // two offsets.
             pub(crate) mod hex_bytes {
                 use super::*;

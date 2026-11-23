@@ -1783,8 +1783,8 @@ pub(crate) enum WFMachinesError {
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
-    /// A Stream call that this Worker can't serve, on a Store with no runtime or in an outage.
-    /// Lang gets the message as it is. For an outage it starts with `StreamStoreUnavailable:`.
+    /// A Stream call that can't be served by this Worker, on a Store with no runtime or in an
+    /// outage. Lang gets the message as-is. For an outage it starts with `StreamStoreUnavailable:`.
     #[error("{0}")]
     Stream(String),
 }

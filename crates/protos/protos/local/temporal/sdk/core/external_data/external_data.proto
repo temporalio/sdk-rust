@@ -42,14 +42,14 @@ message PatchedMarkerData {
 }
 
 // The data of a `core_stream` marker. Core records one in each Workflow Task in which Workflow
-// code got a Stream result or asked for a close. The marker has this message in its `data` detail,
-// as JSON with each `bytes` field as lower-case hex.
+// code got a Stream result or asked for a close. The `data` detail of the marker holds this
+// message as JSON, with each `bytes` field in lower-case hex.
 //
-// History keeps each marker, and every later version of Core reads it. So these rules hold for
-// each message of the marker:
-// * A field keeps its name, which is its key in the JSON.
-// * A new field is `optional`, since the markers of an earlier version don't have it.
-// * A new `repeated` field has `#[serde(default)]` in `build.rs`, for the same reason.
+// Every later version of Core must read the markers in History, so these rules apply to each
+// message of the marker.
+// * A field never changes its name, because the name is its key in the JSON.
+// * A new field is `optional`, because older markers don't have it.
+// * A new `repeated` field gets `#[serde(default)]` in `build.rs`, for the same reason.
 message StreamMarkerData {
   repeated StreamCloseIntent close_intents = 1;
   repeated StreamAppendResult appends = 2;
@@ -84,7 +84,7 @@ message StreamAppendOffsets {
 // Why a Stream call failed. Core builds the failure that Workflow code gets from these two.
 message StreamFailure {
   // The name of the `temporal.api.enums.v1.StreamErrorReason`, such as
-  // `STREAM_ERROR_REASON_CLOSED`. History has the name for good, so a reason keeps its name.
+  // `STREAM_ERROR_REASON_CLOSED`. History stores the name, so a reason must never change its name.
   string reason = 1;
   // The message of the failure, of at most 4096 bytes.
   string message = 2;

@@ -1,5 +1,5 @@
-//! Runs the Stream calls of Workflow code. Their results come in as local inputs, and each call
-//! takes the attempt of a Workflow Task.
+//! Runs the Stream calls of Workflow code. Their results arrive as local inputs, and each call
+//! writes with the attempt of a Workflow Task.
 
 mod calls;
 mod manager;
@@ -32,8 +32,8 @@ use tracing::Span;
 /// is 2 MiB by default.
 const MAX_MARKER_ENTRY_BYTES: usize = 256 * 1024;
 
-/// The Stream runtimes of a Worker, keyed by the name of the Store that each one serves, with the
-/// settings of its Stream calls.
+/// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
+/// with the settings of its Stream calls.
 #[derive(Clone, Debug, Default)]
 pub struct StreamRuntimes {
     runtimes: Arc<HashMap<String, Arc<StreamRuntime>>>,
@@ -42,7 +42,7 @@ pub struct StreamRuntimes {
 }
 
 impl StreamRuntimes {
-    /// Creates the runtimes, keyed by Store name, with the default settings.
+    /// Creates the runtimes, identified by Store name, with the default settings.
     pub fn new(runtimes: impl IntoIterator<Item = (String, Arc<StreamRuntime>)>) -> Self {
         Self {
             runtimes: Arc::new(runtimes.into_iter().collect()),
@@ -50,7 +50,6 @@ impl StreamRuntimes {
         }
     }
 
-    /// Returns the runtime of the Store `store`.
     pub(crate) fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
         self.runtimes.get(store)
     }
@@ -58,8 +57,8 @@ impl StreamRuntimes {
 
 /// The settings of a Worker's Stream calls. A try that fails with
 /// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable), or gets no
-/// answer within its deadline, counts as an outage, and the call then tries again with no limit
-/// in time.
+/// answer within its deadline, counts as an outage, and the call then tries again with no time
+/// limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the
@@ -133,16 +132,16 @@ impl Default for TestBounds {
     }
 }
 
-/// The Workflow Task that a run has in hand, as its Stream calls see it.
+/// The state of the run's current Workflow Task, as its Stream calls see it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum TaskState {
-    /// No task is in hand, so no call starts and no result reaches Workflow code.
+    /// The run has no task, so no call starts and Workflow code gets no result.
     #[default]
     NoTask,
-    /// Calls start, and a call that Workflow code makes takes the attempt of the task.
+    /// Calls start, and each call that Workflow code makes writes with the attempt of the task.
     Open(WorkflowTaskAttempt),
-    /// The run completes the task at its next chance. No call starts, and no live result reaches
-    /// Workflow code, before the next task.
+    /// The run completes the task as soon as it can. Until the next task, no call starts and
+    /// Workflow code gets no live result.
     Completing(WorkflowTaskAttempt),
 }
 
@@ -167,7 +166,7 @@ pub(super) struct Streams {
 }
 
 impl Streams {
-    /// Creates the manager. It runs the calls on the runtime of the caller, which is the Worker's.
+    /// Creates the manager. It runs the calls on the caller's runtime, which is the Worker's.
     pub(super) fn new(config: &WorkerConfig, local_tx: UnboundedSender<LocalInput>) -> Self {
         let results = local_tx.clone();
         let sink = move |run_id, resolution| {
@@ -234,7 +233,7 @@ impl RunStreams {
             let _ = local_tx.send(LocalInput { input, span });
         };
         // The timer runs on the thread of the runs, so a timer that the run aborted sends nothing.
-        // A timeout that it sent before the abort reaches the run ahead of the run's next task.
+        // A timeout that it sent before the abort arrives before the run's next task.
         tokio::spawn(Abortable::new(timer, abort));
     }
 }

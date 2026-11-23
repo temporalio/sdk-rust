@@ -706,8 +706,8 @@ impl ManagedRun {
                 });
         }
 
-        // History gets no marker from a failed task, so none of its Stream results may reach
-        // Workflow code.
+        // History gets no marker from a failed task, so Workflow code must not get any of its
+        // Stream results.
         if !is_no_report_query_fail {
             self.streams.stop(&mut self.wfm.machines.stream_calls);
         }
@@ -833,8 +833,8 @@ impl ManagedRun {
             if self.wfm.machines.outstanding_local_work() == 0 {
                 Ok(None)
             } else {
-                // A forced task for a call that waits on a dead Store would only add events, so
-                // the task fails at its heartbeat and the server tries it again.
+                // A forced task for a call that waits on a Store in an outage would only add
+                // events. So the task fails at its heartbeat, and the server retries it.
                 if completion_pending == Some(EarlyCompletion::Heartbeat)
                     && let Some(outage) = self.streams.outage()
                 {
@@ -946,7 +946,7 @@ impl ManagedRun {
         }
         self.wfm.notify_of_local_result(res)?;
         self.streams.dispatch(&mut self.wfm.machines.stream_calls);
-        // A Stream result that the marker of the task can't take needs the next task.
+        // A Stream result that doesn't fit in the task's marker needs the next task.
         if self.wfm.machines.stream_must_complete()
             && let Some(waiting) = self.waiting_on_la.as_mut()
         {
@@ -1025,22 +1025,21 @@ impl ManagedRun {
         self.task_buffer.has_tasks()
     }
 
-    /// Returns true if the run can't go on with the task `work`, and must replay from History
-    /// first. That's the case if both of these hold:
+    /// Returns true if the run must replay from History before it can process the task `work`.
+    /// That's the case when both of these hold.
     ///
-    /// - The task `work` isn't the next task of the History that the run holds. It replaces the
-    ///   task that the run holds, or its `previous_started_event_id` is above the last started
-    ///   event id that the run knows, so another Worker completed a task.
+    /// - `work` isn't the next task of the run's History. It replaces the task that the run holds,
+    ///   or its `previous_started_event_id` is above the last started event id that the run knows,
+    ///   so another Worker completed a task.
     /// - The run has Stream work, which is a call with no result in a marker, a marker that it
     ///   hasn't sent, or a Stream marker in the events of `work`.
     pub(super) fn stream_work_is_stale_for(&self, work: &PreparedWFT) -> bool {
         let machines = &self.wfm.machines;
         let update = &work.update;
-        // The server gives out a task only after the one before it is over, so a task that comes
-        // while the run holds one that it hasn't reported replaces it, at any started event id.
-        // While lang answers attached queries, the flag is set before the task is reported. A task
-        // that replaces the held one then waits, and the completion of the held task gets
-        // `NotFound`, which also replays the run from History.
+        // The server gives out a task only after the one before it is over. So a task that arrives
+        // while the run holds an unreported task replaces it, at any started event id. While lang
+        // answers attached queries, the flag is set before the task is reported. A replacing task
+        // then waits, and the held task's completion gets `NotFound`, which also replays the run.
         let replaces_held_task = self.wft.is_some()
             && !self.wfm.awaiting_next_wft
             && !self.pending_work_is_legacy_query()
@@ -1061,11 +1060,11 @@ impl ManagedRun {
                 || update.get_events().iter().any(is_stream_marker))
     }
 
-    /// Stops the Stream calls of the run, and evicts it. The run that replaces it takes `work`,
+    /// Stops the Stream calls of the run, and evicts it. The run that replaces it processes `work`,
     /// and replays from History what the other attempt or Worker recorded.
     pub(super) fn evict_for_stale_stream_work(&mut self, work: PermittedWFT) -> RunUpdateAct {
-        // A broken run gives lang no query, and a run with a legacy query must still answer it
-        // before it leaves the cache.
+        // A broken run doesn't give lang a query, and a run with a legacy query must still answer
+        // it before it's evicted.
         if !self.pending_work_is_legacy_query() {
             self.streams.stop(&mut self.wfm.machines.stream_calls);
             // A replay that went on with no Stream result would end in a false nondeterminism
@@ -1447,8 +1446,8 @@ impl ManagedRun {
         }
     }
 
-    /// Closes the task to the Stream calls, so that it can complete while results keep coming. No
-    /// call starts, and no live result reaches Workflow code, before the next task.
+    /// Closes the task to the Stream calls, so that it can complete while results still arrive.
+    /// Until the next task, no call starts and Workflow code gets no live result.
     fn complete_stream_task(&mut self) {
         if let Some(wft) = self.wft.as_ref() {
             let task = TaskState::Completing(task_attempt(&wft.info));

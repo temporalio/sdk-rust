@@ -1146,7 +1146,7 @@ where
                     | ActivationVariant::ResolveStreamClose(_),
                 ) => {
                     return Err(Box::new(Failure {
-                        message: "This SDK sends no Stream command".to_string(),
+                        message: "This SDK doesn't send any Stream command".to_string(),
                         ..Default::default()
                     }));
                 }

@@ -1,5 +1,5 @@
-//! The one Stream Store of Core's tests. It does what [`StreamStore`] requires, and each test sets
-//! its faults.
+//! The Stream Store of Core's tests. It implements [`StreamStore`], and each test sets its
+//! faults.
 
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
@@ -16,14 +16,14 @@ use temporalio_streams::{
 };
 use tokio::sync::watch;
 
-/// A write of the Store, which a fault can hit.
+/// A kind of write that a test can set a fault on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Op {
     Append,
     Close,
 }
 
-/// A write that the Store got, in the order that it came.
+/// A write that the Store got, in the order that it arrived.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     /// An append, with the request id of its call.

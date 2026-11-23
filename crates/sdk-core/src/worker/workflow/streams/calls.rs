@@ -54,7 +54,7 @@ pub(crate) enum Phase {
     Stopped,
 }
 
-/// A call by its kind and seq. The results of one activation come in this order.
+/// A call by its kind and seq. Core gives the results of one activation in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CallKey {
     Append(u32),
@@ -126,17 +126,18 @@ impl Held {
     }
 }
 
-/// The Stream calls of one run. A call leaves the run once its result is in a marker.
+/// The Stream calls of one run. A call is removed from the run once its result is in a marker.
 pub(crate) struct StreamCalls {
     /// The Producer of the run. A write adds the attempt of its Workflow Task.
     producer: WorkflowProducer,
     runtimes: StreamRuntimes,
     phase: Phase,
-    /// The Workflow Task that the run has in hand.
+    /// The state of the run's current Workflow Task.
     task: TaskState,
     appends: HashMap<u32, Append>,
     closes: HashMap<u32, Close>,
-    /// The appends and closes of each Stream, in the order that they joined. Only the head runs.
+    /// The appends and closes of each Stream, in the order that they were queued. Only the head
+    /// runs.
     queues: HashMap<(String, String), VecDeque<CallKey>>,
     last_append: u32,
     last_close: u32,
@@ -186,13 +187,14 @@ impl StreamCalls {
         }
     }
 
-    /// Sets the task that the run has in hand. When the task opens, the head of each queue starts.
+    /// Sets the state of the run's current task. When the task opens, the head of each queue
+    /// starts.
     pub(crate) fn set_task(&mut self, state: TaskState) {
         self.task = state;
         self.start_heads();
     }
 
-    /// Takes an append command.
+    /// Handles an append command.
     pub(crate) fn append(&mut self, command: AppendToStream) -> Result<(), WFMachinesError> {
         if self.phase == Phase::Stopped {
             return Ok(());
@@ -221,7 +223,7 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Takes a close command. The marker of the task records its intent, and the close runs once
+    /// Handles a close command. The marker of the task records its intent, and the close runs once
     /// History has that intent.
     pub(crate) fn close(&mut self, command: CloseStream) -> Result<(), WFMachinesError> {
         if self.phase == Phase::Stopped {
@@ -236,8 +238,8 @@ impl StreamCalls {
         self.match_intent(seq)
     }
 
-    /// Takes the result of a running call, and starts the next call of its Stream. The result of
-    /// a call that was stopped finds no call.
+    /// Handles the result of a running call, and starts the next call of its Stream. It ignores the
+    /// result of a call that was stopped.
     pub(crate) fn resolve(&mut self, resolution: StreamResolution) {
         let StreamResolution {
             call_id,
@@ -351,8 +353,8 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Handles the event of a marker. Each entry of the marker must have reached its call by now,
-    /// and the closes whose intents it has join their queues.
+    /// Handles the event of a marker. Each entry of the marker must already have its call, and each
+    /// close whose intent the marker has joins its queue.
     pub(crate) fn marker_recorded(&mut self) -> Result<(), WFMachinesError> {
         let never = |what: &str, call: CallKey| {
             WFMachinesError::Nondeterminism(format!(
@@ -396,7 +398,7 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Ends the replay. Each call that waits takes the attempt of the task in hand, and the head of
+    /// Ends the replay. Each waiting call gets the attempt of the current task, and the head of
     /// each queue starts.
     pub(crate) fn go_live(&mut self) -> Result<(), WFMachinesError> {
         if self.phase != Phase::Replaying {
@@ -505,10 +507,9 @@ impl StreamCalls {
         self.next_ready_activation().into_iter().chain(held).min()
     }
 
-    /// Releases the results from History for the next activation, whatever their index. It takes
-    /// them in the order of the first run, up to the first one whose call Workflow code hasn't
-    /// issued. A replay with chunking on that has no job to give does the same for the results of
-    /// Local Activities.
+    /// Releases the results from History for the next activation, whatever their index, in the
+    /// order of the first run, up to the first one whose call Workflow code hasn't issued. A replay
+    /// with chunking on and no job to give does the same for Local Activity results.
     pub(crate) fn release_ready(&mut self) {
         let held = self.held.first_result();
         let comes = |key: &&(u64, CallKey)| held.is_none_or(|held| **key < held);
@@ -760,7 +761,7 @@ impl StreamCalls {
         self.requests.push(Request::Run(call));
     }
 
-    /// Removes `call` from the run. A live result already left its queue when it came.
+    /// Removes `call` from the run. A live call left its queue when its result arrived.
     fn leave(&mut self, call: CallKey) {
         let stream = match call {
             CallKey::Append(seq) => (self.appends.remove(&seq))
@@ -794,8 +795,8 @@ impl StreamCalls {
     }
 }
 
-/// Checks that `seq` is above the last one of its kind. A seq that came twice would give two
-/// appends one request id, and a Store would take the second for a resend of the first.
+/// Checks that `seq` is above the last one of its kind. A repeated seq would give two appends one
+/// request id, and a Store would treat the second as a resend of the first.
 fn next_seq(kind: &str, seq: u32, last: &mut u32) -> Result<(), WFMachinesError> {
     if seq == 0 {
         return Err(WFMachinesError::Fatal(format!(
@@ -921,7 +922,7 @@ mod tests {
         calls
     }
 
-    /// Completes the task in hand, and opens the next one.
+    /// Completes the current task, and opens the next one.
     fn next_task(calls: &mut StreamCalls, task: i64) -> Option<StreamMarkerData> {
         let marker = calls.take_marker();
         calls.set_task(TaskState::NoTask);
@@ -1232,12 +1233,12 @@ mod tests {
     /// A Workflow Task that History has, with what the first run did in it.
     #[derive(Clone, Debug, Default)]
     struct Task {
-        /// True if the events of the task give Workflow code a job, so its first activation comes
-        /// even with no Stream result.
+        /// True if the events of the task give Workflow code a job, so the task has a first
+        /// activation even with no Stream result.
         has_events: bool,
         activations: Vec<Activation>,
         marker: Option<StreamMarkerData>,
-        /// True if the last command of the Workflow went out with this task.
+        /// True if this task sent the last command of the Workflow.
         ends_workflow: bool,
     }
 
@@ -1261,9 +1262,9 @@ mod tests {
     /// A run that a generated test drives as the machines of Core do.
     struct Run {
         calls: StreamCalls,
-        /// The index of the next activation of the task in hand.
+        /// The index of the next activation of the current task.
         activation: u64,
-        /// True once the last command of the Workflow came.
+        /// True once Workflow code sent its last command.
         ended: bool,
     }
 
@@ -1296,7 +1297,7 @@ mod tests {
     /// What a replay gives.
     struct Replayed {
         jobs: Vec<TaskJobs>,
-        /// The task in which the last command of the Workflow went out.
+        /// The task that sent the last command of the Workflow.
         sent_in: Option<usize>,
         run: Run,
     }
@@ -1362,13 +1363,13 @@ mod tests {
         })
     }
 
-    /// The things that a generated script reached, over all seeds.
+    /// The cases that the generated scripts reached, over all seeds.
     #[derive(Default)]
     struct Seen {
         full_markers: usize,
         heartbeats: usize,
         failed_tasks: usize,
-        /// The last commands that came while a call had no result in a marker.
+        /// The last commands that Workflow code sent while a call had no result in a marker.
         dropped: usize,
         /// The commands with a Stream id or a Store name out of range.
         invalid: usize,
@@ -1387,8 +1388,8 @@ mod tests {
         task_attempt: WorkflowTaskAttempt,
         /// The Store calls in flight, which the Store answers in any order.
         in_flight: Vec<Call>,
-        /// Results that came while no task was in hand. Core applies them once the next task's
-        /// events are applied.
+        /// Results that arrived while the run had no task. Core applies them after the events of
+        /// the next task.
         deferred: Vec<StreamResolution>,
         last_append: u32,
         last_close: u32,
@@ -1466,7 +1467,7 @@ mod tests {
             self.dispatch();
         }
 
-        /// Runs the task in hand until it completes, and returns an error if it fails.
+        /// Runs the current task until it completes, and returns an error if it fails.
         fn run_task(&mut self) -> Result<(), ()> {
             self.task.has_events = self.history.is_empty() || self.rng.random_bool(0.6);
             if self.task.has_events || self.run.calls.has_jobs(self.run.activation, None) {
@@ -1496,14 +1497,14 @@ mod tests {
                     "seed {seed}: a call waits, and none runs"
                 );
                 match self.rng.random_range(0..40) {
-                    // Core gives an activation for the first answer that comes.
+                    // Core gives an activation for the first answer that arrives.
                     0..=35 => {
                         let resolution = self.answer();
                         self.run.calls.resolve(resolution);
                         self.dispatch();
                     }
                     36..=38 => {
-                        // The heartbeat completes the task. Results that come before the
+                        // The heartbeat completes the task. Results that arrive before the
                         // completion wait for the next task.
                         self.seen.heartbeats += 1;
                         self.run
@@ -1528,7 +1529,7 @@ mod tests {
         fn activate(&mut self) -> Result<(), ()> {
             let index = self.run.activation;
             let (commands, fatal) = self.commands();
-            // The answers that came while Workflow code had the activation. Core takes them
+            // The answers that arrived while Workflow code had the activation. Core handles them
             // after the commands of the completion.
             let came = [0, 0, 1, 2, 3, 8][self.rng.random_range(0..6)].min(self.in_flight.len());
             let late: Vec<StreamResolution> = (0..came).map(|_| self.answer()).collect();
@@ -1564,7 +1565,7 @@ mod tests {
             Ok(())
         }
 
-        /// Returns the commands of an activation. If the last one isn't valid, it comes with the
+        /// Returns the commands of an activation. If the last one isn't valid, it also returns the
         /// error that fails the Workflow Task.
         fn commands(&mut self) -> (Vec<Command>, Option<WFMachinesError>) {
             let mut commands = vec![];
@@ -1713,8 +1714,8 @@ mod tests {
             );
         }
 
-        /// Lets the Store answer while no task is in hand. Core applies these results once the
-        /// next task's events are applied.
+        /// Lets the Store answer while the run has no task. Core applies these results after the
+        /// events of the next task.
         fn between_tasks(&mut self) {
             for _ in 0..self.rng.random_range(0..=2) {
                 if !self.in_flight.is_empty() {

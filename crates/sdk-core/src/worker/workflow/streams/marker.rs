@@ -25,11 +25,11 @@ use temporalio_common::protos::{
 use temporalio_streams::proto::{StreamErrorReason, StreamRef};
 
 /// The maximum activation index that Core takes from a marker entry. A replay adds one to the
-/// index of an entry for each later activation, and the bound keeps that sum from an overflow.
+/// index of an entry for each later activation, and the bound prevents an overflow of that sum.
 const MAX_ACTIVATION: u64 = u32::MAX as u64;
 
-/// The key of the marker's details that holds its data. It can't change once a release wrote a
-/// marker into History.
+/// The key of the marker's details that holds its data. It can't change, because History keeps
+/// the markers that earlier releases wrote.
 const MARKER_DATA_KEY: &str = "data";
 
 /// The length of the JSON of a marker's data with no entry. Each new run and each failed task
@@ -38,7 +38,7 @@ static EMPTY_DATA_BYTES: LazyLock<usize> =
     LazyLock::new(|| json(&StreamMarkerData::default()).data.len());
 
 /// The entry of a result that waits for an activation, as a marker records it, with the length of
-/// its JSON. The room check of each activation then writes no JSON.
+/// its JSON. So the room check of each activation doesn't write JSON.
 #[derive(Debug)]
 pub(crate) struct Waiting<T> {
     /// The entry, which gets its activation when a marker records it.
@@ -88,9 +88,9 @@ pub(crate) fn close_job(entry: &StreamCloseResult) -> ResolveStreamClose {
     }
 }
 
-/// The marker of the task in hand. Its results of each kind are in the order that Core took them,
-/// and its intents are in the order of their seqs. Each caller stops at the first entry that
-/// doesn't fit, so the marker never records an entry while an earlier one waits.
+/// The marker of the current task. Its results of each kind are in the order that Core took them,
+/// and its intents are in `seq` order. Each caller stops at the first entry that doesn't fit, so
+/// the marker never records an entry while an earlier one waits.
 #[derive(Debug)]
 pub(crate) struct MarkerBuilder {
     data: StreamMarkerData,
@@ -189,7 +189,7 @@ impl MarkerBuilder {
         Some(builder.data)
     }
 
-    /// An empty marker takes any entry, since each input of an entry has a bound.
+    /// An empty marker accepts any entry, because each input of an entry has a bound.
     fn has_room(&self, len: usize) -> bool {
         self.is_empty() || self.bytes + len <= self.settings.max_marker_entry_bytes()
     }
@@ -319,8 +319,8 @@ mod tests {
         })
     }
 
-    // Once a release wrote a marker into History, the JSON of the data and the key of its detail
-    // can't change.
+    // History keeps the markers of earlier releases, so the JSON of the data and the key of its
+    // detail can't change.
     #[test]
     fn the_details_of_a_known_marker_never_change() {
         let stream = |id: &str| StreamRef {

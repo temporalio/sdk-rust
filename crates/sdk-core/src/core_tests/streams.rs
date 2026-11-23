@@ -129,7 +129,7 @@ struct StartOpts {
     /// The tasks of the History that the poller gives.
     responses: Vec<ResponseType>,
     /// When set, the poller gives the tasks that the test sends here instead of `responses`, as
-    /// soon as they come. Core can then get a task while an activation is out.
+    /// soon as they arrive. Core can then get a task while an activation is outstanding.
     tasks: Option<UnboundedReceiver<PollWorkflowTaskQueueResponse>>,
     /// While the mock server answers completion `number`, it sends the task that this returns to
     /// `tasks` and closes it. It answers once Core took the task.
@@ -390,8 +390,8 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
 
 type Workflow = fn(&WorkflowActivation) -> Vec<Command>;
 
-/// Completes each activation of `worker` with the commands of `workflow` until the run leaves the
-/// cache, and returns the jobs of each activation with the reason of the eviction.
+/// Completes each activation of `worker` with the commands of `workflow` until the run is
+/// evicted, and returns the jobs of each activation with the reason of the eviction.
 async fn drive_until_evicted(
     worker: &Worker,
     mut workflow: impl FnMut(&WorkflowActivation) -> Vec<Command>,
@@ -426,7 +426,7 @@ async fn drive_until_evicted(
 }
 
 impl Run {
-    /// Drives the run until it leaves the cache, and returns the jobs of each activation.
+    /// Drives the run until it's evicted, and returns the jobs of each activation.
     async fn drive(
         &self,
         workflow: impl FnMut(&WorkflowActivation) -> Vec<Command>,
@@ -633,12 +633,13 @@ async fn a_close_takes_effect_only_after_the_server_took_its_task(#[case] failur
     assert_eq!(store.is_closed("c"), failure.is_none());
 }
 
-/// The state of a call when the last command of the Workflow comes.
+/// The state of a call when Workflow code sends its last command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AtTheEnd {
     /// An activation took the result.
     Taken,
-    /// The Store answered while the last activation was out, so no activation took the result.
+    /// The Store answered while the last activation was outstanding, so no activation got the
+    /// result.
     Answered,
     /// The Store has the request, and gave no answer.
     Runs,
@@ -646,7 +647,7 @@ enum AtTheEnd {
     Waits,
     /// Workflow code asked for the close in the last task, so History has no intent of it.
     Asked,
-    /// The call comes in the completion that has the last command.
+    /// The call is in the completion that has the last command.
     WithTheCommand,
 }
 
@@ -692,7 +693,7 @@ struct Ending {
     in_history: usize,
     /// The indexes of the calls whose results Workflow code takes, in the order of their results.
     taken: Vec<usize>,
-    /// The number of the calls that come ahead of the last command in its completion.
+    /// The number of calls before the last command in its completion.
     ahead: usize,
 }
 
@@ -842,8 +843,8 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
             .map(|call| call.stream.as_str())
             .collect();
         let store = store(&ids).await;
-        // In the first seed whose closes of History all run, their Store is down, and the
-        // heartbeat of the task comes while its last activation is out.
+        // In the first seed whose closes of History all run, their Store is down, and the heartbeat
+        // of the task fires while its last activation is outstanding.
         let closes = &ending.calls[..ending.in_history];
         let run_only = closes.iter().all(|call| matches!(call.state, Runs | Waits));
         let down = !had_outage && !closes.is_empty() && run_only;
@@ -867,7 +868,7 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
         let mut live = vec![];
         let last = 1 + ending.taken.len();
         let mut activation = worker.poll_workflow_activation().await.unwrap();
-        // Core got the task before it gave this activation, so the heartbeat of the task comes
+        // Core got the task before it gave this activation, so the heartbeat of the task fires
         // before `heartbeat`.
         let heartbeat = Instant::now() + task_timeout.mul_f32(0.9);
         for number in 0..=last {
@@ -888,7 +889,7 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
                 WorkflowActivationCompletion::from_cmds(run_id.clone(), ending.commands(number));
             if number == last {
                 // Each call that reaches the Store is there, and the Store answers some of them
-                // while the activation is out.
+                // while the activation is outstanding.
                 let reached = ending.calls.iter().filter(|call| call.reaches_the_store());
                 let reached = reached.count();
                 wait_until(|| calls_at(&store).len() == reached).await;
@@ -910,7 +911,7 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
                 .await
                 .unwrap();
         }
-        // No job reaches lang after the last command.
+        // Lang gets no job after the last command.
         let after = run.drive(|_| vec![]).await;
         assert_eq!(after, Vec::<Vec<Job>>::new(), "seed {seed}: {ending:?}");
         worker.drain_pollers_and_shutdown_ref().await;
@@ -1141,7 +1142,7 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     let sent = run.sent();
     assert!(sent[0].force_create_new_workflow_task && sent[0].commands.is_empty());
     assert_eq!(sent[0].query_responses.len(), usize::from(query));
-    // A heartbeat of the forced task can complete it before the result comes.
+    // A heartbeat of the forced task can complete it before the result arrives.
     let recorded: Vec<usize> = (sent[1..].iter().filter_map(marker))
         .map(|marker| marker.appends.len())
         .collect();
@@ -1200,12 +1201,13 @@ async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
             >= 2
     })
     .await;
-    // The appends of one Stream run one at a time. Each result comes while no activation is out,
-    // so the one that the marker can't take completes the task with a new one forced.
+    // The appends of one Stream run one at a time. Each result arrives while no activation is
+    // outstanding, so the one that doesn't fit in the marker completes the task with a new one
+    // forced.
     let mut results = vec![];
     let is_append = |request: &Request| matches!(request, Request::Append(..));
     while results.len() < 70 {
-        // A release lets go only an append that the Store already holds.
+        // A release frees only an append that the Store already holds.
         wait_until(|| store.requests().into_iter().filter(is_append).count() > results.len()).await;
         store.release();
         store.hold(Op::Append);
@@ -1220,7 +1222,7 @@ async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
     }
     assert_eq!(results, (1..=70).collect::<Vec<_>>());
     assert_eq!(run.failed.lock().clone(), []);
-    // The close goes on in the next task, and ends once the Store is back.
+    // The close continues in the next task, and ends when the Store is available again.
     store.fail(Op::Close, StreamError::store_unavailable("down"), 0);
     let closed = run.worker.poll_workflow_activation().await.unwrap();
     assert!(matches!(
@@ -1309,7 +1311,7 @@ async fn a_replay_worker_makes_no_live_call() {
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-/// What came of task 2, which wrote append 1 and gave no result to History.
+/// What happened to task 2, which wrote append 1 and gave no result to History.
 #[derive(Clone, Copy, Debug)]
 enum EarlierAttempt {
     FailedTask,
@@ -1408,7 +1410,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
         _ => vec![ResponseType::Raw(task)],
     };
     if let EarlierAttempt::Eviction = earlier {
-        // The next task of the evicted run comes by a poll, as the task of another Worker.
+        // The evicted run gets its next task from a poll, as a task of another Worker.
         opts.served = None;
     }
     opts.fails = usize::from(matches!(earlier, EarlierAttempt::LaterRetryOfAFailedTask));
@@ -1508,16 +1510,16 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-/// How a task comes to a cached run after another attempt or Worker took over its task.
+/// How a cached run gets a task after another attempt or Worker took over its task.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum OtherTask {
     /// Task 1 completed with an append in flight, and another Worker completed task 2.
     WithNoActivationOut,
-    /// Task 1 timed out while its first activation was out, and another Worker completed the
-    /// retry.
+    /// Task 1 timed out while its first activation was outstanding, and another Worker completed
+    /// the retry.
     WithAnActivationOut,
     /// Another Worker completed a later attempt of task 1, which has the same started event id,
-    /// while the first activation of attempt 2 was out.
+    /// while the first activation of attempt 2 was outstanding.
     AtTheSameStartedEventId,
 }
 
@@ -1618,7 +1620,7 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
         run.all_taken.take().unwrap().await.unwrap();
         respond(&run.worker, &init, workflow).await;
         assert_eq!(run.drive(workflow).await.len(), 0);
-        // The append came after the run stopped its calls, so it holds no task.
+        // Workflow code sent the append after the run stopped its calls, so it holds no task.
         let stale = run.sent()[0].clone();
         assert!(stale.commands.is_empty() && !stale.force_create_new_workflow_task);
         run
@@ -1947,8 +1949,8 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                 (rng.random_bool(0.5), rng.random_range(0..=1), picked)
             }
         };
-        // Each activation of task 2 after its first one comes for a result, so the activations
-        // of the results are consecutive.
+        // Each activation of task 2 after the first one is for a result, so the activations of the
+        // results are consecutive.
         let mut ranks: Vec<u64> = picked.iter().map(|call| call.1).collect();
         ranks.sort_unstable();
         ranks.dedup();
@@ -1960,8 +1962,8 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                 after,
             })
             .collect();
-        // Core gives a result as soon as it comes. So the result of a call that comes in the
-        // activation after the one that made the call is alone in it.
+        // Core gives a result as soon as it arrives. So a result that arrives in the activation
+        // after the one that made its call is alone in it.
         let alone = |call: &Call| {
             let with = calls
                 .iter()
@@ -1988,7 +1990,7 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
             let mut replays = vec![];
             for calls in [all(local), all(append), calls.clone()] {
                 let replayed = replay_calls(&store, &calls, shape).await;
-                // The results come in the order of the first run, and with chunking off in its
+                // The results are in the order of the first run, and with chunking off also in its
                 // activations.
                 let of_first_run = first_run(&calls);
                 assert_eq!(replayed.concat(), of_first_run.concat(), "{case}");
@@ -1999,8 +2001,9 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
             }
             assert_eq!(replays[1], replays[0], "{case}");
             if chunking {
-                // With Local Activities alone, the result of call 2 comes with the one of call 3,
-                // and after it. The fixed shapes with both kinds replay as their first run.
+                // With Local Activities alone, the result of call 2 is in the same activation as
+                // the one of call 3, after it. The fixed shapes with both kinds replay as their
+                // first run.
                 if seed == 0 {
                     assert_eq!(replays[0], [vec![1], vec![3, 2]], "{case}");
                 }

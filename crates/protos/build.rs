@@ -183,8 +183,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for prefix in SERDE_DERIVE_PREFIXES {
         builder = builder.type_attribute(*prefix, SERDE_ATTR);
     }
-    // The JSON of a Stream marker has a `oneof` under the name of its field. A serde attribute
-    // ahead of the serde derive is a compiler warning, and `SERDE_ATTR` adds that derive here.
+    // A Stream marker's JSON has its `oneof` cases in snake case. This attribute is added after the
+    // loop above, which adds the serde derive. A serde attribute before the derive is a warning.
     builder = builder.type_attribute(
         "coresdk.external_data.StreamAppendResult.result",
         "#[serde(rename_all = \"snake_case\")]",

@@ -81,8 +81,8 @@ struct Task {
     outage: Option<String>,
 }
 
-/// The runner of a Worker's Stream calls. It runs them on the Worker's runtime, so Store work never
-/// holds up the thread of the runs, and dropping it stops every call.
+/// The runner of a Worker's Stream calls. It runs them on the Worker's runtime, so Store work
+/// never blocks the thread of the runs, and dropping it stops every call.
 pub(crate) struct StreamManager {
     runtimes: StreamRuntimes,
     handle: Handle,
@@ -108,7 +108,8 @@ impl StreamManager {
 
     /// Starts and stops calls of the run `run_id`.
     pub(crate) fn dispatch(&self, run_id: &str, requests: Vec<Request>) {
-        // The lock is held across each spawn, so a call that ends immediately finds its task.
+        // The lock is held across each spawn, so a call's entry exists even if the call ends at
+        // once.
         let mut tasks = self.tasks.lock();
         for request in requests {
             match request {
@@ -138,7 +139,7 @@ impl StreamManager {
         }
     }
 
-    /// Stops every call of the run. A result that it already sent finds no call.
+    /// Stops every call of the run. The run ignores a result that a call already sent.
     pub(crate) fn cancel_run(&self, run_id: &str) {
         if let Some(run) = self.tasks.lock().remove(run_id) {
             for task in run.into_values() {
@@ -235,9 +236,9 @@ async fn run(runtime: &StreamRuntime, op: Op, settings: StreamSettings, note: &N
     }
 }
 
-/// Sends the request again while the Store is in an outage, with no bound in time. A Store writes
-/// nothing for the resend of a batch whose request id it still remembers, and a second close
-/// succeeds. A try that reaches the Store after more batches than it remembers is written again.
+/// Sends the request again while the Store is in an outage, with no time limit. A resend is safe,
+/// because a Store doesn't write a batch whose request id it still remembers, and a second close
+/// succeeds.
 async fn tries<T, R, F>(
     settings: StreamSettings,
     note: &Note,
@@ -495,8 +496,8 @@ mod tests {
         })
     }
 
-    // A try that gets no answer by its deadline, or that ends in a panic of the Store's code, is
-    // a failed try in an outage, as one that the Store fails with `StoreUnavailable`.
+    // A try that gets no answer by its deadline, or that panics in the Store's code, counts as a
+    // failed try in an outage, like a `StoreUnavailable` failure.
     #[rstest::rstest]
     #[case::by_its_deadline(false)]
     #[case::for_a_panic(true)]

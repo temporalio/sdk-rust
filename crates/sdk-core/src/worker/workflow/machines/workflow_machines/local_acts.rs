@@ -146,10 +146,9 @@ impl LocalActivityData {
         }
     }
 
-    /// Returns the lowest activation index of a held result of History. That is the index of the
-    /// next peeked resolution, or `stream`, the index of the next Stream result, if it is lower.
-    /// The Stream result then comes first, in a separate activation. It's `None` with no peeked
-    /// resolution, or with one whose marker has no index and so isn't held.
+    /// Returns the lowest activation index of a held result of History. That's the index of the
+    /// next peeked resolution, or `stream`, the index of the next Stream result, if it's lower.
+    /// Returns `None` if there's no peeked resolution, or if its marker has no index.
     pub(super) fn next_held_activation(&self, stream: Option<u64>) -> Option<u64> {
         let marker = self.next_resolution_activation()?;
         Some(stream.map_or(marker, |stream| stream.min(marker)))

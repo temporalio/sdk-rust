@@ -1961,7 +1961,7 @@ impl WorkflowMachines {
                         .advance_to_next_held_activation(self.stream_calls.next_ready_activation());
                     self.apply_local_activity_peeked_resolutions(false)?;
                 }
-                // With no Local Activity result to give, the next Stream result comes.
+                // With no Local Activity result to give, Core gives the next Stream result.
                 if !self.activation_needed()
                     && let Some(stream) = self.stream_calls.next_ready_activation()
                 {
@@ -1969,7 +1969,8 @@ impl WorkflowMachines {
                 }
             } else {
                 self.apply_local_activity_peeked_resolutions(true)?;
-                // The Stream results of History come as these Local Activity results do.
+                // Core gives the Stream results of History in the same way as these Local Activity
+                // results.
                 self.stream_calls.release_ready();
             }
         }
@@ -1985,7 +1986,7 @@ impl WorkflowMachines {
             .local_activity_data
             .peek_preresolution_seq(include_held)
         {
-            // A Stream result that the first run gave in an earlier activation comes first.
+            // Core first gives a Stream result that the first run gave in an earlier activation.
             let marker = self.local_activity_data.next_resolution_activation();
             if let Some(stream) = self.stream_calls.first_result_activation()
                 && marker.is_some_and(|marker| stream < marker)
