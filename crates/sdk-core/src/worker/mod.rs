@@ -2514,6 +2514,8 @@ impl WorkerHeartbeatManager {
 pub(crate) struct PostActivateHookData<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) replaying: bool,
+    /// The run's workflow task, which tells apart runs that share a run id.
+    pub(crate) task_token: Option<&'a TaskToken>,
 }
 
 pub(crate) enum TaskPollers {

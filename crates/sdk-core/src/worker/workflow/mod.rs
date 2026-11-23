@@ -634,7 +634,7 @@ impl Workflows {
             );
         }
 
-        let completion_outcome = if let Ok(c) = rx.await {
+        let mut completion_outcome = if let Ok(c) = rx.await {
             c
         } else if is_empty_completion {
             // The stream may shut down after accepting the message but before processing
@@ -651,6 +651,7 @@ impl Workflows {
             return Ok(());
         };
         let replaying = completion_outcome.replaying;
+        let task_token = completion_outcome.task_token.take();
 
         let mut wft_from_complete = None;
         let wft_report_status = self
@@ -677,6 +678,7 @@ impl Workflows {
             h(PostActivateHookData {
                 run_id: &run_id,
                 replaying,
+                task_token: task_token.as_ref(),
             });
         }
 
@@ -1331,6 +1333,7 @@ struct GetStateInfoMsg {
 #[derive(Debug)]
 struct ActivationCompleteResult {
     replaying: bool,
+    task_token: Option<TaskToken>,
     outcome: ActivationCompleteOutcome,
 }
 

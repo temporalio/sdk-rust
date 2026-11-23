@@ -29,13 +29,14 @@ use std::{
 };
 use temporalio_common::{
     protos::{
+        TaskToken,
         coresdk::workflow_activation::remove_from_cache::EvictionReason,
         temporal::api::{
             common::v1::WorkflowExecution,
             history::v1::History,
             workflowservice::v1::{
-                DescribeNamespaceResponse, RespondWorkflowTaskCompletedResponse,
-                RespondWorkflowTaskFailedResponse,
+                DescribeNamespaceResponse, PollWorkflowTaskQueueResponse,
+                RespondWorkflowTaskCompletedResponse, RespondWorkflowTaskFailedResponse,
             },
         },
     },
@@ -83,11 +84,6 @@ where
         let post_activate = historator.get_post_activate_hook();
         let shutdown_tok = historator.get_shutdown_setter();
         // Create a mock client which can be used by a replay worker to serve up canned histories.
-        // It will return the entire history in one workflow task. If a workflow task failure is
-        // sent to the mock, it will send the complete response again.
-        //
-        // Once it runs out of histories to return, it will serve up default responses after a 10s
-        // delay
         let mut client = if let Some(c) = self.client_override {
             c
         } else {
@@ -106,28 +102,7 @@ where
         // TODO: Should use `new_with_pollers` and avoid re-doing mocking stuff
         client.expect_poll_workflow_task().returning(move |_, _| {
             let historator = historator.clone();
-            async move {
-                let mut hlock = historator.lock().await;
-                // Always wait for permission before dispatching the next task
-                let _ = hlock.allow_stream.next().await;
-
-                if let Some(history) = hlock.next().await {
-                    let hist_info = HistoryInfo::from_owned_history(history.hist).unwrap();
-                    let execution = WorkflowExecution {
-                        workflow_id: history.workflow_id,
-                        run_id: hist_info.orig_run_id().to_string(),
-                    };
-                    let mut resp = hist_info.into_poll_wft_response();
-                    resp.workflow_execution = Some(execution);
-                    Ok(resp)
-                } else {
-                    if let Some(wc) = hlock.worker_closer.get() {
-                        wc.cancel();
-                    }
-                    Ok(Default::default())
-                }
-            }
-            .boxed()
+            async move { Ok(historator.lock().await.next_poll_response().await) }.boxed()
         });
 
         client
@@ -137,8 +112,8 @@ where
             });
         client
             .expect_fail_workflow_task()
-            .returning(move |_, _, _| {
-                hist_allow_tx.send("Failed".to_string()).unwrap();
+            .returning(move |task, _, _| {
+                hist_allow_tx.send(task.task_token).unwrap();
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });
         let mut worker = Worker::new(self.config, None, Arc::new(client), None, None, None)?;
@@ -166,6 +141,36 @@ mod tests {
         input.client_override = Some(client);
 
         input.into_core_worker().unwrap().validate().await.unwrap();
+    }
+
+    #[test]
+    fn hands_out_a_history_only_after_the_one_before_reports_back() {
+        // The same History three times, so run ids can't tell the Histories apart.
+        let history = HistoryForReplay::from(canned_histories::single_timer("1"));
+        let mut historator = Historator::new(stream::iter(vec![history; 3]));
+        let closer = CancellationToken::new();
+        historator.get_shutdown_setter()(closer.clone());
+        let report = historator.replay_done_tx.clone();
+        let mut earlier_reports: Vec<TaskToken> = vec![];
+
+        for _ in 0..3 {
+            let resp = historator.next_poll_response().now_or_never().unwrap();
+            let task_token = TaskToken::from(resp.task_token);
+            // Earlier Histories report back again with each activation they complete.
+            for earlier in &earlier_reports {
+                report.send(earlier.clone()).unwrap();
+            }
+            assert!(historator.next_poll_response().now_or_never().is_none());
+            assert!(!closer.is_cancelled());
+
+            report.send(task_token.clone()).unwrap();
+            earlier_reports.push(task_token);
+        }
+        assert_eq!(
+            historator.next_poll_response().now_or_never(),
+            Some(Default::default())
+        );
+        assert!(closer.is_cancelled());
     }
 }
 
@@ -236,28 +241,60 @@ impl Stream for HistoryFeederStream {
 
 pub(crate) struct Historator {
     iter: Pin<Box<dyn Stream<Item = HistoryForReplay> + Send>>,
-    allow_stream: UnboundedReceiverStream<String>,
+    allow_stream: UnboundedReceiverStream<TaskToken>,
     worker_closer: Arc<OnceLock<CancellationToken>>,
     dat: Arc<Mutex<HistoratorDat>>,
-    replay_done_tx: UnboundedSender<String>,
+    replay_done_tx: UnboundedSender<TaskToken>,
+    /// The task token of the History handed out last, which it reports back with.
+    handed_out: Option<TaskToken>,
 }
 impl Historator {
     pub(crate) fn new(histories: impl Stream<Item = HistoryForReplay> + Send + 'static) -> Self {
         let dat = Arc::new(Mutex::new(HistoratorDat::default()));
         let (replay_done_tx, replay_done_rx) = mpsc::unbounded_channel();
-        // Need to allow the first history item
-        replay_done_tx.send("fake".to_string()).unwrap();
         Self {
             iter: Box::pin(histories.fuse()),
             allow_stream: UnboundedReceiverStream::new(replay_done_rx),
             worker_closer: Arc::new(OnceLock::new()),
             dat,
             replay_done_tx,
+            handed_out: None,
         }
     }
 
-    /// Returns a callback that can be used as the post-activation hook for a worker to indicate
-    /// we're ready to replay the next history, or whatever else.
+    /// Hands out the next History once the one before it has reported back, or ends the worker
+    /// when none are left.
+    async fn next_poll_response(&mut self) -> PollWorkflowTaskQueueResponse {
+        // Earlier Histories can report back again. Only a report from the last one shows Core took
+        // it from the poll buffer, and ending the worker before that drops it.
+        if let Some(handed_out) = &self.handed_out {
+            while let Some(report) = self.allow_stream.next().await {
+                if report == *handed_out {
+                    break;
+                }
+            }
+        }
+
+        if let Some(history) = self.next().await {
+            let hist_info = HistoryInfo::from_owned_history(history.hist).unwrap();
+            let execution = WorkflowExecution {
+                workflow_id: history.workflow_id,
+                run_id: hist_info.orig_run_id().to_string(),
+            };
+            let mut resp = hist_info.into_poll_wft_response();
+            resp.workflow_execution = Some(execution);
+            self.handed_out = Some(resp.task_token.clone().into());
+            resp
+        } else {
+            if let Some(wc) = self.worker_closer.get() {
+                wc.cancel();
+            }
+            Default::default()
+        }
+    }
+
+    /// Returns the post-activation hook. Its reports tell the poll when Core holds the History it
+    /// handed out last.
     pub(crate) fn get_post_activate_hook(
         &self,
     ) -> impl Fn(&Worker, PostActivateHookData) + Send + Sync + use<> {
@@ -269,7 +306,11 @@ impl Historator {
                     "Always evict workflows after replay",
                     EvictionReason::LangRequested,
                 );
-                done_tx.send(data.run_id.to_string()).unwrap();
+            }
+            // Report every completion. A History that fails while replaying, like one with
+            // nondeterminism set to fail the Workflow, never completes an activation after replay.
+            if let Some(task_token) = data.task_token {
+                done_tx.send(task_token.clone()).unwrap();
             }
         }
     }
