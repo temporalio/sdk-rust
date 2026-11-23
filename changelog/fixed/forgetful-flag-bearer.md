@@ -1,1 +1,0 @@
-Workflows that call `patched` no longer fail replay with a nondeterminism error when an earlier workflow task completion was discarded by the server, such as an update rejected on the first task of a workflow started with a start delay.

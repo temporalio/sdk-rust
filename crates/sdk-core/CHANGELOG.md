@@ -36,6 +36,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.12.0] - 2026-11-23
+
 ### Added
 * Low-level Operator Service calls support namespace soft deletion, restoration, and restore
   progress queries.
