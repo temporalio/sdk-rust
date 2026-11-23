@@ -72,8 +72,14 @@ relevant information.
   server may discard that completion without recording it. Previously the cached workflow kept state
   from initialization that history never recorded, so it could fail a later task with a
   nondeterminism error when another worker had handled the first recorded task.
+* A local activity that finishes while the SDK answers a query attached to a workflow task now
+  records its result on the task that delivers it. This prevents replay nondeterminism when a
+  signal or other event arrives before that task. Command-free task coalescing remains subject
+  to [#1737](https://github.com/temporalio/sdk-rust/issues/1737).
 
 ### Changed
+* [lang-internal] A successful activation completion for attached queries must include a query
+  response. Core fails the workflow task if the SDK sends a success without one.
 * [lang-internal] Updated the vendored API to `dc25bae`, including System Nexus WIT definitions
   compatible with current nexgen default expressions and workflow-target generation.
 * Workflow task completions and failures set `resource_id` to `workflow:<workflow_id>`, on every
