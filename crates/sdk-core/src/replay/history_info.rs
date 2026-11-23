@@ -109,13 +109,8 @@ impl HistoryInfo {
                 }
             }
         };
-        let events = match events {
-            Cow::Borrowed(events) => events[..event_count].to_vec(),
-            Cow::Owned(mut events) => {
-                events.truncate(event_count);
-                events
-            }
-        };
+        let mut events = events.into_owned();
+        events.truncate(event_count);
         Ok(Self {
             previous_started_event_id,
             workflow_task_started_event_id,

@@ -798,12 +798,7 @@ mod tests {
         definitions
             .register_workflow::<ClockConditionWorkflow>()
             .unwrap();
-        let workflow_type = definitions
-            .workflow_definitions()
-            .next()
-            .unwrap()
-            .workflow_type
-            .clone();
+        let workflow_type = ClockConditionWorkflow::name().to_owned();
         let init = InitializeWorkflow {
             workflow_type: workflow_type.clone(),
             ..Default::default()

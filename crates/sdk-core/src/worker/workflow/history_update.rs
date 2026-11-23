@@ -36,7 +36,7 @@ static EMPTY_TASK_ERR: LazyLock<tonic::Status> = LazyLock::new(|| {
 /// Represents one or more complete WFT sequences. History events are expected to be consumed from
 /// it and applied to the state machines via [HistoryUpdate::take_next_wft_sequence]
 pub(crate) struct HistoryUpdate {
-    // Consuming tasks from the front must not repeatedly shift the remaining history.
+    // An owning iterator consumes events without shifting the remaining history.
     events: vec::IntoIter<HistoryEvent>,
     /// The event ID of the last started WFT, as according to the WFT which this update was
     /// extracted from. Hence, while processing multiple logical WFTs during replay which were part
@@ -685,8 +685,8 @@ impl HistoryUpdate {
     }
 
     fn ends_at_known_boundary(&self) -> bool {
-        // Extraction already checked the outcome of the last started task before splitting
-        // off its lookahead. Do not require that lookahead again after earlier tasks are drained.
+        // `from_events` already checked the outcome of the last started task before splitting
+        // off its lookahead, so the boundary remains valid as earlier tasks are consumed.
         self.get_events()
             .last()
             .is_some_and(|e| e.event_type() == EventType::WorkflowTaskStarted)
