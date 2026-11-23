@@ -1496,16 +1496,11 @@ mod tests {
                     "seed {seed}: a call waits, and none runs"
                 );
                 match self.rng.random_range(0..40) {
-                    // A few answers can come before Core gives the next activation.
+                    // Core gives an activation for the first answer that comes.
                     0..=35 => {
-                        for _ in 0..self.rng.random_range(1..=8) {
-                            if self.in_flight.is_empty() {
-                                break;
-                            }
-                            let resolution = self.answer();
-                            self.run.calls.resolve(resolution);
-                            self.dispatch();
-                        }
+                        let resolution = self.answer();
+                        self.run.calls.resolve(resolution);
+                        self.dispatch();
                     }
                     36..=38 => {
                         // The heartbeat completes the task. Results that come before the
@@ -1533,12 +1528,19 @@ mod tests {
         fn activate(&mut self) -> Result<(), ()> {
             let index = self.run.activation;
             let (commands, fatal) = self.commands();
+            // The answers that came while Workflow code had the activation. Core takes them
+            // after the commands of the completion.
+            let came = [0, 0, 1, 2, 3, 8][self.rng.random_range(0..6)].min(self.in_flight.len());
+            let late: Vec<StreamResolution> = (0..came).map(|_| self.answer()).collect();
             let result = self.run.activate(&commands);
             if let Some(expected) = fatal {
                 assert_eq!(result, Err(expected), "seed {}", self.seed);
                 return Err(());
             }
             let jobs = result.unwrap_or_else(|error| panic!("seed {}: {error:?}", self.seed));
+            for resolution in late {
+                self.run.calls.resolve(resolution);
+            }
             for command in &commands {
                 match command {
                     Command::Append(append) => {
