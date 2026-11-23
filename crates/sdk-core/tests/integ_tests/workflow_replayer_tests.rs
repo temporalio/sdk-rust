@@ -1,6 +1,7 @@
 use crate::common::{CoreWfStarter, TestWorker, eventually};
 use futures_util::future::LocalBoxFuture;
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -8,20 +9,27 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    PluginError, WorkflowHistory, WorkflowQueryOptions, WorkflowStartOptions,
-    WorkflowTerminateOptions, errors::WorkflowGetResultError,
+    NamespacedClient, PluginError, WorkflowHistory, WorkflowQueryOptions, WorkflowStartOptions,
+    WorkflowTerminateOptions, errors::WorkflowGetResultError, grpc::WorkflowService,
 };
-use temporalio_common::protos::temporal::api::{enums::v1::EventType, history::v1::History};
+use temporalio_common::protos::temporal::api::{
+    common::v1::WorkflowExecution,
+    enums::v1::EventType,
+    history::v1::{History, HistoryEvent, history_event::Attributes},
+    workflowservice::v1::ResetWorkflowExecutionRequest,
+};
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ApplicationFailure, SimplePlugin, WorkerPlugin, WorkerRunError,
     WorkflowContext, WorkflowContextView, WorkflowDefinitions, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{Next, RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor},
+    runtime::WorkflowErrorType,
     workflow_replayer::{
         WorkflowReplayError, WorkflowReplayFailure, WorkflowReplayer, WorkflowReplayerOptions,
     },
 };
+use tonic::IntoRequest;
 
 struct SayHelloActivities;
 
@@ -353,51 +361,185 @@ async fn workflow_replayer_replays_history_with_workflow_task_failure() {
 
 #[tokio::test]
 async fn workflow_replayer_returns_ordered_results_for_multiple_histories() {
-    let (starter, mut worker) =
-        replay_test_worker("workflow_replayer_returns_ordered_results_for_multiple_histories")
-            .await;
-    let successful_handle = worker
-        .submit_workflow(
-            SayHelloWorkflow::run,
-            SayHelloInput::new("Temporal"),
-            WorkflowStartOptions::new(
-                starter.get_task_queue().to_owned(),
-                format!("{}-success", starter.get_wf_id()),
-            )
-            .build(),
-        )
-        .await
-        .unwrap();
-    let nondeterministic_handle = worker
-        .submit_workflow(
-            SayHelloWorkflow::run,
-            SayHelloInput::builder()
-                .name("Temporal")
-                .should_cause_nondeterminism(true)
-                .build(),
-            WorkflowStartOptions::new(
-                starter.get_task_queue().to_owned(),
-                format!("{}-nondeterministic", starter.get_wf_id()),
-            )
-            .build(),
-        )
-        .await
-        .unwrap();
+    let (successful, mut nondeterministic) = successful_and_nondeterministic_runs(
+        "workflow_replayer_returns_ordered_results_for_multiple_histories",
+        0,
+    )
+    .await;
+    let histories = [successful, nondeterministic.remove(0)]
+        .map(|events| WorkflowHistory::from(History { events }));
 
-    worker.run_until_done().await.unwrap();
-    let successful_history = successful_handle.fetch_history(Default::default());
-    let nondeterministic_history = nondeterministic_handle.fetch_history(Default::default());
-
-    let results = replayer()
-        .replay_workflows([successful_history, nondeterministic_history])
-        .await
-        .unwrap();
+    let results = replayer().replay_workflows(histories).await.unwrap();
     assert_eq!(results.len(), 2);
     assert!(results[0].replay_failure.is_none());
     assert!(matches!(
         results[1].replay_failure,
         Some(WorkflowReplayFailure::Nondeterminism { .. })
     ));
+}
+
+/// The outcome of the replay of one History. A case lists its Histories by the outcome that they
+/// must give.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Success,
+    Nondeterminism,
+}
+
+#[rstest::rstest]
+#[case::histories_sharing_a_run_id(
+    &[Outcome::Success, Outcome::Nondeterminism, Outcome::Nondeterminism, Outcome::Nondeterminism],
+    false
+)]
+#[case::nondeterminism_failing_the_workflow(&[Outcome::Nondeterminism], true)]
+#[case::nondeterminism_failing_the_workflow_first(
+    &[Outcome::Nondeterminism, Outcome::Success],
+    true
+)]
+#[tokio::test]
+async fn workflow_replayer_returns_every_outcome_in_order(
+    #[case] outcomes: &[Outcome],
+    #[case] nondeterminism_fails_workflow: bool,
+) {
+    let nondeterministic_count = (outcomes.iter())
+        .filter(|outcome| **outcome == Outcome::Nondeterminism)
+        .count();
+    let (successful, nondeterministic) = successful_and_nondeterministic_runs(
+        "workflow_replayer_returns_every_outcome_in_order",
+        nondeterministic_count - 1,
+    )
+    .await;
+    // The replay worker takes the original run id as the run id, and a reset run keeps it.
+    let run_ids: HashSet<_> = nondeterministic
+        .iter()
+        .map(|run| original_run_id(run))
+        .collect();
+    assert_eq!(run_ids.len(), 1);
+    let mut nondeterministic = nondeterministic.into_iter();
+    let histories: Vec<WorkflowHistory> = (outcomes.iter())
+        .map(|outcome| match outcome {
+            Outcome::Success => successful.clone(),
+            Outcome::Nondeterminism => nondeterministic.next().unwrap(),
+        })
+        .map(|events| History { events }.into())
+        .collect();
+    let mut options = WorkflowReplayerOptions::new()
+        .register_workflow::<SayHelloWorkflow>()
+        .unwrap()
+        .build();
+    if nondeterminism_fails_workflow {
+        options.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    }
+
+    let replayer = WorkflowReplayer::new(options).unwrap();
+    let results = tokio::time::timeout(
+        Duration::from_secs(30),
+        replayer.replay_workflows(histories),
+    )
+    .await
+    .expect("replay finishes")
+    .unwrap();
+    let replayed: Vec<_> = (results.iter())
+        .map(|result| match &result.replay_failure {
+            None => Outcome::Success,
+            Some(WorkflowReplayFailure::Nondeterminism { .. }) => Outcome::Nondeterminism,
+            Some(failure) => panic!("unexpected replay failure: {failure}"),
+        })
+        .collect();
+    assert_eq!(replayed, outcomes);
+}
+
+/// Runs a workflow that replays and one that is nondeterministic on replay, resets the second one
+/// `resets` times, and returns the History events of each run, the nondeterministic base run first.
+async fn successful_and_nondeterministic_runs(
+    test_name: &str,
+    resets: usize,
+) -> (Vec<HistoryEvent>, Vec<Vec<HistoryEvent>>) {
+    let (mut starter, mut worker) = replay_test_worker(test_name).await;
+    worker.fetch_results = false;
+    let mut handles = vec![];
+    for (suffix, input) in [
+        ("success", SayHelloInput::new("Temporal")),
+        (
+            "nondeterministic",
+            SayHelloInput::builder()
+                .name("Temporal")
+                .should_cause_nondeterminism(true)
+                .build(),
+        ),
+    ] {
+        let options = WorkflowStartOptions::new(
+            starter.get_task_queue().to_owned(),
+            format!("{}-{suffix}", starter.get_wf_id()),
+        )
+        .build();
+        let handle = worker.submit_workflow(SayHelloWorkflow::run, input, options);
+        handles.push(handle.await.unwrap());
+    }
+    let nondeterministic = handles.pop().unwrap();
+    let successful = handles.pop().unwrap();
+    let client = starter.get_core_client().await;
+    let run_handle = |run_id: &str| {
+        let mut info = nondeterministic.info().clone();
+        info.run_id = Some(run_id.to_owned());
+        info.bind_untyped(client.clone())
+    };
+
+    let run_and_reset = async {
+        successful.get_result(Default::default()).await.unwrap();
+        nondeterministic
+            .get_result(Default::default())
+            .await
+            .unwrap();
+        let base_run_id = nondeterministic.info().run_id.clone().unwrap();
+        let mut run_ids = vec![base_run_id.clone()];
+        for reset in 0..resets {
+            let request = ResetWorkflowExecutionRequest {
+                namespace: client.namespace(),
+                workflow_execution: Some(WorkflowExecution {
+                    workflow_id: nondeterministic.info().workflow_id.clone(),
+                    run_id: base_run_id.clone(),
+                }),
+                // End of the first workflow task
+                workflow_task_finish_event_id: 4,
+                request_id: format!("reset-{reset}"),
+                ..Default::default()
+            };
+            let reset_run_id = (client
+                .clone()
+                .reset_workflow_execution(request.into_request()))
+            .await
+            .unwrap()
+            .into_inner()
+            .run_id;
+            // Finish each reset run before the next reset, which would terminate it.
+            (run_handle(&reset_run_id).get_result(Default::default()))
+                .await
+                .unwrap();
+            run_ids.push(reset_run_id);
+        }
+        starter.shutdown().await;
+        run_ids
+    };
+    let (run_ids, worker_result) = tokio::join!(run_and_reset, worker.run_until_done());
+    worker_result.unwrap();
+
+    let mut runs = vec![];
+    for run_id in run_ids {
+        let history = run_handle(&run_id).fetch_history(Default::default());
+        runs.push(history.into_events().await.unwrap());
+    }
+    let history = successful.fetch_history(Default::default());
+    (history.into_events().await.unwrap(), runs)
+}
+
+fn original_run_id(events: &[HistoryEvent]) -> &str {
+    match &events[0].attributes {
+        Some(Attributes::WorkflowExecutionStartedEventAttributes(started)) => {
+            &started.original_execution_run_id
+        }
+        _ => panic!("a History starts with its started event"),
+    }
 }
 
 struct ReplayConfigPlugin {
