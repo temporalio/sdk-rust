@@ -284,7 +284,7 @@ macro_rules! cancel_machine {
 }
 
 impl WorkflowMachines {
-    pub(crate) fn new(basics: RunBasics, driven_wf: DrivenWorkflow) -> Self {
+    pub(crate) fn new(basics: RunBasics) -> Self {
         let replaying = basics.history.previous_wft_started_id > 0;
         let mut observed_internal_flags = InternalFlags::new(
             basics.capabilities,
@@ -304,7 +304,7 @@ impl WorkflowMachines {
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
-            drive_me: driven_wf,
+            drive_me: DrivenWorkflow::default(),
             replaying,
             preparing_legacy_query: false,
             update_only_task: false,
@@ -368,8 +368,9 @@ impl WorkflowMachines {
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
+    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
+        update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
@@ -515,7 +516,7 @@ impl WorkflowMachines {
     pub(crate) fn prepare_for_wft_response(&mut self) -> MachinesWFTResponseContent<'_> {
         MachinesWFTResponseContent {
             replaying: self.replaying,
-            has_pending_jobs: self.has_pending_jobs(),
+            activation_needed: self.activation_needed(),
             have_seen_terminal_event: self.have_seen_terminal_event,
             have_pending_la_resolutions: self.has_pending_la_resolutions(),
             me: self,
@@ -544,7 +545,11 @@ impl WorkflowMachines {
     /// The job list may be empty, in which case it is expected the caller handles what to do in a
     /// "no work" situation. Possibly, it may know about some work the machines don't, like queries.
     pub(crate) fn get_wf_activation(&mut self) -> WorkflowActivation {
-        let jobs = self.drive_me.drain_jobs();
+        let jobs = if self.activation_needed() {
+            self.drive_me.drain_jobs()
+        } else {
+            vec![]
+        };
         // Deferred LA results can add ordinary workflow work after history application.
         if Self::has_non_update_jobs(&jobs) {
             self.update_only_task = false;
@@ -600,8 +605,17 @@ impl WorkflowMachines {
         }
     }
 
-    pub(crate) fn has_pending_jobs(&self) -> bool {
-        !self.drive_me.peek_pending_jobs().is_empty()
+    pub(crate) fn activation_needed(&self) -> bool {
+        self.drive_me.peek_pending_jobs().iter().any(|job| {
+            // Avoid sending activations containing only patch notifications: they exist only on
+            // replay and would poll workflow routines when live execution did not. Keep them
+            // queued until another job, such as an LA resolution, needs to activate lang.
+            !self.last_history_from_server.chunking_disabled
+                || !matches!(
+                    job.variant,
+                    workflow_activation_job::Variant::NotifyHasPatch(_)
+                )
+        })
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
@@ -623,9 +637,14 @@ impl WorkflowMachines {
         // current build ID, so that if we get a query before any new history, we properly can
         // report that our ID was the one used for the completion.
         self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
-        (*self.observed_internal_flags)
-            .borrow_mut()
-            .gather_for_wft_complete()
+        let mut flags = (*self.observed_internal_flags).borrow_mut();
+        if cfg!(feature = "disable_workflow_task_chunking")
+            && !self.replaying
+            && self.last_history_from_server.previous_wft_started_id == 0
+        {
+            flags.try_use(CoreInternalFlags::DisableWorkflowTaskChunking, true);
+        }
+        flags.gather_for_wft_complete()
     }
 
     pub(crate) fn add_lang_used_flags(&self, flags: Vec<u32>) {
@@ -662,10 +681,9 @@ impl WorkflowMachines {
         }
     }
 
-    /// Iterate the state machines, which consists of grabbing any pending outgoing commands from
-    /// the workflow code, handling them, and preparing them to be sent off to the server.
-    pub(crate) fn iterate_machines(&mut self) -> Result<()> {
-        let results = self.drive_me.fetch_workflow_iteration_output();
+    /// Apply the language SDK's workflow commands and prepare the resulting commands for the server.
+    pub(crate) fn iterate_machines(&mut self, results: Vec<WFCommand>) -> Result<()> {
+        debug!(in_cmds = %results.display(), "wf bridge iteration fetch");
         if self.update_only_task {
             let accepts_update = results.iter().any(|cmd| {
                 matches!(&cmd.variant, WFCommandVariant::UpdateResponse(response)
@@ -1850,13 +1868,24 @@ impl WorkflowMachines {
         }
     }
 
-    /// Held resolutions wait for a later activation, but with no pending jobs there won't be one.
-    /// That only happens if replay produced different activations than the original execution,
-    /// in which case the resolutions are delivered the way ungrouped markers are, rather than
-    /// never.
+    /// Held LA resolutions can have a recorded activation index beyond the current one.
+    /// If replay has no other jobs, no activation can advance that index; release the next
+    /// recorded resolutions so the task can make progress.
     fn release_held_local_activity_resolutions_if_idle(&mut self) -> Result<()> {
-        if !self.has_pending_jobs() {
-            self.apply_local_activity_peeked_resolutions(true)?;
+        if !self.activation_needed() {
+            if self.last_history_from_server.chunking_disabled {
+                // Advance to the next marker's activation index without sending an empty activation.
+                // Stop there so resolutions recorded in later activations remain separate.
+                if let Some(seq) = self.local_activity_data.peek_preresolution_seq(true)
+                    && self.get_machine_key(CommandID::LocalActivity(seq)).is_ok()
+                {
+                    self.local_activity_data
+                        .advance_to_next_resolution_activation();
+                    self.apply_local_activity_peeked_resolutions(false)?;
+                }
+            } else {
+                self.apply_local_activity_peeked_resolutions(true)?;
+            }
         }
         Ok(())
     }
@@ -1897,7 +1926,7 @@ impl WorkflowMachines {
 pub(crate) struct MachinesWFTResponseContent<'a> {
     me: &'a mut WorkflowMachines,
     pub(crate) replaying: bool,
-    pub(crate) has_pending_jobs: bool,
+    pub(crate) activation_needed: bool,
     pub(crate) have_seen_terminal_event: bool,
     pub(crate) have_pending_la_resolutions: bool,
 }

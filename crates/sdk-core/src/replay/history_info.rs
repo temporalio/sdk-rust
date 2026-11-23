@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail};
 use rand::random;
+use std::borrow::Cow;
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowType,
     enums::v1::{EventType, TaskQueueKind},
@@ -27,7 +28,14 @@ impl HistoryInfo {
     /// Constructs a new instance, retaining only enough events to reach the provided workflow
     /// task number. If not provided, all events are retained.
     pub fn new_from_history(h: &History, to_wf_task_num: Option<usize>) -> Result<Self> {
-        let events = &h.events;
+        Self::from_events(Cow::Borrowed(&h.events), to_wf_task_num)
+    }
+
+    pub(super) fn from_owned_history(history: History) -> Result<Self> {
+        Self::from_events(Cow::Owned(history.events), None)
+    }
+
+    fn from_events(events: Cow<'_, [HistoryEvent]>, to_wf_task_num: Option<usize>) -> Result<Self> {
         if events.is_empty() {
             bail!("History is empty!");
         }
@@ -36,7 +44,7 @@ impl HistoryInfo {
         let to_wf_task_num = to_wf_task_num.unwrap_or(usize::MAX);
         let mut workflow_task_started_event_id = 0;
         let mut wf_task_count = 0;
-        let mut history = events.iter().peekable();
+        let mut history = events.iter().enumerate().peekable();
         let started_attrs = match &events.first().unwrap().attributes {
             Some(history_event::Attributes::WorkflowExecutionStartedEventAttributes(attrs)) => {
                 attrs.clone()
@@ -50,10 +58,9 @@ impl HistoryInfo {
             .name
             .clone();
 
-        let mut events = vec![];
-        while let Some(event) = history.next() {
-            events.push(event.clone());
-            let next_event = history.peek();
+        let (previous_started_event_id, event_count) = loop {
+            let (index, event) = history.next().expect("History ends at a validated event");
+            let next_event = history.peek().map(|(_, event)| *event);
 
             if event.event_type == EventType::WorkflowTaskStarted as i32 {
                 let next_is_completed = next_event
@@ -79,14 +86,7 @@ impl HistoryInfo {
                     }
                     wf_task_count += 1;
                     if wf_task_count == to_wf_task_num || next_event.is_none() {
-                        return Ok(Self {
-                            previous_started_event_id,
-                            workflow_task_started_event_id,
-                            events,
-                            wf_task_count,
-                            wf_type,
-                            wf_exe_started_attrs: started_attrs,
-                        });
+                        break (previous_started_event_id, index + 1);
                     }
                 } else if next_event.is_some() && !next_is_failed_or_timeout_or_term {
                     bail!(
@@ -101,22 +101,24 @@ impl HistoryInfo {
                     // Since this is the end of execution, we are pretending that the SDK is
                     // replaying *complete* history, which would mean the previously started ID is
                     // in fact the last task.
-                    return Ok(Self {
-                        previous_started_event_id: workflow_task_started_event_id,
-                        workflow_task_started_event_id,
-                        events,
-                        wf_task_count,
-                        wf_type,
-                        wf_exe_started_attrs: started_attrs,
-                    });
+                    break (workflow_task_started_event_id, index + 1);
                 }
                 // No more events
                 if workflow_task_started_event_id != event.event_id {
                     bail!("History ends unexpectedly");
                 }
             }
-        }
-        unreachable!()
+        };
+        let mut events = events.into_owned();
+        events.truncate(event_count);
+        Ok(Self {
+            previous_started_event_id,
+            workflow_task_started_event_id,
+            events,
+            wf_task_count,
+            wf_type,
+            wf_exe_started_attrs: started_attrs,
+        })
     }
 
     /// Remove events from the beginning of this history such that it looks like what would've been
@@ -155,11 +157,23 @@ impl HistoryInfo {
     /// randomly generated task token. Caller should attach a meaningful `workflow_execution` if
     /// needed.
     pub fn as_poll_wft_response(&self) -> PollWorkflowTaskQueueResponse {
-        let task_token: [u8; 16] = random();
         PollWorkflowTaskQueueResponse {
             history: Some(History {
                 events: self.events.clone(),
             }),
+            ..self.poll_wft_response()
+        }
+    }
+
+    pub(super) fn into_poll_wft_response(self) -> PollWorkflowTaskQueueResponse {
+        let mut response = self.poll_wft_response();
+        response.history = Some(self.into());
+        response
+    }
+
+    fn poll_wft_response(&self) -> PollWorkflowTaskQueueResponse {
+        let task_token: [u8; 16] = random();
+        PollWorkflowTaskQueueResponse {
             task_token: task_token.to_vec(),
             workflow_type: Some(WorkflowType {
                 name: self.wf_type.clone(),

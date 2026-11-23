@@ -32,9 +32,30 @@ There may be no events for more nuanced reasons:
    rather as a "protocol message" attached to the task.
 3. Server can forcibly generate a new WFT with some obscure APIs
 
-Core does not consider such empty WFT sequences as worthy of waking lang (on replay - as a new
-task, they always will), since nothing meaningful has happened. Thus, they are grouped together
-as part of a "logical" WFT with the last WFT that had any real work in it.
+Legacy chunking groups such WFT sequences into a "logical" WFT with the last WFT that had real
+work in it. This can also merge commandless tasks that delivered signals, changing the timestamps
+and grouping of their activation jobs on replay.
+
+## Disabling chunking
+
+The non-default Core Cargo feature `disable_workflow_task_chunking` records Core SDK flag 5,
+`DisableWorkflowTaskChunking`, in the first successful `WorkflowTaskCompleted` event's SDK
+metadata. That selects unchunked replay for the entire workflow. Workflows whose first completion
+does not record the flag retain legacy chunking for their lifetime, even on a worker built with
+the feature enabled. Server SDK metadata support is required to adopt the new mode.
+
+In unchunked mode, successful workflow tasks are processed separately, preserving the timestamps
+and grouping of their activation jobs. Tasks with no jobs are handled internally without
+activating lang or polling workflow routines, just as during live execution.
+
+Failed and timed-out attempts are still skipped during replay. Queries retain their separate,
+unrecorded activation boundaries. Rejected-update-only activations do not poll workflow routines;
+their persisted tasks can therefore replay without reconstructing the rejected requests. Once
+recorded, the mode is honored even by builds with the Cargo feature disabled; disabling adoption
+only changes the default for new workflows.
+
+The C bridge forwards the same Cargo feature to Core. It is enabled when building the bridge,
+rather than through a worker option at runtime.
 
 ## Possible issues as of this writing (5/25)
 

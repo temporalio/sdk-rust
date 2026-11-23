@@ -41,6 +41,10 @@ relevant information.
   progress queries.
 * Cloud API bindings support v0.27.0, including user group memberships, projects,
   project-scoped custom roles, and caller rate limit operations.
+* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
+  for new workflows only. The mode is recorded on the first successful task completion and defaults to off.
+  Core handles tasks with no activation jobs internally, without polling workflow routines; see
+  [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
 
 ### Fixed
 * Nexus operations cancelled or timed out before starting retain their cancellation or timeout
