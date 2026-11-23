@@ -490,6 +490,35 @@ fn cached_worker_capturing_completions(
     (mock_worker(mock), completions)
 }
 
+/// Core evicts the run after its first task only rejected updates, since the server may have
+/// discarded that completion. The accept task then starts the run over.
+async fn evicted_then_reinitialized(core: &Worker) -> WorkflowActivation {
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        act.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    assert!(!act.is_replaying);
+    assert_matches!(
+        act.jobs.as_slice(),
+        [
+            WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+            },
+            WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::DoUpdate(_)),
+            }
+        ]
+    );
+    act
+}
+
 /// Returns the dropped rejection completion and the persisted update completion
 fn rejection_and_update_completions(
     completions: &Mutex<Vec<CapturedCompletion>>,
@@ -672,15 +701,7 @@ async fn patch_after_discarded_first_task_rejection_replays() {
     .await
     .unwrap();
 
-    // Only the update job (no initialization or eviction) shows the run stayed cached
-    let act = core.poll_workflow_activation().await.unwrap();
-    assert!(!act.is_replaying);
-    assert_matches!(
-        act.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(_)),
-        }]
-    );
+    let act = evicted_then_reinitialized(&core).await;
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         act.run_id,
         accept_update(Some(patch_id)),
@@ -783,14 +804,7 @@ async fn lang_flag_selection_after_discarded_first_task_rejection_matches_replay
     }
     core.complete_workflow_activation(completion).await.unwrap();
 
-    let act = core.poll_workflow_activation().await.unwrap();
-    assert!(!act.is_replaying);
-    assert_matches!(
-        act.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(_)),
-        }]
-    );
+    let act = evicted_then_reinitialized(&core).await;
     let live_available = act.available_internal_flags.clone();
     let (live_uses_flag, report) = default_enabled_lang_flag(&act, lang_flag);
     let mut completion = WorkflowActivationCompletion::from_cmds(act.run_id, accept_update(None));

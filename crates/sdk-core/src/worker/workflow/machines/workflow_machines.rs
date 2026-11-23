@@ -29,11 +29,12 @@ use crate::{
             WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
-                HistEventData, activity_state_machine::ActivityMachine,
+                HistEventData,
+                activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
-                update_state_machine::UpdateMachine,
+                update_state_machine::{REJECTION_TYPE_URL, UpdateMachine},
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
@@ -1908,6 +1909,17 @@ impl MachinesWFTResponseContent<'_> {
 
     pub(crate) fn has_messages(&self) -> bool {
         !self.me.message_outbox.is_empty()
+    }
+
+    /// True if the response would have no commands, and all its messages reject updates
+    pub(crate) fn only_rejects_updates(&self) -> bool {
+        self.commands().peek().is_none()
+            && self.has_messages()
+            && self.me.message_outbox.iter().all(|m| {
+                m.body
+                    .as_ref()
+                    .is_some_and(|b| b.type_url == REJECTION_TYPE_URL)
+            })
     }
 
     pub(crate) fn messages(&mut self) -> Vec<ProtocolMessage> {
