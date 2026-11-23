@@ -10,12 +10,11 @@ use crate::{
     },
 };
 
-/// The maximum length of a Stream id, in bytes. The API states it, in the docs of the Stream
-/// service.
+/// The maximum length of a Stream id, in bytes, as the API of the Stream service sets it.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
 
-/// The maximum length of an offset, in bytes. It's a rule of the contract between the runtime and
-/// every Store, since offsets end up in Workflow History and a reader keeps them.
+/// The maximum length of an offset, in bytes. Every Store keeps to it, since offsets go into
+/// Workflow History and readers keep them.
 pub const MAX_OFFSET_BYTES: usize = 1024;
 
 /// Checks that a Stream id has 1 to [`MAX_STREAM_ID_BYTES`] bytes.

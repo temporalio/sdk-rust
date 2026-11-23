@@ -117,7 +117,7 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
     }
 }
 
-/// The length of an [`attempt_key`], in bytes. It's a fact of the key's format, which Stores keep.
+/// The length of an [`attempt_key`], in bytes. Stores keep these keys, so it never changes.
 pub const ATTEMPT_KEY_LEN: usize = 40;
 
 /// Encodes the attempt of a Producer as a fixed-size key. For two attempts of the same Producer,

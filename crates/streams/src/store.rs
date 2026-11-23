@@ -157,6 +157,8 @@ use futures_util::future::BoxFuture;
 /// - A read's `max_records`, `max_bytes` and `wait` are not negative. They are as the caller set
 ///   them, so nothing else bounds them, and a `max_records` of 0 leaves the page size to the Store.
 /// - A create's conflict policy is `Fail`, `UseExisting` or none.
+// The methods return boxed futures, so the trait stays dyn-compatible for the runtime's
+// `Arc<dyn StreamStore>` and needs no macro crate in the public API.
 pub trait StreamStore: Send + Sync + 'static {
     /// Creates a Stream, or finds the open Stream that already has the id.
     fn create_stream(
