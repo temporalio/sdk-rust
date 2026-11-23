@@ -7,7 +7,7 @@ use std::{
     marker::PhantomData,
     num::NonZero,
     ops::DerefMut,
-    pin::Pin,
+    pin::{Pin, pin},
     task::{Context, Poll},
 };
 
@@ -16,12 +16,14 @@ use async_trait::async_trait;
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt,
     future::{BoxFuture, LocalBoxFuture},
-    stream::FuturesUnordered,
+    stream::{FusedStream, FuturesUnordered},
 };
 use itertools::Either;
 use pin_project::pin_project;
 use tokio::{join, sync::mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+use crate::abstractions::dbg_panic;
 
 /// Asynchronously produces values. Similar to `Stream`, except being empty is not a terminal state:
 /// even after returning [`PollerResult::Drained`], poller can continue producing values on
@@ -53,7 +55,7 @@ pub(crate) trait Poller {
 
     /// Shuts down the poller. After calling this method, the poller should be treated as dropped,
     /// and no other methods called on it.
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>>;
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>>;
 
     /// Gets the associated data of this poller. Usually set by [`Self::with_data`], which exposed
     /// data through a mutable reference. See also [`Self::data_unpinned`].
@@ -92,7 +94,7 @@ pub(crate) trait Poller {
 
     /// Transforms this poller such that [`PollerResult::Drained`] is replaced with
     /// [`PollerResult::Pending`] if the provided predicate returns true.
-    /// 
+    ///
     /// Useful for preventing the poller from being marked as drained prematurely.
     fn pending_when<F>(self, f: F) -> PendingWhen<Self, F>
     where
@@ -200,6 +202,23 @@ pub(crate) trait Poller {
         WithData { inner: self, data }
     }
 
+    /// Converts this poller into a fused stream. As soon as the poller drains the first time, the
+    /// stream ends and the poller is shut down.
+    ///
+    /// WARNING: Do not combine multiple pollers as streams. This will prevent them from reopening
+    /// after draining once. Generally, this should be the last method in an adapter chain, and only
+    /// used if awaiting shutdown on stream read is the desired behavior.
+    fn into_stream_auto_shutdown(mut self) -> IntoStreamAutoShutdown<Self>
+    where
+        Self: Sized,
+    {
+        IntoStreamAutoShutdown {
+            inner: self,
+            shutdown: None,
+            shutdown_completed: false,
+        }
+    }
+
     /// Wraps the poller in [`Either::Left`]. Can be used together with [`Self::right_poller`] to
     /// select between different poller types.
     fn left_poller<P>(self) -> Either<Self, P>
@@ -244,16 +263,6 @@ impl<T> PollerResult<T> {
     }
 }
 
-impl<T> From<PollerResult<T>> for std::task::Poll<T> {
-    fn from(value: PollerResult<T>) -> Self {
-        if let PollerResult::Ready(v) = value {
-            Self::Ready(v)
-        } else {
-            Self::Pending
-        }
-    }
-}
-
 /// Wraps poller data for use by adapter methods. See [`Poller::with_data`].
 #[derive(derive_more::Deref, derive_more::DerefMut)]
 pub(crate) struct DataRef<'a, P: Poller + 'a>(P::Data<'a>);
@@ -262,7 +271,7 @@ pub(crate) struct DataRef<'a, P: Poller + 'a>(P::Data<'a>);
 /// Requires a `project` method (see [`pin_project`]).
 macro_rules! forward_shutdown {
     ($field:ident) => {
-        fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+        fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
             self.project().$field.shutdown()
         }
     };
@@ -316,7 +325,7 @@ where
         self.get_mut().as_mut().poll_next(cx)
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         self.get_mut().as_mut().shutdown()
     }
 
@@ -339,7 +348,7 @@ impl<'a, T> Poller for BoxedPoller<'a, T> {
         self.get_mut().as_mut().poll_next(cx)
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         self.get_mut().as_mut().shutdown()
     }
 
@@ -356,7 +365,7 @@ impl<'a, T> Poller for BoxedLocalPoller<'a, T> {
         self.get_mut().as_mut().poll_next(cx)
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         self.get_mut().as_mut().shutdown()
     }
 
@@ -469,7 +478,7 @@ where
         }
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         let mut this = self.project();
         let inner_shutdown = this.inner.shutdown();
         let fut_was_some = this.fut.is_some();
@@ -602,7 +611,7 @@ where
         }
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         match self.as_pin_mut() {
             Either::Left(p) => p.shutdown(),
             Either::Right(p) => p.shutdown(),
@@ -632,7 +641,7 @@ impl<P, F, Fut> Poller for OnShutdown<P, F, Fut>
 where
     P: Poller,
     F: FnOnce(DataRef<'_, P>) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>> + Send,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     type Item = P::Item;
 
@@ -640,7 +649,7 @@ where
         self.project().inner.poll_next(cx)
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         let mut this = self.project();
         let fut = this
             .f
@@ -685,7 +694,7 @@ where
         self.project().inner.poll_next(cx)
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         self.project().inner.shutdown()
     }
 
@@ -740,7 +749,7 @@ where
         }
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         let is_empty = self.in_progress_queue.is_empty();
         let shutdown = self.project().inner.shutdown();
         async move {
@@ -798,7 +807,7 @@ where
         }
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         future::ready(if self.is_terminated {
             Ok(())
         } else {
@@ -841,15 +850,13 @@ impl<T> Poller for FromUnboundedReceiverDrainable<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> PollerResult<Self::Item> {
-        match self.receiver.try_recv() {
-            Ok(v) => PollerResult::Ready(v),
-            Err(mpsc::error::TryRecvError::Disconnected | mpsc::error::TryRecvError::Empty) => {
-                PollerResult::Drained
-            }
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(v)) => PollerResult::Ready(v),
+            _ => PollerResult::Drained,
         }
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         future::ready(
             self.receiver
                 .is_empty()
@@ -963,7 +970,7 @@ where
         }
     }
 
-    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
+    fn shutdown(self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         let this = self.project();
         let shutdown1 = this.poller1.shutdown();
         let shutdown2 = this.poller2.shutdown();
@@ -984,8 +991,65 @@ where
     }
 }
 
+/// Returned by [`Poller::into_stream_auto_shutdown`].
+#[pin_project]
+pub(crate) struct IntoStreamAutoShutdown<P>
+where
+    P: Poller,
+{
+    #[pin]
+    inner: P,
+    shutdown: Option<BoxFuture<'static, anyhow::Result<()>>>,
+    shutdown_completed: bool,
+}
+
+impl<P> Stream for IntoStreamAutoShutdown<P>
+where
+    P: Poller,
+{
+    type Item = P::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        if self.shutdown_completed {
+            return Poll::Ready(None);
+        }
+
+        let mut this = self.project();
+        let shutdown = match this.shutdown {
+            Some(shutdown) => shutdown,
+            shutdown @ None => match this.inner.as_mut().poll_next(cx) {
+                PollerResult::Ready(v) => return Poll::Ready(Some(v)),
+                PollerResult::Pending => return Poll::Pending,
+                PollerResult::Drained => shutdown.insert(this.inner.shutdown()),
+            },
+        };
+
+        match shutdown.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                *this.shutdown_completed = true;
+                if let Err(e) = result {
+                    dbg_panic!("error during poller shutdown: {}", e);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<P> FusedStream for IntoStreamAutoShutdown<P>
+where
+    P: Poller,
+{
+    fn is_terminated(&self) -> bool {
+        self.shutdown_completed
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::advance_fut;
+
     use super::*;
     use futures::{StreamExt, stream, task::noop_waker_ref};
     use std::{
@@ -1026,6 +1090,7 @@ mod tests {
         steps: VecDeque<PollerResult<T>>,
         polls: Arc<AtomicUsize>,
         shut_down: Arc<AtomicBool>,
+        check_drained_on_shutdown: bool,
     }
 
     impl<T> ScriptedPoller<T> {
@@ -1034,6 +1099,7 @@ mod tests {
                 steps: steps.into_iter().collect(),
                 polls: Arc::new(AtomicUsize::new(0)),
                 shut_down: Arc::new(AtomicBool::new(false)),
+                check_drained_on_shutdown: true,
             }
         }
     }
@@ -1058,12 +1124,15 @@ mod tests {
                 .unwrap_or(PollerResult::Drained)
         }
 
-        fn shutdown(mut self: Pin<&mut Self>) -> BoxFuture<'_, anyhow::Result<()>> {
-            let mut cx = Context::from_waker(noop_waker_ref());
-            assert!(matches!(
-                self.as_mut().poll_next(&mut cx),
-                PollerResult::Drained
-            ));
+        fn shutdown(mut self: Pin<&mut Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+            if self.check_drained_on_shutdown {
+                let mut cx = Context::from_waker(noop_waker_ref());
+                assert!(matches!(
+                    self.as_mut().poll_next(&mut cx),
+                    PollerResult::Drained
+                ));
+            }
+
             let shut_down = self.shut_down.clone();
             async move {
                 shut_down.store(true, Ordering::SeqCst);
@@ -1538,7 +1607,7 @@ mod tests {
             .buffer_unordered(1)
             .with_data(|_| ());
 
-        // exercising every adapter method in reverse order (except boxing due to Send bound)
+        // exercising adapters in reverse order (except boxing due to Send bound)
         let poller2 = source2
             .with_data(|_| ())
             .buffer_unordered(1)
@@ -1690,5 +1759,44 @@ mod tests {
             poller.data().into_inner(),
             (&mut data1_second.clone(), &mut data2_second.clone())
         );
+    }
+
+    #[tokio::test]
+    async fn check_drained_on_shutdown_shuts_down_on_first_drained() {
+        let mut poller = ScriptedPoller::new([
+            PollerResult::Ready(async { 1 }.boxed()),
+            PollerResult::Drained,
+            PollerResult::Ready(async { panic!("polled too much") }.boxed()),
+        ]);
+        poller.check_drained_on_shutdown = false;
+        let polls = poller.polls.clone();
+        let shut_down = poller.shut_down.clone();
+        let (finish_shutdown_tx, finish_shutdown_rx) = oneshot::channel();
+
+        let stream = poller
+            .then(|_, f| f)
+            .on_shutdown(move |_| async {
+                finish_shutdown_rx.await.unwrap();
+                Ok(())
+            })
+            .into_stream_auto_shutdown();
+
+        let mut stream = pin!(stream);
+
+        assert_eq!(stream.next().await, Some(1));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(!shut_down.load(Ordering::SeqCst));
+
+        let next = pin!(stream.next());
+        advance_fut!(next);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert!(shut_down.load(Ordering::SeqCst));
+
+        finish_shutdown_tx.send(()).unwrap();
+        assert_eq!(next.await, None);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+
+        assert_eq!(stream.next().await, None);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
     }
 }

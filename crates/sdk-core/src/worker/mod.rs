@@ -970,7 +970,9 @@ impl Worker {
                                 // and they don't need to use the external stream
                                 crate::pollers_v2::select(
                                     poller,
-                                    crate::pollers_v2::from_unbounded_receiver(external_wft_rx),
+                                    crate::pollers_v2::from_unbounded_receiver_drainable(
+                                        external_wft_rx,
+                                    ),
                                 )
                                 .boxed()
                             } else {

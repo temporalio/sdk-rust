@@ -2968,12 +2968,14 @@ async fn legacy_query_must_not_execute_local_activity(
     )
     .resp;
     let (send_workflow_task, workflow_task_ready) = oneshot::channel::<()>();
+    let shutdown_token = CancellationToken::new();
+    let deferred_workflow_task = stream::once(async move {
+        workflow_task_ready.await.unwrap();
+        workflow_task
+    });
     let tasks = stream::iter([query])
-        .chain(stream::once(async move {
-            workflow_task_ready.await.unwrap();
-            workflow_task
-        }))
-        .chain(stream::pending());
+        .chain(stream::iter(cached.then_some(deferred_workflow_task)).flatten())
+        .chain(stream::pending().take_until(shutdown_token.clone().cancelled_owned()));
     let mut client = mock_worker_client();
     client
         .expect_respond_legacy_query()
@@ -3111,6 +3113,8 @@ async fn legacy_query_must_not_execute_local_activity(
         };
         join!(execute_activity, finish_workflow);
     }
+    core.initiate_shutdown();
+    shutdown_token.cancel();
     core.drain_pollers_and_shutdown().await;
 }
 

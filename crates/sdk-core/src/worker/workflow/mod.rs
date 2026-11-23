@@ -335,11 +335,11 @@ impl Workflows {
             crate::pollers_v2::select_biased(
                 crate::pollers_v2::from_unbounded_receiver_drainable(la_notify_rx)
                     .map(|_, n| n.into()),
-                crate::pollers_v2::from_unbounded_receiver(local_rx),
+                crate::pollers_v2::from_unbounded_receiver_drainable(local_rx),
             )
             .left_poller()
         } else {
-            crate::pollers_v2::from_unbounded_receiver(local_rx).right_poller()
+            crate::pollers_v2::from_unbounded_receiver_drainable(local_rx).right_poller()
         };
         let (activation_tx, activation_rx) = unbounded_channel();
         let (start_polling_tx, start_polling_rx) = oneshot::channel();
@@ -371,12 +371,12 @@ impl Workflows {
                         return;
                     }
 
-                    let mut stream = WFStream::build_v2(
+                    let mut stream = std::pin::pin!(WFStream::build_v2(
                         basics,
                         extracted_wft_poller,
                         locals_poller,
                         local_activity_request_sink,
-                    );
+                    ));
 
                     while let Some(output) = stream.next().await {
                         match output {

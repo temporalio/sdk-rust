@@ -256,7 +256,7 @@ impl WFStream {
         basics: WorkflowBasics,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
-        let mut state = WFStream {
+        let state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
             runs: RunCache::new(
                 basics.worker_config.clone(),
@@ -270,8 +270,10 @@ impl WFStream {
             runs_needing_fetching: Default::default(),
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
         };
-        let mut poller = all_inputs
-            .map(move |_, action: WFStreamInput| {
+
+        all_inputs
+            .with_data(|_| state)
+            .map(move |mut state, action: WFStreamInput| {
                 let span = span!(Level::DEBUG, "new_stream_input", action=?action);
                 let _span_g = span.enter();
 
@@ -366,9 +368,7 @@ impl WFStream {
                         }
                     }
                     WFStreamInput::PollerDead => {
-                        debug!("WFT poller died, beginning shutdown");
-                        state.shutdown_token.cancel();
-                        None
+                        panic!("WFStream v2 should never receive PollerDead");
                     }
                     WFStreamInput::PollerError(e) => {
                         return Err(PollError::TonicError(e));
@@ -382,11 +382,6 @@ impl WFStream {
                         .into_iter()
                         .map(WorkflowStreamAction::Activation),
                 );
-
-                if state.shutdown_done() {
-                    info!("Workflow shutdown is done");
-                    return Err(PollError::ShutDown);
-                }
 
                 Ok(WFStreamOutput {
                     actions: actions.into(),
@@ -403,13 +398,16 @@ impl WFStream {
                     );
                 }
             })
-            .boxed_local();
-
-        stream::poll_fn(move |cx| match poller.as_mut().poll_next(cx) {
-            crate::pollers_v2::PollerResult::Ready(x) => std::task::Poll::Ready(Some(x)),
-            crate::pollers_v2::PollerResult::Pending => std::task::Poll::Pending,
-            crate::pollers_v2::PollerResult::Drained => std::task::Poll::Ready(None),
-        })
+            .pending_when(|state| !state.shutdown_done())
+            .on_shutdown(|state| {
+                let token = state.shutdown_token.clone();
+                async move {
+                    debug!("WFT poller died, beginning shutdown");
+                    token.cancel();
+                    Ok(())
+                }
+            })
+            .into_stream_auto_shutdown()
     }
 
     /// Instantiate or update run machines with a new WFT
@@ -781,15 +779,17 @@ impl WFStream {
     }
 
     fn shutdown_done(&self) -> bool {
-        if self.shutdown_token.is_cancelled() {
-            if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
-                // Don't exit if there are outstanding fetch requests
-                return false;
-            }
-            let all_runs_ready = self.runs.handles().all(|r| !r.has_any_pending_work(false));
-            if all_runs_ready {
-                return true;
-            }
+        #[cfg(not(feature = "exp-poller-v2"))]
+        if !self.shutdown_token.is_cancelled() {
+            return false;
+        }
+        if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
+            // Don't exit if there are outstanding fetch requests
+            return false;
+        }
+        let all_runs_ready = self.runs.handles().all(|r| !r.has_any_pending_work(false));
+        if all_runs_ready {
+            return true;
         }
         false
     }
