@@ -61,15 +61,20 @@ use futures_util::future::BoxFuture;
 ///
 /// An append:
 ///
-/// - A Store remembers the request ids of the recent batches of each Producer of a Stream. How
-///   many is a setting of the Store, and it's at least the last batch. An append with the same
-///   Producer and attempt as a remembered batch, and with the same `request_id`, is a resend. A
-///   try that comes after more batches than the Store remembers isn't considered a resend, and
-///   neither is an append with an empty `request_id`. A Store that doesn't fence compares
-///   Producers and attempts for this rule too.
-/// - The last batch alone isn't enough. A Producer can send more than one append at a time, and a
-///   late copy of an earlier try can come after later batches of the same Producer. With N
-///   remembered batches, the Store catches a copy that has fewer than N later batches before it.
+/// - A try of an append can write its batch and then lose its answer. The caller then sends the
+///   append again, and without a check the Stream would have the batch twice. So each append has
+///   a `request_id`, and every try of it sends the same one.
+/// - A Store remembers the `request_id` of the recent batches of each Producer. An append whose
+///   Producer, attempt and `request_id` match a remembered batch is a resend, and the Store
+///   doesn't write it again.
+/// - The Store remembers more than the last batch, because a resend can come late. A Producer can
+///   send more than one append at the same time, so the retry of one append can come after a
+///   later append was written. A dropped connection can also deliver an old try after newer
+///   batches.
+/// - How many batches a Store remembers is a setting of the Store, at least 1. A resend that comes
+///   after that many newer batches of its Producer is written again.
+/// - An append with an empty `request_id` is not a resend. A Store that doesn't fence still
+///   compares the Producer and the attempt, not only the `request_id`.
 /// - A Store checks an append in this order, and the first check that applies determines the
 ///   answer.
 ///   1. The Stream doesn't exist or it expired, so the append fails with
