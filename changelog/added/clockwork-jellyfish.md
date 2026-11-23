@@ -1,1 +1,0 @@
-New workflows can record a replay mode that preserves every successful workflow task boundary, so activations retain their original timestamps and job grouping. Existing workflows keep legacy chunking; tasks without activation jobs are handled internally without polling workflow routines.

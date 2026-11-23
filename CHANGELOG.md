@@ -21,6 +21,52 @@ This file contains completed Rust SDK releases only.
 
 # Changelog
 
+## [1.3.0] - 2026-11-23
+
+### Added
+
+- New workflows can record a replay mode that preserves every successful workflow task boundary, so activations retain their original timestamps and job grouping. Existing workflows keep legacy chunking; tasks without activation jobs are handled internally without polling workflow routines.
+
+- Cloud API bindings now include v0.27.0, with opt-in user group memberships, project management, project-scoped custom roles, and caller rate limits.
+
+- Workflows can call typed Nexus service operations with `nexus_client`, `execute`, and `start` when the `experimental` feature is enabled, using service definitions from the [`nexus-rpc`](https://crates.io/crates/nexus-rpc) crate. Calls support typed results, operation handles, and cancellation; `NexusOperationError::Failed` retains a `NexusOperationFailureError` with Nexus metadata and a normalized reason, while `Serialization` distinguishes payload conversion errors.
+
+- Experimental `StorageDriverStoreContext::namespace` and `StorageDriverSelectContext::namespace` (requires the `experimental` feature) hold the namespace of the client or worker performing the store.
+
+- Low-level API bindings now include namespace soft-delete and restore RPCs and task queue concurrency-limit configuration.
+
+### Changed
+
+- The experimental S3 storage driver (`temporalio-aws-s3driver`) now writes payloads stored without a workflow or activity target under `v0/ns/{namespace}/d/sha256/{hash}`, using the namespace of the storing client or worker (`null` when it is unknown), instead of `v0/d/sha256/{hash}`. Existing objects remain retrievable.
+
+- Workflow task completions and failures, activity task completions, failures, cancellations, and heartbeats, and async activity completions, failures, cancellations, and heartbeats sent by ID identify their workflow in `resource_id` as `workflow:<workflow_id>` (or `activity:<activity_id>` for a standalone activity), and worker heartbeats identify their worker as `worker:<worker_grouping_key>`, so proxies in front of Temporal can tell which workflow, activity, or worker a request is for.
+
+### :boom: Breaking Changes
+
+- Removed `runtime::WorkerConfig::ignore_evicts_on_shutdown` from the experimental raw-worker API. Raw workers must complete pending eviction activations before shutdown can finish.
+
+### Fixed
+
+- Worker slot metrics track active tasks correctly when pollers reserve or return capacity at the same time.
+
+- A local activity finishing while the SDK answers a query attached to the current workflow task can no longer fail workflow tasks with a `[TMPRL1100]` nondeterminism error when any events, such as a signal, arrived before the forced next task, leaving the workflow stuck. The failure came on the next full replay (with the workflow cache disabled, the task after the forced one; otherwise after an eviction or restart). Queried tasks after one that recorded no commands remain subject to [#1737](https://github.com/temporalio/sdk-rust/issues/1737).
+
+- Workflows that call `patched` no longer fail replay with a nondeterminism error when an earlier workflow task completion was discarded by the server, such as an update rejected on the first task of a workflow started with a start delay.
+
+- A workflow whose first workflow task only rejected updates, such as during a start delay, is now evicted from the cache afterward, so it replays the history the server recorded instead of failing with a nondeterminism error.
+
+- Workflows no longer get stuck failing workflow tasks when an activity cancelled with `ActivityCancellationType::Abandon` later fails or times out.
+
+- Workflows no longer fail workflow tasks when a Nexus operation cancelled with `NexusOperationCancellationType::Abandon` later completes, fails, or times out.
+
+- Cancelling a Nexus operation with `Abandon` or `TryCancel` before it starts now resolves its start future with a cancellation failure right away, and the operation's later start or outcome no longer resolves it again.
+
+- A Nexus operation using `WaitCancellationRequested` whose cancel request fails is no longer resolved a second time when it later finishes.
+
+- Downloading an ephemeral dev or test server binary retries a transfer that breaks while the archive streams in, such as a reset connection, instead of failing the server start.
+
+- Fix a workflow task panic when workflow cancellation and a timer firing arrive in the same activation.
+
 ## [1.2.0] - 2026-11-09
 
 ### Added

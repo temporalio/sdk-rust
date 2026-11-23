@@ -1,1 +1,0 @@
-A workflow whose first workflow task only rejected updates, such as during a start delay, is now evicted from the cache afterward, so it replays the history the server recorded instead of failing with a nondeterminism error.
