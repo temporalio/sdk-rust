@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 #[derive(Default)]
 pub(crate) struct Answers {
+    pub(crate) created: CreateStreamResponse,
     pub(crate) appended: AppendRecordsResponse,
     pub(crate) page: ReadRecordsResponse,
     pub(crate) described: DescribeStreamResponse,
@@ -30,13 +31,15 @@ impl StreamStore for Scripted {
     fn create_stream(
         &self,
         _: CreateStreamRequest,
+        _: String,
     ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
-        Box::pin(async move { Ok(CreateStreamResponse::default()) })
+        Box::pin(async move { Ok(self.answers.lock().created.clone()) })
     }
 
     fn append_records(
         &self,
         _: AppendRecordsRequest,
+        _: String,
     ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
         Box::pin(async move { Ok(self.answers.lock().appended.clone()) })
     }

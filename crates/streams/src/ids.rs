@@ -5,8 +5,8 @@ use crate::{
     AnyError, AnyReason,
     attempt::kind_ids,
     proto::{
-        Producer, StandaloneActivityProducer, WorkflowActivityProducer, WorkflowTaskAttempt,
-        producer::Kind,
+        Producer, StandaloneActivityProducer, StreamRef, WorkflowActivityProducer,
+        WorkflowTaskAttempt, producer::Kind,
     },
 };
 
@@ -29,6 +29,15 @@ pub fn check_stream_id(id: &str) -> Result<(), AnyError> {
         )));
     }
     Ok(())
+}
+
+/// Checks the ref of a request. Its `id` is the Stream id, and its `store` can be anything, since
+/// only an SDK reads it.
+pub(crate) fn check_ref(stream_ref: Option<&StreamRef>) -> Result<&StreamRef, AnyError> {
+    let stream_ref =
+        stream_ref.ok_or_else(|| AnyError::invalid_argument("The request has no ref"))?;
+    check_stream_id(&stream_ref.id)?;
+    Ok(stream_ref)
 }
 
 /// Checks that an offset has at most [`MAX_OFFSET_BYTES`] bytes. The error has the given reason,
@@ -116,6 +125,26 @@ mod tests {
         },
     };
     use prost_types::Timestamp;
+
+    #[test]
+    fn a_ref_needs_an_id_of_1_to_the_maximum_bytes_and_any_store() {
+        for len in [0, 1, MAX_STREAM_ID_BYTES, MAX_STREAM_ID_BYTES + 1] {
+            for store in ["", "x"] {
+                let stream_ref = StreamRef {
+                    id: "s".repeat(len),
+                    store: store.to_string(),
+                };
+                let expected = match len {
+                    0 => Err(AnyError::invalid_argument("The Stream id is empty")),
+                    1..=MAX_STREAM_ID_BYTES => Ok(&stream_ref),
+                    _ => Err(AnyError::invalid_argument(
+                        "The Stream id has 4097 bytes, more than 4096",
+                    )),
+                };
+                assert_eq!(check_ref(Some(&stream_ref)), expected);
+            }
+        }
+    }
 
     #[test]
     fn the_producer_of_a_write_needs_the_ids_and_the_attempt_of_its_kind() {

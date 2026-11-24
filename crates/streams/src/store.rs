@@ -11,7 +11,8 @@ use futures_util::future::BoxFuture;
 /// A Stream Store, which serves the operations of the Nexus service
 /// `temporal.api.streamservice.v1.StreamService`. The API repo defines that service in
 /// `nexus/stream-service.wit`, and [`proto`](crate::proto) has its request and response messages.
-/// The [crate docs](crate) define the terms that these docs use.
+/// The request id of a create or an append is in the envelope of its Nexus call, so those methods
+/// take it next to the request. The [crate docs](crate) define the terms that these docs use.
 ///
 /// # The contract of a Store
 ///
@@ -44,8 +45,9 @@ use futures_util::future::BoxFuture;
 /// A create:
 ///
 /// - A create for an id that has no Stream yet makes the Stream and returns `created` true.
-/// - A create with the `request_id` of the create that made the Stream is a retry of it. A create
-///   with an empty `request_id` is not a retry.
+/// - A create returns the ref as the request had it.
+/// - A create with the request id of the create that made the Stream is a retry of it. A create
+///   with an empty request id is not a retry.
 /// - A Store checks a create for an id that has a Stream in this order, and the first check that
 ///   applies determines the answer.
 ///   1. The Stream expired, so the create fails with
@@ -63,18 +65,18 @@ use futures_util::future::BoxFuture;
 ///
 /// - A try of an append can write its batch and then lose its answer. The caller then sends the
 ///   append again, and without a check the Stream would have the batch twice. So each append has
-///   a `request_id`, and every try of it sends the same one.
-/// - A Store remembers the `request_id` of the recent batches of each Producer. An append whose
-///   Producer, attempt and `request_id` match a remembered batch is a resend, and the Store
-///   doesn't write it again.
+///   a request id, and every try of it sends the same one.
+/// - A Store remembers the request id of the recent batches of each Producer. An append whose
+///   Producer, attempt and request id match a remembered batch is a resend, and the Store doesn't
+///   write it again.
 /// - The Store remembers more than the last batch, because a resend can come late. A Producer can
 ///   send more than one append at the same time, so the retry of one append can come after a
 ///   later append was written. A dropped connection can also deliver an old try after newer
 ///   batches.
 /// - How many batches a Store remembers is a setting of the Store, at least 1. A resend that comes
 ///   after that many newer batches of its Producer is written again.
-/// - An append with an empty `request_id` is not a resend. A Store that doesn't fence still
-///   compares the Producer and the attempt, not only the `request_id`.
+/// - An append with an empty request id is not a resend. A Store that doesn't fence still
+///   compares the Producer and the attempt, not only the request id.
 /// - A Store checks an append in this order, and the first check that applies determines the
 ///   answer.
 ///   1. The Stream doesn't exist or it expired, so the append fails with
@@ -148,8 +150,9 @@ use futures_util::future::BoxFuture;
 ///
 /// [`StreamRuntime`](crate::StreamRuntime) wraps a Store. It checks each response against the parts
 /// of the contract that one response shows, and fails a response that breaks them with
-/// [`AnyReason::StoreCorrupt`](crate::AnyReason::StoreCorrupt). Those are the parts
-/// about 1) offsets, 2) the body and the Producer of a Record, and 3) the status of a describe.
+/// [`AnyReason::StoreCorrupt`](crate::AnyReason::StoreCorrupt). Those are the parts about 1) the
+/// Stream id of the ref of a create, 2) offsets, 3) the body and the Producer of a Record, and 4)
+/// the status of a describe.
 /// It can't check a part that needs more than one response, such as the resend rule, or that a
 /// page skips no Record. A read that gives a Record larger than the Record size of the runtime's
 /// [`StoreLimits`](crate::record::StoreLimits), in its stored form, fails with
@@ -157,8 +160,9 @@ use futures_util::future::BoxFuture;
 /// size may take it.
 /// The runtime also validates each request first, so a Store can assume that:
 ///
-/// - The Stream id is 1 to [`MAX_STREAM_ID_BYTES`](crate::ids::MAX_STREAM_ID_BYTES) bytes. There's
-///   no bound for `request_id`.
+/// - The request has a ref, and its `id` is 1 to
+///   [`MAX_STREAM_ID_BYTES`](crate::ids::MAX_STREAM_ID_BYTES) bytes. The runtime ignores the
+///   `store` of the ref, which only an SDK reads. There's no bound for the request id.
 /// - `from_offset` is at most [`MAX_OFFSET_BYTES`](crate::ids::MAX_OFFSET_BYTES) bytes.
 /// - The Producer of an append or a close has a kind, every id of that kind, and the fields of its
 ///   attempt. The Record size bounds the ids of an append's Producer, since the size of a Record
@@ -172,16 +176,19 @@ use futures_util::future::BoxFuture;
 // The methods return boxed futures, so the trait stays dyn-compatible for the runtime's
 // `Arc<dyn StreamStore>` and needs no macro crate in the public API.
 pub trait StreamStore: Send + Sync + 'static {
-    /// Creates a Stream, or finds the open Stream that already has the id.
+    /// Creates a Stream, or finds the open Stream that already has the id. Every try of one create
+    /// has the same `request_id`.
     fn create_stream(
         &self,
         request: CreateStreamRequest,
+        request_id: String,
     ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>>;
 
-    /// Appends one batch from one Producer.
+    /// Appends one batch from one Producer. Every try of one append has the same `request_id`.
     fn append_records(
         &self,
         request: AppendRecordsRequest,
+        request_id: String,
     ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>>;
 
     /// Reads one page of Records after `from_offset`.

@@ -1,7 +1,7 @@
 use crate::{
     AnyReason, AppendError, CloseError, CreateError, DescribeError, ReadError, StreamError,
     StreamStore,
-    ids::{check_offset, check_producer, check_stream_id},
+    ids::{check_offset, check_producer, check_ref},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
@@ -40,30 +40,40 @@ impl StreamRuntime {
     }
 
     /// Creates a Stream. If an open Stream already has the id, the create fails, or it returns
-    /// `created` false with the `UseExisting` policy.
+    /// `created` false with the `UseExisting` policy. Every try of one create passes the same
+    /// `request_id`, so a retry after a lost response returns `created` true.
     pub async fn create_stream(
         &self,
         request: CreateStreamRequest,
+        request_id: String,
     ) -> Result<CreateStreamResponse, CreateError> {
-        check_stream_id(&request.stream_id)?;
+        let id = check_ref(request.stream_ref.as_ref())?.id.clone();
         let policy = request.id_conflict_policy;
         if StreamIdConflictPolicy::try_from(policy).is_err() {
             return Err(StreamError::invalid_argument(format!(
                 "The conflict policy {policy} is unknown"
             )));
         }
-        self.store.create_stream(request).await
+        let created = self.store.create_stream(request, request_id).await?;
+        if created.r#ref.as_ref().map(|stream_ref| &stream_ref.id) != Some(&id) {
+            return Err(StreamError::store_corrupt(
+                "The Store answered a create without the Stream id of the request",
+            ));
+        }
+        Ok(created)
     }
 
-    /// Appends one batch of at least one Record from one Producer. If this fails with
-    /// [`AnyReason::StoreCorrupt`], the batch may still be in the Stream, because the runtime can
-    /// only check the response after the write.
+    /// Appends one batch of at least one Record from one Producer. Every try of one append passes
+    /// the same `request_id`, so the Store writes the batch once while it remembers the id. If this
+    /// fails with [`AnyReason::StoreCorrupt`], the batch may still be in the Stream, because the
+    /// runtime can only check the response after the write.
     pub async fn append_records(
         &self,
         request: AppendRecordsRequest,
+        request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
         self.limits.check_append(&request)?;
-        let appended = self.store.append_records(request).await?;
+        let appended = self.store.append_records(request, request_id).await?;
         for offset in [&appended.first_offset, &appended.last_offset] {
             if offset.is_empty() {
                 return Err(StreamError::store_corrupt(
@@ -91,7 +101,7 @@ impl StreamRuntime {
         &self,
         request: ReadRecordsRequest,
     ) -> Result<ReadRecordsResponse, ReadError> {
-        check_stream_id(&request.stream_id)?;
+        check_ref(request.r#ref.as_ref())?;
         check_offset(
             &request.from_offset,
             "The from_offset of the read",
@@ -127,7 +137,7 @@ impl StreamRuntime {
         &self,
         request: CloseStreamRequest,
     ) -> Result<CloseStreamResponse, CloseError> {
-        check_stream_id(&request.stream_id)?;
+        check_ref(request.r#ref.as_ref())?;
         check_producer(request.producer.as_ref())?;
         self.store.close_stream(request).await
     }
@@ -137,7 +147,7 @@ impl StreamRuntime {
         &self,
         request: DescribeStreamRequest,
     ) -> Result<DescribeStreamResponse, DescribeError> {
-        check_stream_id(&request.stream_id)?;
+        check_ref(request.r#ref.as_ref())?;
         let described = self.store.describe_stream(request).await?;
         check_offset(
             &described.last_offset,
@@ -242,7 +252,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyError, AppendReason,
-        proto::{AppendRecord, StreamRecord},
+        proto::{AppendRecord, StreamRecord, StreamRef},
         record::DEFAULT_MAX_RECORD_BYTES,
         test_store::{Scripted, client, runtime, task, workflow},
     };
@@ -256,40 +266,45 @@ mod tests {
         }
     }
 
+    fn stream_ref(id: &str, store: &str) -> Option<StreamRef> {
+        Some(StreamRef {
+            id: id.to_string(),
+            store: store.to_string(),
+        })
+    }
+
     fn valid_create() -> CreateStreamRequest {
         CreateStreamRequest {
-            stream_id: "s".to_string(),
+            stream_ref: stream_ref("s", "x"),
             id_conflict_policy: StreamIdConflictPolicy::UseExisting as i32,
-            request_id: "r".to_string(),
         }
     }
 
     fn valid_append() -> AppendRecordsRequest {
         AppendRecordsRequest {
-            stream_id: "s".to_string(),
+            r#ref: stream_ref("s", "x"),
             producer: Some(workflow(Some(task(3, 1, 0)))),
-            request_id: "r".to_string(),
             records: vec![record(); 2],
         }
     }
 
     fn valid_read() -> ReadRecordsRequest {
         ReadRecordsRequest {
-            stream_id: "s".to_string(),
+            r#ref: stream_ref("s", "x"),
             ..Default::default()
         }
     }
 
     fn valid_close() -> CloseStreamRequest {
         CloseStreamRequest {
-            stream_id: "s".to_string(),
+            r#ref: stream_ref("s", "x"),
             producer: Some(client()),
         }
     }
 
     fn valid_describe() -> DescribeStreamRequest {
         DescribeStreamRequest {
-            stream_id: "s".to_string(),
+            r#ref: stream_ref("s", "x"),
         }
     }
 
@@ -330,7 +345,7 @@ mod tests {
             let mut request = valid_create();
             change(&mut request);
             runtime
-                .create_stream(request)
+                .create_stream(request, "r".to_string())
                 .await
                 .map(drop)
                 .map_err(|e| e.to_string())
@@ -339,7 +354,7 @@ mod tests {
             let mut request = valid_append();
             change(&mut request);
             runtime
-                .append_records(request)
+                .append_records(request, "r".to_string())
                 .await
                 .map(drop)
                 .map_err(|e| e.to_string())
@@ -372,14 +387,14 @@ mod tests {
                 .map_err(|e| e.to_string())
         };
         let invalid = |message: &str| AnyError::invalid_argument(message).to_string();
-        let no_id = || invalid("The Stream id is empty");
+        let no_ref = || invalid("The request has no ref");
         let cases = [
-            (create(|r| r.stream_id.clear()).await, no_id()),
+            (create(|r| r.stream_ref = None).await, no_ref()),
             (
                 create(|r| r.id_conflict_policy = 99).await,
                 invalid("The conflict policy 99 is unknown"),
             ),
-            (append(|r| r.stream_id.clear()).await, no_id()),
+            (append(|r| r.r#ref = None).await, no_ref()),
             (
                 append(|r| r.producer = None).await,
                 invalid("The request has no Producer"),
@@ -404,7 +419,7 @@ mod tests {
                 )
                 .to_string(),
             ),
-            (read(|r| r.stream_id.clear()).await, no_id()),
+            (read(|r| r.r#ref = None).await, no_ref()),
             (
                 read(|r| r.from_offset = vec![0; 1025]).await,
                 invalid("The from_offset of the read has 1025 bytes, more than 1024"),
@@ -421,12 +436,12 @@ mod tests {
                 read(|r| r.wait = seconds(-1)).await,
                 invalid("wait must be 0 or more"),
             ),
-            (close(|r| r.stream_id.clear()).await, no_id()),
+            (close(|r| r.r#ref = None).await, no_ref()),
             (
                 close(|r| r.producer = None).await,
                 invalid("The request has no Producer"),
             ),
-            (describe(|r| r.stream_id.clear()).await, no_id()),
+            (describe(|r| r.r#ref = None).await, no_ref()),
         ];
         for (result, error) in cases {
             assert_eq!(result, Err(error));
@@ -595,10 +610,29 @@ mod tests {
             };
             store.answers.lock().appended = answer.clone();
             expect(
-                runtime.append_records(valid_append()).await,
+                runtime
+                    .append_records(valid_append(), "r".to_string())
+                    .await,
                 answer,
                 corrupt,
             );
+        }
+        // A create returns the ref as the request had it, and the runtime compares only its id.
+        let other = "The Store answered a create without the Stream id of the request";
+        let creates = [
+            (stream_ref("s", "x"), None),
+            (stream_ref("s", ""), None),
+            (stream_ref("t", "x"), Some(other)),
+            (None, Some(other)),
+        ];
+        for (r#ref, corrupt) in creates {
+            let answer = CreateStreamResponse {
+                r#ref,
+                created: true,
+            };
+            store.answers.lock().created = answer.clone();
+            let created = runtime.create_stream(valid_create(), "r".to_string()).await;
+            expect(created, answer, corrupt);
         }
         let open = StreamStatus::Open as i32;
         let describes = [

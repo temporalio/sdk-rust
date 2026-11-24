@@ -30,8 +30,8 @@
 //!   also has the started event id and the started time of its Workflow Task, or the scheduled
 //!   time of the Activity attempt, and [`attempt::attempt_key`] orders the attempts of a Producer
 //!   by them.
-//! - A **batch** is the Records of one append. Each try of an append sends the same `request_id`,
-//!   so a Store writes the batch once while it remembers the id for that Producer of the Stream.
+//! - A **batch** is the Records of one append. Each try of an append sends the same request id, so
+//!   a Store writes the batch once while it remembers the id for that Producer of the Stream.
 
 pub mod attempt;
 mod error;
