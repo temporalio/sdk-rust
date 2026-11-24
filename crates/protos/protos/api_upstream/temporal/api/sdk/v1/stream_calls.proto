@@ -43,6 +43,10 @@ message WorkflowTaskStreamCalls {
       AppendOffsets appended = 3;
       CallFailure failure = 4;
     }
+    // The index of the activation of this Workflow Task in which Workflow code got the result,
+    // from 0. A replay gives the result in the activation with this index. A Local Activity marker
+    // has the same index for a result in the same activation.
+    int32 activation_index = 5;
   }
 
   // The offsets of the first and the last Record of a batch, as the Store returned them.
@@ -56,6 +60,10 @@ message WorkflowTaskStreamCalls {
     int32 seq = 1;
     // Unset if the Stream is closed.
     CallFailure failure = 2;
+    // The index of the activation of this Workflow Task in which Workflow code got the result,
+    // from 0. A replay gives the result in the activation with this index. A Local Activity marker
+    // has the same index for a result in the same activation.
+    int32 activation_index = 3;
   }
 
   // The result of a read.
@@ -71,6 +79,10 @@ message WorkflowTaskStreamCalls {
       ReadPage page = 4;
       CallFailure failure = 5;
     }
+    // The index of the activation of this Workflow Task in which Workflow code got the result,
+    // from 0. A replay gives the result in the activation with this index. A Local Activity marker
+    // has the same index for a result in the same activation.
+    int32 activation_index = 6;
   }
 
   // A page that a read gave Workflow code. It doesn't have the Records. A replay reads them from
