@@ -61,12 +61,5 @@ The result should be `Hello, Temporal!`. Check Lambda logs and your collector de
 metrics and spans. The supplied collector configuration logs telemetry for initial verification;
 replace its debug exporter with your CloudWatch/X-Ray configuration for production.
 
-## Local lifecycle tests
-
-Run `cargo integ-test lambda_tests` from the repository root. The integration runner starts a local
-Temporal server and the tests supply synthetic Lambda contexts and a local OTLP collector. They
-exercise repeated warm invocations, versioning, plugin ordering, cancellation, finalization,
-telemetry flushing, and replay. They do not exercise Cloud's automatic invocation, packaging, or IAM.
-
 The handler polls until its deadline even when idle. Cancellation-resistant Activities can require
 recycling the process; use the integration's `run` entry point rather than swallowing restart errors.

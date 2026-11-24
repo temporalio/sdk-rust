@@ -2,22 +2,37 @@
 
 This experimental crate runs a Temporal Worker inside each AWS Lambda invocation. Temporal Cloud
 invokes the function when tasks arrive; the handler ignores the event payload and polls Temporal.
-Both Workflows and Activities use the normal Rust SDK registration APIs. Given `worker_options`
-created with `LambdaWorker::worker_options(task_queue)` and containing your registrations:
+Both Workflows and Activities use the normal Rust SDK registration APIs. For example, an
+Activity-only Worker:
 
 ```rust,no_run
 use temporalio_common::worker::WorkerDeploymentVersion;
-use temporalio_sdk::WorkerOptions;
+use temporalio_macros::activities;
+use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use temporalio_sdk_aws_lambda::LambdaWorker;
 
-# async fn example(worker_options: WorkerOptions) -> Result<(), lambda_runtime::Error> {
-let version = WorkerDeploymentVersion::builder()
-    .deployment_name("payments")
-    .build_id("v1")
-    .build();
-LambdaWorker::builder(version, worker_options).build()?.run().await?;
-# Ok(())
-# }
+struct GreetingActivities;
+
+#[activities]
+impl GreetingActivities {
+    #[activity]
+    async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
+        Ok(format!("Hello, {name}!"))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), lambda_runtime::Error> {
+    lambda_runtime::tracing::init_default_subscriber();
+    let version = WorkerDeploymentVersion::builder()
+        .deployment_name("greeting-worker")
+        .build_id("v1")
+        .build();
+    let mut options = LambdaWorker::worker_options("greeting-task-queue");
+    options.register_activities(GreetingActivities);
+
+    LambdaWorker::builder(version, options).build()?.run().await
+}
 ```
 
 Client connection configuration is loaded once at handler construction, from environment variables
@@ -34,20 +49,15 @@ provides its own behavior. Retain old Lambda deployments until their pinned Work
 are migrated. Use `default_versioning_behavior(VersioningBehavior::AutoUpgrade)` to opt into
 upgrades; changes to auto-upgrading Workflows must remain replay-compatible.
 
-Use `LambdaWorker::worker_options(task_queue)` to create ordinary SDK `WorkerOptions` with Lambda
-defaults: 10 Workflow Task slots, 2 Activity slots, 2 Local Activity slots, 2 Workflow Task pollers,
-1 Activity Task poller, 30 cached Workflows, and 5 seconds of graceful shutdown. Register Workflows
-and Activities and customize the tuner, pollers, cache, and shutdown period directly on these options
-before passing them to `LambdaWorker::builder`. Already-built options retain their tuning; the
-adapter does not guess which SDK defaults were explicitly selected or replace them during `build`.
+Use `LambdaWorker::worker_options(task_queue)` for Lambda-oriented defaults; see its API documentation
+for the preset.
 `lambda_options` configures only the additional drain and hook buffers.
 
-Deployment identity, enabled versioning, the selected default behavior, and disabled eager Activities
-are managed by a final internal Worker plugin after user plugins run. Other worker settings remain
-customizable. The effective `WorkerOptions::graceful_shutdown_period` must be finite (`Some`).
-The final plugin derives the polling cutoff from that period and the Lambda cleanup buffers. Missing,
-overflowing, or too-large periods produce a configuration error before Core is created rather than
-silently replacing the caller's value.
+The handler enforces the supplied deployment identity, enabled versioning, the selected default
+Workflow versioning behavior, and disabled eager Activities. The effective
+`WorkerOptions::graceful_shutdown_period` must be finite (`Some`) and, together with the cleanup
+buffers, determines when polling stops. Missing, overflowing, or too-large periods produce a
+configuration error.
 
 ## Invocation lifecycle
 
@@ -64,13 +74,10 @@ let builder = builder.configure(|mut config| async move {
 # }
 ```
 
-With the Lambda worker preset, the default shutdown reserve is **8.1 seconds**: 5 for graceful
-Activity completion, 1 for cancellation and Worker finalization, 2 for telemetry and application
-hooks, and 100 milliseconds for posting the response. This deliberately reserves more drain time
-than the other SDKs' 7-second default. Allow more than 9.1 seconds for an invocation with these
-defaults. Configuration and connection setup count against the same monotonic invocation deadline.
-After setup and plugins, at least one second must remain for polling after reserving the effective
-worker shutdown period and cleanup buffers.
+The invocation deadline must leave time for graceful Activity completion, Worker finalization,
+telemetry and application hooks, and posting the response. Configuration and connection setup
+count against the same monotonic deadline. After setup, at least one second must remain for polling
+after reserving the effective worker shutdown period and cleanup buffers.
 
 The Worker polls until its shutdown window begins, not until one task completes or the queue is
 idle. It requests Activity cancellation after the graceful period and normally finalizes before
