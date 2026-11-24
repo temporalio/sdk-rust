@@ -166,6 +166,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "coresdk.external_data.LocalActivityMarkerData.backoff",
             "#[serde(with = \"sdk_helpers::opt_duration\")]",
         )
+        // Few completions have Stream calls, and Core keeps the metadata of a completion inline
+        // in its enums.
+        .boxed(".temporal.api.sdk.v1.WorkflowTaskCompletedMetadata.stream_calls")
         .skip_debug(["temporal.api.common.v1.Payload"]);
 
     for prefix in SERDE_DERIVE_PREFIXES {

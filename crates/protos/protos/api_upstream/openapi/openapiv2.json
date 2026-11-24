@@ -12938,6 +12938,14 @@
         "timeSkippingStatePropagation": {
           "$ref": "#/definitions/v1TimeSkippingStatePropagation",
           "description": "Experimental.\nTime-skipping state propagated by the execution that started this workflow.\nThis field is intended for use by the Temporal server, for example when a schedule\nstarts a workflow, and is not intended to be set by external clients."
+        },
+        "eagerWorkerControlTaskQueue": {
+          "type": "string",
+          "description": "Experimental. A dedicated per-worker Nexus task queue for control tasks sent to\nthe worker processing the eager Workflow Task. Used only when eager execution is accepted."
+        },
+        "eagerWorkerCapabilities": {
+          "$ref": "#/definitions/v1StartWorkflowExecutionRequestCapabilities",
+          "description": "Experimental. SDK capabilities of the worker processing the eager Workflow Task.\nUsed only when eager execution is accepted."
         }
       }
     },
@@ -13529,6 +13537,135 @@
       },
       "description": "Used to validate the compute config without attaching it to a Worker Deployment Version."
     },
+    "WorkflowTaskStreamCallsAppendOffsets": {
+      "type": "object",
+      "properties": {
+        "firstOffset": {
+          "type": "string",
+          "format": "byte"
+        },
+        "lastOffset": {
+          "type": "string",
+          "format": "byte"
+        }
+      },
+      "description": "The offsets of the first and the last Record of a batch, as the Store returned them."
+    },
+    "WorkflowTaskStreamCallsAppendResult": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The sequence number that the SDK gave the append."
+        },
+        "ref": {
+          "$ref": "#/definitions/v1StreamRef"
+        },
+        "appended": {
+          "$ref": "#/definitions/WorkflowTaskStreamCallsAppendOffsets"
+        },
+        "failure": {
+          "$ref": "#/definitions/WorkflowTaskStreamCallsCallFailure"
+        }
+      },
+      "description": "The result of an append."
+    },
+    "WorkflowTaskStreamCallsCallFailure": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "$ref": "#/definitions/v1StreamErrorReason"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "description": "Why a call failed. The SDK builds the error that Workflow code gets from it."
+    },
+    "WorkflowTaskStreamCallsCloseIntent": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The sequence number that the SDK gave the close."
+        },
+        "ref": {
+          "$ref": "#/definitions/v1StreamRef"
+        }
+      },
+      "description": "The intent of Workflow code to close a Stream."
+    },
+    "WorkflowTaskStreamCallsCloseResult": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "failure": {
+          "$ref": "#/definitions/WorkflowTaskStreamCallsCallFailure",
+          "description": "Unset if the Stream is closed."
+        }
+      },
+      "description": "The result of a close. The intent with the same `seq` has the ref of the Stream."
+    },
+    "WorkflowTaskStreamCallsReadPage": {
+      "type": "object",
+      "properties": {
+        "recordCount": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The number of Records in the page."
+        },
+        "done": {
+          "type": "boolean",
+          "description": "True if the Stream was closed and had no Record after this page."
+        },
+        "digest": {
+          "type": "string",
+          "format": "byte",
+          "description": "The first 16 bytes of a SHA-256 over the Records, in an encoding that the SDK owns. It's\nempty if the page has no Record."
+        },
+        "recordBytes": {
+          "type": "string",
+          "format": "int64",
+          "description": "The size of the Records in bytes, as the `max_bytes` of a read measures it. It's set when\n`digest` is, so a replay knows how much to read."
+        },
+        "lastOffset": {
+          "type": "string",
+          "format": "byte",
+          "description": "The `last_offset` that Workflow code got with the page. A replay gives the same value,\nsince another read of the Store can end at another offset."
+        }
+      },
+      "description": "A page that a read gave Workflow code. It doesn't have the Records. A replay reads them from\nthe Store again and checks them against `digest`."
+    },
+    "WorkflowTaskStreamCallsReadResult": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The sequence number that the SDK gave the read."
+        },
+        "ref": {
+          "$ref": "#/definitions/v1StreamRef"
+        },
+        "fromOffset": {
+          "type": "string",
+          "format": "byte",
+          "description": "The `from_offset` of the read. A replay reads the Records of the page after it."
+        },
+        "page": {
+          "$ref": "#/definitions/WorkflowTaskStreamCallsReadPage"
+        },
+        "failure": {
+          "$ref": "#/definitions/WorkflowTaskStreamCallsCallFailure"
+        }
+      },
+      "description": "The result of a read."
+    },
     "apiActivityV1CallbackInfo": {
       "type": "object",
       "properties": {
@@ -13843,7 +13980,7 @@
         "lastStartedTime": {
           "type": "string",
           "format": "date-time",
-          "description": "Time the last attempt was started."
+          "description": "Time the current attempt started, or the final attempt if the activity has closed; unset while waiting for a retry."
         },
         "attempt": {
           "type": "integer",
@@ -18265,7 +18402,8 @@
         },
         "lastStartedTime": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Time the current attempt started, or the final attempt if the activity has closed; unset while waiting for a retry."
         },
         "attempt": {
           "type": "integer",
@@ -20272,6 +20410,15 @@
         }
       }
     },
+    "v1StartWorkflowExecutionRequestCapabilities": {
+      "type": "object",
+      "properties": {
+        "supportsWorkflowHeartbeatNotification": {
+          "type": "boolean",
+          "description": "Experimental. Whether this worker supports Workflow heartbeat notifications."
+        }
+      }
+    },
     "v1StartWorkflowExecutionResponse": {
       "type": "object",
       "properties": {
@@ -20312,6 +20459,39 @@
           "description": "The type of the driver, required."
         }
       }
+    },
+    "v1StreamErrorReason": {
+      "type": "string",
+      "enum": [
+        "STREAM_ERROR_REASON_UNSPECIFIED",
+        "STREAM_ERROR_REASON_NOT_FOUND",
+        "STREAM_ERROR_REASON_EXPIRED",
+        "STREAM_ERROR_REASON_CLOSED",
+        "STREAM_ERROR_REASON_FENCED",
+        "STREAM_ERROR_REASON_FORMAT_TOO_NEW",
+        "STREAM_ERROR_REASON_OFFSET_TOO_HIGH",
+        "STREAM_ERROR_REASON_TOO_LARGE",
+        "STREAM_ERROR_REASON_INVALID_ARGUMENT",
+        "STREAM_ERROR_REASON_STORE_UNAVAILABLE",
+        "STREAM_ERROR_REASON_UNSUPPORTED",
+        "STREAM_ERROR_REASON_ALREADY_EXISTS",
+        "STREAM_ERROR_REASON_STORE_CORRUPT"
+      ],
+      "default": "STREAM_ERROR_REASON_UNSPECIFIED",
+      "description": "Experimental. Might change in the future.\nWhy a Stream call failed. Each reason maps to one gRPC status code, shown in parentheses, and\nseveral reasons share a code. So callers check the reason and not the status code. An SDK\nraises one error type with the reason in it.\n\n - STREAM_ERROR_REASON_NOT_FOUND: The Stream was never created (`NOT_FOUND`).\n - STREAM_ERROR_REASON_EXPIRED: The Retention of the Stream or its Producer idle TTL has passed (`NOT_FOUND`).\n - STREAM_ERROR_REASON_CLOSED: The Stream is closed (`FAILED_PRECONDITION`).\n - STREAM_ERROR_REASON_FENCED: A later attempt of the same Producer has already written, and the Store fences\n(`FAILED_PRECONDITION`).\n - STREAM_ERROR_REASON_FORMAT_TOO_NEW: The Stream has a newer format than this caller knows (`FAILED_PRECONDITION`).\n - STREAM_ERROR_REASON_OFFSET_TOO_HIGH: The offset is past the newest one, for example after a failover lost the newest Records. A\nread from it works again once the Stream has Records up to that offset (`OUT_OF_RANGE`).\n - STREAM_ERROR_REASON_TOO_LARGE: A Record or a batch is larger than the Store allows (`INVALID_ARGUMENT`).\n - STREAM_ERROR_REASON_INVALID_ARGUMENT: The request is malformed (`INVALID_ARGUMENT`).\n - STREAM_ERROR_REASON_STORE_UNAVAILABLE: The Store failed or didn't answer, and a retry can succeed (`UNAVAILABLE`).\n - STREAM_ERROR_REASON_UNSUPPORTED: The Store doesn't support something that the call needs (`UNIMPLEMENTED`).\n - STREAM_ERROR_REASON_ALREADY_EXISTS: A create with the `FAIL` policy found that the Stream already exists (`ALREADY_EXISTS`).\n - STREAM_ERROR_REASON_STORE_CORRUPT: The Store returned data that isn't valid, such as a stored value of the wrong length. A\nretry reads the same data (`DATA_LOSS`)."
+    },
+    "v1StreamRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "store": {
+          "type": "string",
+          "description": "The name under which the client and Worker config registered the Store of this Stream. An\nSDK uses it to send a call on this ref to the right Store. When it's empty, the SDK picks\nthe Store from its config. Only an SDK sets and reads this field. The server and a Store\nignore it."
+        }
+      },
+      "description": "Experimental. Might change in the future.\nA reference to one Stream, which code passes to other code as data. Callers treat the `id` as\nopaque. An id is never used for a second Stream while the Store remembers the first one, so a\ncreate for a closed or expired Stream fails. A Store can forget an expired Stream after a time\nof its choice, and a create for its id succeeds after that. Every SDK encodes a ref in a\nPayload with this message, so a ref that one SDK writes decodes in another."
     },
     "v1StructuredCalendarSpec": {
       "type": "object",
@@ -21628,7 +21808,7 @@
         "targetPollers": {
           "type": "integer",
           "format": "int32",
-          "description": "Number of pollers this poller pool is currently targeting, which may differ from current_pollers.\n0 if unknown, such as a poller pool of fixed size."
+          "description": "Number of pollers this poller pool is currently targeting, which may differ from current_pollers.\n0 if the SDK does not report a target. See is_autoscaling for whether the target can change."
         }
       }
     },
@@ -22793,10 +22973,9 @@
           "type": "string",
           "description": "Version of the SDK that processed the task. This is usually something like \"1.20.0\" and is\nusually the same as client-version gRPC header. This should only be set if its value changed\nsince the last time recorded on the workflow (or be set on the first task)."
         },
-        "coreStreamCalls": {
-          "type": "string",
-          "format": "byte",
-          "description": "The Stream calls of this Workflow Task, in a format that SDK Core owns. A replay gives\nWorkflow code the same results from it."
+        "streamCalls": {
+          "$ref": "#/definitions/v1WorkflowTaskStreamCalls",
+          "description": "Experimental. Might change in the future.\nThe Stream calls of this Workflow Task. An SDK sets it if Workflow code got the result of a\nStream call in the task or asked for a close."
         }
       }
     },
@@ -22959,6 +23138,44 @@
           "title": "Used by server internally to properly reapply build ID redirects to an execution\nwhen rebuilding it from events.\nDeprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]"
         }
       }
+    },
+    "v1WorkflowTaskStreamCalls": {
+      "type": "object",
+      "properties": {
+        "closeIntents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/WorkflowTaskStreamCallsCloseIntent"
+          },
+          "description": "The closes that Workflow code asked for in this task. The SDK closes a Stream only when\nHistory has the intent, so the result of a close is in a later task."
+        },
+        "appendResults": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/WorkflowTaskStreamCallsAppendResult"
+          },
+          "description": "The results of the appends that Workflow code got in this task."
+        },
+        "closeResults": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/WorkflowTaskStreamCallsCloseResult"
+          },
+          "description": "The results of the closes that Workflow code got in this task."
+        },
+        "readResults": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/WorkflowTaskStreamCallsReadResult"
+          },
+          "description": "The results of the reads that Workflow code got in this task."
+        }
+      },
+      "description": "Experimental. Might change in the future.\nThe Stream calls of one Workflow Task. An SDK records them on the completion of the task, so\nthat a replay gives Workflow code the same result for each call. A replay doesn't append or\nclose again for a result that is here. For a page, it reads the Records from the Store again."
     },
     "v1WorkflowTaskTimedOutEventAttributes": {
       "type": "object",
