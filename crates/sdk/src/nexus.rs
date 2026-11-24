@@ -43,18 +43,22 @@
 pub use temporalio_macros::{temporal_nexus_service_handler, temporal_operation};
 pub use temporalio_workflow::nexus::*;
 
-use crate::{ApplicationFailure, CommonWorker, OutgoingError, WorkerRunError};
+use crate::{ApplicationFailure, CommonWorker, OutgoingError, WorkerRunError, panic_formatter};
 use base64::{
     Engine,
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig, general_purpose},
 };
 use futures_util::{FutureExt, future::BoxFuture};
+use heck::ToUpperCamelCase;
 use nexus_rpc::{HandlerError, HandlerErrorRetryBehavior, HandlerErrorType, OperationError};
 pub use nexus_rpc::{NexusOperation, NexusService};
+use operation_token::TemporalOperationToken;
+use parking_lot::Mutex;
+use prost::Name;
 use serde::{Deserialize, Serialize};
 use std::{
-    any::Any, cell::RefCell, collections::HashMap, future::Future, marker::PhantomData,
-    panic::AssertUnwindSafe, sync::Arc, time::SystemTime,
+    collections::HashMap, future::Future, marker::PhantomData, mem, panic::AssertUnwindSafe,
+    sync::Arc, time::SystemTime,
 };
 use temporalio_client::{
     Client, NamespacedClient, Url, WorkflowCancelOptions, WorkflowExecutionInfo,
@@ -91,18 +95,19 @@ use tokio_util::sync::CancellationToken;
 pub enum TemporalOperationResult<T> {
     /// The operation completed in the handler.
     Sync(T),
-    /// A workflow will complete the operation through its completion callback.
-    Async(TemporalOperationToken),
+    /// A workflow started with [`TemporalNexusClient::start_workflow`] will complete the operation.
+    Async(TemporalOperationToken<T>),
 }
 
-/// Opaque identity of a workflow-backed operation.
-#[derive(Debug)]
-pub struct TemporalOperationToken {
-    token: String,
-}
+mod operation_token {
+    use std::marker::PhantomData;
 
-tokio::task_local! {
-    static OUTBOUND_LINKS: RefCell<Vec<proto::Link>>;
+    /// Opaque identity of a workflow-backed operation with output `T`.
+    #[derive(Debug)]
+    pub struct TemporalOperationToken<T> {
+        pub(super) token: String,
+        pub(super) output: PhantomData<fn() -> T>,
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -188,6 +193,7 @@ impl NexusContext {
 pub struct TemporalNexusClient {
     client: Client,
     request: proto::StartOperationRequest,
+    outbound_links: Arc<Mutex<Vec<proto::Link>>>,
 }
 
 /// Information about the Nexus request currently being served.
@@ -234,11 +240,12 @@ impl TemporalNexusClient {
         let token =
             WorkflowOperationToken::new(self.client.namespace(), options.workflow_id.clone())
                 .encode_token();
+        let workflow_event_type = link::WorkflowEvent::full_name();
         let links = self
             .request
             .links
             .iter()
-            .filter(|link| link.r#type == "temporal.api.common.v1.Link.WorkflowEvent")
+            .filter(|link| link.r#type == workflow_event_type)
             .map(proto::workflow_event_link_from_nexus)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| TemporalOperationError::handler("BAD_REQUEST", error, false))?;
@@ -265,12 +272,11 @@ impl TemporalNexusClient {
         .await
         .map_err(TemporalOperationError::from)?;
         if let Some(link) = workflow_event_link_to_nexus(response_link)? {
-            OUTBOUND_LINKS.with(|links| {
-                links.borrow_mut().push(link);
-            });
+            self.outbound_links.lock().push(link);
         }
         Ok(TemporalOperationResult::Async(TemporalOperationToken {
             token,
+            output: PhantomData,
         }))
     }
 }
@@ -298,25 +304,30 @@ fn workflow_event_link_to_nexus(
                 "eventID",
                 reference.event_id.to_string(),
                 reference.event_type,
-                "EventReference",
+                link::workflow_event::EventReference::NAME,
             ),
             link::workflow_event::Reference::RequestIdRef(reference) => (
                 "requestID",
                 reference.request_id,
                 reference.event_type,
-                "RequestIdReference",
+                link::workflow_event::RequestIdReference::NAME,
             ),
         };
         let event_type = EventType::try_from(event_type)
             .map_err(|error| TemporalOperationError::handler("INTERNAL", error, true))?;
+        // Other SDKs emit the short PascalCase name, not the full protobuf enum name.
+        let event_type = event_type
+            .as_str_name()
+            .trim_start_matches("EVENT_TYPE_")
+            .to_upper_camel_case();
         url.query_pairs_mut()
             .append_pair(key, &value)
-            .append_pair("eventType", &format!("{event_type:?}"))
+            .append_pair("eventType", &event_type)
             .append_pair("referenceType", reference_type);
     }
     Ok(Some(proto::Link {
         url: url.into(),
-        r#type: "temporal.api.common.v1.Link.WorkflowEvent".to_owned(),
+        r#type: link::WorkflowEvent::full_name(),
     }))
 }
 
@@ -324,13 +335,13 @@ fn workflow_event_link_to_nexus(
 #[derive(Debug, thiserror::Error)]
 pub enum NexusRegistrationError {
     /// A service has no registered operations.
-    #[error("Nexus service {0:?} has no registered operations")]
+    #[error("Nexus service {0} has no registered operations")]
     EmptyService(String),
     /// A service with this wire name is already registered.
-    #[error("Nexus service {0:?} is already registered")]
+    #[error("Nexus service {0} is already registered")]
     DuplicateService(String),
     /// An operation with this wire name is already registered in the service.
-    #[error("Nexus operation {service:?}/{operation:?} is already registered")]
+    #[error("Nexus operation {service}/{operation} is already registered")]
     DuplicateOperation {
         /// Service wire name.
         service: String,
@@ -458,6 +469,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
                             payload,
                         )
                         .map_err(TemporalOperationError::input_conversion_error)?;
+                    let outbound_links = client.outbound_links.clone();
                     match handler(context, client, input).await? {
                         TemporalOperationResult::Sync(output) => {
                             let payload = converter
@@ -473,7 +485,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
                             Ok(start_operation_response::Variant::SyncSuccess(
                                 start_operation_response::Sync {
                                     payload: Some(payload),
-                                    links: OUTBOUND_LINKS.with(|links| links.take()),
+                                    links: mem::take(&mut *outbound_links.lock()),
                                 },
                             ))
                         }
@@ -483,7 +495,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
                                 start_operation_response::Async {
                                     operation_id: token.token.clone(),
                                     operation_token: token.token,
-                                    links: OUTBOUND_LINKS.with(|links| links.take()),
+                                    links: mem::take(&mut *outbound_links.lock()),
                                 },
                             ))
                         }
@@ -888,19 +900,16 @@ async fn dispatch(
             retrieve_external_payloads(&mut start, &converter)
                 .await
                 .map_err(TemporalOperationError::from)?;
-            let result = OUTBOUND_LINKS
-                .scope(
-                    RefCell::new(Vec::new()),
-                    handler(
-                        NexusContext { info: info.clone() },
-                        TemporalNexusClient {
-                            client,
-                            request: start,
-                        },
-                        converter,
-                    ),
-                )
-                .await;
+            let result = handler(
+                NexusContext { info: info.clone() },
+                TemporalNexusClient {
+                    client,
+                    request: start,
+                    outbound_links: Arc::default(),
+                },
+                converter,
+            )
+            .await;
             for interceptor in services.interceptors.iter().rev() {
                 interceptor
                     .on_finish(&info, result.as_ref().map(|_| ()))
@@ -967,7 +976,7 @@ async fn execute_request(
             Ok(Ok(status)) => status,
             Ok(Err(error)) => error.into_status(converter),
             Err(panic) => TemporalOperationError::Unexpected(Box::new(NexusHandlerPanic(
-                panic_message(panic),
+                panic_formatter(panic).to_string(),
             )))
             .into_status(converter),
         };
@@ -1009,7 +1018,7 @@ async fn execute_request(
         result = AssertUnwindSafe(execute).catch_unwind() => match result {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => failure_building_completion(error.to_string()),
-            Err(panic) => failure_building_completion(panic_message(panic)),
+            Err(panic) => failure_building_completion(panic_formatter(panic).to_string()),
         },
     }
 }
@@ -1017,15 +1026,6 @@ async fn execute_request(
 #[derive(Debug, thiserror::Error)]
 #[error("Nexus handler panicked: {0}")]
 struct NexusHandlerPanic(String);
-
-fn panic_message(panic: Box<dyn Any + Send>) -> String {
-    panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap_or("non-string panic")
-        .to_owned()
-}
 
 fn failure_building_completion(error: String) -> nexus_task_completion::Status {
     // Reusing a failing converter or codec here could strand the task and its worker slot.
@@ -1090,6 +1090,30 @@ mod tests {
     #[nexus_rpc::service]
     trait Payments {
         fn quote(input: String) -> String;
+    }
+
+    #[test]
+    fn workflow_event_links_round_trip_escaped_path_segments() {
+        let link = Link {
+            variant: Some(link::Variant::WorkflowEvent(link::WorkflowEvent {
+                namespace: "example namespace+".to_owned(),
+                workflow_id: "folder/処理?x=%2F".to_owned(),
+                run_id: "example run".to_owned(),
+                reference: Some(link::workflow_event::Reference::EventRef(
+                    link::workflow_event::EventReference {
+                        event_id: 42,
+                        event_type: EventType::WorkflowExecutionOptionsUpdated as i32,
+                    },
+                )),
+            })),
+        };
+        let encoded = workflow_event_link_to_nexus(Some(link.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proto::workflow_event_link_from_nexus(&encoded).unwrap(),
+            link
+        );
     }
 
     #[test]
@@ -1278,15 +1302,13 @@ mod tests {
         services
             .register(
                 NexusServiceHandler::new(Payments)
-                    .operation(Payments::quote, move |ctx, _, input: String| {
+                    .operation(Payments::quote, move |ctx, client, input: String| {
                         let barrier = barrier.clone();
                         async move {
                             for suffix in ["first", "second"] {
-                                OUTBOUND_LINKS.with(|links| {
-                                    links.borrow_mut().push(proto::Link {
-                                        url: format!("{}/{suffix}", ctx.info().request_id),
-                                        r#type: "test".to_owned(),
-                                    });
+                                client.outbound_links.lock().push(proto::Link {
+                                    url: format!("{}/{suffix}", ctx.info().request_id),
+                                    r#type: "test".to_owned(),
                                 });
                             }
                             barrier.wait().await;
@@ -1295,6 +1317,7 @@ mod tests {
                             } else {
                                 TemporalOperationResult::Async(TemporalOperationToken {
                                     token: "operation-token".to_owned(),
+                                    output: PhantomData,
                                 })
                             })
                         }
@@ -1521,14 +1544,18 @@ mod tests {
                 .register(
                     NexusServiceHandler::new(Payments)
                         .operation(Payments::quote, |_, client, input| async move {
-                            client
-                                .start_workflow(
-                                    BackingWorkflow,
-                                    input,
-                                    WorkflowStartOptions::new("backing-queue", "backing/id")
-                                        .build(),
-                                )
-                                .await
+                            tokio::spawn(async move {
+                                client
+                                    .start_workflow(
+                                        BackingWorkflow,
+                                        input,
+                                        WorkflowStartOptions::new("backing-queue", "backing/id")
+                                            .build(),
+                                    )
+                                    .await
+                            })
+                            .await
+                            .unwrap()
                         })
                         .unwrap(),
                 )

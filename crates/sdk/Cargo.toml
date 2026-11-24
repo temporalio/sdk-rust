@@ -26,6 +26,7 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 gethostname = "1.0.2"
+heck = { version = "0.5", optional = true }
 nexus-rpc = { workspace = true, optional = true }
 opentelemetry = { workspace = true, features = ["trace"], optional = true }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
@@ -80,7 +81,7 @@ rstest = "0.28"
 [features]
 default = ["envconfig", "prometheus"]
 envconfig = ["temporalio-sdk-core/envconfig"]
-experimental = ["temporalio-client/experimental", "temporalio-workflow/experimental", "dep:nexus-rpc", "dep:base64", "dep:serde_json", "serde/derive"]
+experimental = ["temporalio-client/experimental", "temporalio-workflow/experimental", "dep:nexus-rpc", "dep:base64", "dep:heck", "dep:serde_json", "serde/derive"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
