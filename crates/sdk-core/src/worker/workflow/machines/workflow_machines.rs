@@ -1108,8 +1108,8 @@ impl WorkflowMachines {
         next_event: Option<&HistoryEvent>,
     ) -> Result<EventHandlingOutcome> {
         let event = &event_dat.event;
-        // A ledger counts as in History once the commands of its completion are, as Core handles
-        // a call that its task asked for after the commands of that task.
+        // Core handles the Stream calls of a task after the commands of that task. So the ledger
+        // of a completion is checked against the calls only after its command events.
         if self.ledger_to_record
             && (!event.is_command_event() || event.is_final_wf_execution_event())
         {

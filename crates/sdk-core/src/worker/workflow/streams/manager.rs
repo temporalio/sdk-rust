@@ -27,7 +27,6 @@ const RETRY_RANDOMIZATION: f64 = 0.2;
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Most requests start a call
 pub(crate) enum Request {
-    /// Starts a call.
     Run(Call),
     /// Stops the call with this id, which then gives no result.
     Stop(u64),
@@ -473,8 +472,6 @@ mod tests {
         })
     }
 
-    // A try that gets no answer by its deadline counts as a failed try in an outage, like a
-    // `StoreUnavailable` failure.
     #[tokio::test(start_paused = true)]
     async fn a_try_with_no_answer_is_an_outage() {
         let (store, manager, mut results) = manager().await;
@@ -537,9 +534,8 @@ mod tests {
         message
     }
 
-    // Workflow code gets the failure of a call from the reason and the message that a ledger
-    // records, in the first run and in a replay. A message over 4096 bytes is cut on a character,
-    // with `...` at the end.
+    // The failure is built from what a ledger records, so a replay gives the same one as the
+    // first run. A long message is cut on a character boundary.
     #[test]
     fn a_failure_reads_back_as_the_failure_of_its_call() {
         let reasons: Vec<StreamErrorReason> = (0..)

@@ -788,8 +788,8 @@ fn find_end_index_of_next_wft_seq_chunked(
             continue;
         }
 
-        // A completion with a ledger counts as a command, so that a task with Stream calls never
-        // joins a chain of heartbeats.
+        // A Local Activity marker is a command event, so its task is never taken as a heartbeat.
+        // A ledger has no event, so its completion counts as a command here.
         if e.is_command_event() || has_ledger(e) {
             saw_command = true;
             saw_command_or_started = true;
@@ -1191,8 +1191,6 @@ mod tests {
         assert_eq!(seq.len(), 2);
     }
 
-    // A completion with a ledger, even one with no entry, gives the WFT sequences of a command
-    // event right after it, also for a task with no other command and a forced next task.
     #[test]
     fn a_ledger_ends_sequences_as_a_command_after_its_completion_does() {
         let mut forced_ledgers = 0;
@@ -1205,8 +1203,7 @@ mod tests {
                 t.add_by_type(EventType::WorkflowExecutionStarted);
                 t.add_workflow_task_scheduled_and_started();
             }
-            // The started events of the History with ledgers, by the id of the same event in the
-            // History with commands.
+            // Maps each started event of `with_ledger` to the same event of `with_command`.
             let mut ids = vec![];
             for task in 0..rng.random_range(1..8) {
                 let (ledger, command) = (rng.random_bool(0.5), rng.random_bool(0.3));

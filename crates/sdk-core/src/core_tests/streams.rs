@@ -84,7 +84,6 @@ fn stream(id: &str) -> StreamRef {
     }
 }
 
-/// Creates a Store with the Streams `ids`.
 async fn store(ids: &[&str]) -> Arc<MemoryStore> {
     let store = Arc::new(MemoryStore::default());
     for id in ids {
@@ -114,7 +113,6 @@ impl Drop for SeedOnPanic {
     }
 }
 
-/// Returns a History up to its first Workflow Task, with a task timeout of `task_timeout`.
 fn history(task_timeout: Duration) -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(task_timeout);
@@ -507,7 +505,6 @@ fn complete() -> Command {
     CompleteWorkflowExecution { result: None }.into()
 }
 
-/// Returns the ledger of a completion, if it has one.
 fn ledger(completion: &WorkflowTaskCompletion) -> Option<WorkflowTaskStreamCalls> {
     completion.sdk_metadata.stream_calls.as_deref().cloned()
 }
@@ -1017,7 +1014,6 @@ fn calls_at(store: &MemoryStore) -> Vec<(Op, String)> {
     calls
 }
 
-/// Returns true if the Store wrote the append or the close `call`.
 fn written(store: &MemoryStore, call: &EndingCall) -> bool {
     match call.op {
         Op::Append => !store.records(&call.stream).is_empty(),
@@ -1335,7 +1331,6 @@ enum EarlierAttempt {
     UpdateRejected,
 }
 
-/// Returns true if `activation` has the result of append `seq`.
 fn resolves_append(activation: &WorkflowActivation, seq: u32) -> bool {
     (activation.jobs.iter()).any(
         |job| matches!(&job.variant, Some(Job::ResolveStreamAppend(append)) if append.seq == seq),
@@ -1545,7 +1540,6 @@ async fn wait_until(mut done: impl FnMut() -> bool) {
     (tokio::time::timeout(Duration::from_secs(30), wait).await).expect("The wait timed out");
 }
 
-/// Completes `activation` with the commands of `workflow`.
 async fn respond(worker: &Worker, activation: &WorkflowActivation, workflow: Workflow) {
     let commands = workflow(activation);
     let completion = WorkflowActivationCompletion::from_cmds(activation.run_id.clone(), commands);
@@ -1787,10 +1781,9 @@ fn reject_update() -> Command {
     .into()
 }
 
-// The server drops the completion of a speculative task, which an Update makes, when it has no
-// command and only rejects Updates. A ledger isn't a command, so a completion with one forces a
-// new task, which makes the server keep it. Here task 2 has a Signal too, so that Workflow code
-// can append in it, which the validator of an Update can't.
+// The server drops the completion of a speculative task that has no command and only rejects
+// Updates. A ledger isn't a command, so Core forces a new task to make the server keep it. Task 2
+// has a Signal too, because the validator of an Update can't append.
 #[rstest::rstest]
 #[case::with_an_append(true)]
 #[case::with_no_stream_call(false)]
@@ -2150,18 +2143,14 @@ struct Earlier {
     at: usize,
 }
 
-/// Returns the commands of the Workflow code of `script` for `activation`. It answers each query
-/// and rejects each Update, which leave no event, and takes the next step of `script` for an
-/// activation with any other job.
+/// Returns the commands of `script` for `activation`. It answers each query, rejects each Update,
+/// and takes the next step for an activation with any other job.
 ///
-/// It keeps the last step while a Local Activity runs. If the result comes while Workflow code
-/// sends the last command, Core gives it in one more activation and records its marker after that
-/// command. A replay then stops at the last command while it still replays, so the replay Worker
-/// never evicts the run.
+/// It keeps the last step while a Local Activity runs. A result that comes with the last command
+/// gets its marker after that command, and a replay Worker then never evicts the run.
 ///
-/// On a Worker that took the run over, an activation that gives activations of the `earlier`
-/// Worker again takes the steps that they took, as in a replay. Each such activation must have the
-/// jobs of one or more of them, one after the other.
+/// On a Worker that took the run over, an activation that repeats activations of the `earlier`
+/// Worker takes the steps that they took.
 fn scripted(
     script: &[Vec<Command>],
     progress: &mut Progress,
@@ -2332,12 +2321,10 @@ struct Reached {
     taken_over: usize,
 }
 
-// The first run of generated Workflow code, with Local Activities, queries, rejected Updates and
-// Store calls that wait, writes a History whose replay gives the same jobs in the same activations.
-// Queries and rejected Updates leave no event, so the replay has none of their jobs. With chunking
-// on, one activation of the replay can have the jobs of several, in the order of the first run.
-// Some runs move to a new Worker in the middle, and the activations of that Worker are then the
-// first run.
+// Generated Workflow code runs with Local Activities, queries, rejected Updates and slow Store
+// calls. A replay of its History must give the same jobs in the same activations. With chunking
+// on, one replay activation can have the jobs of several, in order. In some runs a new Worker
+// takes over midway.
 #[tokio::test]
 async fn a_replay_gives_the_activations_of_the_first_run() {
     let ids = ["s0", "s1", "s2"];
@@ -2347,11 +2334,9 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         let mut rng = StdRng::seed_from_u64(seed);
         let script = script(&mut rng);
         let store = store(&ids).await;
-        // The server gives each task with a Signal, and some of them with a query or an Update.
-        // A forced task has no new event. Each completion lets the Store answer the calls that
-        // wait, so a task that waits for one ends. Once in a run, after a random completion or
-        // after the first heartbeat, a forced completion with no event and no ledger, it keeps the
-        // next task for a new Worker.
+        // Each task has a Signal, and some have a query or an Update. A forced task has no new
+        // event. Each completion lets the Store answer the calls that wait. Once in a run, the
+        // server keeps the next task for a new Worker.
         let (handover, handed_over) = (Arc::new(Notify::new()), Arc::new(Mutex::new(false)));
         let server = {
             let (released, handover, handed_over) =

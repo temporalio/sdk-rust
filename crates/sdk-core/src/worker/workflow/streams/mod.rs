@@ -27,8 +27,8 @@ use temporalio_streams::StreamRuntime;
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tracing::Span;
 
-/// The maximum encoded size of the ledger of one task. It keeps a completion far below the
-/// message size limit of gRPC and the size of one write to History on the server.
+/// Keeps a completion far below the gRPC message size limit and the size of one write to History
+/// on the server.
 const MAX_LEDGER_BYTES: usize = 256 * 1024;
 
 /// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
@@ -54,10 +54,9 @@ impl StreamRuntimes {
     }
 }
 
-/// The settings of a Worker's Stream calls. A try that fails with
-/// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable), or gets no
-/// answer within its deadline, counts as an outage, and the call then tries again with no time
-/// limit.
+/// The retry settings of a Worker's Stream calls. A call tries again, with no time limit, after
+/// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable) or a try with
+/// no answer within `try_deadline`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the

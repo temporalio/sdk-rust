@@ -52,8 +52,8 @@ impl<T: Message> Waiting<T> {
     }
 }
 
-/// Returns the job that gives Workflow code the result of append `seq` in a ledger. A replay and a
-/// live run both build their jobs from the entry, so both give Workflow code the same job for it.
+/// A live run and a replay both build the job from the ledger entry, so Workflow code gets the same
+/// job in both.
 pub(crate) fn append_job(seq: u32, entry: &AppendResult) -> ResolveStreamAppend {
     let status = entry.result.as_ref().map(|result| match result {
         append_result::Result::Appended(offsets) => {
@@ -69,7 +69,6 @@ pub(crate) fn append_job(seq: u32, entry: &AppendResult) -> ResolveStreamAppend 
     ResolveStreamAppend { seq, status }
 }
 
-/// Returns the job that gives Workflow code the result of close `seq` in a ledger.
 pub(crate) fn close_job(seq: u32, entry: &CloseResult) -> ResolveStreamClose {
     ResolveStreamClose {
         seq,
@@ -83,7 +82,6 @@ pub(crate) fn seq_of(seq: i32) -> Result<u32, WFMachinesError> {
     u32::try_from(seq).map_err(|_| malformed(format!("has the negative seq {seq}")))
 }
 
-/// Returns the activation index of a result in History.
 pub(crate) fn activation_of(index: i32) -> u64 {
     u64::try_from(index).expect("The check of a ledger in History refuses a negative index")
 }
@@ -100,7 +98,6 @@ pub(crate) struct LedgerBuilder {
 }
 
 impl LedgerBuilder {
-    /// Creates an empty ledger with the sizes of `settings`.
     pub(crate) fn new(settings: StreamSettings) -> Self {
         Self {
             bytes: 0,

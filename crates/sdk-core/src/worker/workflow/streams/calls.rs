@@ -35,12 +35,11 @@ use temporalio_streams::{
     },
 };
 
-/// The maximum length of a Store name in a Workflow call, in bytes. A ledger records the Store of
-/// each call, so Core fails the Workflow Task of a call with a longer name.
+/// A ledger records the Store name of each call, so a longer name fails the Workflow Task.
 const MAX_STORE_NAME_BYTES: usize = 4096;
 
-/// The counter of the ids of running calls, for every run of the process. A late result of a call
-/// of an evicted run then never matches a call of the run that replaces it.
+/// One counter for the whole process, so a late result of an evicted run never matches a call of
+/// the run that replaces it.
 static CALL_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// How far a run is through its History.
@@ -138,7 +137,6 @@ pub(crate) struct StreamCalls {
     /// True if the server keeps the `sdk_metadata` of a completion, which has the ledger of the
     /// task.
     keeps_ledgers: bool,
-    /// The state of the run's current Workflow Task.
     task: TaskState,
     appends: HashMap<u32, Append>,
     closes: HashMap<u32, Close>,
@@ -195,14 +193,12 @@ impl StreamCalls {
         }
     }
 
-    /// Sets the state of the run's current task. When the task opens, the head of each queue
-    /// starts.
+    /// When the task opens, the head of each queue starts.
     pub(crate) fn set_task(&mut self, state: TaskState) {
         self.task = state;
         self.start_heads();
     }
 
-    /// Handles an append command.
     pub(crate) fn append(&mut self, command: AppendToStream) -> Result<(), WFMachinesError> {
         if self.phase == Phase::Stopped {
             return Ok(());
@@ -231,8 +227,8 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Handles a close command. The ledger of the task records its intent, and the close runs once
-    /// History has that intent.
+    /// Records only the intent. The close runs once History has it, so a task that fails closes
+    /// nothing.
     pub(crate) fn close(&mut self, command: CloseStream) -> Result<(), WFMachinesError> {
         if self.phase == Phase::Stopped {
             return Ok(());
@@ -712,8 +708,6 @@ impl StreamCalls {
         }
     }
 
-    /// Starts the call at the head of the queue of one Stream, once the run is live and its task
-    /// is open.
     fn start_head(&mut self, queue: &(String, String)) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
@@ -852,8 +846,7 @@ fn check_store_name(store: &str) -> Result<(), AnyError> {
     Ok(())
 }
 
-/// Returns the Stream of the command of `call`, or an error if the command has none, or one with
-/// an id or a Store name out of range. Such a command is not valid, so it fails its Workflow Task.
+/// A command with no Stream, or with an id or a Store name out of range, fails its Workflow Task.
 fn valid_stream(call: CallKey, stream: Option<StreamRef>) -> Result<StreamRef, WFMachinesError> {
     let stream =
         stream.ok_or_else(|| WFMachinesError::Fatal(format!("Stream {call} has no Stream")))?;
@@ -912,12 +905,8 @@ fn producer(run: &WorkflowProducer, attempt: WorkflowTaskAttempt) -> Producer {
     }
 }
 
-/// Returns the request id of append `seq` of the run `run_id` in the attempt of `producer`. It's
-/// the same exactly when the run, the attempt and the seq are, and it joins these parts with `/`.
-///
-/// - the run id
-/// - the [`attempt_key`] of the attempt, in hex (56 characters)
-/// - the seq
+/// Returns `<run id>/<attempt key in hex>/<seq>`. A new try of an append has the same id, so the
+/// Store writes its batch once. A later attempt of the task has another id.
 fn request_id(run_id: &str, producer: &Producer, seq: u32) -> String {
     let key: String = (attempt_key(producer.kind.as_ref()).iter())
         .map(|byte| format!("{byte:02x}"))
@@ -949,7 +938,6 @@ mod tests {
     use tokio::runtime::Handle;
     use workflow_activation_job::Variant;
 
-    /// The number of seeds that each generated test runs.
     const SEEDS: u64 = 400;
 
     fn runtimes(stores: &[&str]) -> StreamRuntimes {

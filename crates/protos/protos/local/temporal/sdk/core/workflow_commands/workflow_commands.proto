@@ -424,46 +424,26 @@ message RequestCancelNexusOperation {
     uint32 seq = 1;
 }
 
-// Appends Records to a Stream as the Workflow's Producer. Core makes the request id of the append
-// and sends the result in a `ResolveStreamAppend` job. History keeps the result in the ledger of
-// the Workflow Task in which lang got it, which is the `stream_calls` of the `sdk_metadata` of the
-// completion of that task. While an append runs, Core keeps the task and doesn't send its
-// completion, as for a Local Activity, until each call has an answer or Core must complete the
-// task earlier, as at its heartbeat. `ResolveStreamAppend` says in which activation a result comes.
+// Appends Records to a Stream as the Workflow's Producer. Core calls the Store while the Workflow
+// Task is open, and sends the result in a `ResolveStreamAppend` job. As for a Local Activity, Core
+// keeps the task open while an append runs. An append has no event, so History keeps its result in
+// the `stream_calls` of the `sdk_metadata` of the task's completion.
 //
-// An append is at-least-once. A later attempt of the Workflow Task writes it again, on this Worker
-// or on another one.
+// An append is at-least-once. If History has no result of it, a later attempt of the Workflow Task
+// writes the batch again.
 //
 // No command cancels an append, so lang must accept the job of an append that nothing awaits.
-// When lang sends the Workflow's last command, Core drops each append that has no result, as it
-// does for a Local Activity. Such an append may or may not have reached the Store, and lang gets
-// no job for it.
+// Core drops an append that has no result when lang sends the Workflow's last command.
 //
 // Core sends the appends and the closes of one Stream to the Store one at a time, in the order of
-// their commands. A close gets its place in that order only when History has its intent. So an
-// append that lang sends after a `CloseStream`, but before History has the task of that close, is
-// written before the close.
+// their commands.
 //
-// Core fails the Workflow Task in each of these cases, and gives lang no failure of the append.
-// * `seq` is 0, isn't above the `seq` of the append before it, or is above 2147483647, since
-//   History keeps it as an `int32`.
-// * `stream` is unset, its id is empty or longer than 4096 bytes, or its Store name is longer than
-//   4096 bytes.
-// * The Worker has no Stream runtime for the Store of `stream`.
-// * The server doesn't take the `sdk_metadata` of a completion, so History can't keep the result.
-// * The append must wait for the task's heartbeat to try again, because the Store answered
-//   `StoreUnavailable` or gave no answer. The failure message then starts with
-//   `StreamStoreUnavailable:`.
+// A bad `seq` or `stream`, or a Store that the Worker has no runtime for, fails the Workflow Task.
+// So does a Store that is still unavailable at the task's heartbeat. The failure message then
+// starts with `StreamStoreUnavailable:`. An empty batch, or one over the limits of its Store,
+// gives lang a `failed` job.
 //
-// An append with no `bodies`, or with a batch over the limits of its Store, doesn't fail the
-// Workflow Task. Lang gets a `failed` job for it.
-//
-// In a replay, Core compares the `seq` and the `stream` of the command with History, but not the
-// `bodies`. A `stream` with no Store name matches any Store in History. An append with no result
-// in History runs again after the replay, as a later attempt, so a reader can see its batch twice.
-//
-// If lang completes the Workflow Task while an append has no result in a ledger, Core forces a new
-// task, unless the completion has the Workflow's last command.
+// A replay compares the `seq` and the `stream` of the command with History, not the `bodies`.
 message AppendToStream {
     // Lang's incremental sequence number for appends, starting at 1.
     uint32 seq = 1;
@@ -471,19 +451,15 @@ message AppendToStream {
     repeated temporal.api.common.v1.Payload bodies = 3;
 }
 
-// Closes a Stream. The Workflow Task that sends the command records only the intent to close.
-// Core closes the Stream when History has that task, and sends the result in a
-// `ResolveStreamClose` job of a later task. So a close needs at least one more Workflow Task.
+// Closes a Stream. The Workflow Task of the command records only the intent to close. Core closes
+// the Stream once History has that task, so a task that fails closes nothing, and its retry can
+// still append. The result comes in a `ResolveStreamClose` job of a later task.
 //
-// These rules of `AppendToStream` apply to a close too.
-// * No command cancels it.
-// * Core drops it if it has no result when lang sends the Workflow's last command.
-// * The same cases fail the Workflow Task.
-// * A replay compares the command with History in the same way.
-// * If lang completes the task while the close has no result in a ledger, Core forces a new task.
+// An append that lang sends in the same task is written before the close.
 //
-// Workflow code that needs its close must await the result before its last command. A close whose
-// intent is in History with no result runs again after a replay.
+// The rules of `AppendToStream` about cancellation, the Workflow's last command, task failures and
+// replay apply to a close too. So Workflow code that needs its close must await the result before
+// its last command.
 message CloseStream {
     // Lang's incremental sequence number for closes, starting at 1.
     uint32 seq = 1;
