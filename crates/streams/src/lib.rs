@@ -17,7 +17,7 @@
 //! - An **offset** is the position of a Record in its Stream. The Store assigns it as opaque
 //!   bytes, and the offsets of one Stream sort bytewise in the order of their Records.
 //! - A **Store** is the system that keeps the Records, such as Redis.
-//! - A closed Stream **expires** one **Retention** after its close. An open Stream expires after a
+//! - A closed Stream **expires** after **Retention** has elapsed. An open Stream expires after a
 //!   time with no write, if the Store sets such a time. Both times are settings of the Store. A
 //!   Store answers a call for an expired Stream with `Expired`, and no longer keeps its Records.
 //! - A **Producer** is one writer of a Stream. It's a Workflow run, an Activity, a Local Activity

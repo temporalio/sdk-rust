@@ -43,8 +43,8 @@ pub fn producer_key(producer: &Producer) -> Option<Vec<u8>> {
     Some(key)
 }
 
-/// Returns the proto field number of `kind` in [`Producer`], and the ids of the kind in the order
-/// of their proto fields, each with its name in an error message.
+/// Returns the proto field number of `kind` in [`Producer`], and a list of ids as tuples of the
+/// form (human readable id description, id value)
 pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
     let (namespace_id, workflow, run, activity) =
         ("namespace", "Workflow id", "run id", "Activity id");
@@ -117,7 +117,7 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
     }
 }
 
-/// The length of an [`attempt_key`], in bytes. Stores keep these keys, so it never changes.
+/// The length of an [`attempt_key`], in bytes. Stores keep these keys, so it must never change.
 pub const ATTEMPT_KEY_LEN: usize = 40;
 
 /// Encodes the attempt of a Producer as a fixed-size key. For two attempts of the same Producer,
