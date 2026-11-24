@@ -18,7 +18,7 @@ pub const MAX_STREAM_ID_BYTES: usize = 4096;
 pub const MAX_OFFSET_BYTES: usize = 1024;
 
 /// Checks that a Stream id has 1 to [`MAX_STREAM_ID_BYTES`] bytes.
-pub fn check_stream_id(id: &str) -> Result<(), AnyError> {
+pub fn validate_stream_id(id: &str) -> Result<(), AnyError> {
     if id.is_empty() {
         return Err(AnyError::invalid_argument("The Stream id is empty"));
     }
@@ -33,16 +33,16 @@ pub fn check_stream_id(id: &str) -> Result<(), AnyError> {
 
 /// Checks the ref of a request. Its `id` is the Stream id, and its `store` can be anything, since
 /// only an SDK reads it.
-pub(crate) fn check_ref(stream_ref: Option<&StreamRef>) -> Result<&StreamRef, AnyError> {
+pub(crate) fn validate_ref(stream_ref: Option<&StreamRef>) -> Result<&StreamRef, AnyError> {
     let stream_ref =
         stream_ref.ok_or_else(|| AnyError::invalid_argument("The request has no ref"))?;
-    check_stream_id(&stream_ref.id)?;
+    validate_stream_id(&stream_ref.id)?;
     Ok(stream_ref)
 }
 
 /// Checks that an offset has at most [`MAX_OFFSET_BYTES`] bytes. The error has the given reason,
 /// and its message starts with `what`, which says where the offset is from.
-pub fn check_offset(offset: &[u8], what: &str, reason: AnyReason) -> Result<(), AnyError> {
+pub fn validate_offset(offset: &[u8], what: &str, reason: AnyReason) -> Result<(), AnyError> {
     if offset.len() > MAX_OFFSET_BYTES {
         return Err(AnyError::new(
             reason,
@@ -59,7 +59,7 @@ pub fn check_offset(offset: &[u8], what: &str, reason: AnyReason) -> Result<(), 
 /// attempt. Stores and readers tell Producers apart by their ids, and the attempts of a Producer
 /// by the fields of the attempt, so both have to be complete. The started time of a Workflow Task
 /// is the one optional field, because the server doesn't always send it.
-pub(crate) fn check_producer(producer: Option<&Producer>) -> Result<&Producer, AnyError> {
+pub(crate) fn validate_producer(producer: Option<&Producer>) -> Result<&Producer, AnyError> {
     let producer =
         producer.ok_or_else(|| AnyError::invalid_argument("The request has no Producer"))?;
     let kind = producer.kind.as_ref().ok_or_else(|| missing("kind"))?;
@@ -69,12 +69,12 @@ pub(crate) fn check_producer(producer: Option<&Producer>) -> Result<&Producer, A
     match kind {
         Kind::Workflow(workflow) => {
             let task = workflow.attempt.as_ref();
-            check_task(task.ok_or_else(|| missing("Workflow Task attempt"))?)?;
+            validate_task(task.ok_or_else(|| missing("Workflow Task attempt"))?)?;
         }
         Kind::LocalActivity(local) => {
             let attempt = local.attempt.as_ref().ok_or_else(|| missing("attempt"))?;
             let task = attempt.task.as_ref();
-            check_task(task.ok_or_else(|| missing("Workflow Task that dispatched it"))?)?;
+            validate_task(task.ok_or_else(|| missing("Workflow Task that dispatched it"))?)?;
             at_least_one(attempt.attempt, "Local Activity")?;
         }
         Kind::WorkflowActivity(WorkflowActivityProducer { attempt, .. })
@@ -103,7 +103,7 @@ fn at_least_one(attempt_number: i32, of: &str) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn check_task(task: &WorkflowTaskAttempt) -> Result<(), AnyError> {
+fn validate_task(task: &WorkflowTaskAttempt) -> Result<(), AnyError> {
     // Tasks are ordered by their started event id first, so an attempt without one would sort
     // below every real task.
     if task.started_event_id <= 0 {
@@ -141,7 +141,7 @@ mod tests {
                         "The Stream id has 4097 bytes, more than 4096",
                     )),
                 };
-                assert_eq!(check_ref(Some(&stream_ref)), expected);
+                assert_eq!(validate_ref(Some(&stream_ref)), expected);
             }
         }
     }
@@ -163,14 +163,14 @@ mod tests {
             (client(), &[(0, "namespace"), (3, "client id")]),
         ];
         for (producer, needed) in kinds {
-            assert_eq!(check_producer(Some(&producer)), Ok(&producer));
+            assert_eq!(validate_producer(Some(&producer)), Ok(&producer));
             for (at, id) in needed {
                 let mut ids = ids;
                 ids[*at] = "";
                 let mut without = producer.clone();
                 set_ids(&mut without, ids);
                 let error = AnyError::invalid_argument(format!("The Producer has no {id}"));
-                assert_eq!(check_producer(Some(&without)), Err(error));
+                assert_eq!(validate_producer(Some(&without)), Err(error));
             }
         }
 
@@ -203,7 +203,7 @@ mod tests {
         let time = Some(Timestamp::default());
         // The started time of a Workflow Task is optional.
         for producer in [workflow(no_time(3, 1)), local(dispatched(no_time(3, 1), 1))] {
-            assert_eq!(check_producer(Some(&producer)), Ok(&producer));
+            assert_eq!(validate_producer(Some(&producer)), Ok(&producer));
         }
         let started_event_id = "The Workflow Task attempt has no started event id";
         let cases = [
@@ -241,7 +241,7 @@ mod tests {
         for (producer, message) in cases {
             let error = AnyError::invalid_argument(message);
             assert_eq!(
-                check_producer(producer.as_ref()),
+                validate_producer(producer.as_ref()),
                 Err(error),
                 "{producer:?}"
             );

@@ -3,7 +3,7 @@
 
 use crate::{
     AnyError, AppendError, AppendReason, StreamError,
-    ids::{check_producer, check_ref},
+    ids::{validate_producer, validate_ref},
     proto::{AppendRecordsRequest, Producer},
 };
 use prost::{Message, length_delimiter_len};
@@ -85,9 +85,9 @@ impl StoreLimits {
     /// append. A lang bridge calls it for an append of client code, which reaches its Store through
     /// no runtime with these limits. It computes the stored size of each Record without encoding
     /// it, since a batch can be megabytes long.
-    pub fn check_append(&self, request: &AppendRecordsRequest) -> Result<(), AppendError> {
-        check_ref(request.r#ref.as_ref())?;
-        let producer = check_producer(request.producer.as_ref())?;
+    pub fn validate_append(&self, request: &AppendRecordsRequest) -> Result<(), AppendError> {
+        validate_ref(request.r#ref.as_ref())?;
+        let producer = validate_producer(request.producer.as_ref())?;
         let records = &request.records;
         if records.is_empty() {
             return Err(StreamError::invalid_argument("The batch has no Record"));
@@ -230,7 +230,7 @@ mod tests {
     fn a_store_limit_decides_which_batches_it_takes() {
         let producer = client();
         let check = |limits: StoreLimits, records: &[AppendRecord]| {
-            limits.check_append(&AppendRecordsRequest {
+            limits.validate_append(&AppendRecordsRequest {
                 r#ref: Some(StreamRef {
                     id: "s".to_string(),
                     ..Default::default()

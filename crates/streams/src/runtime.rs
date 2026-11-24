@@ -1,7 +1,7 @@
 use crate::{
     AnyReason, AppendError, CloseError, CreateError, DescribeError, ReadError, StreamError,
     StreamStore,
-    ids::{check_offset, check_producer, check_ref},
+    ids::{validate_offset, validate_producer, validate_ref},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
@@ -47,7 +47,7 @@ impl StreamRuntime {
         request: CreateStreamRequest,
         request_id: String,
     ) -> Result<CreateStreamResponse, CreateError> {
-        let id = check_ref(request.stream_ref.as_ref())?.id.clone();
+        let id = validate_ref(request.stream_ref.as_ref())?.id.clone();
         let policy = request.id_conflict_policy;
         if StreamIdConflictPolicy::try_from(policy).is_err() {
             return Err(StreamError::invalid_argument(format!(
@@ -72,7 +72,7 @@ impl StreamRuntime {
         request: AppendRecordsRequest,
         request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
-        self.limits.check_append(&request)?;
+        self.limits.validate_append(&request)?;
         let appended = self.store.append_records(request, request_id).await?;
         for offset in [&appended.first_offset, &appended.last_offset] {
             if offset.is_empty() {
@@ -80,7 +80,7 @@ impl StreamRuntime {
                     "The Store answered an append with no offset",
                 ));
             }
-            check_offset(offset, "An offset from the Store", AnyReason::StoreCorrupt)?;
+            validate_offset(offset, "An offset from the Store", AnyReason::StoreCorrupt)?;
         }
         if appended.first_offset > appended.last_offset {
             return Err(StreamError::store_corrupt(
@@ -101,8 +101,8 @@ impl StreamRuntime {
         &self,
         request: ReadRecordsRequest,
     ) -> Result<ReadRecordsResponse, ReadError> {
-        check_ref(request.r#ref.as_ref())?;
-        check_offset(
+        validate_ref(request.r#ref.as_ref())?;
+        validate_offset(
             &request.from_offset,
             "The from_offset of the read",
             AnyReason::InvalidArgument,
@@ -137,8 +137,8 @@ impl StreamRuntime {
         &self,
         request: CloseStreamRequest,
     ) -> Result<CloseStreamResponse, CloseError> {
-        check_ref(request.r#ref.as_ref())?;
-        check_producer(request.producer.as_ref())?;
+        validate_ref(request.r#ref.as_ref())?;
+        validate_producer(request.producer.as_ref())?;
         self.store.close_stream(request).await
     }
 
@@ -147,9 +147,9 @@ impl StreamRuntime {
         &self,
         request: DescribeStreamRequest,
     ) -> Result<DescribeStreamResponse, DescribeError> {
-        check_ref(request.r#ref.as_ref())?;
+        validate_ref(request.r#ref.as_ref())?;
         let described = self.store.describe_stream(request).await?;
-        check_offset(
+        validate_offset(
             &described.last_offset,
             "The last offset from the Store",
             AnyReason::StoreCorrupt,
@@ -194,7 +194,7 @@ fn fit_page(
                 "The Store gave a Record with no offset",
             ));
         }
-        check_offset(
+        validate_offset(
             &record.offset,
             "An offset from the Store",
             AnyReason::StoreCorrupt,
@@ -231,7 +231,7 @@ fn fit_page(
         }
         newest = &record.offset;
     }
-    check_offset(
+    validate_offset(
         &page.last_offset,
         "The last offset from the Store",
         AnyReason::StoreCorrupt,
