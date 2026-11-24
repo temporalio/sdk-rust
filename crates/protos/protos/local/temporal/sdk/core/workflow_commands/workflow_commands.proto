@@ -56,6 +56,7 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        ReadStream read_stream = 23;
         AppendToStream append_to_stream = 25;
         CloseStream close_stream = 26;
     }
@@ -464,4 +465,48 @@ message CloseStream {
     // Lang's incremental sequence number for closes, starting at 1.
     uint32 seq = 1;
     temporal.api.stream.v1.StreamRef stream = 2;
+}
+
+// Reads one page of a Stream, which has the Records after `from_offset`. The result comes in one
+// `ResolveStreamRead` job, by the activation rules of `ResolveStreamAppend`. To read on, lang sends
+// a new `ReadStream` from the `last_offset` of the page.
+//
+// A read has a time limit in each Workflow Task (`StreamSettings::read_time`), which is always
+// before the heartbeat of the task. So a read alone never keeps a task open with heartbeats. At
+// the limit, a read with no answer gives a page with no Record whose `last_offset` is its
+// `from_offset`. It fails with `STREAM_ERROR_REASON_STORE_UNAVAILABLE` only if its last try failed
+// or got no answer.
+//
+// Core keeps the Workflow Task while a read has no answer, as for an append, with one difference.
+// A command or a message for the server doesn't wait for a read. Core then completes the task and
+// asks for a new one, and the page comes in a later task.
+//
+// No command cancels a read, so lang must accept the job of a read that nothing awaits. Core drops
+// a read that has no result when lang sends the Workflow's last command.
+//
+// History keeps the offsets, the count and a digest of each page, not its Records. A replay reads
+// the page from the Store again, and fails if the Records are gone or differ. That includes the
+// replay for a query of a closed Workflow.
+//
+// One Workflow Task gives at most 16 MiB of Records. A page that doesn't fit comes in the next
+// task.
+//
+// A negative `wait`, `max_records` or `max_bytes`, or a `from_offset` over 1024 bytes, fails the
+// Workflow Task, as the cases of `AppendToStream` do. A replay compares the `seq`, the `stream`
+// and the `from_offset` of the command with History.
+message ReadStream {
+    // Lang's incremental sequence number for reads, starting at 1.
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The page has the Records after this offset. If it's empty, the page starts at the beginning
+    // of the Stream.
+    bytes from_offset = 3;
+    // How long the read waits for a Record if the Stream has none after `from_offset`. If it's
+    // unset, the read doesn't wait.
+    google.protobuf.Duration wait = 4;
+    // The maximum number of Records in the page, which is 256 if this is zero.
+    int32 max_records = 5;
+    // The maximum size of the Records in the page, which is 4 MiB if this is zero. Core asks the
+    // Store for at most 16 MiB. One larger Record still comes as a page.
+    int64 max_bytes = 6;
 }

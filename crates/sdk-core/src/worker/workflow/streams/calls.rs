@@ -2,36 +2,43 @@
 //! and the Worker's [`StreamManager`](super::StreamManager) runs the requests that they start.
 
 use super::{
-    StreamRuntimes, TaskState,
-    ledger::{LedgerBuilder, Waiting, activation_of, append_job, close_job, seq_of},
-    manager::{Call, Op, Outcome, Request, StreamResolution},
+    DEFAULT_PAGE_BYTES, DEFAULT_PAGE_RECORDS, LedgerReads, StreamRuntimes, StreamSettings,
+    TaskState,
+    ledger::{
+        LedgerBuilder, ReadDone, Waiting, activation_of, append_job, close_job, read_job, seq_of,
+    },
+    manager::{Call, LastTry, Op, Outcome, ReadCall, Request, StreamResolution},
+    replay::{ReplayError, needs_records, offset_text},
 };
 use crate::worker::workflow::WFMachinesError;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    fmt,
+    fmt, mem,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 use temporalio_common::protos::{
     coresdk::{
         workflow_activation::workflow_activation_job,
-        workflow_commands::{AppendToStream, CloseStream},
+        workflow_commands::{AppendToStream, CloseStream, ReadStream},
+        workflow_completion,
     },
     temporal::api::{
         common::v1::Payload,
+        failure::v1::failure::FailureInfo,
         sdk::v1::{
             WorkflowTaskStreamCalls,
-            workflow_task_stream_calls::{AppendResult, CloseIntent, CloseResult},
+            workflow_task_stream_calls::{AppendResult, CloseIntent, CloseResult, ReadResult},
         },
     },
 };
 use temporalio_streams::{
-    AnyError,
+    AnyError, AnyReason,
     attempt::attempt_key,
-    ids::validate_stream_id,
+    ids::{validate_offset, validate_stream_id},
     proto::{
-        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, StreamRef,
-        WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, ReadRecordsRequest,
+        StreamRecord, StreamRef, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
     },
 };
 
@@ -41,6 +48,35 @@ const MAX_STORE_NAME_BYTES: usize = 4096;
 /// One counter for the whole process, so a late result of an evicted run never matches a call of
 /// the run that replaces it.
 static CALL_IDS: AtomicU64 = AtomicU64::new(0);
+
+impl From<ReplayError> for WFMachinesError {
+    fn from(error: ReplayError) -> Self {
+        match error {
+            ReplayError::Gone(message) => WFMachinesError::StreamReplay(message),
+            ReplayError::Unavailable(message) => WFMachinesError::Stream(message),
+        }
+    }
+}
+
+/// The type of the failure of a [`WFMachinesError::StreamReplay`], which can fail the Workflow.
+/// It's a fact of the format of that failure, which History keeps.
+const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
+
+/// Gives the failure of a [`WFMachinesError::StreamReplay`] its type.
+pub(crate) fn set_replay_failure_type(failure: &mut workflow_completion::Failure) {
+    if let Some(FailureInfo::ApplicationFailureInfo(info)) =
+        (failure.failure.as_mut()).and_then(|failure| failure.failure_info.as_mut())
+    {
+        info.r#type = STREAM_REPLAY_ERROR_TYPE.to_string();
+    }
+}
+
+/// Returns true for the failure of a [`WFMachinesError::StreamReplay`].
+pub(crate) fn is_stream_replay_failure(failure: &workflow_completion::Failure) -> bool {
+    let info = (failure.failure.as_ref()).and_then(|failure| failure.failure_info.as_ref());
+    matches!(info, Some(FailureInfo::ApplicationFailureInfo(info))
+        if info.r#type == STREAM_REPLAY_ERROR_TYPE)
+}
 
 /// How far a run is through its History.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +97,7 @@ pub(crate) enum Phase {
 enum CallKey {
     Append(u32),
     Close(u32),
+    Read(u32),
 }
 
 impl fmt::Display for CallKey {
@@ -68,6 +105,7 @@ impl fmt::Display for CallKey {
         match self {
             CallKey::Append(seq) => write!(f, "append {seq}"),
             CallKey::Close(seq) => write!(f, "close {seq}"),
+            CallKey::Read(seq) => write!(f, "read {seq}"),
         }
     }
 }
@@ -109,12 +147,37 @@ enum CloseState {
     Replayed,
 }
 
+struct Read {
+    stream: StreamRef,
+    from_offset: Vec<u8>,
+    state: ReadState,
+}
+
+enum ReadState {
+    /// The read hasn't started. A live one starts once its task is open, and a replayed one once
+    /// the replay is over.
+    Waiting(ReadCall),
+    /// The read runs, and has the failure of its last try while it waits to try again.
+    Running(u64, LastTry),
+    /// The result waits for an activation, in the form that the ledger records it.
+    Done(ReadDone),
+    /// History has the result, which waits for its activation.
+    Replayed,
+}
+
 /// The entries of History's ledgers whose calls Workflow code hasn't issued yet, by seq.
 #[derive(Default)]
 struct Held {
     appends: HashMap<u32, AppendResult>,
     intents: HashMap<u32, CloseIntent>,
     closes: HashMap<u32, CloseResult>,
+    reads: HashMap<u32, HeldRead>,
+}
+
+/// A read result of History, with the Records that the replay has for its page.
+struct HeldRead {
+    entry: ReadResult,
+    records: Result<Vec<StreamRecord>, ReplayError>,
 }
 
 impl Held {
@@ -124,7 +187,9 @@ impl Held {
             .map(|(seq, a)| (activation_of(a.activation_index), CallKey::Append(*seq)));
         let closes = (self.closes.iter())
             .map(|(seq, c)| (activation_of(c.activation_index), CallKey::Close(*seq)));
-        appends.chain(closes).min()
+        let reads = (self.reads.iter())
+            .map(|(seq, r)| (activation_of(r.entry.activation_index), CallKey::Read(*seq)));
+        appends.chain(closes).chain(reads).min()
     }
 }
 
@@ -140,11 +205,15 @@ pub(crate) struct StreamCalls {
     task: TaskState,
     appends: HashMap<u32, Append>,
     closes: HashMap<u32, Close>,
+    reads: HashMap<u32, Read>,
     /// The appends and closes of each Stream, in the order that they were queued. Only the head
     /// runs.
     queues: HashMap<(String, String), VecDeque<CallKey>>,
     last_append: u32,
     last_close: u32,
+    last_read: u32,
+    /// True once the task in hand passed its read limit, so its reads hold it no longer.
+    read_limit_passed: bool,
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
@@ -181,9 +250,12 @@ impl StreamCalls {
             task: TaskState::NoTask,
             appends: HashMap::new(),
             closes: HashMap::new(),
+            reads: HashMap::new(),
             queues: HashMap::new(),
             last_append: 0,
             last_close: 0,
+            last_read: 0,
+            read_limit_passed: false,
             done: BTreeSet::new(),
             held: Held::default(),
             ready: BTreeMap::new(),
@@ -196,6 +268,7 @@ impl StreamCalls {
     /// When the task opens, the head of each queue starts.
     pub(crate) fn set_task(&mut self, state: TaskState) {
         self.task = state;
+        self.read_limit_passed = false;
         self.start_heads();
     }
 
@@ -242,6 +315,62 @@ impl StreamCalls {
         self.match_intent(seq)
     }
 
+    /// Handles a read command. A live read starts at once, and its Store waits at most the time
+    /// that its task has left to its read limit.
+    pub(crate) fn read(&mut self, command: ReadStream) -> Result<(), WFMachinesError> {
+        if self.phase == Phase::Stopped {
+            return Ok(());
+        }
+        let ReadStream {
+            seq,
+            stream,
+            from_offset,
+            wait,
+            max_records,
+            max_bytes,
+        } = command;
+        next_seq("read", seq, &mut self.last_read)?;
+        let call = CallKey::Read(seq);
+        let stream = valid_stream(call, stream)?;
+        let wait = validate_offset(&from_offset, "The offset", AnyReason::InvalidArgument)
+            .and_then(|()| check_page_size(max_records, max_bytes))
+            .and_then(|()| wait.map_or(Ok(Duration::ZERO), wait_duration))
+            .map_err(|error| {
+                WFMachinesError::Fatal(format!("Stream {call} is invalid: {}", error.message))
+            })?;
+        self.check_runtime(&stream)?;
+        // A page must fit a task with no Records yet.
+        let room = self.runtimes.settings.max_task_record_bytes();
+        let max_bytes = match max_bytes {
+            0 => DEFAULT_PAGE_BYTES,
+            max => max,
+        };
+        let request = ReadRecordsRequest {
+            r#ref: Some(stream.clone()),
+            from_offset: from_offset.clone(),
+            max_records: match max_records {
+                0 => DEFAULT_PAGE_RECORDS,
+                max => max,
+            },
+            max_bytes: max_bytes.min(i64::try_from(room).unwrap_or(i64::MAX)),
+            wait: None,
+        };
+        let state = ReadState::Waiting(ReadCall {
+            request,
+            wait,
+            last_try: LastTry::default(),
+        });
+        let read = Read {
+            stream,
+            from_offset,
+            state,
+        };
+        self.reads.insert(seq, read);
+        self.match_read(seq)?;
+        self.run_read(seq);
+        Ok(())
+    }
+
     /// Handles the result of a running call, and starts the next call of its Stream. It ignores the
     /// result of a call that was stopped.
     pub(crate) fn resolve(&mut self, resolution: StreamResolution) {
@@ -251,6 +380,18 @@ impl StreamCalls {
             outcome,
         } = resolution;
         let (call, queue) = match outcome {
+            // A read is in no queue.
+            Outcome::Read(result) => {
+                let Some(read) = self.reads.get_mut(&seq) else {
+                    return;
+                };
+                if !matches!(read.state, ReadState::Running(id, _) if id == call_id) {
+                    return;
+                }
+                read.state = ReadState::Done(result);
+                self.done.insert(CallKey::Read(seq));
+                return;
+            }
             Outcome::Append(result) => {
                 let Some(append) = self.appends.get_mut(&seq) else {
                     return;
@@ -325,13 +466,18 @@ impl StreamCalls {
         jobs
     }
 
-    /// Holds the entries of a ledger from History, each for its call.
-    pub(crate) fn peeked(&mut self, data: WorkflowTaskStreamCalls) -> Result<(), WFMachinesError> {
+    /// Holds the entries of a ledger from History, each for its call, with the Records that the
+    /// replay read for its read entries.
+    pub(crate) fn peeked(
+        &mut self,
+        data: WorkflowTaskStreamCalls,
+        mut replayed: LedgerReads,
+    ) -> Result<(), WFMachinesError> {
         let WorkflowTaskStreamCalls {
             close_intents,
             append_results,
             close_results,
-            ..
+            read_results,
         } = data;
         for intent in close_intents {
             let seq = seq_of(intent.seq)?;
@@ -354,6 +500,23 @@ impl StreamCalls {
             }
             self.match_result(seq)?;
         }
+        for (index, entry) in read_results.into_iter().enumerate() {
+            let seq = seq_of(entry.seq)?;
+            let records = if needs_records(&entry) {
+                (replayed.get_mut(index).and_then(Option::take)).unwrap_or_else(|| {
+                    Err(ReplayError::Unavailable(format!(
+                        "Core read no Records of Stream read {seq} for its replay"
+                    )))
+                })
+            } else {
+                Ok(vec![])
+            };
+            let held = HeldRead { entry, records };
+            if self.held.reads.insert(seq, held).is_some() {
+                return Err(second("result", CallKey::Read(seq)));
+            }
+            self.match_read(seq)?;
+        }
         Ok(())
     }
 
@@ -373,6 +536,9 @@ impl StreamCalls {
         }
         if let Some(seq) = self.held.closes.keys().min() {
             return Err(never("a result", CallKey::Close(*seq)));
+        }
+        if let Some(seq) = self.held.reads.keys().min() {
+            return Err(never("a result", CallKey::Read(*seq)));
         }
         if let Some((_, call)) = self.ready.keys().next() {
             return Err(WFMachinesError::Nondeterminism(format!(
@@ -411,6 +577,7 @@ impl StreamCalls {
         let appends = (self.appends.iter()).map(|(seq, append)| (CallKey::Append(*seq), append));
         let unserved = (appends.map(|(call, append)| (call, &append.stream)))
             .chain((self.closes.iter()).map(|(seq, close)| (CallKey::Close(*seq), &close.stream)))
+            .chain((self.reads.iter()).map(|(seq, read)| (CallKey::Read(*seq), &read.stream)))
             .filter(|(_, stream)| self.runtimes.get(&stream.store).is_none())
             .min_by_key(|(call, _)| *call);
         if let Some((_, stream)) = unserved {
@@ -457,20 +624,24 @@ impl StreamCalls {
             CloseState::Running(call_id) => Some(call_id),
             _ => None,
         });
-        let running = appends
-            .chain(closes)
-            .filter(|call_id| !unsent.contains(call_id));
+        let reads = (self.reads.values()).filter_map(|read| match read.state {
+            ReadState::Running(call_id, _) => Some(call_id),
+            _ => None,
+        });
+        let running = appends.chain(closes).chain(reads);
+        let running = running.filter(|call_id| !unsent.contains(call_id));
         self.requests.extend(running.map(Request::Stop));
         self.phase = Phase::Stopped;
         self.appends.clear();
         self.closes.clear();
+        self.reads.clear();
         self.queues.clear();
         self.done.clear();
     }
 
     /// Returns true while a call has no result in a ledger, so the run needs another task.
     pub(crate) fn needs_next_task(&self) -> bool {
-        !self.appends.is_empty() || !self.closes.is_empty()
+        !self.appends.is_empty() || !self.closes.is_empty() || !self.reads.is_empty()
     }
 
     /// Returns true if the ledger of the task has an entry.
@@ -484,8 +655,10 @@ impl StreamCalls {
         self.next_result_fits(activation) == Some(false)
     }
 
-    /// Returns the number of live calls that hold the task open, as a Local Activity does.
-    pub(crate) fn outstanding(&self) -> usize {
+    /// Returns the number of live calls that hold the task open, as a Local Activity does. A read
+    /// holds it only before its read limit and while the task has no work for the server
+    /// (`has_work_for_server`), so a command never waits for a read.
+    pub(crate) fn outstanding(&self, has_work_for_server: bool) -> usize {
         if self.phase != Phase::Live {
             return 0;
         }
@@ -500,7 +673,35 @@ impl StreamCalls {
         let closes = (self.closes.values())
             .filter(|close| matches!(close.state, CloseState::Waiting(_) | CloseState::Running(_)))
             .count();
-        appends + closes
+        if has_work_for_server || self.read_limit_passed {
+            return appends + closes;
+        }
+        let reads = (self.reads.values())
+            .filter(|read| matches!(read.state, ReadState::Waiting(_) | ReadState::Running(..)))
+            .count();
+        appends + closes + reads
+    }
+
+    pub(crate) fn settings(&self) -> &StreamSettings {
+        &self.runtimes.settings
+    }
+
+    /// Returns true while a live read of the task in hand has no answer.
+    pub(crate) fn read_runs(&self) -> bool {
+        self.phase == Phase::Live
+            && self.task.is_open()
+            && (self.reads.values()).any(|read| matches!(read.state, ReadState::Running(..)))
+    }
+
+    /// Ends the task's reads that have no answer, at its read limit. Each later read of the task
+    /// asks the Store not to wait, and doesn't hold the task.
+    pub(crate) fn read_limit(&mut self) {
+        if self.phase != Phase::Live || !self.task.is_open() {
+            return;
+        }
+        self.read_limit_passed = true;
+        let reads: Vec<CallKey> = self.reads.keys().map(|seq| CallKey::Read(*seq)).collect();
+        self.end_reads(&reads);
     }
 
     /// Returns the activation of the first result from History whose call Workflow code issued.
@@ -643,6 +844,83 @@ impl StreamCalls {
         Ok(())
     }
 
+    /// Gives a replayed read the result that History has for it. An entry of another read is a
+    /// nondeterminism error, and so is an entry whose Records the replay doesn't have.
+    fn match_read(&mut self, seq: u32) -> Result<(), WFMachinesError> {
+        let Some(read) = self.reads.get_mut(&seq) else {
+            return Ok(());
+        };
+        let Some(held) = self.held.reads.remove(&seq) else {
+            return Ok(());
+        };
+        let (call, entry) = (CallKey::Read(seq), &held.entry);
+        check_stream(call, &read.stream, entry.r#ref.as_ref())?;
+        if entry.from_offset != read.from_offset {
+            return Err(WFMachinesError::Nondeterminism(format!(
+                "Stream read {seq} gives the Records after {}, and History has them after {}",
+                offset_text(&read.from_offset),
+                offset_text(&entry.from_offset)
+            )));
+        }
+        if !matches!(read.state, ReadState::Waiting(_)) {
+            return Err(second("result", call));
+        }
+        let records = held.records?;
+        read.state = ReadState::Replayed;
+        let at = (activation_of(entry.activation_index), call);
+        self.ready.insert(at, read_job(seq, entry, records).into());
+        Ok(())
+    }
+
+    /// Starts read `seq` if it waits, the run is live and its task is open.
+    fn run_read(&mut self, seq: u32) {
+        if self.phase != Phase::Live || !self.task.is_open() {
+            return;
+        }
+        let Some(read) = self.reads.get_mut(&seq) else {
+            return;
+        };
+        let ReadState::Waiting(waiting) = &read.state else {
+            return;
+        };
+        let call_id = CALL_IDS.fetch_add(1, Ordering::Relaxed);
+        let running = ReadState::Running(call_id, waiting.last_try.clone());
+        let ReadState::Waiting(call) = mem::replace(&mut read.state, running) else {
+            return;
+        };
+        let call = Call {
+            call_id,
+            seq,
+            store: read.stream.store.clone(),
+            op: Op::Read(call),
+        };
+        self.requests.push(Request::Run(call));
+    }
+
+    /// Ends each read of `calls` that has no answer. Its result is the failure of its last try if
+    /// that try failed, or else a page with no Record.
+    fn end_reads(&mut self, calls: &[CallKey]) {
+        for call in calls {
+            let CallKey::Read(seq) = *call else {
+                continue;
+            };
+            let Some(read) = self.reads.get_mut(&seq) else {
+                continue;
+            };
+            let failure = match &read.state {
+                ReadState::Running(call_id, last_try) => {
+                    stop_call(&mut self.requests, *call_id);
+                    last_try.lock().clone()
+                }
+                ReadState::Waiting(_) => None,
+                ReadState::Done(_) | ReadState::Replayed => continue,
+            };
+            let from_offset = read.from_offset.clone();
+            read.state = ReadState::Done(ReadDone::cut(&read.stream, seq, from_offset, failure));
+            self.done.insert(*call);
+        }
+    }
+
     /// Returns whether the ledger has room for the first result that waits, if the task is open.
     fn next_result_fits(&self, activation: u64) -> Option<bool> {
         let call = *self.done.first()?;
@@ -661,6 +939,12 @@ impl StreamCalls {
                     return None;
                 };
                 Some(self.ledger.has_room_for(result, activation))
+            }
+            CallKey::Read(seq) => {
+                let ReadState::Done(result) = &self.reads[&seq].state else {
+                    return None;
+                };
+                Some(self.ledger.has_room_for_read(result, activation))
             }
         }
     }
@@ -691,11 +975,24 @@ impl StreamCalls {
                 }
                 Some(close_job(seq, &result.entry).into())
             }
+            CallKey::Read(seq) => {
+                let ReadState::Done(result) = &self.reads[&seq].state else {
+                    return None;
+                };
+                if !self.ledger.has_room_for_read(result, activation) {
+                    return None;
+                }
+                let ReadState::Done(result) = self.reads.remove(&seq)?.state else {
+                    return None;
+                };
+                Some(self.ledger.read_result(seq, result, activation).into())
+            }
         }
     }
 
-    /// Starts the call at the head of each queue, once the run is live and its task is open. It
-    /// runs only when the task opens and at go-live, since every other change starts its own head.
+    /// Starts the call at the head of each queue, and each read that waits, once the run is live
+    /// and its task is open. It runs only when the task opens and at go-live, since every other
+    /// change starts its own calls.
     fn start_heads(&mut self) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
@@ -705,6 +1002,11 @@ impl StreamCalls {
             .collect();
         for call in heads {
             self.start(call);
+        }
+        let mut reads: Vec<u32> = self.reads.keys().copied().collect();
+        reads.sort_unstable();
+        for seq in reads {
+            self.run_read(seq);
         }
     }
 
@@ -770,6 +1072,8 @@ impl StreamCalls {
                 };
                 (seq, call_id, &close.stream, Op::Close(request))
             }
+            // A read is in no queue.
+            CallKey::Read(_) => return,
         };
         let call = Call {
             call_id,
@@ -789,6 +1093,10 @@ impl StreamCalls {
             CallKey::Close(seq) => (self.closes.remove(&seq))
                 .filter(|close| !matches!(close.state, CloseState::Done(_)))
                 .map(|close| close.stream),
+            CallKey::Read(seq) => {
+                self.reads.remove(&seq);
+                None
+            }
         };
         if let Some(stream) = stream {
             self.leave_queue(&key(&stream), call);
@@ -856,6 +1164,45 @@ fn valid_stream(call: CallKey, stream: Option<StreamRef>) -> Result<StreamRef, W
             WFMachinesError::Fatal(format!("Stream {call} is invalid: {}", error.message))
         })?;
     Ok(stream)
+}
+
+/// Checks that neither maximum of the page of a read is negative.
+fn check_page_size(max_records: i32, max_bytes: i64) -> Result<(), AnyError> {
+    let maximums = [
+        ("max_records", i64::from(max_records)),
+        ("max_bytes", max_bytes),
+    ];
+    match maximums.into_iter().find(|(_, max)| *max < 0) {
+        Some((field, max)) => Err(AnyError::invalid_argument(format!(
+            "The `{field}` of the read is {max}, which is negative"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Returns the wait of a read, or a failure for a duration that is negative or that has its
+/// nanoseconds out of range.
+fn wait_duration(wait: prost_types::Duration) -> Result<Duration, AnyError> {
+    let prost_types::Duration { seconds, nanos } = wait;
+    match (u64::try_from(seconds), u32::try_from(nanos)) {
+        (Ok(whole), Ok(part)) if part < 1_000_000_000 => Ok(Duration::new(whole, part)),
+        _ => Err(AnyError::invalid_argument(format!(
+            "The wait of the read has {seconds} seconds and {nanos} nanoseconds, which is \
+             negative or has its nanoseconds out of range"
+        ))),
+    }
+}
+
+/// Stops the call `call_id`. A call that the Worker didn't start yet never starts.
+fn stop_call(requests: &mut Vec<Request>, call_id: u64) {
+    let queued = (requests.iter())
+        .position(|request| matches!(request, Request::Run(call) if call.call_id == call_id));
+    match queued {
+        Some(at) => {
+            requests.remove(at);
+        }
+        None => requests.push(Request::Stop(call_id)),
+    }
 }
 
 fn no_ledger() -> WFMachinesError {
@@ -928,13 +1275,18 @@ mod tests {
     use std::sync::Arc;
     use temporalio_common::protos::{
         coresdk::workflow_activation::{
-            ResolveStreamAppend, ResolveStreamClose, resolve_stream_append,
+            ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, resolve_stream_append,
+            resolve_stream_read,
         },
         temporal::api::sdk::v1::workflow_task_stream_calls::{
             AppendOffsets, CallFailure, append_result,
         },
     };
-    use temporalio_streams::{AnyError, StreamRuntime, record::StoreLimits};
+    use temporalio_streams::{
+        AnyError, StreamRuntime,
+        proto::{ClientProducer, ReadRecordsResponse},
+        record::StoreLimits,
+    };
     use tokio::runtime::Handle;
     use workflow_activation_job::Variant;
 
@@ -992,6 +1344,38 @@ mod tests {
         }
     }
 
+    /// Returns the read `seq` of the Stream `id`. It reads after an offset of its own, so that a
+    /// page that ends where it starts shows that the run ended the read.
+    fn read(seq: u32, id: &str) -> ReadStream {
+        ReadStream {
+            seq,
+            stream: Some(stream(id)),
+            from_offset: from_offset(seq),
+            ..Default::default()
+        }
+    }
+
+    fn from_offset(seq: u32) -> Vec<u8> {
+        seq.to_be_bytes().to_vec()
+    }
+
+    /// Returns the Store's page for read `seq`, with `count` Records. It ends past the start of
+    /// the read.
+    fn page(seq: u32, count: usize) -> ReadRecordsResponse {
+        let records = (0..count).map(|at| StreamRecord {
+            offset: [from_offset(seq), vec![at as u8]].concat(),
+            producer: Some(Producer {
+                kind: Some(Kind::Client(ClientProducer::default())),
+            }),
+            body: Some(Payload::default()),
+        });
+        ReadRecordsResponse {
+            records: records.collect(),
+            last_offset: [from_offset(seq), vec![0xff]].concat(),
+            done: false,
+        }
+    }
+
     fn appended(seq: u32) -> append_result::Result {
         append_result::Result::Appended(AppendOffsets {
             first_offset: vec![seq as u8],
@@ -1030,6 +1414,10 @@ mod tests {
                     Request::Run(Call { seq, op, .. }) => match op {
                         Op::Append(r, _) => (CallKey::Append(seq), r.r#ref, r.producer),
                         Op::Close(r) => (CallKey::Close(seq), r.r#ref, r.producer),
+                        // A read writes nothing, so it has no Producer.
+                        Op::Read(r) => {
+                            return format!("read {seq} of {}", r.request.r#ref.unwrap().id);
+                        }
                     },
                     Request::Stop(_) => return "stop".to_string(),
                 };
@@ -1064,6 +1452,17 @@ mod tests {
                 };
                 (call_id, seq, Outcome::Close(failed))
             }
+            CallKey::Read(seq) => {
+                let ReadState::Running(call_id, _) = calls.reads[&seq].state else {
+                    panic!("{call} doesn't run");
+                };
+                let result = match failed {
+                    Some(failure) => Err(failure),
+                    None => Ok(page(seq, 1)),
+                };
+                let done = ReadDone::new(&stream("s"), seq, from_offset(seq), result);
+                (call_id, seq, Outcome::Read(done))
+            }
         };
         calls.resolve(StreamResolution {
             call_id,
@@ -1086,6 +1485,11 @@ mod tests {
                     failed: Some(failure),
                 }) => format!("close {seq}: {}", failure.message),
                 Variant::ResolveStreamClose(close) => format!("close {}", close.seq),
+                Variant::ResolveStreamRead(ResolveStreamRead {
+                    seq,
+                    status: Some(resolve_stream_read::Status::Failed(failure)),
+                }) => format!("read {seq}: {}", failure.message),
+                Variant::ResolveStreamRead(read) => format!("read {}", read.seq),
                 other => panic!("{other:?}"),
             })
             .collect()
@@ -1101,6 +1505,10 @@ mod tests {
             Op::Close(request) => (
                 CallKey::Close(call.seq),
                 &request.r#ref.as_ref().unwrap().id,
+            ),
+            Op::Read(read) => (
+                CallKey::Read(call.seq),
+                &read.request.r#ref.as_ref().unwrap().id,
             ),
         }
     }
@@ -1123,6 +1531,19 @@ mod tests {
                 Outcome::Append(append_result::Result::Failure(failure))
             }
             (Op::Close(_), failure) => Outcome::Close(failure),
+            (Op::Read(read), failure) => {
+                let stream = read.request.r#ref.as_ref().unwrap();
+                let result = match failure {
+                    Some(failure) => Err(failure),
+                    None => Ok(page(call.seq, 2)),
+                };
+                Outcome::Read(ReadDone::new(
+                    stream,
+                    call.seq,
+                    from_offset(call.seq),
+                    result,
+                ))
+            }
         };
         StreamResolution {
             call_id: call.call_id,
@@ -1193,13 +1614,13 @@ mod tests {
         let ledger = history(|ledger| assert!(ledger.append_result(&append_done(1, "1"), 2)));
         let mut replay = calls(Phase::Replaying, 9);
         replay.append(append(1, "1")).unwrap();
-        replay.peeked(ledger).unwrap();
+        replay.peeked(ledger, vec![]).unwrap();
         replay.release_ready();
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
         // A result of the next task waits for its own activation.
         replay.append(append(2, "2")).unwrap();
         let next = history(|ledger| assert!(ledger.append_result(&append_done(2, "2"), 1)));
-        replay.peeked(next).unwrap();
+        replay.peeked(next, vec![]).unwrap();
         assert!(!replay.has_jobs(0, None));
     }
 
@@ -1208,6 +1629,7 @@ mod tests {
     enum Command {
         Append(AppendToStream),
         Close(CloseStream),
+        Read(ReadStream),
         /// A command that ends the Workflow.
         Terminal,
     }
@@ -1267,6 +1689,7 @@ mod tests {
                 match command {
                     Command::Append(append) => self.calls.append(append.clone())?,
                     Command::Close(close) => self.calls.close(close.clone())?,
+                    Command::Read(read) => self.calls.read(read.clone())?,
                     Command::Terminal => {
                         self.calls.stop_for_terminal();
                         self.ended = true;
@@ -1276,10 +1699,11 @@ mod tests {
             Ok(jobs)
         }
 
-        /// Returns the appends and closes that the run still tracks.
+        /// Returns the calls that the run still tracks.
         fn tracked(&self) -> BTreeSet<CallKey> {
             (self.calls.appends.keys().map(|seq| CallKey::Append(*seq)))
                 .chain(self.calls.closes.keys().map(|seq| CallKey::Close(*seq)))
+                .chain(self.calls.reads.keys().map(|seq| CallKey::Read(*seq)))
                 .collect()
         }
     }
@@ -1306,15 +1730,34 @@ mod tests {
             ended: false,
         };
         run.calls.set_task(TaskState::Open(live));
+        // The Store still has the Records of each page that the first run gave.
+        let pages: HashMap<u32, Vec<StreamRecord>> = (history.iter())
+            .flat_map(|task| &task.activations)
+            .flat_map(|activation| &activation.jobs)
+            .filter_map(|job| match job {
+                Variant::ResolveStreamRead(ResolveStreamRead {
+                    seq,
+                    status: Some(resolve_stream_read::Status::Page(page)),
+                }) => Some((*seq, page.records.clone())),
+                _ => None,
+            })
+            .collect();
         let mut replayed = vec![];
         let mut sent_in = None;
         for (index, task) in history.iter().enumerate() {
             if index > 0 && history[index - 1].ledger.is_some() {
                 run.calls.ledger_recorded()?;
             }
-            // Core peeks the ledger that the task's completion recorded before it activates.
+            // Core peeks the ledger that the task's completion recorded before it activates, with
+            // the Records of its read entries.
             if let Some(ledger) = &task.ledger {
-                run.calls.peeked(ledger.clone())?;
+                let records = (ledger.read_results.iter())
+                    .map(|entry| {
+                        let records = pages.get(&(entry.seq as u32)).cloned();
+                        needs_records(entry).then(|| records.ok_or_else(missing))
+                    })
+                    .collect();
+                run.calls.peeked(ledger.clone(), records)?;
             }
             run.activation = 0;
             let mut activations = vec![];
@@ -1353,6 +1796,11 @@ mod tests {
         })
     }
 
+    /// Returns the error of a replay that has no Records for a read entry.
+    fn missing() -> ReplayError {
+        ReplayError::Unavailable("The replay has no Records".to_string())
+    }
+
     /// The cases that the generated scripts reached, over all seeds.
     #[derive(Default)]
     struct Seen {
@@ -1364,6 +1812,10 @@ mod tests {
         /// The commands with a Stream id or a Store name out of range.
         invalid: usize,
         bad_seqs: usize,
+        /// The reads that the read limit ended, and the tasks that completed with a command while
+        /// a read had no answer.
+        ended_reads: usize,
+        reads_left_running: usize,
     }
 
     /// The first run of a generated script. It writes History, and checks a replay of it at each
@@ -1383,10 +1835,13 @@ mod tests {
         deferred: Vec<StreamResolution>,
         last_append: u32,
         last_close: u32,
+        last_read: u32,
+        /// True if the activation that the task completes with has work for the server.
+        has_work_for_server: bool,
         /// The calls whose result no ledger has.
         unresolved: BTreeSet<CallKey>,
         /// The state as of the last task in History, which a failed task goes back to.
-        committed: (u32, u32, BTreeSet<CallKey>),
+        committed: ((u32, u32, u32), BTreeSet<CallKey>),
     }
 
     impl<'a> FirstRun<'a> {
@@ -1408,6 +1863,8 @@ mod tests {
                 deferred: vec![],
                 last_append: 0,
                 last_close: 0,
+                last_read: 0,
+                has_work_for_server: false,
                 unresolved: BTreeSet::new(),
                 committed: Default::default(),
             }
@@ -1477,7 +1934,9 @@ mod tests {
                     self.complete();
                     return Ok(());
                 }
-                if self.run.calls.outstanding() == 0 {
+                let for_server = self.has_work_for_server;
+                if self.run.calls.outstanding(for_server) == 0 {
+                    self.seen.reads_left_running += usize::from(self.run.calls.read_runs());
                     self.complete();
                     return Ok(());
                 }
@@ -1491,6 +1950,12 @@ mod tests {
                     0..=35 => {
                         let resolution = self.answer();
                         self.run.calls.resolve(resolution);
+                        self.dispatch();
+                    }
+                    // The read limit ends each read with no answer.
+                    36 if self.run.calls.read_runs() => {
+                        self.seen.ended_reads += 1;
+                        self.run.calls.read_limit();
                         self.dispatch();
                     }
                     36..=38 => {
@@ -1529,6 +1994,7 @@ mod tests {
                 return Err(());
             }
             let jobs = result.unwrap_or_else(|error| panic!("seed {}: {error:?}", self.seed));
+            self.has_work_for_server = self.rng.random_bool(0.2);
             for resolution in late {
                 self.run.calls.resolve(resolution);
             }
@@ -1539,6 +2005,9 @@ mod tests {
                     }
                     Command::Close(close) => {
                         self.unresolved.insert(CallKey::Close(close.seq));
+                    }
+                    Command::Read(read) => {
+                        self.unresolved.insert(CallKey::Read(read.seq));
                     }
                     Command::Terminal => {
                         self.seen.dropped += usize::from(!self.unresolved.is_empty());
@@ -1569,6 +2038,10 @@ mod tests {
                     45..=69 => {
                         self.last_close += 1;
                         commands.push(Command::Close(close(self.last_close, &id)));
+                    }
+                    73..=79 | 90..=94 => {
+                        self.last_read += 1;
+                        commands.push(Command::Read(read(self.last_read, &id)));
                     }
                     70..=72 => {
                         self.seen.invalid += 1;
@@ -1659,7 +2132,7 @@ mod tests {
                         _ => None,
                     }
                 }
-                Op::Close(_) => self.rng.random_bool(0.3).then(|| refused("refused")),
+                Op::Close(_) | Op::Read(_) => self.rng.random_bool(0.3).then(|| refused("refused")),
             };
             answer(&call, failure)
         }
@@ -1680,12 +2153,18 @@ mod tests {
                 for close in &entry.close_results {
                     self.unresolved.remove(&CallKey::Close(close.seq as u32));
                 }
+                for read in &entry.read_results {
+                    self.unresolved.remove(&CallKey::Read(read.seq as u32));
+                }
             }
             let mut task = std::mem::take(&mut self.task);
             task.ledger = ledger;
             task.ends_workflow = self.run.ended;
             self.history.push(task);
-            self.committed = (self.last_append, self.last_close, self.unresolved.clone());
+            self.committed = (
+                (self.last_append, self.last_close, self.last_read),
+                self.unresolved.clone(),
+            );
             let seed = self.seed;
             assert_eq!(self.run.tracked(), self.unresolved, "seed {seed}");
             let in_flight = &self.in_flight;
@@ -1721,7 +2200,10 @@ mod tests {
             self.run.calls.stop();
             self.in_flight.clear();
             self.deferred.clear();
-            (self.last_append, self.last_close, self.unresolved) = self.committed.clone();
+            (
+                (self.last_append, self.last_close, self.last_read),
+                self.unresolved,
+            ) = self.committed.clone();
             self.task = Task::default();
             self.task_attempt.attempt += 1;
             self.run = self.check_replay(self.task_attempt);
@@ -1759,10 +2241,13 @@ mod tests {
                 let (key, sent) = match op {
                     Op::Append(append, _) => (CallKey::Append(*seq), &append.producer),
                     Op::Close(close) => (CallKey::Close(*seq), &close.producer),
+                    // A read writes nothing, so it has no Producer.
+                    Op::Read(_) => (CallKey::Read(*seq), &None),
                 };
                 assert!(!recorded.contains(&key), "seed {seed}: {key} ran again");
-                let expected = producer(&run.calls.producer, live);
-                assert_eq!(*sent, Some(expected), "seed {seed}");
+                let expected =
+                    (!matches!(key, CallKey::Read(_))).then(|| producer(&run.calls.producer, live));
+                assert_eq!(*sent, expected, "seed {seed}");
                 run.calls.requests.push(request);
             }
             run
@@ -1789,6 +2274,8 @@ mod tests {
             dropped,
             invalid,
             bad_seqs,
+            ended_reads,
+            reads_left_running,
         } = seen;
         let counts = [
             full_ledgers,
@@ -1797,6 +2284,8 @@ mod tests {
             dropped,
             invalid,
             bad_seqs,
+            ended_reads,
+            reads_left_running,
         ];
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
     }
@@ -1969,6 +2458,7 @@ mod tests {
                     let (seq, high) = match call {
                         CallKey::Append(seq) => (*seq, &mut highest.0),
                         CallKey::Close(seq) => (*seq, &mut highest.1),
+                        CallKey::Read(_) => unreachable!("The test makes no read"),
                     };
                     out_of_order += usize::from(seq < *high);
                     *high = seq.max(*high);
@@ -2112,6 +2602,7 @@ mod tests {
                 }
                 (_, Command::Append(append)) => append.stream.as_mut().unwrap().id.push('!'),
                 (_, Command::Close(close)) => close.stream.as_mut().unwrap().id.push('!'),
+                (_, Command::Read(read)) => read.stream.as_mut().unwrap().id.push('!'),
                 (_, Command::Terminal) => return None,
             }
             return Some(change);
@@ -2159,6 +2650,7 @@ mod tests {
                     }
                 }
             }
+            CallKey::Read(_) => unreachable!("No read is in the entries"),
         }
         Some(change)
     }
@@ -2203,7 +2695,7 @@ mod tests {
         nameless.stream.as_mut().unwrap().store.clear();
         replay.append(nameless).unwrap();
         let ledger = history(|m| assert!(m.append_result(&append_done(1, "s"), 0)));
-        replay.peeked(ledger).unwrap();
+        replay.peeked(ledger, vec![]).unwrap();
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
     }
 
@@ -2266,6 +2758,7 @@ mod tests {
                     let tracked = match call {
                         CallKey::Append(seq) => calls.appends.contains_key(&seq),
                         CallKey::Close(seq) => calls.closes.contains_key(&seq),
+                        CallKey::Read(seq) => calls.reads.contains_key(&seq),
                     };
                     assert!(!tracked, "seed {seed}");
                     break;
@@ -2313,6 +2806,7 @@ mod tests {
                     let id = match request {
                         StoreRequest::Append(append, _) => append.r#ref.unwrap().id,
                         StoreRequest::Close(close) => close.r#ref.unwrap().id,
+                        StoreRequest::Read(read) => read.r#ref.unwrap().id,
                     };
                     assert_eq!(store_of[&id], *name, "seed {seed}: Stream {id}");
                 }

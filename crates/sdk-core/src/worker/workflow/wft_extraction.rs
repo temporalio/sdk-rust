@@ -1,3 +1,4 @@
+use super::streams::{ReplayReads, StreamRecordsReq};
 use crate::{
     abstractions::OwnedMeteredSemPermit,
     protosext::ValidPollWFTQResponse,
@@ -13,6 +14,7 @@ use crate::{
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
 use std::{future, sync::Arc};
 use temporalio_common::protos::coresdk::WorkflowSlotInfo;
+use tokio::runtime::Handle;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -28,7 +30,7 @@ pub(super) enum WFTExtractorOutput {
     ),
     NextPage {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        update: FetchedPage,
         span: Span,
         rc: Arc<HistfetchRC>,
     },
@@ -52,6 +54,14 @@ pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
 }
+/// The result of a fetch that a completion waits for.
+#[derive(derive_more::Debug)]
+pub(super) enum FetchedPage {
+    History(HistoryUpdate),
+    /// The Records of the next ledgers of the History that the run has.
+    #[debug("StreamRecords")]
+    StreamRecords(ReplayReads),
+}
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
 #[derive(Debug)]
 pub(super) struct HistfetchRC {}
@@ -62,6 +72,7 @@ impl WFTExtractor {
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
+        records_stream: impl Stream<Item = StreamRecordsReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
@@ -106,7 +117,7 @@ impl WFTExtractor {
             .right_future()
             .left_future()]));
 
-        stream::select_with_strategy(
+        let fetched = stream::select_with_strategy(
             wft_stream,
             fetch_stream.map(move |fetchreq: HistoryFetchReq| {
                 let client = fetch_client.clone();
@@ -135,7 +146,7 @@ impl WFTExtractor {
                             match req.paginator.extract_next_update().await {
                                 Ok(update) => WFTExtractorOutput::NextPage {
                                     paginator: req.paginator,
-                                    update,
+                                    update: FetchedPage::History(update),
                                     span: req.span,
                                     rc,
                                 },
@@ -153,6 +164,16 @@ impl WFTExtractor {
             // Priority always goes to the fetching stream
             |_: &mut ()| PollNext::Right,
         )
-        .buffer_unordered(max_fetch_concurrency)
+        .buffer_unordered(max_fetch_concurrency);
+        // In a separate stage, a Store that gives no answer keeps no poll out of the fetch stage.
+        // Each read runs on the Worker's runtime, so no Store code holds the thread of the runs.
+        let handle = Handle::current();
+        let records = records_stream
+            .map(move |request| {
+                let read = handle.spawn(request.read());
+                read.map(|output| output.map_err(|e| tonic::Status::internal(e.to_string())))
+            })
+            .buffer_unordered(usize::MAX);
+        stream::select(fetched, records)
     }
 }

@@ -50,8 +50,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * Stream results go after the local activity resolutions, because a replay scans ahead for them
-//  too. Appends go before closes, each in `seq` order. If a replay gives several activations in
-//  one, the Stream results keep the order of those activations.
+//  too. Appends go first, then closes, then reads, each in `seq` order. If a replay gives several
+//  activations in one, the Stream results keep the order of those activations.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -151,6 +151,8 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A read of a Stream finished.
+        ResolveStreamRead resolve_stream_read = 17;
         // An append to a Stream finished.
         ResolveStreamAppend resolve_stream_append = 18;
         // A close of a Stream finished.
@@ -473,4 +475,28 @@ message ResolveStreamClose {
     // Unset if the Stream is closed, also when it was already closed. When set, it has the same
     // parts as the `failed` of a `ResolveStreamAppend`.
     temporal.api.failure.v1.Failure failed = 2;
+}
+
+// The result of a `ReadStream`. Each read gets exactly one, unless Core drops the read (see
+// `ReadStream`). The activation rules of `ResolveStreamAppend` apply to it too.
+message ResolveStreamRead {
+    // The `seq` of the `ReadStream`.
+    uint32 seq = 1;
+    oneof status {
+        StreamPage page = 2;
+        // The failure of the read. It has the parts of the `failed` of a `ResolveStreamAppend`.
+        temporal.api.failure.v1.Failure failed = 3;
+    }
+}
+
+message StreamPage {
+    // The Records of the page, in the order of the Stream. It's empty if the Stream is closed and
+    // has no Record after the `from_offset` of the read, or if no Record came while the read
+    // waited.
+    repeated temporal.api.stream.v1.StreamRecord records = 1;
+    // True if the Stream is closed and has no Record after this page.
+    bool done = 2;
+    // The offset where the page ends, also for a page with no Record. The next read can pass it as
+    // its `from_offset`.
+    bytes last_offset = 3;
 }

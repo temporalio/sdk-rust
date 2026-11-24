@@ -54,6 +54,23 @@ relevant information.
   waiting to try again at the task's heartbeat, because a try failed with `StoreUnavailable` or got
   no answer within `try_deadline`, the task fails, and its failure message starts with
   `StreamStoreUnavailable:`.
+* [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. A read
+  gets one page, of at most the `max_records` and the `max_bytes` of the command, in one
+  `ResolveStreamRead` job with the page or a failure. The page has the `last_offset` of the Store's
+  answer, also with no Record, which the next read can pass as its `from_offset`. The result comes
+  in an activation, and the ledger keeps its activation index, as for the result of an append. A
+  read waits at most to the read limit of its task. The new `StreamSettings::read_time` sets that
+  limit, which is half the Workflow Task timeout by default and always before the heartbeat of the
+  task. At the limit a read with no answer gives a page with no Record that ends at its
+  `from_offset`, or a `STORE_UNAVAILABLE` failure if its last try failed. A command or a message for
+  the server doesn't wait for a read. The task then completes, and the result of the read comes in a
+  later task. No command cancels a read. A task gives at most 16 MiB of Records, and its ledger has
+  an entry for each read with a digest of the Records of its page. A replay reads digested Records
+  again, a part of at most 16 MiB at a time, with at most the new
+  `StreamSettings::replay_concurrency` reads at a time, and tries a Store in an outage for at most
+  the new `StreamSettings::replay_retry_bound`, 3 s by default. If the Store doesn't have the same
+  Records, the task fails. With the new `WorkflowErrorType::StreamReplay` variant in
+  `workflow_failure_errors`, the Workflow fails in its place, on the first attempt of the task.
 
 ## [0.12.0] - 2026-11-23
 

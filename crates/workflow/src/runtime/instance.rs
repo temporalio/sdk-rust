@@ -1142,7 +1142,8 @@ where
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
                 Some(
-                    ActivationVariant::ResolveStreamAppend(_)
+                    ActivationVariant::ResolveStreamRead(_)
+                    | ActivationVariant::ResolveStreamAppend(_)
                     | ActivationVariant::ResolveStreamClose(_),
                 ) => {
                     return Err(Box::new(Failure {

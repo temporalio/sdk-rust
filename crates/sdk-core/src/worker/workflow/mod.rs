@@ -38,7 +38,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
-            streams::{StreamResolution, Streams},
+            streams::{StreamRecordsReq, StreamResolution, Streams, set_replay_failure_type},
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -190,6 +190,7 @@ impl Workflows {
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
+        let (records_tx, records_rx) = unbounded_channel();
         let streams = Arc::new(Streams::new(&basics.worker_config, local_tx.clone()));
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
@@ -204,6 +205,7 @@ impl Workflows {
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
+            UnboundedReceiverStream::new(records_rx),
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang
@@ -262,6 +264,11 @@ impl Workflows {
                                     fetch_tx
                                         .send(fetchreq)
                                         .expect("Fetch channel must not be dropped");
+                                }
+                                for request in o.read_stream_records {
+                                    records_tx
+                                        .send(request)
+                                        .expect("Records channel must not be dropped");
                                 }
                                 for action in o.actions {
                                     activation_tx
@@ -984,6 +991,7 @@ struct NextPageReq {
 struct WFStreamOutput {
     actions: VecDeque<WorkflowStreamAction>,
     fetch_histories: VecDeque<HistoryFetchReq>,
+    read_stream_records: VecDeque<StreamRecordsReq>,
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -1529,7 +1537,6 @@ impl ValidatedCompletion {
 }
 
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
     Stream(StreamResolution),
@@ -1644,6 +1651,7 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    ReadStream(ReadStream),
     AppendToStream(AppendToStream),
     CloseStream(CloseStream),
 }
@@ -1707,6 +1715,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::ReadStream(s) => WFCommandVariant::ReadStream(s),
             workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
             workflow_command::Variant::CloseStream(s) => WFCommandVariant::CloseStream(s),
         };
@@ -1789,6 +1798,9 @@ pub(crate) enum WFMachinesError {
     /// outage. Lang gets the message as-is. For an outage it starts with `StreamStoreUnavailable:`.
     #[error("{0}")]
     Stream(String),
+    /// A replay whose Store has lost or changed the Records that a read of the first run got.
+    #[error("{0}")]
+    StreamReplay(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1823,12 +1835,14 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_)
+            | WFMachinesError::Stream(_)
+            | WFMachinesError::StreamReplay(_) => EvictionReason::Fatal,
         }
     }
 
     fn as_failure(&self) -> Failure {
-        Failure {
+        let mut failure = Failure {
             failure: Some(
                 temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
                     self.to_string(),
@@ -1836,7 +1850,11 @@ impl WFMachinesError {
                 ),
             ),
             force_cause: WorkflowTaskFailedCause::from(self.evict_reason()) as i32,
+        };
+        if let WFMachinesError::StreamReplay(_) = self {
+            set_replay_failure_type(&mut failure);
         }
+        failure
     }
 }
 
@@ -1942,7 +1960,8 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::DoUpdate(_) => 3,
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
                 workflow_activation_job::Variant::ResolveStreamAppend(_)
-                | workflow_activation_job::Variant::ResolveStreamClose(_) => 5,
+                | workflow_activation_job::Variant::ResolveStreamClose(_)
+                | workflow_activation_job::Variant::ResolveStreamRead(_) => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.
