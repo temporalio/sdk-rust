@@ -48,9 +48,10 @@ use futures_util::future::BoxFuture;
 ///
 /// When the Store fails or doesn't respond in time, it returns
 /// [`AnyReason::StoreUnavailable`](crate::AnyReason::StoreUnavailable), which tells the caller
-/// that a retry may succeed. Core tries a call of Workflow code again after that reason, with no
-/// time limit, and Workflow code never gets that error. So a Store returns it only for a failure
-/// that can be resolved at a later try.
+/// that a retry may succeed. Core tries an append or a close of Workflow code again after that
+/// reason, with no time limit, and Workflow code never gets that error for them. A read of
+/// Workflow code has a time limit, so it can end with that error. So a Store returns it only for
+/// a failure that can be resolved at a later try.
 ///
 /// # How callers call a Store
 ///
@@ -59,10 +60,10 @@ use futures_util::future::BoxFuture;
 /// not block the appends of the Store.
 ///
 /// A caller can drop the future of any call at any `await`. Core does so at the deadline of a try,
-/// and when Workflow code stops a read. The call may still take effect, and the Store must stay
-/// usable after it. For example, a Store must not reuse a connection if it didn't read the answer
-/// of the last call on it. A resend can arrive while its first try still runs, and the Store still
-/// writes the batch once.
+/// and when a read of Workflow code reaches its time limit. The call may still take effect, and
+/// the Store must stay usable after it. For example, a Store must not reuse a connection if it
+/// didn't read the answer of the last call on it. A resend can arrive while its first try still
+/// runs, and the Store still writes the batch once.
 ///
 /// # What the runtime checks
 ///
