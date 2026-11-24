@@ -21546,6 +21546,12 @@ components:
             Version of the SDK that processed the task. This is usually something like "1.20.0" and is
              usually the same as client-version gRPC header. This should only be set if its value changed
              since the last time recorded on the workflow (or be set on the first task).
+        coreStreamCalls:
+          type: string
+          description: |-
+            The Stream calls of this Workflow Task, in a format that SDK Core owns. A replay gives
+             Workflow code the same results from it.
+          format: bytes
     WorkflowTaskFailedEventAttributes:
       type: object
       properties:
