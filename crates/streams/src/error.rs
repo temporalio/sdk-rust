@@ -22,7 +22,7 @@ pub enum AnyReason {
     FormatTooNew,
 }
 
-/// The reasons that a create returns, besides the ones of [`AnyReason`].
+/// The reasons that a create returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
 #[non_exhaustive]
 pub enum CreateReason {
@@ -32,9 +32,11 @@ pub enum CreateReason {
     Closed,
     /// The Stream expired. A create fails for it with either conflict policy.
     Expired,
+    /// A reason that any call can return.
+    Other(AnyReason),
 }
 
-/// The reasons that an append returns, besides the ones of [`AnyReason`].
+/// The reasons that an append returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
 #[non_exhaustive]
 pub enum AppendReason {
@@ -51,9 +53,11 @@ pub enum AppendReason {
     /// A Record or the batch is larger than the Store allows. The runtime returns it for a batch
     /// over its [`StoreLimits`](crate::record::StoreLimits).
     TooLarge,
+    /// A reason that any call can return.
+    Other(AnyReason),
 }
 
-/// The reasons that a read returns, besides the ones of [`AnyReason`].
+/// The reasons that a read returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
 #[non_exhaustive]
 pub enum ReadReason {
@@ -65,9 +69,11 @@ pub enum ReadReason {
     /// The read's `from_offset` is past the end of the Stream. A read from it works again once the
     /// Stream has Records up to it.
     OffsetTooHigh,
+    /// A reason that any call can return.
+    Other(AnyReason),
 }
 
-/// The reasons that a close returns, besides the ones of [`AnyReason`].
+/// The reasons that a close returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
 #[non_exhaustive]
 pub enum CloseReason {
@@ -79,9 +85,11 @@ pub enum CloseReason {
     /// A later attempt of the closing Producer has already written to the Stream. Only a Store
     /// that fences returns it.
     Fenced,
+    /// A reason that any call can return.
+    Other(AnyReason),
 }
 
-/// The reasons that a describe returns, besides the ones of [`AnyReason`].
+/// The reasons that a describe returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
 #[non_exhaustive]
 pub enum DescribeReason {
@@ -90,31 +98,17 @@ pub enum DescribeReason {
     NotFound,
     /// The Stream expired.
     Expired,
-}
-
-/// Why a Stream call failed. `R` is the reason enum of the call's operation, such as
-/// [`AppendReason`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reason<R> {
-    /// A reason of the call's operation.
-    Op(R),
     /// A reason that any call can return.
-    Any(AnyReason),
+    Other(AnyReason),
 }
 
-impl<R> From<AnyReason> for Reason<R> {
-    fn from(reason: AnyReason) -> Self {
-        Self::Any(reason)
-    }
-}
-
-/// The error that a failed Stream call returns. `R` is the type of its reason, which is a
-/// [`Reason`] of the call's operation, or [`AnyReason`] for a check that all operations share.
+/// The error that a failed Stream call returns. `R` is the reason enum of the call's operation,
+/// such as [`AppendReason`], or [`AnyReason`] for a check that all operations share.
 ///
 /// A Store fails a call with a reason of its operation, or with one that any call can return:
 ///
 /// ```
-/// use temporalio_streams::{AnyError, AppendError, AppendReason, ReadError};
+/// use temporalio_streams::{AnyError, AnyReason, AppendError, AppendReason, ReadError};
 ///
 /// let closed = AppendError::operation(AppendReason::Closed, "The Stream is closed");
 /// assert_eq!(closed.to_string(), "stream_closed: The Stream is closed");
@@ -123,6 +117,7 @@ impl<R> From<AnyReason> for Reason<R> {
 ///
 /// // An `AnyError` becomes the error of any operation, which is what `?` does with it.
 /// let invalid: AppendError = AnyError::invalid_argument("The Stream id is empty").into();
+/// assert_eq!(invalid.reason, AppendReason::Other(AnyReason::InvalidArgument));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamError<R> {
@@ -133,15 +128,15 @@ pub struct StreamError<R> {
 }
 
 /// The error of a create.
-pub type CreateError = StreamError<Reason<CreateReason>>;
+pub type CreateError = StreamError<CreateReason>;
 /// The error of an append.
-pub type AppendError = StreamError<Reason<AppendReason>>;
+pub type AppendError = StreamError<AppendReason>;
 /// The error of a read.
-pub type ReadError = StreamError<Reason<ReadReason>>;
+pub type ReadError = StreamError<ReadReason>;
 /// The error of a close.
-pub type CloseError = StreamError<Reason<CloseReason>>;
+pub type CloseError = StreamError<CloseReason>;
 /// The error of a describe.
-pub type DescribeError = StreamError<Reason<DescribeReason>>;
+pub type DescribeError = StreamError<DescribeReason>;
 /// An error that any call can return. `?` converts it into the error of an operation.
 pub type AnyError = StreamError<AnyReason>;
 
@@ -155,10 +150,10 @@ impl<R> StreamError<R> {
     }
 }
 
-impl<R> StreamError<Reason<R>> {
+impl<R: WireReason> StreamError<R> {
     /// Creates an error with a reason of the call's operation.
     pub fn operation(reason: R, message: impl Into<String>) -> Self {
-        Self::new(Reason::Op(reason), message)
+        Self::new(reason, message)
     }
 }
 
@@ -206,7 +201,7 @@ impl<R: Copy + Into<StreamErrorReason>> fmt::Display for StreamError<R> {
 
 impl<R: Copy + fmt::Debug + Into<StreamErrorReason>> std::error::Error for StreamError<R> {}
 
-impl<R> From<AnyError> for StreamError<Reason<R>> {
+impl<R: WireReason> From<AnyError> for StreamError<R> {
     fn from(error: AnyError) -> Self {
         Self::new(error.reason, error.message)
     }
@@ -230,6 +225,7 @@ impl From<CreateReason> for StreamErrorReason {
             CreateReason::AlreadyExists => Self::AlreadyExists,
             CreateReason::Closed => Self::Closed,
             CreateReason::Expired => Self::Expired,
+            CreateReason::Other(reason) => reason.into(),
         }
     }
 }
@@ -242,6 +238,7 @@ impl From<AppendReason> for StreamErrorReason {
             AppendReason::Closed => Self::Closed,
             AppendReason::Fenced => Self::Fenced,
             AppendReason::TooLarge => Self::TooLarge,
+            AppendReason::Other(reason) => reason.into(),
         }
     }
 }
@@ -252,6 +249,7 @@ impl From<ReadReason> for StreamErrorReason {
             ReadReason::NotFound => Self::NotFound,
             ReadReason::Expired => Self::Expired,
             ReadReason::OffsetTooHigh => Self::OffsetTooHigh,
+            ReadReason::Other(reason) => reason.into(),
         }
     }
 }
@@ -262,6 +260,7 @@ impl From<CloseReason> for StreamErrorReason {
             CloseReason::NotFound => Self::NotFound,
             CloseReason::Expired => Self::Expired,
             CloseReason::Fenced => Self::Fenced,
+            CloseReason::Other(reason) => reason.into(),
         }
     }
 }
@@ -271,26 +270,39 @@ impl From<DescribeReason> for StreamErrorReason {
         match reason {
             DescribeReason::NotFound => Self::NotFound,
             DescribeReason::Expired => Self::Expired,
+            DescribeReason::Other(reason) => reason.into(),
         }
     }
 }
 
-impl<R: Into<StreamErrorReason>> From<Reason<R>> for StreamErrorReason {
-    fn from(reason: Reason<R>) -> Self {
-        match reason {
-            Reason::Op(reason) => reason.into(),
-            Reason::Any(reason) => reason.into(),
-        }
-    }
+/// The reason enum of one operation, such as [`AppendReason`]. [`StreamError::from_wire`] finds the
+/// reason of a number among the values of the enum.
+pub trait WireReason:
+    Sequence + Copy + From<AnyReason> + Into<StreamErrorReason> + 'static
+{
 }
 
-/// A reason enum of this crate. [`StreamError::from_wire`] finds the reason of a number among the
-/// values of the enum.
-pub trait WireReason: Sequence + Copy + Into<StreamErrorReason> + 'static {}
+macro_rules! operation_reasons {
+    ($($reason:ident),*) => {$(
+        impl From<AnyReason> for $reason {
+            fn from(reason: AnyReason) -> Self {
+                Self::Other(reason)
+            }
+        }
 
-impl<R: Sequence + Copy + Into<StreamErrorReason> + 'static> WireReason for R {}
+        impl WireReason for $reason {}
+    )*};
+}
 
-impl<R: WireReason> StreamError<Reason<R>> {
+operation_reasons!(
+    CreateReason,
+    AppendReason,
+    ReadReason,
+    CloseReason,
+    DescribeReason
+);
+
+impl<R: WireReason> StreamError<R> {
     /// Creates the error of an operation from the number of a `StreamErrorReason` and a message.
     /// The bridge of a lang SDK uses it to return the error of a Store that is written in the
     /// SDK's language. Zero, an unknown number and a reason that the operation can't return give
@@ -298,10 +310,8 @@ impl<R: WireReason> StreamError<Reason<R>> {
     pub fn from_wire(reason: i32, message: impl Into<String>) -> Self {
         let message = message.into();
         let wire = StreamErrorReason::try_from(reason).ok();
-        let found = wire.and_then(|wire| {
-            let any = find(wire).map(Reason::Any);
-            any.or_else(|| find(wire).map(Reason::Op))
-        });
+        let found =
+            wire.and_then(|wire| enum_iterator::all::<R>().find(|reason| (*reason).into() == wire));
         match found {
             Some(reason) => Self::new(reason, message),
             None => Self::store_corrupt(format!(
@@ -310,10 +320,6 @@ impl<R: WireReason> StreamError<Reason<R>> {
             )),
         }
     }
-}
-
-fn find<R: WireReason>(wire: StreamErrorReason) -> Option<R> {
-    enum_iterator::all::<R>().find(|reason| (*reason).into() == wire)
 }
 
 #[cfg(test)]
@@ -330,7 +336,7 @@ mod tests {
             // The numbers of the proto, with zero, and one that the proto doesn't have.
             let unknown = (1..).find(|number| Wire::try_from(*number).is_err());
             for number in 0..=unknown.unwrap() {
-                let error = StreamError::<Reason<R>>::from_wire(number, "It failed");
+                let error = StreamError::<R>::from_wire(number, "It failed");
                 let returned = (Wire::try_from(number).ok()).filter(|wire| returns.contains(wire));
                 let expected = match returned {
                     Some(wire) => (wire, "It failed".to_string()),

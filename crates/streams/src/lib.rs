@@ -44,8 +44,7 @@ mod test_store;
 
 pub use error::{
     AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
-    CreateReason, DescribeError, DescribeReason, ReadError, ReadReason, Reason, StreamError,
-    WireReason,
+    CreateReason, DescribeError, DescribeReason, ReadError, ReadReason, StreamError, WireReason,
 };
 pub use runtime::StreamRuntime;
 pub use store::StreamStore;
