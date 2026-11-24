@@ -26,19 +26,28 @@ pub(super) enum WFTExtractorOutput {
     FetchResult(
         PermittedWFT,
         // Field isn't read, but we need to hold on to it.
-        #[allow(dead_code)] Arc<HistfetchRC>,
+        #[cfg(not(feature = "exp-poller-v2"))]
+        #[allow(dead_code)]
+        Arc<HistfetchRC>,
+        #[cfg(feature = "exp-poller-v2")]
+        #[allow(dead_code)]
+        (),
     ),
     NextPage {
         paginator: HistoryPaginator,
         update: HistoryUpdate,
         span: Span,
+        #[cfg(not(feature = "exp-poller-v2"))]
         rc: Arc<HistfetchRC>,
+        #[cfg(feature = "exp-poller-v2")]
+        rc: (),
     },
     FailedFetch {
         run_id: String,
         err: tonic::Status,
         auto_reply_fail: Option<UnstoredWftFailInfo>,
     },
+    #[cfg(not(feature = "exp-poller-v2"))]
     PollerDead,
 }
 
@@ -49,16 +58,29 @@ pub(crate) type WFTStreamIn = Result<
     ),
     tonic::Status,
 >;
+
+#[cfg(not(feature = "exp-poller-v2"))]
 #[derive(derive_more::From, Debug)]
 pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
 }
+
+// TODO: after removing old poller code, remove the unit 2nd field
+#[cfg(feature = "exp-poller-v2")]
+#[derive(derive_more::From, Debug)]
+pub(super) enum HistoryFetchReq {
+    Full(Box<CacheMissFetchReq>, ()),
+    NextPage(Box<NextPageReq>, ()),
+}
+
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
+#[cfg(not(feature = "exp-poller-v2"))]
 #[derive(Debug)]
 pub(super) struct HistfetchRC {}
 
 impl WFTExtractor {
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) fn build(
         client: Arc<dyn WorkerClient>,
         max_fetch_concurrency: usize,
@@ -158,7 +180,8 @@ impl WFTExtractor {
         .buffer_unordered(max_fetch_concurrency)
     }
 
-    pub(super) fn build_v2(
+    #[cfg(feature = "exp-poller-v2")]
+    pub(super) fn build(
         client: Arc<dyn WorkerClient>,
         max_fetch_concurrency: usize,
         wft_poller: impl pollers_v2::Poller<Item = WFTStreamIn> + Send + 'static,

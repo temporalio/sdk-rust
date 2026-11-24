@@ -14,8 +14,8 @@ use std::sync::Arc;
 use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(feature = "exp-poller-v2"))]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
     sticky_queue_name: &Option<String>,
@@ -92,9 +92,9 @@ pub(crate) fn make_wft_poller(
     new_wft_poller(wf_task_poll_buffer, metrics.clone())
 }
 
+#[cfg(feature = "exp-poller-v2")]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn make_wft_poller_v2(
+pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
     sticky_queue_name: &Option<String>,
     client: &Arc<dyn WorkerClient>,
@@ -171,9 +171,10 @@ pub(crate) fn make_wft_poller_v2(
         Some(sp) => crate::pollers_v2::select(wf_task_poll_buffer, sp).left_poller(),
         None => wf_task_poll_buffer.right_poller(),
     };
-    new_wft_poller_v2(wf_task_poll_buffer, metrics.clone())
+    new_wft_poller(wf_task_poll_buffer, metrics.clone())
 }
 
+#[cfg(not(feature = "exp-poller-v2"))]
 fn new_wft_poller(
     poller: BoxedWFPoller,
     metrics: MetricsContext,
@@ -226,7 +227,8 @@ fn new_wft_poller(
     })
 }
 
-fn new_wft_poller_v2(
+#[cfg(feature = "exp-poller-v2")]
+fn new_wft_poller(
     poller: impl crate::pollers_v2::Poller<
         Item = Result<
             (

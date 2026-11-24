@@ -954,7 +954,7 @@ impl Worker {
 
                         #[cfg(feature = "exp-poller-v2")]
                         let wft_stream = if config.task_types.enable_workflows {
-                            let poller = workflow::wft_poller::make_wft_poller_v2(
+                            let poller = workflow::wft_poller::make_wft_poller(
                                 &config,
                                 &sticky_queue_name,
                                 &client,
@@ -1132,12 +1132,7 @@ impl Worker {
                 });
 
                 let workflows = wft_stream.map(|stream| {
-                    #[cfg(not(feature = "exp-poller-v2"))]
-                    let new = Workflows::new;
-                    #[cfg(feature = "exp-poller-v2")]
-                    let new = Workflows::new_v2;
-
-                    new(
+                    Workflows::new(
                         WorkflowBasics {
                             worker_config: Arc::new(config.clone()),
                             shutdown_token: shutdown_token.child_token(),
@@ -1691,6 +1686,7 @@ impl Worker {
 
         // Push a BumpStream message to the workflow activation queue. This ensures that
         // any pending workflow activation polls will resolve, even if there are no other inputs.
+        #[cfg(not(feature = "exp-poller-v2"))]
         if let Some(workflows) = self.task_subsystems.workflows.as_ref() {
             workflows.bump_stream();
         }

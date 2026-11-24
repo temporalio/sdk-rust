@@ -5,7 +5,7 @@ use crate::{
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
-        wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
+        wft_extraction::{HistoryFetchReq, WFTExtractorOutput},
         *,
     },
 };
@@ -17,6 +17,9 @@ use temporalio_common::protos::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, Span};
+
+#[cfg(not(feature = "exp-poller-v2"))]
+use crate::worker::workflow::wft_extraction::HistfetchRC;
 
 /// This struct holds all the state needed for tracking the state of currently cached workflow runs
 /// and directs all actions which affect them. It is ultimately the top-level arbiter of nearly
@@ -33,7 +36,9 @@ pub(super) struct WFStream {
     /// manipulation. Must be drained after handling each input.
     runs_needing_fetching: VecDeque<HistoryFetchReq>,
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     history_fetch_refcounter: Arc<HistfetchRC>,
+
     shutdown_token: CancellationToken,
 
     metrics: MetricsContext,
@@ -61,6 +66,7 @@ impl WFStream {
     /// local activity management. Likely the best option would be to move the pure state info
     /// needed to determine immediate responses into LA state machines themselves (out of the LA
     /// manager), which is a quite substantial change.
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) fn build(
         basics: WorkflowBasics,
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
@@ -80,7 +86,8 @@ impl WFStream {
         Self::build_internal(all_inputs, basics, local_activity_request_sink)
     }
 
-    pub(super) fn build_v2(
+    #[cfg(feature = "exp-poller-v2")]
+    pub(super) fn build(
         basics: WorkflowBasics,
         wft_poller: impl crate::pollers_v2::Poller<Item = Result<WFTExtractorOutput, tonic::Status>>
         + Send
@@ -92,9 +99,10 @@ impl WFStream {
             local_poller.map(|_, t| t.into()),
             wft_poller.map(|_, t| ExternalPollerInputs::from(t).into()),
         );
-        Self::build_internal_v2(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(all_inputs, basics, local_activity_request_sink)
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
@@ -251,7 +259,8 @@ impl WFStream {
             .take_while(|o| future::ready(!matches!(o, Err(PollError::ShutDown))))
     }
 
-    fn build_internal_v2(
+    #[cfg(feature = "exp-poller-v2")]
+    fn build_internal(
         all_inputs: impl crate::pollers_v2::Poller<Item = WFStreamInput> + Send + 'static,
         basics: WorkflowBasics,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
@@ -268,7 +277,6 @@ impl WFStream {
             shutdown_token: basics.shutdown_token,
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
-            history_fetch_refcounter: Arc::new(HistfetchRC {}),
         };
 
         all_inputs
@@ -325,9 +333,6 @@ impl WFStream {
                                 });
                                 None
                             }
-                            LocalInputs::BumpStream => {
-                                panic!("WFStream v2 should never receive BumpStream")
-                            }
                         }
                     }
                     WFStreamInput::FailedFetch {
@@ -364,9 +369,6 @@ impl WFStream {
                                 })
                                 .into_run_update_resp()
                         }
-                    }
-                    WFStreamInput::PollerDead => {
-                        panic!("WFStream v2 should never receive PollerDead");
                     }
                     WFStreamInput::PollerError(e) => {
                         return Err(PollError::TonicError(e));
@@ -453,9 +455,13 @@ impl WFStream {
             debug!(run_id=?run_id, "Workflow task has partial history, but workflow is not in \
                    cache. Will fetch history");
             self.metrics.sticky_cache_miss();
+            #[cfg(not(feature = "exp-poller-v2"))]
+            let rc = self.history_fetch_refcounter.clone();
+            #[cfg(feature = "exp-poller-v2")]
+            let rc = ();
             return Err(HistoryFetchReq::Full(
                 Box::new(CacheMissFetchReq { original_wft: pwft }),
-                self.history_fetch_refcounter.clone(),
+                rc,
             ));
         }
 
@@ -487,11 +493,12 @@ impl WFStream {
                 ) {
                     Ok(acts) => acts,
                     Err(npr) => {
+                        #[cfg(not(feature = "exp-poller-v2"))]
+                        let rc = self.history_fetch_refcounter.clone();
+                        #[cfg(feature = "exp-poller-v2")]
+                        let rc = ();
                         self.runs_needing_fetching
-                            .push_back(HistoryFetchReq::NextPage(
-                                npr,
-                                self.history_fetch_refcounter.clone(),
-                            ));
+                            .push_back(HistoryFetchReq::NextPage(npr, rc));
                         None
                     }
                 },
@@ -778,13 +785,16 @@ impl WFStream {
 
     fn shutdown_done(&self) -> bool {
         #[cfg(not(feature = "exp-poller-v2"))]
-        if !self.shutdown_token.is_cancelled() {
-            return false;
+        {
+            if !self.shutdown_token.is_cancelled() {
+                return false;
+            }
+            if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
+                // Don't exit if there are outstanding fetch requests
+                return false;
+            }
         }
-        if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
-            // Don't exit if there are outstanding fetch requests
-            return false;
-        }
+
         let all_runs_ready = self.runs.handles().all(|r| !r.has_any_pending_work(false));
         if all_runs_ready {
             return true;
@@ -815,6 +825,7 @@ enum WFStreamInput {
     NewWft(Box<PermittedWFT>),
     Local(Box<LocalInput>),
     /// The stream given to us which represents the poller (or a mock) terminated.
+    #[cfg(not(feature = "exp-poller-v2"))]
     PollerDead,
     /// The stream given to us which represents the poller (or a mock) encountered a non-retryable
     /// error while polling
@@ -869,6 +880,7 @@ pub(super) enum LocalInputs {
     #[from(ignore)]
     LocalActivityCancelProcessed(String),
     GetStateInfo(GetStateInfoMsg),
+    #[cfg(not(feature = "exp-poller-v2"))]
     BumpStream,
 }
 impl LocalInputs {
@@ -881,7 +893,9 @@ impl LocalInputs {
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(run_id)
             | LocalInputs::LocalActivityCancelProcessed(run_id) => run_id,
-            LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
+            LocalInputs::GetStateInfo(_) => return None,
+            #[cfg(not(feature = "exp-poller-v2"))]
+            LocalInputs::BumpStream => return None,
         })
     }
 }
@@ -889,6 +903,7 @@ impl LocalInputs {
 #[allow(clippy::large_enum_variant)] // PollerDead only ever gets used once, so not important.
 enum ExternalPollerInputs {
     NewWft(PermittedWFT),
+    #[cfg(not(feature = "exp-poller-v2"))]
     PollerDead,
     PollerError(tonic::Status),
     FetchedUpdate(PermittedWFT),
@@ -907,6 +922,7 @@ impl From<ExternalPollerInputs> for WFStreamInput {
     fn from(l: ExternalPollerInputs) -> Self {
         match l {
             ExternalPollerInputs::NewWft(v) => WFStreamInput::NewWft(Box::new(v)),
+            #[cfg(not(feature = "exp-poller-v2"))]
             ExternalPollerInputs::PollerDead => WFStreamInput::PollerDead,
             ExternalPollerInputs::PollerError(e) => WFStreamInput::PollerError(e),
             ExternalPollerInputs::FetchedUpdate(wft) => WFStreamInput::NewWft(Box::new(wft)),
@@ -956,6 +972,7 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
                 err,
                 auto_reply_fail,
             },
+            #[cfg(not(feature = "exp-poller-v2"))]
             Ok(WFTExtractorOutput::PollerDead) => ExternalPollerInputs::PollerDead,
             Err(e) => ExternalPollerInputs::PollerError(e),
         }

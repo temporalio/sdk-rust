@@ -174,8 +174,8 @@ pub(crate) struct RunBasics<'a> {
 }
 
 impl Workflows {
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
-    #[allow(dead_code)]
     pub(super) fn new(
         basics: WorkflowBasics,
         sticky_attrs: Option<StickyExecutionAttributes>,
@@ -298,9 +298,9 @@ impl Workflows {
         }
     }
 
+    #[cfg(feature = "exp-poller-v2")]
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
-    #[allow(dead_code)]
-    pub(super) fn new_v2(
+    pub(super) fn new(
         basics: WorkflowBasics,
         sticky_attrs: Option<StickyExecutionAttributes>,
         client: Arc<dyn WorkerClient>,
@@ -322,7 +322,7 @@ impl Workflows {
         let default_versioning_behavior = basics.default_versioning_behavior;
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
-        let extracted_wft_poller = WFTExtractor::build_v2(
+        let extracted_wft_poller = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
             wft_poller,
@@ -371,7 +371,7 @@ impl Workflows {
                         return;
                     }
 
-                    let mut stream = std::pin::pin!(WFStream::build_v2(
+                    let mut stream = std::pin::pin!(WFStream::build(
                         basics,
                         extracted_wft_poller,
                         locals_poller,
@@ -857,9 +857,9 @@ impl Workflows {
 
     /// Send a `BumpStream` message to the workflow stream. This ensures that any pending
     /// workflow activation polls will resolve, like during shutdown, even if there are no other inputs.
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) fn bump_stream(&self) {
         // BumpStream breaks poller v2, making it no-op works
-        #[cfg(not(feature = "exp-poller-v2"))]
         self.send_local(LocalInputs::BumpStream);
     }
 
@@ -877,6 +877,7 @@ impl Workflows {
         self.wft_semaphore.unused_permits()
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) async fn shutdown(&self) -> Result<(), anyhow::Error> {
         if let Some(jh) = self.processing_task.take_once() {
             // This serves to drive the stream if it is still alive and wouldn't otherwise receive
@@ -897,6 +898,17 @@ impl Workflows {
                 })
             );
             jh_res?.map_err(|e| {
+                let as_str = e.downcast::<&str>();
+                anyhow!("Error joining workflow processing thread: {as_str:?}")
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "exp-poller-v2")]
+    pub(super) async fn shutdown(&self) -> Result<(), anyhow::Error> {
+        if let Some(jh) = self.processing_task.take_once() {
+            spawn_blocking(move || jh.join()).await?.map_err(|e| {
                 let as_str = e.downcast::<&str>();
                 anyhow!("Error joining workflow processing thread: {as_str:?}")
             })?;
@@ -948,7 +960,9 @@ impl Workflows {
     fn send_local(&self, msg: impl Into<LocalInputs>) -> bool {
         let msg = msg.into();
         let print_err = match &msg {
-            LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => false,
+            LocalInputs::GetStateInfo(_) => false,
+            #[cfg(not(feature = "exp-poller-v2"))]
+            LocalInputs::BumpStream => false,
             LocalInputs::LocalResolution(lr) if lr.res.is_la_cancel_confirmation() => false,
             _ => true,
         };
