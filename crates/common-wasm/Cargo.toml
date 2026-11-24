@@ -48,5 +48,6 @@ workspace = true
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }
 rstest = "0.28"
+temporalio-macros = { path = "../macros", version = "~1.2.0" }
 tempfile = "3.21"
 tokio = { version = "1.47", features = ["macros", "rt"] }

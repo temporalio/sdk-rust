@@ -6,7 +6,55 @@ mod activities_definitions;
 mod cloud_test_exclusion;
 mod fsm_impl;
 mod macro_utils;
+mod temporal_transfer;
 mod workflow_definitions;
+
+/// Declares a model's canonical transfer type and implements its Temporal serialization traits.
+///
+/// Supply `From<&Model>` or `TryFrom<&Model>` for the transfer type, and `From<Transfer>` or
+/// `TryFrom<Transfer>` for the model. Conversion errors must implement
+/// `std::error::Error + Send + Sync + 'static`. The model must not also implement the corresponding
+/// Serde traits, because their blanket Temporal implementations would conflict.
+///
+/// ```
+/// use temporalio_common::data_converters::HasTransferType;
+/// use temporalio_macros::TemporalTransfer;
+///
+/// #[derive(TemporalTransfer)]
+/// #[temporal(transfer_type = String)]
+/// struct UserId(u64);
+///
+/// impl From<&UserId> for String {
+///     fn from(id: &UserId) -> Self {
+///         id.0.to_string()
+///     }
+/// }
+///
+/// impl TryFrom<String> for UserId {
+///     type Error = std::num::ParseIntError;
+///
+///     fn try_from(value: String) -> Result<Self, Self::Error> {
+///         value.parse().map(UserId)
+///     }
+/// }
+///
+/// fn accepts_transfer_model<T: HasTransferType>(_: &T) {}
+/// accepts_transfer_model(&UserId(42));
+/// ```
+///
+/// The default SDK path is `::temporalio_common`. Use `#[temporal(crate = path)]` when that crate
+/// has been renamed or re-exported.
+///
+/// Transfer conversion applies once per top-level payload value, including failure details.
+/// It does not recursively convert nested fields and is not applied to memo values.
+#[proc_macro_derive(TemporalTransfer, attributes(temporal))]
+pub fn temporal_transfer(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    match temporal_transfer::expand(input) {
+        Ok(output) => output.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
 
 /// Can be used to define Activities for invocation and execution. Using this macro requires that
 /// you also depend on the `temporalio_sdk` crate.

@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `Model: From<std::string::String>` is not satisfied
+ --> tests/temporal_transfer/missing_decode_fail.rs:3:10
+  |
+3 | #[derive(TemporalTransfer)]
+  |          ^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `From<std::string::String>` is not implemented for `Model`
+ --> tests/temporal_transfer/missing_decode_fail.rs:5:1
+  |
+5 | struct Model;
+  | ^^^^^^^^^^^^
+  = note: required for `std::string::String` to implement `Into<Model>`
+  = note: required for `Model` to implement `TryFrom<std::string::String>`
+  = note: this error originates in the derive macro `TemporalTransfer` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -47,7 +47,7 @@ use temporalio_common::{
         },
     },
 };
-use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_macros::{TemporalTransfer, activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions, Runtime, SyncWorkflowContext,
     WorkerOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
@@ -471,6 +471,92 @@ async fn client_with_storage(driver: Arc<dyn StorageDriver>) -> Client {
         .data_converter(DataConverter::default().with_external_storage(storage))
         .build();
     Client::new(get_integ_connection(None).await, client_opts).unwrap()
+}
+
+#[derive(Debug, PartialEq, TemporalTransfer)]
+#[temporal(transfer_type = String)]
+struct StoredTransfer(String);
+
+impl From<&StoredTransfer> for String {
+    fn from(value: &StoredTransfer) -> Self {
+        format!("wire:{}", value.0)
+    }
+}
+
+impl TryFrom<String> for StoredTransfer {
+    type Error = std::io::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value
+            .strip_prefix("wire:")
+            .map(|value| Self(value.to_owned()))
+            .ok_or_else(|| std::io::Error::other("missing transfer prefix"))
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct StoredTransferWorkflow;
+
+#[workflow_methods]
+impl StoredTransferWorkflow {
+    #[run]
+    async fn run(
+        _ctx: &mut WorkflowContext<Self>,
+        input: StoredTransfer,
+    ) -> WorkflowResult<StoredTransfer> {
+        Ok(input)
+    }
+}
+
+#[tokio::test]
+async fn transfer_types_round_trip_through_external_storage() {
+    let driver = Arc::new(InMemoryDriver::default());
+    let client = client_with_storage(driver.clone()).await;
+    let mut starter =
+        CoreWfStarter::new_with_overrides(StoredTransferWorkflow::name(), None, Some(client));
+    starter
+        .sdk_config
+        .register_workflow::<StoredTransferWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let input = "transfer".repeat(1_000);
+    let handle = worker
+        .submit_workflow(
+            StoredTransferWorkflow::run,
+            StoredTransfer(input.clone()),
+            WorkflowStartOptions::new(starter.get_task_queue(), starter.get_task_queue()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    assert_eq!(
+        handle.get_result(Default::default()).await.unwrap(),
+        StoredTransfer(input.clone())
+    );
+    {
+        let stored = driver.stored.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        for payload in stored.values() {
+            assert_eq!(payload.metadata["encoding"], b"json/plain");
+            assert_eq!(
+                serde_json::from_slice::<String>(&payload.data).unwrap(),
+                format!("wire:{input}")
+            );
+        }
+    }
+    let history = starter.get_history().await;
+    let input = history
+        .events
+        .iter()
+        .find_map(|event| match &event.attributes {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attrs)) => {
+                attrs.input.as_ref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(is_reference(&input.payloads[0]));
 }
 
 #[tokio::test]

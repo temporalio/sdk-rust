@@ -23,6 +23,8 @@ quote = "1.0"
 # This is to enable doctests for the macros
 temporalio-common = { path = "../common", version = "~1.3.0" }
 derive_more = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+trybuild = { version = "1.0", features = ["diff"] }
 
 [package.metadata.workspaces]
 independent = true

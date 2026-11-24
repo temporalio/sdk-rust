@@ -1,0 +1,21 @@
+error[E0119]: conflicting implementations of trait `TemporalDeserializable` for type `Model`
+ --> tests/temporal_transfer/serde_conflict_fail.rs:3:48
+  |
+3 | #[derive(serde::Serialize, serde::Deserialize, TemporalTransfer)]
+  |                                                ^^^^^^^^^^^^^^^^
+  |
+  = note: conflicting implementation in crate `temporalio_common_wasm`:
+          - impl<T> TemporalDeserializable for T
+            where T: DeserializeOwned;
+  = note: this error originates in the derive macro `TemporalTransfer` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `TemporalSerializable` for type `Model`
+ --> tests/temporal_transfer/serde_conflict_fail.rs:3:48
+  |
+3 | #[derive(serde::Serialize, serde::Deserialize, TemporalTransfer)]
+  |                                                ^^^^^^^^^^^^^^^^
+  |
+  = note: conflicting implementation in crate `temporalio_common_wasm`:
+          - impl<T> TemporalSerializable for T
+            where T: Serialize;
+  = note: this error originates in the derive macro `TemporalTransfer` (in Nightly builds, run with -Z macro-backtrace for more info)

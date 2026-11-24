@@ -1,0 +1,31 @@
+error[E0277]: the trait bound `for<'__temporal_transfer> std::string::String: From<&'__temporal_transfer Model>` is not satisfied
+  --> tests/temporal_transfer/missing_encode_fail.rs:16:25
+   |
+16 |     requires_transfer::<Model>();
+   |                         ^^^^^ the trait `for<'__temporal_transfer> From<&'__temporal_transfer Model>` is not implemented for `std::string::String`
+   |
+   = help: `std::string::String` implements trait `From<T>`:
+             From<&mut str>
+             From<&std::string::String>
+             From<&str>
+             From<ActivityType>
+             From<Box<str>>
+             From<Cow<'_, str>>
+             From<char>
+             From<url::Url>
+   = note: required for `&'__temporal_transfer Model` to implement `for<'__temporal_transfer> Into<std::string::String>`
+   = note: required for `std::string::String` to implement `for<'__temporal_transfer> TryFrom<&'__temporal_transfer Model>`
+note: required for `Model` to implement `HasTransferType`
+  --> tests/temporal_transfer/missing_encode_fail.rs:5:8
+   |
+ 3 | #[derive(TemporalTransfer)]
+   |          ---------------- type parameter would need to implement `HasTransferType`
+ 4 | #[temporal(transfer_type = String)]
+ 5 | struct Model;
+   |        ^^^^^
+   = help: consider manually implementing `HasTransferType` to avoid undesired bounds
+note: required by a bound in `requires_transfer`
+  --> tests/temporal_transfer/missing_encode_fail.rs:13:25
+   |
+13 | fn requires_transfer<T: temporalio_common::data_converters::HasTransferType>() {}
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_transfer`

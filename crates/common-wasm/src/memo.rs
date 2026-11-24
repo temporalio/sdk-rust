@@ -1,7 +1,7 @@
 use crate::{
     data_converters::{
-        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable, TemporalSerializable,
+        PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
+        TemporalDeserializable, TemporalSerializable,
     },
     protos::temporal::api::common::v1::{Memo as ProtoMemo, Payload},
 };
@@ -36,6 +36,8 @@ impl Memo {
     }
 
     /// Decode a memo value as `T`, returning `None` when the key is absent.
+    ///
+    /// Memo values use native payload serialization without transfer conversion.
     pub fn get<T: TemporalDeserializable + 'static>(
         &self,
         key: &str,
@@ -44,7 +46,7 @@ impl Memo {
             return Ok(None);
         };
         self.payload_converter
-            .from_payload(
+            .from_payload_without_transfer(
                 &SerializationContext::new(&self.context, &self.payload_converter),
                 payload.clone(),
             )
@@ -102,7 +104,7 @@ where
         &self,
         context: &SerializationContext<'_>,
     ) -> Result<Payload, PayloadConversionError> {
-        context.converter.to_payload(context, self)
+        context.converter.to_payload_without_transfer(context, self)
     }
 }
 
@@ -116,6 +118,8 @@ pub struct MemoValue {
 
 impl MemoValue {
     /// Create a memo value that will be serialized with the workflow's data converter.
+    ///
+    /// Transfer conversion is not applied to memo values.
     pub fn new<T: TemporalSerializable + Send + Sync + 'static>(value: T) -> Self {
         Self {
             value: Arc::new(value),
@@ -168,7 +172,7 @@ impl MemoValues {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_converters::WorkflowSerializationContext;
+    use crate::data_converters::{GenericPayloadConverter, WorkflowSerializationContext};
     use std::collections::HashMap;
 
     #[test]
