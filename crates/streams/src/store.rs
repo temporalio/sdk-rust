@@ -160,8 +160,10 @@ pub trait StreamStore: Send + Sync + 'static {
     ///   total (zero means no limit). A page always has its first Record, even when that Record
     ///   alone is over `max_bytes`. The runtime measures a Record as the page encodes it, with the
     ///   tag and the length of its field. It trims a page that is over a limit.
-    /// - A page's `last_offset` is where the next read continues. It's never below `from_offset` or
-    ///   the offset of a Record in the page, and it never skips a Record.
+    /// - A page's `last_offset` is where the next read continues. A Store doesn't have to set it.
+    ///   If it's empty, the runtime gives the caller the offset of the last Record of the page, or
+    ///   the `from_offset` of the read for a page with no Record. A Store that sets it gives an
+    ///   offset that isn't below those and that skips no Record.
     /// - A page is `done` when the Stream is closed and no Record comes after the page. That holds
     ///   for an empty page too.
     /// - A read with nothing after `from_offset` answers once 1) an entry becomes available, 2) the

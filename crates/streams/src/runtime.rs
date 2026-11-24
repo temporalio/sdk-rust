@@ -231,6 +231,10 @@ fn fit_page(
         }
         newest = &record.offset;
     }
+    // The page shows where it ended, so a Store doesn't have to say it.
+    if page.last_offset.is_empty() {
+        page.last_offset = newest.to_vec();
+    }
     validate_offset(
         &page.last_offset,
         "The last offset from the Store",
@@ -567,7 +571,7 @@ mod tests {
             ("a", page(&["a"], "a", false), Some(first)),
             ("", page(&["b", "a"], "b", false), Some(second)),
             ("", page(&["a", "a"], "a", false), Some(second)),
-            ("a", page(&["b"], "", false), Some(below_record)),
+            ("", page(&["a", "b"], "a", false), Some(below_record)),
             ("m", page(&[], "a", false), Some(below_from)),
             ("", broken(|r| r.producer = None), Some(incomplete)),
             ("", broken(|r| r.body = None), Some(incomplete)),
@@ -579,6 +583,17 @@ mod tests {
                 ..valid_read()
             };
             expect(runtime.read_records(read).await, answer, corrupt);
+        }
+        // A Store can leave last_offset empty. The page then ends at its last Record, or where its
+        // read started.
+        for (offsets, ends_at) in [(&[][..], "m"), (&["n", "o"][..], "o")] {
+            store.answers.lock().page = page(offsets, "", false);
+            let read = ReadRecordsRequest {
+                from_offset: b"m".to_vec(),
+                ..valid_read()
+            };
+            let filled = page(offsets, ends_at, false);
+            assert_eq!(runtime.read_records(read).await, Ok(filled));
         }
         // The Record size is the limit of the runtime, so a Record over the default is one that
         // this runtime can't take, and a larger limit takes it.
