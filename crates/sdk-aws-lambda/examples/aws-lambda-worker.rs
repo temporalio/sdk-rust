@@ -2,7 +2,7 @@ mod workflows;
 
 use std::env;
 use temporalio_common::worker::WorkerDeploymentVersion;
-use temporalio_sdk_aws_lambda::{LambdaWorker, otel::OpenTelemetryOptions};
+use temporalio_sdk_aws_lambda::{LambdaWorker, otel::LambdaOpenTelemetryOptions};
 use workflows::{GreetingActivities, GreetingWorkflow};
 
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .register_workflow::<GreetingWorkflow>()?
         .register_activities(GreetingActivities);
     LambdaWorker::builder(version, options)
-        .open_telemetry(OpenTelemetryOptions::default())
+        .open_telemetry(LambdaOpenTelemetryOptions::default())
         .build()?
         .run()
         .await

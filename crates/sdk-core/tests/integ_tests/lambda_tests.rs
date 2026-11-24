@@ -49,7 +49,7 @@ use temporalio_sdk::{
     opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
-use temporalio_sdk_aws_lambda::{LambdaWorker, otel::OpenTelemetryOptions};
+use temporalio_sdk_aws_lambda::{LambdaWorker, otel::LambdaOpenTelemetryOptions};
 use tokio::{
     net::TcpListener,
     sync::{Notify, oneshot},
@@ -412,7 +412,7 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay(#[case] aut
     let hook_registry = registry.clone();
     let key = Arc::new(Mutex::new(None::<Uuid>));
     let hook_key = key.clone();
-    let mut telemetry = OpenTelemetryOptions::default();
+    let mut telemetry = LambdaOpenTelemetryOptions::default();
     telemetry.metrics = Some(
         OtelCollectorOptions::builder()
             .url(metric_endpoint)

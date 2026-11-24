@@ -168,7 +168,7 @@ pub struct LambdaWorkerBuilder {
     configure: Option<Configure>,
     shutdown_hooks: Vec<ShutdownHook>,
     #[cfg(feature = "otel")]
-    open_telemetry: Option<otel::OpenTelemetryOptions>,
+    open_telemetry: Option<otel::LambdaOpenTelemetryOptions>,
 }
 
 impl LambdaWorkerBuilder {
@@ -192,7 +192,7 @@ impl LambdaWorkerBuilder {
     ///
     /// Creates the SDK runtime; cannot be combined with [`Self::runtime`].
     #[cfg(feature = "otel")]
-    pub fn open_telemetry(mut self, options: otel::OpenTelemetryOptions) -> Self {
+    pub fn open_telemetry(mut self, options: otel::LambdaOpenTelemetryOptions) -> Self {
         self.open_telemetry = Some(options);
         self
     }

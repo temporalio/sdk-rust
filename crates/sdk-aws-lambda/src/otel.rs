@@ -30,7 +30,7 @@ const DEFAULT_SERVICE_NAME: &str = "temporal-lambda-worker";
 /// Lambda telemetry setup using the shared metric options and an independent span exporter.
 #[derive(Debug, Default)]
 #[non_exhaustive]
-pub struct OpenTelemetryOptions {
+pub struct LambdaOpenTelemetryOptions {
     /// Metric exporter configuration, passed to [`build_otlp_metric_exporter`].
     ///
     /// If unset, uses OTLP gRPC at `OTEL_EXPORTER_OTLP_ENDPOINT` or `http://localhost:4317`,
@@ -53,7 +53,7 @@ pub struct OpenTelemetryOptions {
 }
 
 pub(crate) fn configure(
-    options: OpenTelemetryOptions,
+    options: LambdaOpenTelemetryOptions,
     client: &mut ClientOptions,
     worker: &mut WorkerOptions,
     shutdown_hooks: &mut Vec<ShutdownHook>,
