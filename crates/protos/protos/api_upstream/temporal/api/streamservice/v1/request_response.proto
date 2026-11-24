@@ -119,10 +119,11 @@ message ReadRecordsRequest {
 // One page of a read.
 message ReadRecordsResponse {
     repeated temporal.api.stream.v1.StreamRecord records = 1;
-    // The last position that the read covered. The next read passes it as `from_offset`. Every
-    // Store can give it, as the offset of the last Record in this page, or as the `from_offset`
-    // of the request for an empty page. A Store can also give a later offset that skips only
-    // entries of its own that aren't Records, so the next read doesn't scan them again.
+    // The last position that the read covered. The next read passes it as `from_offset`. A Store
+    // doesn't have to set it. If it's empty, that position is the offset of the last Record in
+    // this page, or the `from_offset` of the request for an empty page. A Store can set a later
+    // offset that skips only entries of its own that aren't Records, so the next read doesn't
+    // scan them again.
     bytes last_offset = 2;
     // True when the Stream is closed and this page has its last Record. A read has no other sign
     // of a close, because a close stores no Record. A read of a closed Stream with no Record left
