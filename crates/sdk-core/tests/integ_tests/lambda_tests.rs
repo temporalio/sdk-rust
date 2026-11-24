@@ -49,7 +49,9 @@ use temporalio_sdk::{
     opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
-use temporalio_sdk_aws_lambda::{LambdaWorker, otel::LambdaOpenTelemetryOptions};
+use temporalio_sdk_aws_lambda::{
+    LambdaInvocationError, LambdaWorker, otel::LambdaOpenTelemetryOptions,
+};
 use tokio::{
     net::TcpListener,
     sync::{Notify, oneshot},
@@ -305,6 +307,7 @@ async fn lambda_uses_effective_post_plugin_shutdown_period(
         if let Some(expected_cause) = expected_cause {
             let error = result.unwrap_err();
             assert!(!error.requires_restart());
+            assert!(matches!(error, LambdaInvocationError::WorkerCreation(_)));
             assert!(format!("{:#}", anyhow::Error::new(error)).contains(expected_cause));
         } else {
             result.unwrap();
@@ -345,6 +348,7 @@ async fn lambda_validation_failure_runs_hooks_and_prevents_reuse() {
     .await
     .expect("cleanup exceeded the invocation deadline")
     .unwrap_err();
+    assert!(matches!(error, LambdaInvocationError::WorkerExecution(_)));
     assert!(error.requires_restart());
     assert!(called.load(Ordering::Relaxed));
     assert!(
@@ -701,7 +705,9 @@ async fn lambda_drains_cancelled_activities_before_hooks(
     let result = worker.handle(event("cancel-activity")).await;
     assert!(hook_called.load(Ordering::Relaxed));
     if block_completion {
-        assert!(result.unwrap_err().requires_restart());
+        let error = result.unwrap_err();
+        assert!(matches!(error, LambdaInvocationError::DrainTimeout(_)));
+        assert!(error.requires_restart());
         assert!(!observed.load(Ordering::Relaxed));
         assert!(
             worker

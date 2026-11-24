@@ -30,6 +30,7 @@ otel = [
 
 [dependencies]
 anyhow = "1.0"
+bon = { workspace = true }
 lambda_runtime = "1.3"
 opentelemetry = { workspace = true, features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [

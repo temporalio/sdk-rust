@@ -144,7 +144,10 @@ pub(crate) fn configure(
     }));
     shutdown_hooks.insert(
         0,
-        Arc::new(move |_| Box::pin(BlockingFlushers::flush(flushers.clone()))),
+        Arc::new(move |_| {
+            let flushers = flushers.clone();
+            Box::pin(async move { BlockingFlushers::flush(flushers).await.map_err(Into::into) })
+        }),
     );
     Ok(())
 }

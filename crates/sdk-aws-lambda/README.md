@@ -63,7 +63,7 @@ configuration error.
 
 Create the handler once and reuse it. Each invocation receives a fresh client and Worker; a live
 Worker or Workflow cache is never retained across invocations. The optional asynchronous
-`configure` callback runs on every invocation and returns modified `LambdaInvocationConfig`:
+`configure` callback runs on every invocation and returns modified `LambdaInvocationOptions`:
 
 ```rust,no_run
 # fn configure(builder: temporalio_sdk_aws_lambda::LambdaWorkerBuilder) {

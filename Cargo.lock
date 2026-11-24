@@ -4653,6 +4653,7 @@ name = "temporalio-sdk-aws-lambda"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
  "futures",
  "http 1.5.0",
  "lambda_runtime",
