@@ -99,6 +99,7 @@ interface stream-service {
     workflow-id: string,
     run-id: string,
     activity-id: string,
+    scheduled-event-id: option<s64>,
     attempt: activity-attempt,
   }
 
