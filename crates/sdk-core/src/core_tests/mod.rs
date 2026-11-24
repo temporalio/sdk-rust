@@ -1,5 +1,6 @@
 mod activity_tasks;
 mod event_groups;
+mod legacy_query_replay;
 mod local_activity_workflow_task;
 mod nexus_operations;
 mod queries;

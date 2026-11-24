@@ -1,0 +1,1 @@
+Answering a legacy query while a workflow task is pending no longer lets the next workflow task record history that fails replay with a nondeterminism error, such as `Update machine does not handle this event: WorkflowPropertiesModified`; when needed, the worker now rebuilds the workflow from history before that task.

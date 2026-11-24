@@ -124,6 +124,10 @@ pub(crate) struct WorkflowMachines {
     /// Legacy queries cannot produce commands, so catching up on their history must not cause any
     /// side effects, like dispatching LA requests.
     preparing_legacy_query: bool,
+    /// Set when preparing a legacy query applied events newer than the last started workflow task.
+    /// Workflow code reacting to those events has no task to commit its effects in, so a cached run
+    /// carrying them would later split one replay activation into two.
+    legacy_query_applied_uncommitted_events: bool,
     /// Rejection-only tasks can be discarded, so they must not release LAs waiting on replay.
     update_only_task: bool,
     /// Workflow identifier
@@ -307,6 +311,7 @@ impl WorkflowMachines {
             drive_me: DrivenWorkflow::default(),
             replaying,
             preparing_legacy_query: false,
+            legacy_query_applied_uncommitted_events: false,
             update_only_task: false,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -363,6 +368,7 @@ impl WorkflowMachines {
         }
         self.protocol_msgs = protocol_messages;
         self.preparing_legacy_query = preparing_legacy_query;
+        self.legacy_query_applied_uncommitted_events = false;
         self.update_only_task = false;
         self.new_history_from_server(update)?;
         Ok(())
@@ -427,6 +433,10 @@ impl WorkflowMachines {
     pub(crate) fn drain_queued_local_activities(&mut self) -> Vec<LocalActRequest> {
         self.local_activity_data
             .take_all_reqs(&self.workflow_type, &self.workflow_id, &self.run_id)
+    }
+
+    pub(crate) fn has_executing_or_preresolved_local_activities(&self) -> bool {
+        self.local_activity_data.has_executing_or_preresolutions()
     }
 
     /// Returns the number of local activities we know we need to execute but have not yet finished
@@ -507,6 +517,10 @@ impl WorkflowMachines {
         if self.failed_wft_started_ids.len() > MAX_FAILED_WFTS {
             self.failed_wft_started_ids.pop_first();
         }
+    }
+
+    pub(crate) fn legacy_query_applied_uncommitted_events(&self) -> bool {
+        self.legacy_query_applied_uncommitted_events
     }
 
     pub(crate) fn history_size_bytes(&self) -> u64 {
@@ -616,6 +630,12 @@ impl WorkflowMachines {
                     workflow_activation_job::Variant::NotifyHasPatch(_)
                 )
         })
+    }
+
+    /// Unlike [Self::activation_needed], counts jobs that are only patch notifications too, which
+    /// unchunked replay leaves queued without activating lang.
+    pub(crate) fn has_pending_jobs(&self) -> bool {
+        !self.drive_me.peek_pending_jobs().is_empty()
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
@@ -845,13 +865,14 @@ impl WorkflowMachines {
             // event, because that will typically show up as the first event in an incremental
             // history, and we want to ignore it and its associated commands since we "produced"
             // them.
-            if self.replaying
-                && !self.preparing_legacy_query
-                && has_final_event
+            let is_new_event = has_final_event
                 && eid > self.last_history_from_server.previous_wft_started_id
                 && event.event_type() != EventType::WorkflowTaskCompleted
-                && !event.is_command_event()
-            {
+                && !event.is_command_event();
+            if self.preparing_legacy_query && is_new_event {
+                self.legacy_query_applied_uncommitted_events = true;
+            }
+            if self.replaying && !self.preparing_legacy_query && is_new_event {
                 // Replay is finished
                 self.replaying = false;
             }
