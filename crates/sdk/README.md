@@ -128,12 +128,6 @@ let client = env.client().clone();
 env.shutdown().await?;
 ```
 
-## AWS Lambda workers
-
-The experimental [`temporalio-sdk-aws-lambda`](../sdk-aws-lambda/README.md) crate runs Workers
-inside AWS Lambda invocations, with deployment versioning, deadline-aware shutdown, and optional
-OpenTelemetry support. It is a separate dependency and does not add AWS dependencies to this crate.
-
 ## Crate Features
 
 The SDK enables a few convenience integrations by default. Users who want a smaller dependency
