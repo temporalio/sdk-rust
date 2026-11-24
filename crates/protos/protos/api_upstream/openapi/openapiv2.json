@@ -22792,6 +22792,11 @@
         "sdkVersion": {
           "type": "string",
           "description": "Version of the SDK that processed the task. This is usually something like \"1.20.0\" and is\nusually the same as client-version gRPC header. This should only be set if its value changed\nsince the last time recorded on the workflow (or be set on the first task)."
+        },
+        "coreStreamCalls": {
+          "type": "string",
+          "format": "byte",
+          "description": "The Stream calls of this Workflow Task, in a format that SDK Core owns. A replay gives\nWorkflow code the same results from it."
         }
       }
     },
