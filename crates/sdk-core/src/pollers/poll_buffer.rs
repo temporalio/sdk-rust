@@ -525,9 +525,7 @@ impl<T, SK: SlotKind> LongPollBuffer<T, SK> {
         use crate::pollers_v2::Poller;
 
         let stream = stream::once(async move {
-            self.starter
-                .send(())
-                .expect("sending poller start signal failed");
+            let _ = self.starter.send(());
             None
         })
         .filter_map(future::ready)

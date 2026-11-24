@@ -315,33 +315,28 @@ async fn worker_heartbeat_basic(backing: &str) {
     let test_fut = async {
         acts_started.notified().await;
         let client = starter.get_core_client().await;
-        let raw_client = client.clone();
+        let query = format!("WorkerInstanceKey=\"{worker_instance_key}\"");
         let heartbeat = eventually(
-            || {
-                let client = client.clone();
-                async move {
-                    let heartbeat = list_worker_heartbeats(&client, String::new())
-                        .await
-                        .into_iter()
-                        .find(|heartbeat| {
-                            heartbeat.worker_instance_key == worker_instance_key.to_string()
-                        })
-                        .ok_or_else(|| anyhow!("worker heartbeat has not been recorded"))?;
-                    let workflow_tasks = heartbeat
-                        .workflow_task_slots_info
-                        .as_ref()
-                        .map_or(0, |slots| slots.total_processed_tasks);
-                    let activities = heartbeat
-                        .activity_task_slots_info
-                        .as_ref()
-                        .map_or(0, |slots| slots.current_used_slots);
-                    if workflow_tasks == 1 && activities == 1 {
-                        Ok(heartbeat)
-                    } else {
-                        Err(anyhow!(
-                            "Heartbeat not ready: workflow tasks={workflow_tasks}, activities={activities}"
-                        ))
-                    }
+            async || {
+                let heartbeat = list_worker_heartbeats(&client, query.as_str())
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("worker heartbeat has not been recorded"))?;
+                let workflow_tasks = heartbeat
+                    .workflow_task_slots_info
+                    .as_ref()
+                    .map_or(0, |slots| slots.total_processed_tasks);
+                let activities = heartbeat
+                    .activity_task_slots_info
+                    .as_ref()
+                    .map_or(0, |slots| slots.current_used_slots);
+                if workflow_tasks == 1 && activities == 1 {
+                    Ok(heartbeat)
+                } else {
+                    Err(anyhow!(
+                        "Heartbeat not ready: workflow tasks={workflow_tasks}, activities={activities}"
+                    ))
                 }
             },
             Duration::from_secs(5),
@@ -358,51 +353,27 @@ async fn worker_heartbeat_basic(backing: &str) {
         // Poll until the heartbeat reflects shutdown with the second WFT processed.
         // The worker stays alive (join! waits for both futures) so heartbeats keep firing.
         eventually(
-            || {
-                let mut rc = raw_client.clone();
-                let ns = client.namespace().to_owned();
-                async move {
-                    let workers_list = WorkflowService::list_workers(
-                        &mut rc,
-                        ListWorkersRequest {
-                            namespace: ns,
-                            page_size: 100,
-                            next_page_token: Vec::new(),
-                            query: String::new(),
-                            include_system_workers: false,
-                        }
-                        .into_request(),
-                    )
+            async || {
+                let hb = list_worker_heartbeats(&client, query.as_str())
                     .await
-                    .unwrap()
-                    .into_inner();
-                    #[allow(deprecated)]
-                    let hb = workers_list
-                        .workers_info
-                        .iter()
-                        .find_map(|wi| {
-                            wi.worker_heartbeat.as_ref().filter(|hb| {
-                                hb.worker_instance_key == worker_instance_key.to_string()
-                            })
-                        })
-                        .unwrap()
-                        .clone();
-                    let tasks_done = hb
-                        .workflow_task_slots_info
-                        .as_ref()
-                        .is_some_and(|s| s.total_processed_tasks >= 2);
-                    let is_shutting_down = hb.status == WorkerStatus::ShuttingDown as i32;
-                    if tasks_done && is_shutting_down {
-                        Ok(hb)
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "Heartbeat not ready: tasks={}, shutting_down={}",
-                            hb.workflow_task_slots_info
-                                .as_ref()
-                                .map_or(0, |s| s.total_processed_tasks),
-                            is_shutting_down,
-                        ))
-                    }
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("worker heartbeat has not been recorded"))?;
+                let tasks_done = hb
+                    .workflow_task_slots_info
+                    .as_ref()
+                    .is_some_and(|s| s.total_processed_tasks >= 2);
+                let is_shutting_down = hb.status == WorkerStatus::ShuttingDown as i32;
+                if tasks_done && is_shutting_down {
+                    Ok(hb)
+                } else {
+                    Err(anyhow!(
+                        "Heartbeat not ready: tasks={}, shutting_down={}",
+                        hb.workflow_task_slots_info
+                            .as_ref()
+                            .map_or(0, |s| s.total_processed_tasks),
+                        is_shutting_down,
+                    ))
                 }
             },
             Duration::from_secs(5),

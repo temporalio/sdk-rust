@@ -326,9 +326,7 @@ impl WFStream {
                                 None
                             }
                             LocalInputs::BumpStream => {
-                                // Ensures pending workflow activation polls resolve for
-                                // scenarios like during shutdown
-                                None
+                                panic!("WFStream v2 should never receive BumpStream")
                             }
                         }
                     }

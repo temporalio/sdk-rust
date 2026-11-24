@@ -718,16 +718,16 @@ async fn update_validation_gates_local_activity_dispatch(
     for i in 0..update_count {
         update_task.add_update_request(format!("update-{i}"), update_task.started_event_id - 1);
     }
+    let all_rejected_only = !accept_update && !with_signal;
     let (continue_tx, continue_rx) = oneshot::channel();
+    let continuation_task = stream::once(async move {
+        continue_rx.await.unwrap();
+        continuation
+    });
     let tasks = stream::iter([update_task])
-        .chain(stream::once(async move {
-            continue_rx.await.unwrap();
-            continuation
-        }))
-        .chain(stream::pending());
+        .chain(stream::iter(all_rejected_only.then_some(continuation_task)).flatten());
     let (reported_tx, reported_rx) = oneshot::channel();
     let mut reported_tx = Some(reported_tx);
-    let all_rejected_only = !accept_update && !with_signal;
     let mut client = mock_worker_client();
     client
         .expect_complete_workflow_task()

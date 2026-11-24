@@ -858,6 +858,8 @@ impl Workflows {
     /// Send a `BumpStream` message to the workflow stream. This ensures that any pending
     /// workflow activation polls will resolve, like during shutdown, even if there are no other inputs.
     pub(super) fn bump_stream(&self) {
+        // BumpStream breaks poller v2, making it no-op works
+        #[cfg(not(feature = "exp-poller-v2"))]
         self.send_local(LocalInputs::BumpStream);
     }
 
