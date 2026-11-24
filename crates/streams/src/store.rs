@@ -82,8 +82,9 @@ use futures_util::future::BoxFuture;
 ///   [`MAX_STREAM_ID_BYTES`](crate::ids::MAX_STREAM_ID_BYTES) bytes. The runtime ignores the
 ///   `store` of the ref, which only an SDK reads. There's no bound for the request id.
 /// - `from_offset` is at most [`MAX_OFFSET_BYTES`](crate::ids::MAX_OFFSET_BYTES) bytes.
-/// - The Producer of an append or a close has a kind, every id of that kind, and the fields of its
-///   attempt. Each time of the attempt has nanos from 0 to 999,999,999. The Record size bounds the
+/// - The Producer of an append or a close has a kind, every text id of that kind, and the fields
+///   of its attempt. Its scheduled event id, for an Activity that a Workflow scheduled, is 0 or
+///   more. Each time of the attempt has nanos from 0 to 999,999,999. The Record size bounds the
 ///   ids of an append's Producer, since the size of a Record counts its Producer.
 /// - A batch has at least one Record, every Record has a body, and the batch fits the
 ///   [`StoreLimits`](crate::record::StoreLimits) of the runtime. Those are the limits of the

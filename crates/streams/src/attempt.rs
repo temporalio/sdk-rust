@@ -12,22 +12,24 @@ use crate::proto::{
 
 /// Encodes what identifies a Producer, which is its kind and the ids of that kind. Two Producers
 /// are the same exactly when their keys are equal. The attempt isn't part of the key. Stores keep
-/// these bytes, so the layout must never change. A new id of a kind would change every key of that
-/// kind that a Store keeps.
+/// these bytes, so the layout must never change.
 ///
 /// The key has these fields:
 ///
 /// 1. The proto field number of the kind in [`Producer`] (1 byte)
 /// 2. Each id of the kind, in the order of its proto fields. An id has two parts:
-///    - its length in bytes, as UTF-8, as a big-endian number (4 bytes)
-///    - its bytes
+///    - its length in bytes, as a big-endian number (4 bytes)
+///    - its bytes, which are UTF-8 for a text id, and big-endian for a number id (8 bytes)
+///
+/// The key leaves out a number id of zero, which means that the SDK doesn't have the id. So adding
+/// a number id to a kind doesn't change the keys of that kind that Stores keep.
 ///
 /// The ids of each kind are:
 ///
 /// - A Workflow has a namespace, a Workflow id and a run id.
 /// - A Local Activity has a namespace, a Workflow id, a run id and an Activity id.
-/// - An Activity that a Workflow scheduled has a namespace, a Workflow id, a run id and an
-///   Activity id.
+/// - An Activity that a Workflow scheduled has a namespace, a Workflow id, a run id, an Activity
+///   id, and the id of its scheduled event as a number id.
 /// - A Standalone Activity has a namespace, an Activity id and a run id.
 /// - A client has a namespace and an id.
 ///
@@ -36,16 +38,29 @@ use crate::proto::{
 pub fn producer_key(producer: &Producer) -> Option<Vec<u8>> {
     let (number, ids) = kind_ids(producer.kind.as_ref()?);
     let mut key = vec![number];
+    let mut push = |bytes: &[u8]| {
+        key.extend((bytes.len() as u32).to_be_bytes());
+        key.extend(bytes);
+    };
     for (_, id) in ids {
-        key.extend((id.len() as u32).to_be_bytes());
-        key.extend(id.as_bytes());
+        match id {
+            Id::Text(text) => push(text.as_bytes()),
+            Id::Number(0) => {}
+            Id::Number(number) => push(&number.to_be_bytes()),
+        }
     }
     Some(key)
 }
 
+/// One id of a Producer kind.
+pub(crate) enum Id<'a> {
+    Text(&'a str),
+    Number(i64),
+}
+
 /// Returns the proto field number of `kind` in [`Producer`], and a list of ids as tuples of the
 /// form (human readable id description, id value)
-pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
+pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, Id<'_>)>) {
     let (namespace_id, workflow, run, activity) =
         ("namespace", "Workflow id", "run id", "Activity id");
     // Each pattern has every field of its kind, so that a new id doesn't compile until it has its
@@ -59,9 +74,9 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
         }) => (
             1,
             vec![
-                (namespace_id, namespace.as_str()),
-                (workflow, workflow_id.as_str()),
-                (run, run_id.as_str()),
+                (namespace_id, Id::Text(namespace)),
+                (workflow, Id::Text(workflow_id)),
+                (run, Id::Text(run_id)),
             ],
         ),
         Kind::LocalActivity(LocalActivityProducer {
@@ -73,10 +88,10 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
         }) => (
             2,
             vec![
-                (namespace_id, namespace.as_str()),
-                (workflow, workflow_id.as_str()),
-                (run, run_id.as_str()),
-                (activity, activity_id.as_str()),
+                (namespace_id, Id::Text(namespace)),
+                (workflow, Id::Text(workflow_id)),
+                (run, Id::Text(run_id)),
+                (activity, Id::Text(activity_id)),
             ],
         ),
         Kind::WorkflowActivity(WorkflowActivityProducer {
@@ -84,14 +99,16 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
             workflow_id,
             run_id,
             activity_id,
+            scheduled_event_id,
             attempt: _,
         }) => (
             3,
             vec![
-                (namespace_id, namespace.as_str()),
-                (workflow, workflow_id.as_str()),
-                (run, run_id.as_str()),
-                (activity, activity_id.as_str()),
+                (namespace_id, Id::Text(namespace)),
+                (workflow, Id::Text(workflow_id)),
+                (run, Id::Text(run_id)),
+                (activity, Id::Text(activity_id)),
+                ("scheduled event id", Id::Number(*scheduled_event_id)),
             ],
         ),
         Kind::StandaloneActivity(StandaloneActivityProducer {
@@ -102,16 +119,16 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
         }) => (
             4,
             vec![
-                (namespace_id, namespace.as_str()),
-                (activity, activity_id.as_str()),
-                (run, run_id.as_str()),
+                (namespace_id, Id::Text(namespace)),
+                (activity, Id::Text(activity_id)),
+                (run, Id::Text(run_id)),
             ],
         ),
         Kind::Client(ClientProducer { namespace, id }) => (
             5,
             vec![
-                (namespace_id, namespace.as_str()),
-                ("client id", id.as_str()),
+                (namespace_id, Id::Text(namespace)),
+                ("client id", Id::Text(id)),
             ],
         ),
     }
@@ -188,7 +205,8 @@ mod tests {
         ids::validate_producer,
         proto::WorkflowTaskAttempt,
         test_store::{
-            activity, client, local_activity, set_ids, standalone_activity, task, workflow,
+            activity, client, local_activity, set_ids, standalone_activity, task,
+            with_scheduled_event_id, workflow,
         },
     };
     use prost::Message;
@@ -264,8 +282,8 @@ mod tests {
         let texts = ["", "a", "aa"];
         let mut producers = vec![];
         for attempt in [1, 2] {
-            // The proto field number of each kind, and its ids in the order of their proto fields,
-            // as places in the ids of `set_ids`.
+            // The proto field number of each kind, and its text ids in the order of their proto
+            // fields, as places in the ids of `set_ids`.
             let kinds: [(u8, &[usize], Producer); 5] = [
                 (1, &[0, 1, 2], workflow(Some(task(3, attempt, 0)))),
                 (2, &[0, 1, 2, 3], local_activity(task(3, 1, 0), attempt)),
@@ -274,11 +292,20 @@ mod tests {
                 (5, &[0, 3], client()),
             ];
             for (number, order, mut producer) in kinds {
+                // Only a Workflow's Activity has a scheduled event id, and zero means that the SDK
+                // doesn't have it.
+                let event_ids: &[i64] = if number == 3 { &[0, 1, -1] } else { &[0] };
                 for at in 0..81 {
                     let ids = [at, at / 3, at / 9, at / 27].map(|place| texts[place % 3]);
                     set_ids(&mut producer, ids);
                     let same: Vec<&str> = order.iter().map(|at| ids[*at]).collect();
-                    producers.push(((number, same), producer_key(&producer).unwrap()));
+                    for event_id in event_ids {
+                        if number == 3 {
+                            producer = with_scheduled_event_id(producer, *event_id);
+                        }
+                        let key = producer_key(&producer).unwrap();
+                        producers.push(((number, same.clone(), *event_id), key));
+                    }
                 }
             }
         }
@@ -305,8 +332,10 @@ mod tests {
         };
         let hex =
             |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
-        // The ids `n`, `w`, `r` and `a` of the test Producers, each after its length.
+        // The ids `n`, `w`, `r` and `a` of the test Producers, and the scheduled event id 5, each
+        // after its length.
         let (n, w, r, a) = ("000000016e", "0000000177", "0000000172", "0000000161");
+        let e = "000000080000000000000005";
         let activity_attempt =
             "0000000000000000000000000000000000000000000000000000000068e778013b9ac9ff00000002";
         let zero = "0".repeat(80);
@@ -324,6 +353,11 @@ mod tests {
             (
                 activity(1_760_000_001, 999_999_999, 2),
                 Some(format!("03{n}{w}{r}{a}")),
+                activity_attempt,
+            ),
+            (
+                with_scheduled_event_id(activity(1_760_000_001, 999_999_999, 2), 5),
+                Some(format!("03{n}{w}{r}{a}{e}")),
                 activity_attempt,
             ),
             (

@@ -82,8 +82,8 @@ pub(crate) fn task(started_event_id: i64, attempt: i32, seconds: i64) -> Workflo
     }
 }
 
-/// Sets the ids of `producer` to a namespace, a Workflow id, a run id, and an Activity id or the
-/// id of a client. A kind takes the ids that it has.
+/// Sets the text ids of `producer` to a namespace, a Workflow id, a run id, and an Activity id or
+/// the id of a client. A kind takes the ids that it has.
 pub(crate) fn set_ids(producer: &mut Producer, ids: [&str; 4]) {
     let [namespace, workflow_id, run_id, other] = ids.map(str::to_string);
     match producer.kind.as_mut().expect("The Producer has a kind") {
@@ -105,7 +105,7 @@ pub(crate) fn set_ids(producer: &mut Producer, ids: [&str; 4]) {
     }
 }
 
-/// Returns a Producer of `kind` with each of its ids set.
+/// Returns a Producer of `kind` with each of its text ids set.
 pub(crate) fn producer(kind: Kind) -> Producer {
     let mut producer = Producer { kind: Some(kind) };
     set_ids(&mut producer, ["n", "w", "r", "a"]);
@@ -141,6 +141,16 @@ pub(crate) fn activity(seconds: i64, nanos: i32, attempt_number: i32) -> Produce
         attempt: activity_attempt(seconds, nanos, attempt_number),
         ..Default::default()
     }))
+}
+
+/// Returns `producer`, which is a Producer of a Workflow's Activity, with the given scheduled event
+/// id.
+pub(crate) fn with_scheduled_event_id(mut producer: Producer, id: i64) -> Producer {
+    match producer.kind.as_mut() {
+        Some(Kind::WorkflowActivity(of)) => of.scheduled_event_id = id,
+        kind => panic!("{kind:?} isn't a Workflow's Activity"),
+    }
+    producer
 }
 
 pub(crate) fn standalone_activity(seconds: i64, nanos: i32, attempt_number: i32) -> Producer {

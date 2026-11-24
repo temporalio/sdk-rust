@@ -3,7 +3,7 @@
 
 use crate::{
     AnyError, AnyReason,
-    attempt::kind_ids,
+    attempt::{Id, kind_ids},
     proto::{
         Producer, StandaloneActivityProducer, StreamRef, WorkflowActivityProducer,
         WorkflowTaskAttempt, producer::Kind,
@@ -60,8 +60,9 @@ pub fn validate_offset(offset: &[u8], what: &str, reason: AnyReason) -> Result<(
     Ok(())
 }
 
-/// Checks the Producer of a write. It needs a kind, every id of that kind, and the fields of its
-/// attempt. Stores and readers tell Producers apart by their ids, and the attempts of a Producer
+/// Checks the Producer of a write. It needs a kind, every text id of that kind, and the fields of
+/// its attempt. A number id can be zero, which means that the SDK doesn't have it, but not
+/// negative. Stores and readers tell Producers apart by their ids, and the attempts of a Producer
 /// by the fields of the attempt, so both have to be complete. The started time of a Workflow Task
 /// is the one optional field, because the server doesn't always send it. Each time of the attempt
 /// must have nanos from 0 to 999,999,999.
@@ -69,8 +70,16 @@ pub(crate) fn validate_producer(producer: Option<&Producer>) -> Result<&Producer
     let producer =
         producer.ok_or_else(|| AnyError::invalid_argument("The request has no Producer"))?;
     let kind = producer.kind.as_ref().ok_or_else(|| missing("kind"))?;
-    if let Some((id, _)) = kind_ids(kind).1.iter().find(|(_, id)| id.is_empty()) {
-        return Err(missing(id));
+    for (name, id) in kind_ids(kind).1 {
+        match id {
+            Id::Text("") => return Err(missing(name)),
+            Id::Number(number) if number < 0 => {
+                return Err(AnyError::invalid_argument(format!(
+                    "The {name} is {number}, and it must be 0 or more"
+                )));
+            }
+            _ => {}
+        }
     }
     match kind {
         Kind::Workflow(workflow) => {
@@ -139,7 +148,7 @@ mod tests {
         proto::{ActivityAttempt, LocalActivityAttempt, LocalActivityProducer},
         test_store::{
             activity, client, local_activity, producer, set_ids, standalone_activity, task,
-            workflow,
+            with_scheduled_event_id, workflow,
         },
     };
     use prost_types::Timestamp;
@@ -170,10 +179,11 @@ mod tests {
         // Each id of a kind, as its place in `ids` and the words of its error.
         let workflow_run = [(0, "namespace"), (1, "Workflow id"), (2, "run id")];
         let of_activity = [workflow_run.as_slice(), &[(3, "Activity id")]].concat();
-        let kinds: [(Producer, &[(usize, &str)]); 5] = [
+        let kinds: [(Producer, &[(usize, &str)]); 6] = [
             (workflow(Some(task(3, 1, 0))), &workflow_run),
             (local_activity(task(3, 1, 0), 1), &of_activity),
             (activity(0, 0, 1), &of_activity),
+            (with_scheduled_event_id(activity(0, 0, 1), 5), &of_activity),
             (
                 standalone_activity(0, 0, 1),
                 &[(0, "namespace"), (3, "Activity id"), (2, "run id")],
@@ -234,6 +244,10 @@ mod tests {
         let started_event_id = "The Workflow Task attempt has no started event id";
         let cases = [
             (None, "The request has no Producer"),
+            (
+                Some(with_scheduled_event_id(activity(0, 0, 1), -1)),
+                "The scheduled event id is -1, and it must be 0 or more",
+            ),
             (Some(Producer::default()), "The Producer has no kind"),
             (
                 Some(workflow(None)),
