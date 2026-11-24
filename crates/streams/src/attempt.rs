@@ -135,57 +135,64 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, Id<'_>)>) {
 }
 
 /// The length of an [`attempt_key`], in bytes. Stores keep these keys, so it must never change.
-pub const ATTEMPT_KEY_LEN: usize = 40;
+pub const ATTEMPT_KEY_LEN: usize = 28;
 
 /// Encodes the attempt of a Producer as a fixed-size key. For two attempts of the same Producer,
 /// the byte order of the keys is the order of the attempts. That holds when the nanos of each time
 /// are from 0 to 999,999,999, and the runtime refuses a write with other nanos.
 ///
-/// The key has these big-endian fields, in the order they're compared:
+/// The layout of the key depends on the kind of the Producer. A Producer has one kind, so all its
+/// keys have one layout, and two layouts never meet in a comparison. The fields are big-endian, in
+/// the order they're compared, and a field that doesn't apply, or that is negative, is zero.
 ///
-/// 1. The started event id of the Workflow Task (8 bytes)
-/// 2. The attempt number of that Workflow Task (4 bytes)
+/// For a Workflow, the task is the Workflow Task that made the write, and for a Local Activity,
+/// it's the Workflow Task that dispatched it:
+///
+/// 1. The started event id of the task (8 bytes)
+/// 2. The attempt number of the task (4 bytes)
 /// 3. The seconds of the task's started time (8 bytes)
 /// 4. The nanos of the task's started time (4 bytes)
-/// 5. The seconds of the Activity attempt's scheduled time (8 bytes)
-/// 6. The nanos of the Activity attempt's scheduled time (4 bytes)
-/// 7. The attempt number of the Activity or Local Activity (4 bytes)
+/// 5. The attempt number of the Local Activity, which is zero for a Workflow (4 bytes)
 ///
-/// Fields 1 to 4 are set for a Workflow, where the task is the one that made the write, and for a
-/// Local Activity, where it's the task that dispatched it. Fields 5 and 6 are set for an Activity,
-/// and field 7 for an Activity or a Local Activity. A field that doesn't apply, or that is
-/// negative, is zero, so a client's key is all zeros.
+/// For an Activity that a Workflow scheduled, and for a Standalone Activity:
+///
+/// 1. The seconds of the attempt's scheduled time (8 bytes)
+/// 2. The nanos of the attempt's scheduled time (4 bytes)
+/// 3. The attempt number (4 bytes)
+/// 4. Zeros (12 bytes)
+///
+/// A client's key is all zeros.
 ///
 /// An Activity's attempts are ordered by the server's clock first. If that clock steps back
 /// between two attempts, the later one gets the lower key, and a Store that fences refuses it
 /// with [`AppendReason::Fenced`](crate::AppendReason::Fenced).
 pub fn attempt_key(kind: Option<&Kind>) -> [u8; ATTEMPT_KEY_LEN] {
-    let (task, scheduled, attempt_number) = match kind {
-        Some(Kind::Workflow(workflow)) => (workflow.attempt, None, 0),
+    let mut key = [0; ATTEMPT_KEY_LEN];
+    let (task, local_attempt) = match kind {
+        Some(Kind::Workflow(workflow)) => (workflow.attempt.unwrap_or_default(), 0),
         Some(Kind::LocalActivity(local)) => {
             let attempt = local.attempt.unwrap_or_default();
-            (attempt.task, None, attempt.attempt)
+            (attempt.task.unwrap_or_default(), attempt.attempt)
         }
         Some(
             Kind::WorkflowActivity(WorkflowActivityProducer { attempt, .. })
             | Kind::StandaloneActivity(StandaloneActivityProducer { attempt, .. }),
         ) => {
             let attempt = attempt.unwrap_or_default();
-            (None, attempt.attempt_scheduled_time, attempt.attempt)
+            let scheduled = attempt.attempt_scheduled_time.unwrap_or_default();
+            key[..8].copy_from_slice(&be64(scheduled.seconds));
+            key[8..12].copy_from_slice(&be32(scheduled.nanos));
+            key[12..16].copy_from_slice(&be32(attempt.attempt));
+            return key;
         }
-        Some(Kind::Client(_)) | None => (None, None, 0),
+        Some(Kind::Client(_)) | None => return key,
     };
-    let task = task.unwrap_or_default();
     let started = task.started_time.unwrap_or_default();
-    let scheduled = scheduled.unwrap_or_default();
-    let mut key = [0; ATTEMPT_KEY_LEN];
     key[..8].copy_from_slice(&be64(task.started_event_id));
     key[8..12].copy_from_slice(&be32(task.attempt));
     key[12..20].copy_from_slice(&be64(started.seconds));
     key[20..24].copy_from_slice(&be32(started.nanos));
-    key[24..32].copy_from_slice(&be64(scheduled.seconds));
-    key[32..36].copy_from_slice(&be32(scheduled.nanos));
-    key[36..].copy_from_slice(&be32(attempt_number));
+    key[24..].copy_from_slice(&be32(local_attempt));
     key
 }
 
@@ -336,19 +343,18 @@ mod tests {
         // after its length.
         let (n, w, r, a) = ("000000016e", "0000000177", "0000000172", "0000000161");
         let e = "000000080000000000000005";
-        let activity_attempt =
-            "0000000000000000000000000000000000000000000000000000000068e778013b9ac9ff00000002";
-        let zero = "0".repeat(80);
+        let activity_attempt = "0000000068e778013b9ac9ff00000002000000000000000000000000";
+        let zero = "0".repeat(56);
         let keys = [
             (
                 workflow(Some(task)),
                 Some(format!("01{n}{w}{r}")),
-                "0000000000000008000000020000000068e778000000000500000000000000000000000000000000",
+                "0000000000000008000000020000000068e778000000000500000000",
             ),
             (
                 local_activity(WorkflowTaskAttempt { attempt: 1, ..task }, 3),
                 Some(format!("02{n}{w}{r}{a}")),
-                "0000000000000008000000010000000068e778000000000500000000000000000000000000000003",
+                "0000000000000008000000010000000068e778000000000500000003",
             ),
             (
                 activity(1_760_000_001, 999_999_999, 2),
