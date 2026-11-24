@@ -21589,7 +21589,8 @@ components:
           description: |-
             Experimental. Might change in the future.
              The Stream calls of this Workflow Task. An SDK sets it if Workflow code got the result of a
-             Stream call in the task or asked for a close.
+             Stream call in the task, asked for a close, or has a call with no result yet. So it can have
+             no entry.
     WorkflowTaskFailedEventAttributes:
       type: object
       properties:
