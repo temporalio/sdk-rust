@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package temporal.api.sdk.v1;
+
+option go_package = "go.temporal.io/api/sdk/v1;sdk";
+option java_package = "io.temporal.api.sdk.v1";
+option java_multiple_files = true;
+option java_outer_classname = "StreamCallsProto";
+option ruby_package = "Temporalio::Api::Sdk::V1";
+option csharp_namespace = "Temporalio.Api.Sdk.V1";
+
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/stream/v1/message.proto";
+
+// Experimental. Might change in the future.
+// The Stream calls of one Workflow Task. An SDK records them on the completion of the task, so
+// that a replay gives Workflow code the same result for each call. A replay doesn't append or
+// close again for a result that is here. For a page, it reads the Records from the Store again.
+message WorkflowTaskStreamCalls {
+  // The closes that Workflow code asked for in this task. The SDK closes a Stream only when
+  // History has the intent, so the result of a close is in a later task.
+  repeated CloseIntent close_intents = 1;
+  // The results of the appends that Workflow code got in this task.
+  repeated AppendResult append_results = 2;
+  // The results of the closes that Workflow code got in this task.
+  repeated CloseResult close_results = 3;
+  // The results of the reads that Workflow code got in this task.
+  repeated ReadResult read_results = 4;
+
+  // The intent of Workflow code to close a Stream.
+  message CloseIntent {
+    // The sequence number that the SDK gave the close.
+    int32 seq = 1;
+    temporal.api.stream.v1.StreamRef ref = 2;
+  }
+
+  // The result of an append.
+  message AppendResult {
+    // The sequence number that the SDK gave the append.
+    int32 seq = 1;
+    temporal.api.stream.v1.StreamRef ref = 2;
+    oneof result {
+      AppendOffsets appended = 3;
+      CallFailure failure = 4;
+    }
+  }
+
+  // The offsets of the first and the last Record of a batch, as the Store returned them.
+  message AppendOffsets {
+    bytes first_offset = 1;
+    bytes last_offset = 2;
+  }
+
+  // The result of a close. The intent with the same `seq` has the ref of the Stream.
+  message CloseResult {
+    int32 seq = 1;
+    // Unset if the Stream is closed.
+    CallFailure failure = 2;
+  }
+
+  // The result of a read.
+  message ReadResult {
+    // The sequence number that the SDK gave the read.
+    int32 seq = 1;
+    temporal.api.stream.v1.StreamRef ref = 2;
+    // The `from_offset` of the read. A replay reads the Records of the page after it.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
+    bytes from_offset = 3;
+    oneof result {
+      ReadPage page = 4;
+      CallFailure failure = 5;
+    }
+  }
+
+  // A page that a read gave Workflow code. It doesn't have the Records. A replay reads them from
+  // the Store again and checks them against `digest`.
+  message ReadPage {
+    // The number of Records in the page.
+    int32 record_count = 1;
+    // True if the Stream was closed and had no Record after this page.
+    bool done = 2;
+    // The first 16 bytes of a SHA-256 over the Records, in an encoding that the SDK owns. It's
+    // empty if the page has no Record.
+    bytes digest = 3;
+    // The size of the Records in bytes, as the `max_bytes` of a read measures it. It's set when
+    // `digest` is, so a replay knows how much to read.
+    int64 record_bytes = 4;
+    // The `last_offset` that Workflow code got with the page. A replay gives the same value,
+    // since another read of the Store can end at another offset.
+    bytes last_offset = 5;
+  }
+
+  // Why a call failed. The SDK builds the error that Workflow code gets from it.
+  message CallFailure {
+    temporal.api.enums.v1.StreamErrorReason reason = 1;
+    string message = 2;
+  }
+}
