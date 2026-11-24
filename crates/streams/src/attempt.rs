@@ -121,7 +121,8 @@ pub(crate) fn kind_ids(kind: &Kind) -> (u8, Vec<(&'static str, &str)>) {
 pub const ATTEMPT_KEY_LEN: usize = 40;
 
 /// Encodes the attempt of a Producer as a fixed-size key. For two attempts of the same Producer,
-/// the byte order of the keys is the order of the attempts.
+/// the byte order of the keys is the order of the attempts. That holds when the nanos of each time
+/// are from 0 to 999,999,999, and the runtime refuses a write with other nanos.
 ///
 /// The key has these big-endian fields, in the order they're compared:
 ///
@@ -184,6 +185,7 @@ fn be32(value: i32) -> [u8; 4] {
 mod tests {
     use super::*;
     use crate::{
+        ids::validate_producer,
         proto::WorkflowTaskAttempt,
         test_store::{
             activity, client, local_activity, set_ids, standalone_activity, task, workflow,
@@ -196,49 +198,60 @@ mod tests {
         attempt_key(producer.kind.as_ref())
     }
 
-    /// The seven fields of an attempt key, in the order that the key compares them.
-    type Fields = (i64, i32, i64, i32, i64, i32, i32);
+    /// The parts of an attempt, in the order that the attempts of a Producer compare:
+    ///
+    /// 1. The started event id of the Workflow Task
+    /// 2. The attempt number of that Workflow Task
+    /// 3. The started time of that task, in nanoseconds since 1970
+    /// 4. The scheduled time of the Activity attempt, in nanoseconds since 1970
+    /// 5. The attempt number of the Activity or the Local Activity
+    type Order = (i64, i32, i128, i128, i32);
 
     #[test]
-    fn the_order_of_two_keys_is_the_order_of_their_attempts() {
-        let mut workflows: Vec<(Fields, [u8; ATTEMPT_KEY_LEN])> = vec![];
+    fn for_the_attempts_that_the_runtime_takes_the_order_of_two_keys_is_their_order() {
+        let mut workflows: Vec<(Order, Producer)> = vec![];
         let mut locals = vec![];
         let mut activities = vec![];
         let mut standalones = vec![];
-        // Each grid has 1 and 256, which sort the other way round as little-endian bytes.
+        // Each grid has 1 and 256, which sort the other way round as little-endian bytes. It also
+        // has values that the runtime refuses, such as nanos of one second or more.
         let attempts = [-1, 1, 256, i32::MAX];
         for seconds in [-1, 0, 1, 256, i64::MAX] {
-            for nanos in [0, 1, 256, 999_999_999] {
+            for nanos in [-1, 0, 1, 256, 999_999_999, 1_000_000_000, i32::MAX] {
+                // A time before 1970 counts as 1970, as it does in the key.
+                let at = i128::from(seconds.max(0)) * 1_000_000_000 + i128::from(nanos);
                 for attempt in attempts {
-                    // A negative field counts as zero.
-                    let (at, tries) = (seconds.max(0), attempt.max(0));
-                    let scheduled = (0, 0, 0, 0, at, nanos, tries);
-                    activities.push((scheduled, key(&activity(seconds, nanos, attempt))));
-                    let standalone = standalone_activity(seconds, nanos, attempt);
-                    standalones.push((scheduled, key(&standalone)));
+                    let scheduled = (0, 0, 0, at, attempt);
+                    activities.push((scheduled, activity(seconds, nanos, attempt)));
+                    standalones.push((scheduled, standalone_activity(seconds, nanos, attempt)));
                     for started_event_id in [0, 1, 256, i64::MAX] {
                         let task = WorkflowTaskAttempt {
                             started_event_id,
                             attempt,
                             started_time: Some(Timestamp { seconds, nanos }),
                         };
-                        let started = (started_event_id, tries, at, nanos, 0, 0, 0);
-                        workflows.push((started, key(&workflow(Some(task)))));
+                        let started = (started_event_id, attempt, at, 0, 0);
+                        workflows.push((started, workflow(Some(task))));
                         for local in attempts {
-                            let fields = (started_event_id, tries, at, nanos, 0, 0, local.max(0));
-                            locals.push((fields, key(&local_activity(task, local))));
+                            let order = (started_event_id, attempt, at, 0, local);
+                            locals.push((order, local_activity(task, local)));
                         }
                     }
                 }
             }
         }
-        for keys in [workflows, locals, activities, standalones] {
-            for (fields, key) in &keys {
-                for (other_fields, other_key) in &keys {
+        for attempts in [workflows, locals, activities, standalones] {
+            let taken: Vec<(Order, [u8; ATTEMPT_KEY_LEN])> = attempts
+                .iter()
+                .filter(|(_, producer)| validate_producer(Some(producer)).is_ok())
+                .map(|(order, producer)| (*order, key(producer)))
+                .collect();
+            for (order, key) in &taken {
+                for (other_order, other_key) in &taken {
                     assert_eq!(
                         key.cmp(other_key),
-                        fields.cmp(other_fields),
-                        "{fields:?} and {other_fields:?}"
+                        order.cmp(other_order),
+                        "{order:?} and {other_order:?}"
                     );
                 }
             }

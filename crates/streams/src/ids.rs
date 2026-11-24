@@ -13,6 +13,11 @@ use crate::{
 /// The maximum length of a Stream id, in bytes, as the API of the Stream service sets it.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
 
+/// The maximum nanos of a time in an attempt. [`attempt_key`](crate::attempt::attempt_key) compares
+/// the seconds of a time before its nanos, which is the order of the times only when the nanos are
+/// less than one second.
+const MAX_NANOS: i32 = 999_999_999;
+
 /// The maximum length of an offset, in bytes. Every Store keeps to it, since offsets go into
 /// Workflow History and readers keep them.
 pub const MAX_OFFSET_BYTES: usize = 1024;
@@ -58,7 +63,8 @@ pub fn validate_offset(offset: &[u8], what: &str, reason: AnyReason) -> Result<(
 /// Checks the Producer of a write. It needs a kind, every id of that kind, and the fields of its
 /// attempt. Stores and readers tell Producers apart by their ids, and the attempts of a Producer
 /// by the fields of the attempt, so both have to be complete. The started time of a Workflow Task
-/// is the one optional field, because the server doesn't always send it.
+/// is the one optional field, because the server doesn't always send it. Each time of the attempt
+/// must have nanos from 0 to 999,999,999.
 pub(crate) fn validate_producer(producer: Option<&Producer>) -> Result<&Producer, AnyError> {
     let producer =
         producer.ok_or_else(|| AnyError::invalid_argument("The request has no Producer"))?;
@@ -80,9 +86,9 @@ pub(crate) fn validate_producer(producer: Option<&Producer>) -> Result<&Producer
         Kind::WorkflowActivity(WorkflowActivityProducer { attempt, .. })
         | Kind::StandaloneActivity(StandaloneActivityProducer { attempt, .. }) => {
             let attempt = attempt.as_ref().ok_or_else(|| missing("attempt"))?;
-            if attempt.attempt_scheduled_time.is_none() {
-                return Err(missing("attempt scheduled time"));
-            }
+            let scheduled = attempt.attempt_scheduled_time.as_ref();
+            let scheduled = scheduled.ok_or_else(|| missing("attempt scheduled time"))?;
+            validate_nanos(scheduled.nanos, "attempt scheduled time")?;
             at_least_one(attempt.attempt, "Activity")?;
         }
         Kind::Client(_) => {}
@@ -111,7 +117,19 @@ fn validate_task(task: &WorkflowTaskAttempt) -> Result<(), AnyError> {
             "The Workflow Task attempt has no started event id",
         ));
     }
+    if let Some(started) = &task.started_time {
+        validate_nanos(started.nanos, "started time of the Workflow Task")?;
+    }
     at_least_one(task.attempt, "Workflow Task")
+}
+
+fn validate_nanos(nanos: i32, time: &str) -> Result<(), AnyError> {
+    if !(0..=MAX_NANOS).contains(&nanos) {
+        return Err(AnyError::invalid_argument(format!(
+            "The {time} has {nanos} nanos, and it must have 0 to {MAX_NANOS}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -201,6 +219,14 @@ mod tests {
             })
         };
         let time = Some(Timestamp::default());
+        let nanos = |nanos| Some(Timestamp { seconds: 1, nanos });
+        let task_at = |started_time| {
+            Some(WorkflowTaskAttempt {
+                started_event_id: 3,
+                attempt: 1,
+                started_time,
+            })
+        };
         // The started time of a Workflow Task is optional.
         for producer in [workflow(no_time(3, 1)), local(dispatched(no_time(3, 1), 1))] {
             assert_eq!(validate_producer(Some(&producer)), Ok(&producer));
@@ -236,6 +262,20 @@ mod tests {
             (
                 Some(standalone(scheduled(time, 0))),
                 "The Activity attempt number is 0, and it must be 1 or more",
+            ),
+            (
+                Some(standalone(scheduled(nanos(-1), 1))),
+                "The attempt scheduled time has -1 nanos, and it must have 0 to 999999999",
+            ),
+            (
+                Some(workflow(task_at(nanos(1_000_000_000)))),
+                "The started time of the Workflow Task has 1000000000 nanos, and it must have 0 to \
+                 999999999",
+            ),
+            (
+                Some(local(dispatched(task_at(nanos(-1)), 1))),
+                "The started time of the Workflow Task has -1 nanos, and it must have 0 to \
+                 999999999",
             ),
         ];
         for (producer, message) in cases {

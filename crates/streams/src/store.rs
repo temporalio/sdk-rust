@@ -165,8 +165,8 @@ use futures_util::future::BoxFuture;
 ///   `store` of the ref, which only an SDK reads. There's no bound for the request id.
 /// - `from_offset` is at most [`MAX_OFFSET_BYTES`](crate::ids::MAX_OFFSET_BYTES) bytes.
 /// - The Producer of an append or a close has a kind, every id of that kind, and the fields of its
-///   attempt. The Record size bounds the ids of an append's Producer, since the size of a Record
-///   counts its Producer.
+///   attempt. Each time of the attempt has nanos from 0 to 999,999,999. The Record size bounds the
+///   ids of an append's Producer, since the size of a Record counts its Producer.
 /// - A batch has at least one Record, every Record has a body, and the batch fits the
 ///   [`StoreLimits`](crate::record::StoreLimits) of the runtime. Those are the limits of the
 ///   caller, from the Stream config of its SDK, so a Store with a lower limit checks its own
