@@ -1075,6 +1075,8 @@ impl PreparedWFT {
 #[derive(Debug)]
 struct OutstandingTask {
     info: WorkflowTaskInfo,
+    /// True if the task came with an Update request, so the server may have made it speculative.
+    has_update_request: bool,
     /// Set if the outstanding task has quer(ies) which must be fulfilled upon finishing replay
     pending_queries: Vec<QueryWorkflow>,
     start_time: Instant,

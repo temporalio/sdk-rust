@@ -425,7 +425,11 @@ message RequestCancelNexusOperation {
 }
 
 // Appends Records to a Stream as the Workflow's Producer. Core makes the request id of the append
-// and sends the result in a `ResolveStreamAppend` job.
+// and sends the result in a `ResolveStreamAppend` job. History keeps the result in the ledger of
+// the Workflow Task in which lang got it, which is the `stream_calls` of the `sdk_metadata` of the
+// completion of that task. While an append runs, Core keeps the task and doesn't send its
+// completion, as for a Local Activity, until each call has an answer or Core must complete the
+// task earlier, as at its heartbeat. `ResolveStreamAppend` says in which activation a result comes.
 //
 // An append is at-least-once. A later attempt of the Workflow Task writes it again, on this Worker
 // or on another one.
@@ -441,10 +445,12 @@ message RequestCancelNexusOperation {
 // written before the close.
 //
 // Core fails the Workflow Task in each of these cases, and gives lang no failure of the append.
-// * `seq` is 0, or isn't above the `seq` of the append before it.
+// * `seq` is 0, isn't above the `seq` of the append before it, or is above 2147483647, since
+//   History keeps it as an `int32`.
 // * `stream` is unset, its id is empty or longer than 4096 bytes, or its Store name is longer than
 //   4096 bytes.
 // * The Worker has no Stream runtime for the Store of `stream`.
+// * The server doesn't take the `sdk_metadata` of a completion, so History can't keep the result.
 // * The append must wait for the task's heartbeat to try again, because the Store answered
 //   `StoreUnavailable` or gave no answer. The failure message then starts with
 //   `StreamStoreUnavailable:`.
@@ -456,7 +462,7 @@ message RequestCancelNexusOperation {
 // `bodies`. A `stream` with no Store name matches any Store in History. An append with no result
 // in History runs again after the replay, as a later attempt, so a reader can see its batch twice.
 //
-// If lang completes the Workflow Task while an append has no result in a marker, Core forces a new
+// If lang completes the Workflow Task while an append has no result in a ledger, Core forces a new
 // task, unless the completion has the Workflow's last command.
 message AppendToStream {
     // Lang's incremental sequence number for appends, starting at 1.
@@ -474,7 +480,7 @@ message AppendToStream {
 // * Core drops it if it has no result when lang sends the Workflow's last command.
 // * The same cases fail the Workflow Task.
 // * A replay compares the command with History in the same way.
-// * If lang completes the task while the close has no result in a marker, Core forces a new task.
+// * If lang completes the task while the close has no result in a ledger, Core forces a new task.
 //
 // Workflow code that needs its close must await the result before its last command. A close whose
 // intent is in History with no result runs again after a replay.

@@ -15,7 +15,6 @@ mod modify_workflow_properties_state_machine;
 mod nexus_operation_state_machine;
 mod patch_state_machine;
 mod signal_external_state_machine;
-mod stream_marker_state_machine;
 mod timer_state_machine;
 mod update_state_machine;
 mod upsert_search_attributes_state_machine;
@@ -25,7 +24,9 @@ mod workflow_task_state_machine;
 mod transition_coverage;
 
 pub(crate) use temporalio_common::fsm_trait::MachineError;
-pub(crate) use workflow_machines::{MachinesWFTResponseContent, WorkflowMachines};
+pub(crate) use workflow_machines::{
+    MachinesWFTResponseContent, WorkflowMachines, is_update_rejection,
+};
 
 use crate::{
     telemetry::VecDisplayer,
@@ -47,7 +48,6 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::{Debug, Display},
 };
-use stream_marker_state_machine::StreamMarkerMachine;
 use temporalio_common::{
     fsm_trait::{StateMachine, TransitionResult},
     protos::temporal::api::{
@@ -84,7 +84,6 @@ enum Machines {
     ModifyWorkflowPropertiesMachine,
     UpdateMachine,
     NexusOperationMachine,
-    StreamMarkerMachine,
 }
 
 /// Extends [rustfsm::StateMachine] with some functionality specific to the temporal SDK.

@@ -14,8 +14,8 @@ use crate::{
             WFCommand, WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION,
             WFTReportStatus, WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
-            machines::{MachinesWFTResponseContent, WorkflowMachines},
-            streams::{RunStreams, Streams, TaskState, is_stream_marker, task_attempt},
+            machines::{MachinesWFTResponseContent, WorkflowMachines, is_update_rejection},
+            streams::{RunStreams, Streams, TaskState, has_ledger, task_attempt},
         },
     },
 };
@@ -235,6 +235,7 @@ impl ManagedRun {
         }
         self.wft = Some(OutstandingTask {
             info: wft_info,
+            has_update_request: !work.messages.is_empty(),
             pending_queries,
             start_time,
             permit: pwft.permit,
@@ -706,7 +707,7 @@ impl ManagedRun {
                 });
         }
 
-        // History gets no marker from a failed task, so Workflow code must not get any of its
+        // History gets no ledger from a failed task, so Workflow code must not get any of its
         // Stream results.
         if !is_no_report_query_fail {
             self.streams.stop(&mut self.wfm.machines.stream_calls);
@@ -946,7 +947,7 @@ impl ManagedRun {
         }
         self.wfm.notify_of_local_result(res)?;
         self.streams.dispatch(&mut self.wfm.machines.stream_calls);
-        // A Stream result that doesn't fit in the task's marker needs the next task.
+        // A Stream result that doesn't fit in the task's ledger needs the next task.
         if self.wfm.machines.stream_must_complete()
             && let Some(waiting) = self.waiting_on_la.as_mut()
         {
@@ -1031,8 +1032,8 @@ impl ManagedRun {
     /// - `work` isn't the next task of the run's History. It replaces the task that the run holds,
     ///   or its `previous_started_event_id` is above the last started event id that the run knows,
     ///   so another Worker completed a task.
-    /// - The run has Stream work, which is a call with no result in a marker, a marker that it
-    ///   hasn't sent, or a Stream marker in the events of `work`.
+    /// - The run has Stream work, which is a call with no result in a ledger, a ledger that it
+    ///   hasn't sent, or a completion with a ledger in the events of `work`.
     pub(super) fn stream_work_is_stale_for(&self, work: &PreparedWFT) -> bool {
         let machines = &self.wfm.machines;
         let update = &work.update;
@@ -1056,8 +1057,8 @@ impl ManagedRun {
         let after_other_tasks = update.is_real() && update.previous_wft_started_id > held;
         (replaces_held_task || after_other_tasks)
             && (machines.stream_calls.needs_next_task()
-                || machines.stream_calls.has_marker()
-                || update.get_events().iter().any(is_stream_marker))
+                || machines.stream_calls.has_ledger()
+                || update.get_events().iter().any(has_ledger))
     }
 
     /// Stops the Stream calls of the run, and evicts it. The run that replaces it processes `work`,
@@ -1341,12 +1342,12 @@ impl ManagedRun {
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         // An evicted run with an open Stream call completes its task, and doesn't let it time out.
         let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
-        let has_stream_marker = self.wfm.machines.stream_calls.has_marker();
+        let has_ledger = self.wfm.machines.stream_calls.has_ledger();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
             && (machines_wft_response.commands().peek().is_some()
                 || machines_wft_response.has_messages()
-                || has_stream_marker
+                || has_ledger
                 || stream_calls_open);
 
         let query_responses = data.query_responses;
@@ -1394,12 +1395,22 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                machines_wft_response.seal_stream_marker();
                 (
                     machines_wft_response.commands().collect(),
                     machines_wft_response.messages(),
                 )
             };
+            let sdk_metadata = machines_wft_response.metadata_for_complete();
+            // The server drops the completion of a speculative task, which an Update makes, if it
+            // has no command and only rejects Updates. A ledger isn't a command, so a forced task
+            // makes the server keep the completion that has one.
+            if sdk_metadata.stream_calls.is_some()
+                && commands.is_empty()
+                && messages.iter().all(is_update_rejection)
+                && self.wft.as_ref().is_some_and(|t| t.has_update_request)
+            {
+                force_new_wft = true;
+            }
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
@@ -1410,7 +1421,7 @@ impl ManagedRun {
                     commands,
                     messages,
                     query_responses,
-                    sdk_metadata: machines_wft_response.metadata_for_complete(),
+                    sdk_metadata,
                     versioning_behavior: data.versioning_behavior,
                     attempt,
                 },
@@ -1667,7 +1678,7 @@ struct WaitingOnLAs {
     wft_timeout: Duration,
     /// Can be used to abort heartbeat timeouts
     hb_timeout_handle: AbortHandle,
-    /// Defers the completion of the workflow task at its heartbeat, or at a full Stream marker,
+    /// Defers the completion of the workflow task at its heartbeat, or at a full ledger,
     /// when lang must finish an outstanding activation before Core can safely complete the task.
     completion_pending: Option<EarlyCompletion>,
 }
@@ -1677,7 +1688,7 @@ struct WaitingOnLAs {
 enum EarlyCompletion {
     /// The heartbeat of the task fired.
     Heartbeat,
-    /// The Stream marker of the task has no room for the next result.
+    /// The ledger of the task has no room for the next result.
     OutOfRoom,
 }
 #[derive(Debug)]

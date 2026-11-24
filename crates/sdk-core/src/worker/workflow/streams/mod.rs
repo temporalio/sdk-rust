@@ -2,12 +2,12 @@
 //! writes with the attempt of a Workflow Task.
 
 mod calls;
+mod ledger;
 mod manager;
-mod marker;
 
 pub(crate) use calls::{Phase, StreamCalls};
+pub(crate) use ledger::{has_ledger, peeked_ledger};
 pub(crate) use manager::{StreamManager, StreamResolution};
-pub(crate) use marker::{is_stream_marker, marker_details, peeked_marker};
 
 use crate::{
     WorkerConfig,
@@ -27,10 +27,9 @@ use temporalio_streams::StreamRuntime;
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tracing::Span;
 
-/// The maximum size of the entries of one marker, which is the length of the JSON in its `data`
-/// detail. The server terminates a Workflow that records a marker over its blob size limit, which
-/// is 2 MiB by default.
-const MAX_MARKER_ENTRY_BYTES: usize = 256 * 1024;
+/// The maximum encoded size of the ledger of one task. It keeps a completion far below the
+/// message size limit of gRPC and the size of one write to History on the server.
+const MAX_LEDGER_BYTES: usize = 256 * 1024;
 
 /// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
 /// with the settings of its Stream calls.
@@ -106,12 +105,12 @@ impl StreamSettings {
         Ok(())
     }
 
-    /// Returns [`MAX_MARKER_ENTRY_BYTES`], or the bound that a test set.
-    pub(crate) fn max_marker_entry_bytes(&self) -> usize {
+    /// Returns [`MAX_LEDGER_BYTES`], or the bound that a test set.
+    pub(crate) fn max_ledger_bytes(&self) -> usize {
         #[cfg(test)]
-        let max = self.bounds.max_marker_entry_bytes;
+        let max = self.bounds.max_ledger_bytes;
         #[cfg(not(test))]
-        let max = MAX_MARKER_ENTRY_BYTES;
+        let max = MAX_LEDGER_BYTES;
         max
     }
 }
@@ -120,14 +119,14 @@ impl StreamSettings {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TestBounds {
-    pub(crate) max_marker_entry_bytes: usize,
+    pub(crate) max_ledger_bytes: usize,
 }
 
 #[cfg(test)]
 impl Default for TestBounds {
     fn default() -> Self {
         Self {
-            max_marker_entry_bytes: MAX_MARKER_ENTRY_BYTES,
+            max_ledger_bytes: MAX_LEDGER_BYTES,
         }
     }
 }

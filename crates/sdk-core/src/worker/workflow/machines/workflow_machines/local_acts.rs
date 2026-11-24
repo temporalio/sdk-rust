@@ -140,18 +140,21 @@ impl LocalActivityData {
         self.activation_index += 1;
     }
 
-    pub(super) fn advance_to_next_held_activation(&mut self, stream: Option<u64>) {
-        if let Some(activation_index) = self.next_held_activation(stream) {
-            self.activation_index = self.activation_index.max(activation_index);
+    /// Advances to the next held result of History: the next peeked resolution, or the Stream
+    /// result at index `stream` if that's lower. Stream results use this index because no event of
+    /// History starts their activation, so History must keep which activation it was. Both kinds
+    /// count the activations of one task, and a replay must give them in the order of the first
+    /// run, so they share one counter. A separate counter would be a copy that the code must keep
+    /// equal: the same reset and step, and each jump to a held result of either kind moving both.
+    pub(super) fn advance_to_next_resolution_activation(&mut self, stream: Option<u64>) {
+        if let Some(activation_index) = self
+            .preresolutions
+            .front()
+            .and_then(|item| item.activation_index)
+        {
+            let next = stream.map_or(activation_index, |stream| stream.min(activation_index));
+            self.activation_index = self.activation_index.max(next);
         }
-    }
-
-    /// Returns the lowest activation index of a held result of History. That's the index of the
-    /// next peeked resolution, or `stream`, the index of the next Stream result, if it's lower.
-    /// Returns `None` if there's no peeked resolution, or if its marker has no index.
-    pub(super) fn next_held_activation(&self, stream: Option<u64>) -> Option<u64> {
-        let marker = self.next_resolution_activation()?;
-        Some(stream.map_or(marker, |stream| stream.min(marker)))
     }
 
     /// Returns the activation index of the next peeked resolution, if its marker has one.

@@ -50,7 +50,7 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions, because a replay also
-//  scans ahead for their marker. Appends go before closes, and each kind is in `seq` order. When a
+//  scans ahead for their ledger. Appends go before closes, and each kind is in `seq` order. When a
 //  replay gives the results of several activations in one, the Stream results keep the order of
 //  those activations, after all local activity resolutions.
 // * Queries always go last (and, in fact, always come in their own activation)
@@ -443,20 +443,20 @@ message RemoveFromCache {
 }
 
 // The result of an `AppendToStream`. Core gives each result in the next activation after the
-// Store answers, so each result can cost an activation.
+// Store answers, so each result can cost an activation. The ledger of the task keeps the index of
+// that activation, which Core counts as it does for the marker of a local activity. A result that
+// arrives while the task completes, or that doesn't fit in the ledger, comes in the first
+// activation of the next task.
 //
-// A replay gives each result in the same activation as the first run only if History has the flag
-// that turns workflow task chunking off. Without the flag, a replay keeps the order of the results
-// of a task, but it can give a result in another activation in two cases.
-// * A Workflow Task completes with no command, and the first activation of the next task has a
-//   result. A replay takes the two tasks as one, and can give the results of the first two
-//   activations of the second task in one.
+// A replay gives each result in the activation with its index, and never before a local activity
+// resolution that the first run gave earlier. It gives the activations of the first run only if
+// History has the flag that turns workflow task chunking off. Without the flag, a replay can give
+// the jobs of several activations of the first run in one, in their order, in two cases.
+// * A Workflow Task completes with no command and no `stream_calls`. A replay takes it and the
+//   next task as one.
 // * A Workflow Task starts with an Update that Workflow code rejects, which leaves no event. When
-//   such a replay has no other job to give, it gives the results of History in one activation, in
-//   the order of the first run, up to the first one whose call Workflow code hasn't made yet.
-// A task with only Stream calls replays in the same activations as a task with only Local
-// Activities. In a task with both, a result waits for each result of the other kind that the first
-// run gave before it, so its activations can differ from those of Local Activities alone.
+//   such a replay has no other job to give, it gives the results of History in one activation, up
+//   to the first one whose call Workflow code hasn't made yet.
 message ResolveStreamAppend {
     // The `seq` of the `AppendToStream`.
     uint32 seq = 1;

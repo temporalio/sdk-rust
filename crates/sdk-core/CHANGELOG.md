@@ -44,11 +44,16 @@ relevant information.
 * [lang-internal] Workflow code can append to and close a Stream with the experimental
   `AppendToStream` and `CloseStream` commands, on a Store in `WorkerConfig::stream_runtimes`. Each
   call writes with the Producer and the attempt of its Workflow Task. Its result comes back in a
-  `ResolveStreamAppend` or `ResolveStreamClose` job and goes into a `core_stream` marker, so a
-  replay doesn't make a Store call. Core drops a call that has no result when the Workflow's last
-  command arrives, as it drops a Local Activity. If a call is waiting to try again at the task's
-  heartbeat, because a try failed with `StoreUnavailable` or got no answer within `try_deadline`,
-  the task fails, and its failure message starts with `StreamStoreUnavailable:`.
+  `ResolveStreamAppend` or `ResolveStreamClose` job and goes into the ledger of the task, which Core
+  puts on the completion as the new `stream_calls` of `sdk_metadata`, so a replay doesn't make a
+  Store call. A result comes in the next activation after the Store answers, and the ledger keeps
+  the index of that activation, which a replay counts as for a Local Activity result. A close runs
+  once History has the task that asked for it. A Stream call adds no event to History. If the
+  server doesn't take `sdk_metadata`, a Stream call fails its task. Core drops a call that has no
+  result when the Workflow's last command arrives, as it drops a Local Activity. If a call is
+  waiting to try again at the task's heartbeat, because a try failed with `StoreUnavailable` or got
+  no answer within `try_deadline`, the task fails, and its failure message starts with
+  `StreamStoreUnavailable:`.
 
 ## [0.12.0] - 2026-11-23
 

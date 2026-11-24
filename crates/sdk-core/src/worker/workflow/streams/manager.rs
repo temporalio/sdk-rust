@@ -4,12 +4,10 @@ use super::{StreamRuntimes, StreamSettings};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
 use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
-use temporalio_common::protos::{
-    coresdk::external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
-    temporal::api::{
-        common::v1::{Payload, Payloads},
-        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
-    },
+use temporalio_common::protos::temporal::api::{
+    common::v1::{Payload, Payloads},
+    failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+    sdk::v1::workflow_task_stream_calls::{AppendOffsets, CallFailure, append_result},
 };
 use temporalio_streams::{
     AnyReason, StreamError, StreamRuntime,
@@ -17,7 +15,7 @@ use temporalio_streams::{
 };
 use tokio::{runtime::Handle, task::AbortHandle};
 
-/// The maximum length of a failure message that Workflow code gets and a marker records, in bytes.
+/// The maximum length of a failure message that Workflow code gets and a ledger records, in bytes.
 /// A Store can return error text of any size, so the message needs a bound.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
 
@@ -62,9 +60,9 @@ pub(crate) struct StreamResolution {
 
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    Append(stream_append_result::Result),
+    Append(append_result::Result),
     /// `None` if the Stream is closed.
-    Close(Option<StreamFailure>),
+    Close(Option<CallFailure>),
 }
 
 type Sink = Arc<dyn Fn(String, StreamResolution) + Send + Sync>;
@@ -219,11 +217,11 @@ async fn run(runtime: &StreamRuntime, op: Op, settings: StreamSettings, note: &N
             let send = || runtime.append_records(request.clone(), request_id.clone());
             let answer = tries(settings, note, send).await;
             Outcome::Append(match answer {
-                Ok(appended) => stream_append_result::Result::Appended(StreamAppendOffsets {
+                Ok(appended) => append_result::Result::Appended(AppendOffsets {
                     first_offset: appended.first_offset,
                     last_offset: appended.last_offset,
                 }),
-                Err(error) => stream_append_result::Result::Failure(recorded(&error)),
+                Err(error) => append_result::Result::Failure(recorded(&error)),
             })
         }
         Op::Close(request) => {
@@ -328,18 +326,19 @@ pub(super) fn is_outage<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R
     error.reason.into() == StreamErrorReason::StoreUnavailable
 }
 
-/// Returns the reason and the message of `error`, as a marker records a failed call.
-pub(super) fn recorded<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>) -> StreamFailure {
-    StreamFailure {
-        reason: error.reason.into().as_str_name().to_string(),
+/// Returns the reason and the message of `error`, as a ledger records a failed call.
+pub(super) fn recorded<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>) -> CallFailure {
+    let reason: StreamErrorReason = error.reason.into();
+    CallFailure {
+        reason: reason.into(),
         message: cut(error.message.clone()),
     }
 }
 
-/// Returns the failure that Workflow code gets for a failed call that a marker records.
-pub(super) fn failure_of(recorded: &StreamFailure) -> Failure {
-    let reason = StreamErrorReason::from_str_name(&recorded.reason)
-        .expect("The decode of a marker checks the reason of each failure");
+/// Returns the failure that Workflow code gets for a failed call that a ledger records.
+pub(super) fn failure_of(recorded: &CallFailure) -> Failure {
+    let reason = StreamErrorReason::try_from(recorded.reason)
+        .expect("The check of a ledger in History refuses a failure with an unknown reason");
     let message = recorded.message.clone();
     failure(&StreamError { reason, message })
 }
@@ -490,7 +489,7 @@ mod tests {
         assert_eq!(run_id, "r");
         assert!(matches!(
             resolution.outcome,
-            Outcome::Append(stream_append_result::Result::Appended(_))
+            Outcome::Append(append_result::Result::Appended(_))
         ));
         assert_eq!(manager.outage("r"), None);
         let tries = store.requests();
@@ -538,7 +537,7 @@ mod tests {
         message
     }
 
-    // Workflow code gets the failure of a call from the reason and the message that a marker
+    // Workflow code gets the failure of a call from the reason and the message that a ledger
     // records, in the first run and in a replay. A message over 4096 bytes is cut on a character,
     // with `...` at the end.
     #[test]
