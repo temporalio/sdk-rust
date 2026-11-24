@@ -49,7 +49,7 @@ use temporalio_sdk::{
     opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
-use temporalio_sdk_aws_lambda::{LambdaWorker, LambdaWorkerOptions, otel::OpenTelemetryOptions};
+use temporalio_sdk_aws_lambda::{LambdaWorker, otel::OpenTelemetryOptions};
 use tokio::{
     net::TcpListener,
     sync::{Notify, oneshot},
@@ -228,7 +228,7 @@ impl WorkerPlugin for ConflictingPlugin {
                 .build(),
         )
         .build();
-        options.graceful_shutdown_period = Some(Duration::from_secs(60));
+        options.graceful_shutdown_period = Some(Duration::from_millis(200));
         options.max_eager_activity_reservations_per_workflow_task = 3;
         Ok(())
     }
@@ -246,28 +246,92 @@ fn event(request_id: &str) -> LambdaEvent<()> {
     LambdaEvent::new((), context)
 }
 
+struct ShutdownPeriodPlugin(Option<Duration>);
+
+impl WorkerPlugin for ShutdownPeriodPlugin {
+    fn name(&self) -> &str {
+        "lambda-shutdown-period"
+    }
+
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
+        options.graceful_shutdown_period = self.0;
+        Ok(())
+    }
+}
+
+#[rstest::rstest]
+#[case::shorter_period(Some(Duration::from_millis(100)), None)]
+#[case::missing(None, Some("finite"))]
+#[case::too_long(
+    Some(Duration::from_secs(60)),
+    Some("insufficient Lambda invocation time")
+)]
+#[case::overflow(Some(Duration::MAX), Some("supported duration"))]
+#[tokio::test]
+async fn lambda_uses_effective_post_plugin_shutdown_period(
+    #[case] period: Option<Duration>,
+    #[case] expected_cause: Option<&str>,
+) {
+    let queue = format!("lambda-shutdown-config-{}", Uuid::new_v4());
+    let mut options = LambdaWorker::worker_options(queue.clone());
+    options.register_workflow::<LambdaWorkflow>().unwrap();
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let hook_calls = hooks.clone();
+    let worker = LambdaWorker::builder(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(queue)
+            .build_id("test")
+            .build(),
+        options,
+    )
+    .client_options(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace()).build(),
+    )
+    .configure(move |mut config| {
+        config
+            .worker_options
+            .worker_plugin(ShutdownPeriodPlugin(period));
+        async { Ok(config) }
+    })
+    .shutdown_hook(move |_| {
+        hook_calls.fetch_add(1, Ordering::Relaxed);
+        async { Ok(()) }
+    })
+    .build()
+    .unwrap();
+    for _ in 0..2 {
+        let result = worker.handle(event("post-plugin-shutdown-period")).await;
+        if let Some(expected_cause) = expected_cause {
+            let error = result.unwrap_err();
+            assert!(!error.requires_restart());
+            assert!(format!("{:#}", anyhow::Error::new(error)).contains(expected_cause));
+        } else {
+            result.unwrap();
+        }
+    }
+    assert_eq!(hooks.load(Ordering::Relaxed), 2);
+}
+
 #[tokio::test]
 async fn lambda_validation_failure_runs_hooks_and_prevents_reuse() {
     let queue = format!("lambda-validation-{}", Uuid::new_v4());
     let called = Arc::new(AtomicBool::new(false));
     let hook_called = called.clone();
-    let mut limits = LambdaWorkerOptions::default();
-    limits.graceful_shutdown_period = Duration::from_millis(100);
+    let mut options = LambdaWorker::worker_options(queue.clone());
+    options.graceful_shutdown_period = Some(Duration::from_millis(100));
+    options.register_workflow::<LambdaWorkflow>().unwrap();
     let worker = LambdaWorker::builder(
         WorkerDeploymentVersion::builder()
             .deployment_name(queue.clone())
             .build_id("test")
             .build(),
-        WorkerOptions::new(queue)
-            .register_workflow::<LambdaWorkflow>()
-            .unwrap()
-            .build(),
+        options,
     )
     .client_options(
         get_integ_server_options(),
         ClientOptions::new(format!("missing-{}", Uuid::new_v4())).build(),
     )
-    .lambda_options(limits)
     .shutdown_hook(move |_| {
         hook_called.store(true, Ordering::Relaxed);
         async { Ok(()) }
@@ -376,52 +440,48 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay(#[case] aut
             .unwrap(),
     );
     telemetry.service_name = Some("trace-service".to_owned());
-    let mut limits = LambdaWorkerOptions::default();
-    limits.graceful_shutdown_period = Duration::from_millis(100);
     let conflicts = Arc::new(AtomicUsize::new(0));
     let callback_conflicts = conflicts.clone();
-    let builder = LambdaWorker::builder(
-        version.clone(),
-        WorkerOptions::new(queue.clone())
-            .register_workflow::<LambdaWorkflow>()
-            .unwrap()
-            .register_activities(LambdaActivities {
-                registry,
-                ..Default::default()
-            })
-            .worker_interceptor(ShutdownObserver(key))
-            .worker_plugin(ConflictingPlugin(conflicts.clone()))
-            .build(),
-    )
-    .client_options(
-        get_integ_server_options(),
-        ClientOptions::new(integ_namespace())
-            .plugin(ClientAndWorkerPlugin::new(ConflictingPlugin(
-                conflicts.clone(),
-            )))
-            .build(),
-    )
-    .configure(move |mut config| {
-        config
-            .worker_options
-            .worker_plugin(ConflictingPlugin(callback_conflicts.clone()));
-        async { Ok(config) }
-    })
-    .lambda_options(limits)
-    .open_telemetry(telemetry)
-    .shutdown_hook(move |_| {
-        if let Some(registry) = hook_registry.lock().unwrap().take() {
-            // Keeping the registry alive prevents client drop from hiding a missing finalizer.
-            assert!(
-                registry
-                    .unregister_slot_provider(hook_key.lock().unwrap().unwrap())
-                    .is_err(),
-                "worker registration remains when hooks start"
-            );
-        }
-        hook_calls.fetch_add(1, Ordering::Relaxed);
-        async { Ok(()) }
-    });
+    let mut options = LambdaWorker::worker_options(queue.clone());
+    options.graceful_shutdown_period = Some(Duration::from_millis(100));
+    options
+        .register_workflow::<LambdaWorkflow>()
+        .unwrap()
+        .register_activities(LambdaActivities {
+            registry,
+            ..Default::default()
+        })
+        .worker_interceptor(ShutdownObserver(key))
+        .worker_plugin(ConflictingPlugin(conflicts.clone()));
+    let builder = LambdaWorker::builder(version.clone(), options)
+        .client_options(
+            get_integ_server_options(),
+            ClientOptions::new(integ_namespace())
+                .plugin(ClientAndWorkerPlugin::new(ConflictingPlugin(
+                    conflicts.clone(),
+                )))
+                .build(),
+        )
+        .configure(move |mut config| {
+            config
+                .worker_options
+                .worker_plugin(ConflictingPlugin(callback_conflicts.clone()));
+            async { Ok(config) }
+        })
+        .open_telemetry(telemetry)
+        .shutdown_hook(move |_| {
+            if let Some(registry) = hook_registry.lock().unwrap().take() {
+                // Keeping the registry alive prevents client drop from hiding a missing finalizer.
+                assert!(
+                    registry
+                        .unregister_slot_provider(hook_key.lock().unwrap().unwrap())
+                        .is_err(),
+                    "worker registration remains when hooks start"
+                );
+            }
+            hook_calls.fetch_add(1, Ordering::Relaxed);
+            async { Ok(()) }
+        });
     let worker = if auto_upgrade {
         builder.default_versioning_behavior(VersioningBehavior::AutoUpgrade)
     } else {
@@ -597,38 +657,34 @@ async fn lambda_drains_cancelled_activities_before_hooks(
     let finished = cancelled.clone();
     let release = Arc::new(AtomicBool::new(false));
     let release_from_hook = release.clone();
-    let mut limits = LambdaWorkerOptions::default();
-    limits.graceful_shutdown_period = Duration::from_millis(100);
-    let worker = LambdaWorker::builder(
-        version.clone(),
-        WorkerOptions::new(queue.clone())
-            .register_workflow::<LambdaCancellationWorkflow>()
-            .unwrap()
-            .register_activities(LambdaActivities {
-                cancelled: cancelled.clone(),
-                completion: completion.clone(),
-                gate: gate.clone(),
-                registry: registry.clone(),
-            })
-            .worker_interceptor(ShutdownObserver(key.clone()))
-            .build(),
-    )
-    .client_options(
-        get_integ_server_options(),
-        ClientOptions::new(integ_namespace()).build(),
-    )
-    .lambda_options(limits)
-    .shutdown_hook(move |remaining| {
-        assert!(!remaining.is_zero(), "drain consumed the hook reserve");
-        called.store(true, Ordering::Relaxed);
-        observed_in_hook.store(finished.load(Ordering::Relaxed), Ordering::Relaxed);
-        if release_from_hook.load(Ordering::Relaxed) {
-            hook_gate.as_ref().unwrap().notify_one();
-        }
-        async { Ok(()) }
-    })
-    .build()
-    .unwrap();
+    let mut options = LambdaWorker::worker_options(queue.clone());
+    options.graceful_shutdown_period = Some(Duration::from_millis(100));
+    options
+        .register_workflow::<LambdaCancellationWorkflow>()
+        .unwrap()
+        .register_activities(LambdaActivities {
+            cancelled: cancelled.clone(),
+            completion: completion.clone(),
+            gate: gate.clone(),
+            registry: registry.clone(),
+        })
+        .worker_interceptor(ShutdownObserver(key.clone()));
+    let worker = LambdaWorker::builder(version.clone(), options)
+        .client_options(
+            get_integ_server_options(),
+            ClientOptions::new(integ_namespace()).build(),
+        )
+        .shutdown_hook(move |remaining| {
+            assert!(!remaining.is_zero(), "drain consumed the hook reserve");
+            called.store(true, Ordering::Relaxed);
+            observed_in_hook.store(finished.load(Ordering::Relaxed), Ordering::Relaxed);
+            if release_from_hook.load(Ordering::Relaxed) {
+                hook_gate.as_ref().unwrap().notify_one();
+            }
+            async { Ok(()) }
+        })
+        .build()
+        .unwrap();
     worker.handle(event("register-version")).await.unwrap();
     hook_called.store(false, Ordering::Relaxed);
     release.store(release_during_cleanup, Ordering::Relaxed);

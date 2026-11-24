@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context as TaskContext, Poll},
@@ -35,7 +35,7 @@ use temporalio_sdk::{
     Runtime, Worker, WorkerOptions, WorkerPlugin,
     runtime::{
         PollerBehavior,
-        worker_tuner::{FixedSizeSlotSupplier, TunerHolder, WorkerTuner},
+        worker_tuner::{FixedSizeSlotSupplier, TunerHolder},
     },
 };
 use tokio::{
@@ -56,28 +56,13 @@ type ShutdownHook = Arc<dyn Fn(Duration) -> HookFuture + Send + Sync>;
 type ConfigureFuture = Pin<Box<dyn Future<Output = anyhow::Result<LambdaInvocationConfig>> + Send>>;
 type Configure = Arc<dyn Fn(LambdaInvocationConfig) -> ConfigureFuture + Send + Sync>;
 
-/// Lambda-oriented concurrency limits and shutdown budgets.
+/// Invocation cleanup budgets that are not part of SDK [`WorkerOptions`].
 ///
-/// Applied before the optional per-invocation configuration callback. A custom tuner can replace
-/// the fixed-size tuner; deployment versioning, disabled eager Activities, and the shutdown period
-/// are enforced after user plugins so they cannot invalidate invocation lifecycle guarantees.
+/// Worker tuning and graceful shutdown are configured on [`WorkerOptions`]. Use
+/// [`LambdaWorker::worker_options`] for Lambda-oriented defaults before customizing those options.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct LambdaWorkerOptions {
-    /// Maximum concurrent Workflow Tasks.
-    pub workflow_slots: usize,
-    /// Maximum concurrent Activities.
-    pub activity_slots: usize,
-    /// Maximum concurrent Local Activities.
-    pub local_activity_slots: usize,
-    /// Maximum concurrent Workflow Task polls.
-    pub workflow_task_pollers: usize,
-    /// Maximum concurrent Activity Task polls.
-    pub activity_task_pollers: usize,
-    /// Maximum number of cached Workflows.
-    pub max_cached_workflows: usize,
-    /// Time allowed for graceful Activity completion before cancellation is requested.
-    pub graceful_shutdown_period: Duration,
     /// Additional drain and finalization time after the graceful period.
     pub worker_shutdown_buffer: Duration,
     /// Shared budget for telemetry flush and application hooks.
@@ -87,13 +72,6 @@ pub struct LambdaWorkerOptions {
 impl Default for LambdaWorkerOptions {
     fn default() -> Self {
         Self {
-            workflow_slots: 10,
-            activity_slots: 2,
-            local_activity_slots: 2,
-            workflow_task_pollers: 2,
-            activity_task_pollers: 1,
-            max_cached_workflows: 30,
-            graceful_shutdown_period: Duration::from_secs(5),
             worker_shutdown_buffer: Duration::from_secs(1),
             shutdown_hook_buffer: Duration::from_secs(2),
         }
@@ -113,7 +91,7 @@ pub struct LambdaInvocationConfig {
     pub connection_options: ConnectionOptions,
     /// Namespace-bound client options.
     pub client_options: ClientOptions,
-    /// Worker registrations and options, initially populated with Lambda defaults.
+    /// Worker registrations and options, cloned from the options supplied to the builder.
     pub worker_options: WorkerOptions,
 }
 
@@ -186,7 +164,6 @@ pub struct LambdaWorkerBuilder {
     client_options: Option<(ConnectionOptions, ClientOptions)>,
     runtime: Option<Arc<Runtime>>,
     lambda_options: LambdaWorkerOptions,
-    custom_tuner: Option<WorkerTuner>,
     default_versioning_behavior: VersioningBehavior,
     configure: Option<Configure>,
     shutdown_hooks: Vec<ShutdownHook>,
@@ -220,15 +197,9 @@ impl LambdaWorkerBuilder {
         self
     }
 
-    /// Set Lambda-oriented limits and shutdown timings.
+    /// Set the additional Worker drain and application cleanup budgets.
     pub fn lambda_options(mut self, options: LambdaWorkerOptions) -> Self {
         self.lambda_options = options;
-        self
-    }
-
-    /// Replace the Lambda fixed-size tuner with an explicit custom tuner.
-    pub fn worker_tuner(mut self, tuner: impl Into<WorkerTuner>) -> Self {
-        self.custom_tuner = Some(tuner.into());
         self
     }
 
@@ -290,36 +261,6 @@ impl LambdaWorkerBuilder {
                 "task queue is required: set WorkerOptions.task_queue or TEMPORAL_TASK_QUEUE",
             ));
         }
-        self.worker_options.tuner = self.custom_tuner.unwrap_or_else(|| {
-            TunerHolder::builder()
-                .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(
-                    self.lambda_options.workflow_slots,
-                ))
-                .activity_task_slot_supplier(FixedSizeSlotSupplier::new(
-                    self.lambda_options.activity_slots,
-                ))
-                .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(
-                    self.lambda_options.local_activity_slots,
-                ))
-                .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
-                .build()
-                .into()
-        });
-        self.worker_options.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(
-            self.lambda_options.workflow_task_pollers,
-        ));
-        self.worker_options.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(
-            self.lambda_options.activity_task_pollers,
-        ));
-        self.worker_options.max_cached_workflows = self.lambda_options.max_cached_workflows;
-        let invariants = LambdaWorkerPlugin {
-            version: self.version,
-            default_versioning_behavior: self.default_versioning_behavior,
-            graceful_shutdown_period: self.lambda_options.graceful_shutdown_period,
-        };
-        invariants
-            .configure_worker_options(&mut self.worker_options)
-            .map_err(LambdaWorkerBuildError::new)?;
         #[allow(unused_mut)]
         let (connection_options, mut client_options) = match self.client_options {
             Some(options) => options,
@@ -348,21 +289,16 @@ impl LambdaWorkerBuilder {
                     .map_err(LambdaWorkerBuildError::new)?,
             ),
         };
-        let drain_budget = self.lambda_options.graceful_shutdown_period
-            + self.lambda_options.worker_shutdown_buffer;
-        let shutdown_buffer =
-            drain_budget + self.lambda_options.shutdown_hook_buffer + RESPONSE_BUFFER;
         Ok(LambdaWorker {
             inner: Arc::new(LambdaWorkerInner {
                 connection_options,
                 client_options,
                 worker_options: self.worker_options,
-                invariants,
+                version: self.version,
+                default_versioning_behavior: self.default_versioning_behavior,
                 configure: self.configure,
                 runtime,
-                shutdown_buffer,
-                drain_budget,
-                hook_budget: self.lambda_options.shutdown_hook_buffer,
+                lambda_options: self.lambda_options,
                 shutdown_hooks: self.shutdown_hooks,
                 invocation_gate: Semaphore::new(1),
                 healthy: AtomicBool::new(true),
@@ -375,7 +311,9 @@ impl LambdaWorkerBuilder {
 struct LambdaWorkerPlugin {
     version: WorkerDeploymentVersion,
     default_versioning_behavior: VersioningBehavior,
-    graceful_shutdown_period: Duration,
+    lambda_options: LambdaWorkerOptions,
+    invocation_deadline: Instant,
+    shutdown_at: Arc<OnceLock<Instant>>,
 }
 
 impl WorkerPlugin for LambdaWorkerPlugin {
@@ -384,12 +322,46 @@ impl WorkerPlugin for LambdaWorkerPlugin {
     }
 
     fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
+        let graceful_period = options.graceful_shutdown_period.ok_or_else(|| {
+            PluginError::new(LambdaWorkerBuildError::invalid(
+                "Lambda workers require a finite WorkerOptions::graceful_shutdown_period",
+            ))
+        })?;
+        let reserve = graceful_period
+            .checked_add(self.lambda_options.worker_shutdown_buffer)
+            .and_then(|budget| budget.checked_add(self.lambda_options.shutdown_hook_buffer))
+            .and_then(|budget| budget.checked_add(RESPONSE_BUFFER))
+            .ok_or_else(|| {
+                PluginError::new(LambdaWorkerBuildError::invalid(
+                    "worker shutdown period and Lambda cleanup buffers exceed the supported duration",
+                ))
+            })?;
+        let shutdown_at = self.invocation_deadline.checked_sub(reserve).filter(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) > MINIMUM_WORK_TIME
+        }).ok_or_else(|| {
+            PluginError::new(LambdaWorkerBuildError::invalid(
+                "insufficient Lambda invocation time for the configured worker shutdown period and cleanup buffers",
+            ))
+        })?;
+        let work_time = shutdown_at.saturating_duration_since(Instant::now());
+        if work_time < LOW_WORK_TIME_WARNING {
+            tracing::warn!(
+                ?work_time,
+                "Lambda invocation has little time available for Worker polling"
+            );
+        }
+        // Only this last plugin sees the effective shutdown period. Publish its cutoff before
+        // Core is created so configuration and connection time cannot extend polling.
+        self.shutdown_at.set(shutdown_at).map_err(|_| {
+            PluginError::new(LambdaWorkerBuildError::invalid(
+                "Lambda shutdown deadline was already configured",
+            ))
+        })?;
         options.deployment_options = WorkerDeploymentOptions::new(self.version.clone())
             .use_worker_versioning(true)
             .default_versioning_behavior(self.default_versioning_behavior)
             .build();
         options.max_eager_activity_reservations_per_workflow_task = 0;
-        options.graceful_shutdown_period = Some(self.graceful_shutdown_period);
         Ok(())
     }
 }
@@ -404,12 +376,11 @@ struct LambdaWorkerInner {
     connection_options: ConnectionOptions,
     client_options: ClientOptions,
     worker_options: WorkerOptions,
-    invariants: LambdaWorkerPlugin,
+    version: WorkerDeploymentVersion,
+    default_versioning_behavior: VersioningBehavior,
     configure: Option<Configure>,
     runtime: Arc<Runtime>,
-    shutdown_buffer: Duration,
-    drain_budget: Duration,
-    hook_budget: Duration,
+    lambda_options: LambdaWorkerOptions,
     shutdown_hooks: Vec<ShutdownHook>,
     invocation_gate: Semaphore,
     healthy: AtomicBool,
@@ -472,7 +443,33 @@ where
 }
 
 impl LambdaWorker {
-    /// Start building a handler around existing SDK registrations.
+    /// Create ordinary SDK options with Lambda-oriented defaults, before caller customization.
+    ///
+    /// Defaults are ten Workflow Task slots, two Activity slots, two Local Activity slots, two
+    /// Workflow pollers, one Activity poller, thirty cached Workflows, and five seconds of graceful
+    /// shutdown. Customize these fields and registrations directly on the returned options.
+    pub fn worker_options(task_queue: impl Into<String>) -> WorkerOptions {
+        WorkerOptions::new(task_queue)
+            .tuner(
+                TunerHolder::builder()
+                    .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(10))
+                    .activity_task_slot_supplier(FixedSizeSlotSupplier::new(2))
+                    .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(2))
+                    .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+                    .build(),
+            )
+            .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+            .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(1))
+            .max_cached_workflows(30)
+            .graceful_shutdown_period(Duration::from_secs(5))
+            .build()
+    }
+
+    /// Start building a handler around existing SDK options without replacing their tuning.
+    ///
+    /// Use [`Self::worker_options`] for Lambda defaults. The effective options after per-invocation
+    /// configuration and plugins must specify a finite graceful shutdown period that fits the
+    /// invocation. Deployment versioning and disabled eager Activities are managed by the adapter.
     pub fn builder(
         version: WorkerDeploymentVersion,
         worker_options: WorkerOptions,
@@ -483,7 +480,6 @@ impl LambdaWorker {
             client_options: None,
             runtime: None,
             lambda_options: LambdaWorkerOptions::default(),
-            custom_tuner: None,
             default_versioning_behavior: VersioningBehavior::Pinned,
             configure: None,
             shutdown_hooks: Vec::new(),
@@ -507,21 +503,18 @@ impl LambdaWorker {
             .deadline()
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
-        let work_time = initial_remaining.saturating_sub(self.inner.shutdown_buffer);
+        let minimum_shutdown_buffer = self.inner.lambda_options.worker_shutdown_buffer
+            + self.inner.lambda_options.shutdown_hook_buffer
+            + RESPONSE_BUFFER;
+        let work_time = initial_remaining.saturating_sub(minimum_shutdown_buffer);
         if work_time <= MINIMUM_WORK_TIME {
             return Err(LambdaInvocationError::new(
                 anyhow::anyhow!(
                     "insufficient Lambda invocation time: {initial_remaining:?} remaining with a {:?} shutdown buffer",
-                    self.inner.shutdown_buffer
+                    minimum_shutdown_buffer
                 ),
                 false,
             ));
-        }
-        if work_time < LOW_WORK_TIME_WARNING {
-            tracing::warn!(
-                ?work_time,
-                "Lambda invocation has little time available for Worker polling"
-            );
         }
         let _permit = self.inner.invocation_gate.try_acquire().map_err(|_| {
             LambdaInvocationError::new(
@@ -538,15 +531,16 @@ impl LambdaWorker {
         };
         // One monotonic deadline prevents wall-clock changes and setup time from extending polling.
         let invocation_deadline = now + initial_remaining;
-        let shutdown_at = invocation_deadline - self.inner.shutdown_buffer;
-        let drain_deadline = shutdown_at + self.inner.drain_budget;
         let response_deadline = invocation_deadline - RESPONSE_BUFFER;
-        let worker_run = self.run_worker(event.context, shutdown_at);
+        let drain_deadline = response_deadline - self.inner.lambda_options.shutdown_hook_buffer;
+        let setup_deadline = drain_deadline - self.inner.lambda_options.worker_shutdown_buffer;
+        let worker_run = self.run_worker(event.context, setup_deadline, invocation_deadline);
         tokio::pin!(worker_run);
         let result = match timeout_at(drain_deadline, &mut worker_run).await {
             Ok(result) => {
                 self.run_shutdown_hooks(
-                    response_deadline.min(Instant::now() + self.inner.hook_budget),
+                    response_deadline
+                        .min(Instant::now() + self.inner.lambda_options.shutdown_hook_buffer),
                 )
                 .await;
                 result
@@ -560,17 +554,17 @@ impl LambdaWorker {
                 let (drain_result, ()) = tokio::join!(
                     timeout_at(response_deadline, &mut worker_run),
                     self.run_shutdown_hooks(
-                        response_deadline.min(Instant::now() + self.inner.hook_budget)
+                        response_deadline
+                            .min(Instant::now() + self.inner.lambda_options.shutdown_hook_buffer)
                     ),
                 );
                 if !matches!(drain_result, Ok(Ok(()))) {
                     tracing::error!(?drain_result, "Worker shutdown failed during cleanup");
                 }
                 Err(LambdaInvocationError::new(
-                    anyhow::Error::new(error).context(format!(
-                        "Temporal Worker did not drain and finalize within {:?}",
-                        self.inner.drain_budget
-                    )),
+                    anyhow::Error::new(error).context(
+                        "Temporal Worker did not drain and finalize before the invocation cleanup deadline",
+                    ),
                     true,
                 ))
             }
@@ -604,8 +598,10 @@ impl LambdaWorker {
     async fn run_worker(
         &self,
         context: lambda_runtime::Context,
-        shutdown_at: Instant,
+        setup_deadline: Instant,
+        invocation_deadline: Instant,
     ) -> Result<(), LambdaInvocationError> {
+        let shutdown_at = Arc::new(OnceLock::new());
         let setup = async {
             let mut config = LambdaInvocationConfig {
                 context,
@@ -624,15 +620,17 @@ impl LambdaWorker {
             {
                 config.connection_options.identity = invocation_identity(&config.context);
             }
-            // Worker::new applies client plugins before worker plugins. Append after the
-            // invocation callback so neither it nor an earlier plugin can weaken invariants.
-            config
-                .worker_options
-                .worker_plugin(self.inner.invariants.clone());
+            config.worker_options.worker_plugin(LambdaWorkerPlugin {
+                version: self.inner.version.clone(),
+                default_versioning_behavior: self.inner.default_versioning_behavior,
+                lambda_options: self.inner.lambda_options.clone(),
+                invocation_deadline,
+                shutdown_at: shutdown_at.clone(),
+            });
             let client = Client::connect(config.connection_options, config.client_options).await?;
             Ok::<_, anyhow::Error>((client, config.worker_options))
         };
-        let (client, options) = timeout_at(shutdown_at, setup)
+        let (client, options) = timeout_at(setup_deadline, setup)
             .await
             .map_err(|error| {
                 LambdaInvocationError::new(
@@ -644,6 +642,9 @@ impl LambdaWorker {
             .map_err(|error| LambdaInvocationError::new(error, false))?;
         let worker = Worker::new(&self.inner.runtime, client, options)
             .map_err(|error| LambdaInvocationError::new(error, false))?;
+        let shutdown_at = *shutdown_at
+            .get()
+            .expect("Worker creation ran the final Lambda plugin");
         // Dropping run_until alone can leave Activities holding Core alive.
         let _shutdown = ShutdownGuard(Some(worker.shutdown_handle()));
         worker
@@ -683,33 +684,14 @@ fn validate_version(version: &WorkerDeploymentVersion) -> Result<(), LambdaWorke
 }
 
 fn validate_lambda_options(options: &LambdaWorkerOptions) -> Result<(), LambdaWorkerBuildError> {
-    if options.workflow_slots == 0
-        || options.activity_slots == 0
-        || options.local_activity_slots == 0
-    {
-        return Err(LambdaWorkerBuildError::invalid(
-            "fixed-size tuner slot counts must be greater than zero",
-        ));
-    }
-    let minimum_pollers = if options.max_cached_workflows == 0 {
-        1
-    } else {
-        2
-    };
-    if options.workflow_task_pollers < minimum_pollers || options.activity_task_pollers == 0 {
-        return Err(LambdaWorkerBuildError::invalid(
-            "poller counts must be positive, with at least two workflow pollers when caching is enabled",
-        ));
-    }
     if options.worker_shutdown_buffer.is_zero() || options.shutdown_hook_buffer.is_zero() {
         return Err(LambdaWorkerBuildError::invalid(
             "worker and hook shutdown buffers must be greater than zero",
         ));
     }
     let total = options
-        .graceful_shutdown_period
-        .checked_add(options.worker_shutdown_buffer)
-        .and_then(|budget| budget.checked_add(options.shutdown_hook_buffer))
+        .worker_shutdown_buffer
+        .checked_add(options.shutdown_hook_buffer)
         .and_then(|budget| budget.checked_add(RESPONSE_BUFFER));
     if total.is_none_or(|budget| Instant::now().checked_add(budget).is_none()) {
         return Err(LambdaWorkerBuildError::invalid(
@@ -776,7 +758,10 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use std::sync::{Mutex, atomic::AtomicUsize};
-    use temporalio_sdk::RuntimeError;
+    use temporalio_sdk::{
+        RuntimeError,
+        runtime::worker_tuner::{SlotSupplier, WorkerTuner},
+    };
     use tokio::sync::Notify;
 
     fn builder() -> LambdaWorkerBuilder {
@@ -785,7 +770,7 @@ mod tests {
                 .deployment_name("deployment")
                 .build_id("build")
                 .build(),
-            WorkerOptions::new("queue").build(),
+            LambdaWorker::worker_options("queue"),
         )
         .client_options(
             ConnectionOptions::new(temporalio_client::Url::parse("http://127.0.0.1:9").unwrap())
@@ -820,11 +805,11 @@ mod tests {
                 ..Default::default()
             },
             LambdaWorkerOptions {
-                graceful_shutdown_period: Duration::MAX,
+                worker_shutdown_buffer: Duration::MAX,
                 ..Default::default()
             },
             LambdaWorkerOptions {
-                workflow_task_pollers: 1,
+                shutdown_hook_buffer: Duration::ZERO,
                 ..Default::default()
             },
         ] {
@@ -839,12 +824,102 @@ mod tests {
                     .is::<std::io::Error>()
             );
         }
-        let options = LambdaWorkerOptions {
-            workflow_task_pollers: 1,
-            max_cached_workflows: 0,
-            ..Default::default()
+    }
+
+    #[tokio::test]
+    async fn building_does_not_replace_caller_worker_tuning() {
+        let mut builder = builder();
+        builder.worker_options.max_cached_workflows = 7;
+        builder.worker_options.workflow_task_poller_behavior =
+            Some(PollerBehavior::SimpleMaximum(4));
+        builder.worker_options.activity_task_poller_behavior =
+            Some(PollerBehavior::SimpleMaximum(3));
+        builder.worker_options.graceful_shutdown_period = Some(Duration::from_secs(9));
+        builder.worker_options.tuner = TunerHolder::builder()
+            .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(6))
+            .activity_task_slot_supplier(FixedSizeSlotSupplier::new(8))
+            .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(4))
+            .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+            .build()
+            .into();
+        let worker = builder.build().unwrap();
+        let options = &worker.inner.worker_options;
+        assert_eq!(options.max_cached_workflows, 7);
+        assert_eq!(
+            options.workflow_task_poller_behavior,
+            Some(PollerBehavior::SimpleMaximum(4))
+        );
+        assert_eq!(
+            options.activity_task_poller_behavior,
+            Some(PollerBehavior::SimpleMaximum(3))
+        );
+        assert_eq!(
+            options.graceful_shutdown_period,
+            Some(Duration::from_secs(9))
+        );
+        let WorkerTuner::TunerHolder(tuner) = &options.tuner else {
+            panic!("caller tuner was replaced");
         };
-        validate_lambda_options(&options).unwrap();
+        assert!(
+            matches!(&tuner.workflow_task_slot_supplier, SlotSupplier::FixedSize(s) if s.num_slots == 6)
+        );
+        assert!(
+            matches!(&tuner.activity_task_slot_supplier, SlotSupplier::FixedSize(s) if s.num_slots == 8)
+        );
+        assert!(
+            matches!(&tuner.local_activity_task_slot_supplier, SlotSupplier::FixedSize(s) if s.num_slots == 4)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cutoff_uses_effective_grace_and_remaining_invocation_time() {
+        let now = Instant::now();
+        let cutoff = Arc::new(OnceLock::new());
+        let plugin = LambdaWorkerPlugin {
+            version: builder().version,
+            default_versioning_behavior: VersioningBehavior::Pinned,
+            lambda_options: LambdaWorkerOptions::default(),
+            invocation_deadline: now + Duration::from_secs(30),
+            shutdown_at: cutoff.clone(),
+        };
+        let mut options = LambdaWorker::worker_options("queue");
+        options.graceful_shutdown_period = Some(Duration::from_secs(2));
+        plugin.configure_worker_options(&mut options).unwrap();
+        assert_eq!(
+            options.graceful_shutdown_period,
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(*cutoff.get().unwrap(), now + Duration::from_millis(24_900));
+
+        tokio::time::advance(Duration::from_secs(25)).await;
+        let plugin = LambdaWorkerPlugin {
+            shutdown_at: Arc::new(OnceLock::new()),
+            ..plugin
+        };
+        assert!(plugin.configure_worker_options(&mut options).is_err());
+        assert!(plugin.shutdown_at.get().is_none());
+        assert_eq!(
+            options.graceful_shutdown_period,
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_worker_shutdown_periods_are_rejected_without_replacement() {
+        for period in [None, Some(Duration::MAX), Some(Duration::from_secs(60))] {
+            let plugin = LambdaWorkerPlugin {
+                version: builder().version,
+                default_versioning_behavior: VersioningBehavior::Pinned,
+                lambda_options: LambdaWorkerOptions::default(),
+                invocation_deadline: Instant::now() + Duration::from_secs(30),
+                shutdown_at: Arc::new(OnceLock::new()),
+            };
+            let mut options = LambdaWorker::worker_options("queue");
+            options.graceful_shutdown_period = period;
+            assert!(plugin.configure_worker_options(&mut options).is_err());
+            assert_eq!(options.graceful_shutdown_period, period);
+            assert!(plugin.shutdown_at.get().is_none());
+        }
     }
 
     #[tokio::test(start_paused = true)]
