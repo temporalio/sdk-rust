@@ -33,8 +33,6 @@ interface stream-service {
     nanos: s32,
   }
 
-  // A request sends only the id of its ref, through the `to` helper of its `ref` field. The SDK
-  // reads the Store name from the ref to pick the Store of the call.
   /// @nexus.doc "A reference to one Stream. Callers treat the id as opaque."
   /// @nexus.proto "temporal.api.stream.v1.StreamRef"
   /// @nexus.generic "body-t"
@@ -167,20 +165,12 @@ interface stream-service {
   ///   "Create a Stream. If it already exists, fail, or return it with use-existing."
   /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamRequest"
   record create-stream-request {
+    // This field isn't called `ref`, so the created Stream takes its ref from the response.
     /// @nexus.doc "The Stream to create. Its id must not be empty."
-    /// @nexus.proto-field "stream_id" python-to="stream_ref_to_id" python-from="stream_ref_from_id"
-    ///   typescript-to="streamRefToId" typescript-from="streamRefFromId"
-    ///   dotnet-to="StreamSupport.RefToId" dotnet-from="StreamSupport.RefFromId"
     /// @nexus.flatten-in-api
-    ref: stream-ref,
+    stream-ref: stream-ref,
     /// @nexus.doc "What the create does if the Stream already exists. Unspecified means fail."
     id-conflict-policy: option<stream-id-conflict-policy>,
-    // A retry of the create that made the Stream sends the same id, so it doesn't fail as a
-    // conflict. In a Workflow the helper returns a deterministic id.
-    /// @nexus.doc "Unique for each create call, and the same on its retries."
-    /// @nexus.source python="request_id()" typescript="requestId()"
-    ///   dotnet="StreamWorkflowContext.RequestId()"
-    request-id: option<string>,
   }
 
   /// What a create does when its Stream exists. Unspecified is fail.
@@ -202,9 +192,6 @@ interface stream-service {
   /// @nexus.doc "Append one batch. The Store writes a batch that arrives again only once."
   /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsRequest"
   record append-records-request {
-    /// @nexus.proto-field "stream_id" python-to="stream_ref_to_id" python-from="stream_ref_from_id"
-    ///   typescript-to="streamRefToId" typescript-from="streamRefFromId"
-    ///   dotnet-to="StreamSupport.RefToId" dotnet-from="StreamSupport.RefFromId"
     ref: stream-ref,
     records: list<append-record>,
     // Workflow code never passes a Producer. Its helper returns the Producer of the run, and the
@@ -217,12 +204,6 @@ interface stream-service {
     /// @nexus.default targets="client" python="_support.default_producer(self._nexus_client)"
     ///   typescript="support.defaultProducer()" dotnet="StreamActivityContext.Producer()"
     producer: producer,
-    // A resend of a batch has the id of its first send, so the Store writes the batch once. For
-    // Workflow code the helper returns nothing, and the SDK sets the id when it sends the batch.
-    /// @nexus.doc "Unique for each append call, and the same on its retries."
-    /// @nexus.source python="append_request_id()" typescript="appendRequestId()"
-    ///   dotnet="StreamWorkflowContext.AppendRequestId()"
-    request-id: option<string>,
   }
 
   /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsResponse"
@@ -235,9 +216,6 @@ interface stream-service {
   /// @nexus.doc "Close a Stream. Readers get the Records that are left. Later appends fail."
   /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamRequest"
   record close-stream-request {
-    /// @nexus.proto-field "stream_id" python-to="stream_ref_to_id" python-from="stream_ref_from_id"
-    ///   typescript-to="streamRefToId" typescript-from="streamRefFromId"
-    ///   dotnet-to="StreamSupport.RefToId" dotnet-from="StreamSupport.RefFromId"
     ref: stream-ref,
     /// @nexus.doc
     ///   "The Producer that closes the Stream. Defaults to the Producer of the calling context."
@@ -255,9 +233,6 @@ interface stream-service {
   /// @nexus.doc "Read Records after an offset."
   /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsRequest"
   record read-records-request {
-    /// @nexus.proto-field "stream_id" python-to="stream_ref_to_id" python-from="stream_ref_from_id"
-    ///   typescript-to="streamRefToId" typescript-from="streamRefFromId"
-    ///   dotnet-to="StreamSupport.RefToId" dotnet-from="StreamSupport.RefFromId"
     ref: stream-ref,
     // To read only new Records, a caller gets last-offset from a describe and reads after it.
     /// @nexus.doc "Read after this offset. Empty means from the beginning."
@@ -281,9 +256,6 @@ interface stream-service {
 
   /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamRequest"
   record describe-stream-request {
-    /// @nexus.proto-field "stream_id" python-to="stream_ref_to_id" python-from="stream_ref_from_id"
-    ///   typescript-to="streamRefToId" typescript-from="streamRefFromId"
-    ///   dotnet-to="StreamSupport.RefToId" dotnet-from="StreamSupport.RefFromId"
     ref: stream-ref,
   }
 
@@ -337,7 +309,6 @@ interface stream-service {
 
   // The Workflow API has no other way to create a Stream, so this function stays public.
   /// @nexus.operation name="CreateStream"
-  /// @nexus.resource-binding ref="request.ref" created="result.created"
   create-stream: func(request: create-stream-request) -> create-stream-result;
 
   /// @nexus.doc "Append one batch. For Workflow code, Core makes the call."
