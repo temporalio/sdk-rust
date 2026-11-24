@@ -2,11 +2,8 @@
 
 use super::{StreamRuntimes, StreamSettings};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
-use futures_util::FutureExt;
 use parking_lot::Mutex;
-use std::{
-    collections::HashMap, fmt, future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration,
-};
+use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
 use temporalio_common::protos::{
     coresdk::external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
     temporal::api::{
@@ -250,7 +247,7 @@ where
 {
     let mut waits = retry_waits(&settings);
     loop {
-        let error = match tokio::time::timeout(settings.try_deadline, caught(send())).await {
+        let error = match tokio::time::timeout(settings.try_deadline, send()).await {
             Ok(Err(error)) if is_outage(&error) => error,
             Ok(answer) => {
                 note.set(None);
@@ -264,25 +261,6 @@ where
         note.set(Some(&error));
         tokio::time::sleep(next_wait(&mut waits)).await;
     }
-}
-
-/// Returns the answer of one try of a Store call. A panic of the Store's code counts as a failed
-/// try in an outage. Without that, the call would hold its Workflow Task and never get a result.
-async fn caught<T, R: From<AnyReason>>(
-    call: impl Future<Output = Result<T, StreamError<R>>>,
-) -> Result<T, StreamError<R>> {
-    #[allow(clippy::redundant_async_block)] // The block drops the Store's future inside the catch.
-    let answer = AssertUnwindSafe(async move { call.await })
-        .catch_unwind()
-        .await;
-    answer.unwrap_or_else(|panic| {
-        let message = (panic.downcast_ref::<&str>().copied())
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("Couldn't turn panic into a string");
-        Err(StreamError::store_unavailable(format!(
-            "The Store panicked: {message}"
-        )))
-    })
 }
 
 /// Returns the waits between the tries of a call, which double from `retry_initial_interval` up to
@@ -496,39 +474,25 @@ mod tests {
         })
     }
 
-    // A try that gets no answer by its deadline, or that panics in the Store's code, counts as a
-    // failed try in an outage, like a `StoreUnavailable` failure.
-    #[rstest::rstest]
-    #[case::by_its_deadline(false)]
-    #[case::for_a_panic(true)]
+    // A try that gets no answer by its deadline counts as a failed try in an outage, like a
+    // `StoreUnavailable` failure.
     #[tokio::test(start_paused = true)]
-    async fn a_try_with_no_answer_is_an_outage(#[case] panics: bool) {
+    async fn a_try_with_no_answer_is_an_outage() {
         let (store, manager, mut results) = manager().await;
-        let error = if panics {
-            store.panic(StoreOp::Append);
-            "The Store panicked: The Store has a bug"
-        } else {
-            store.hold(StoreOp::Append);
-            "The Store gave no answer in 5s"
-        };
+        store.hold(StoreOp::Append);
         manager.dispatch("r", vec![append(1)]);
         tokio::time::sleep(Duration::from_millis(5010)).await;
-        let outage = format!(
-            "StreamStoreUnavailable: append of Stream \"s\" on Store \"mem\": \
-             stream_store_unavailable: {error}"
-        );
-        assert_eq!(manager.outage("r"), Some(outage));
-        // The Store that panics never stops, so only the other one ends its call.
-        if !panics {
-            store.release();
-            let (run_id, resolution) = results.recv().await.unwrap();
-            assert_eq!(run_id, "r");
-            assert!(matches!(
-                resolution.outcome,
-                Outcome::Append(stream_append_result::Result::Appended(_))
-            ));
-            assert_eq!(manager.outage("r"), None);
-        }
+        let outage = "StreamStoreUnavailable: append of Stream \"s\" on Store \"mem\": \
+                      stream_store_unavailable: The Store gave no answer in 5s";
+        assert_eq!(manager.outage("r").as_deref(), Some(outage));
+        store.release();
+        let (run_id, resolution) = results.recv().await.unwrap();
+        assert_eq!(run_id, "r");
+        assert!(matches!(
+            resolution.outcome,
+            Outcome::Append(stream_append_result::Result::Appended(_))
+        ));
+        assert_eq!(manager.outage("r"), None);
         let tries = store.requests();
         assert!(tries.len() >= 2, "{tries:?}");
         assert!(tries.windows(2).all(|pair| pair[0] == pair[1]));

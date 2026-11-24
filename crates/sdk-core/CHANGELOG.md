@@ -47,9 +47,8 @@ relevant information.
   `ResolveStreamAppend` or `ResolveStreamClose` job and goes into a `core_stream` marker, so a
   replay doesn't make a Store call. Core drops a call that has no result when the Workflow's last
   command arrives, as it drops a Local Activity. If a call is waiting to try again at the task's
-  heartbeat, because a try failed with `StoreUnavailable`, got no answer within `try_deadline` or
-  panicked in the code of the Store, the task fails, and its failure message starts with
-  `StreamStoreUnavailable:`.
+  heartbeat, because a try failed with `StoreUnavailable` or got no answer within `try_deadline`,
+  the task fails, and its failure message starts with `StreamStoreUnavailable:`.
 
 ## [0.12.0] - 2026-11-23
 

@@ -61,7 +61,6 @@ struct State {
     held: HashSet<Op>,
     held_streams: HashSet<String>,
     failures: HashMap<Op, (AnyError, usize)>,
-    panics: HashSet<Op>,
     lost_answers: HashMap<Op, usize>,
 }
 
@@ -104,11 +103,6 @@ impl MemoryStore {
         self.state.lock().failures.insert(op, (error, times));
     }
 
-    /// Makes each call of `op` panic, as a bug in the code of a Store does.
-    pub fn panic(&self, op: Op) {
-        self.state.lock().panics.insert(op);
-    }
-
     /// Makes the next `times` calls of `op` write, and then fail with `StoreUnavailable`.
     pub fn lose_answers(&self, op: Op, times: usize) {
         self.state.lock().lost_answers.insert(op, times);
@@ -144,9 +138,6 @@ impl MemoryStore {
         let held = {
             let mut state = self.state.lock();
             state.requests.push(request);
-            if state.panics.contains(&op) {
-                panic!("The Store has a bug");
-            }
             state.held.contains(&op)
         };
         if held {

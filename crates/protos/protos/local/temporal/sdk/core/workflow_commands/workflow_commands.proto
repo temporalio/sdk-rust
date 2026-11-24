@@ -446,7 +446,7 @@ message RequestCancelNexusOperation {
 //   4096 bytes.
 // * The Worker has no Stream runtime for the Store of `stream`.
 // * The append must wait for the task's heartbeat to try again, because the Store answered
-//   `StoreUnavailable`, gave no answer or panicked. The failure message then starts with
+//   `StoreUnavailable` or gave no answer. The failure message then starts with
 //   `StreamStoreUnavailable:`.
 //
 // An append with no `bodies`, or with a batch over the limits of its Store, doesn't fail the
