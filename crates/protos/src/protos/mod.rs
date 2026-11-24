@@ -42,6 +42,7 @@ pub mod coresdk {
 
         use crate::protos::{
             ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL,
+            task_token::scheduled_event_id,
             temporal::api::{
                 common::v1::{Payload, Payloads, RetryPolicy, WorkflowExecution},
                 enums::v1::{
@@ -320,6 +321,7 @@ pub mod coresdk {
 
         impl ActivityTask {
             pub fn start_from_poll_resp(r: PollActivityTaskQueueResponse) -> Self {
+                let scheduled_event_id = scheduled_event_id(&r.task_token);
                 let (workflow_id, run_id) = r
                     .workflow_execution
                     .map(|we| (we.workflow_id, we.run_id))
@@ -357,6 +359,7 @@ pub mod coresdk {
                             propagated_nexus_serialization_context: r
                                 .propagated_nexus_serialization_context,
                             workflow_task: None,
+                            scheduled_event_id,
                         },
                     )),
                 }

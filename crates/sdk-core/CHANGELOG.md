@@ -83,6 +83,10 @@ relevant information.
   `stream_replay_read_execution_latency`, and a try that `replay_retry_bound` stops has no sample.
   Each `_execution_failed` counter has the attribute `failure_reason` with the reason of the
   Stream error, such as `stream_closed`, or `stream_store_unavailable` for a try in an outage.
+* [lang-internal] The `Start` of an activity task has the new `scheduled_event_id`, the event id of
+  the `ActivityTaskScheduled` event of an activity that a workflow scheduled. The server has no API
+  field for it, so Core reads it from the task token. It's 0 for a local activity, for a standalone
+  activity, and for a token that Core can't read.
 
 ## [0.12.0] - 2026-11-23
 
