@@ -2256,13 +2256,15 @@ fn script(rng: &mut StdRng) -> Vec<Vec<Command>> {
                         closes += 1;
                         commands.push(close(closes, &id));
                     }
-                    // A read of the first Records of a Stream, which waits for one if it has none.
+                    // A read of the first Records of a Stream. Some reads wait for one if it has
+                    // none.
                     6..=7 => {
                         reads += 1;
+                        let wait = rng.random_bool(0.5).then(|| Duration::from_secs(60));
                         let read = ReadStream {
                             seq: reads,
                             stream: Some(stream(&id)),
-                            wait: Some(Duration::from_secs(60).try_into().unwrap()),
+                            wait: wait.map(|wait| wait.try_into().unwrap()),
                             max_records: 2,
                             ..Default::default()
                         };
@@ -2494,6 +2496,8 @@ struct Reached {
     /// The pages of reads with Records, and those with none.
     pages: usize,
     empty_pages: usize,
+    /// The pages of reads that don't wait, of a Stream that had a Record.
+    no_wait_pages: usize,
 }
 
 // Generated Workflow code runs with Local Activities, queries, rejected Updates and slow Store
@@ -2570,6 +2574,9 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         let mut run = start(history(Duration::from_secs(1)), opts());
         let mut locals_rng = StdRng::seed_from_u64(seed + 1);
         let (mut earlier, mut progress, mut made) = (None, Progress::default(), HashMap::new());
+        // For each read that doesn't wait, true if its Stream had a Record when the first run sent
+        // it.
+        let mut had_records = HashMap::new();
         let live = loop {
             let mut number = 0;
             let workflow = |activation: &WorkflowActivation| {
@@ -2587,7 +2594,14 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
                         Command::CloseStream(close) => {
                             (format!("close {}", close.seq), &close.stream)
                         }
-                        Command::ReadStream(read) => (format!("read {}", read.seq), &read.stream),
+                        Command::ReadStream(read) => {
+                            if read.wait.is_none() {
+                                let id = &read.stream.as_ref().unwrap().id;
+                                let had = !store.records(id).is_empty();
+                                had_records.entry(read.seq).or_insert(had);
+                            }
+                            (format!("read {}", read.seq), &read.stream)
+                        }
                         _ => continue,
                     };
                     made.insert(call, number);
@@ -2656,6 +2670,18 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
             assert_eq!(at, first.len(), "seed {seed}: {replayed:?} {first:?}");
         }
 
+        // Only the Store can end a read that doesn't wait with no Record, so such a read of a
+        // Stream that had a Record gets a page with one, or a failure.
+        let results = live.iter().flatten().filter_map(|job| match job {
+            Job::ResolveStreamRead(read) => Some(read),
+            _ => None,
+        });
+        for read in results.filter(|read| had_records.get(&read.seq) == Some(&true)) {
+            if let Some(resolve_stream_read::Status::Page(page)) = &read.status {
+                assert!(!page.records.is_empty(), "seed {seed}: {read:?}");
+                reached.no_wait_pages += 1;
+            }
+        }
         for (at, jobs) in live.iter().enumerate() {
             let summaries: Vec<String> = jobs.iter().map(summary).collect();
             for done in summaries
@@ -2689,6 +2715,7 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         taken_over,
         pages,
         empty_pages,
+        no_wait_pages,
     } = reached;
     let counts = [
         next,
@@ -2699,6 +2726,7 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         taken_over,
         pages,
         empty_pages,
+        no_wait_pages,
     ];
     assert!(counts.iter().all(|count| *count > 0), "{reached:?}");
 }

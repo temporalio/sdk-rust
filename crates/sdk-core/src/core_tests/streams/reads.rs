@@ -220,6 +220,70 @@ async fn a_read_with_no_answer_ends_at_its_limit_or_in_the_next_task(#[case] cas
     assert_eq!(run.replay(workflow).await, live);
 }
 
+/// What a Store does with a read that doesn't wait.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NoWait {
+    /// The Store answers after the read limit of the task.
+    AnswersLate,
+    /// The Store never answers.
+    NeverAnswers,
+}
+
+// Only the Store can say that a Stream has no Record after the offset of a read that doesn't
+// wait. So the read limit doesn't end such a read while its try waits for the answer. Its page
+// comes when the Store answers, or its try fails at the try deadline, and the read then ends with
+// that failure at a read limit.
+#[rstest::rstest]
+#[case(NoWait::AnswersLate)]
+#[case(NoWait::NeverAnswers)]
+#[tokio::test]
+async fn a_read_with_no_wait_gets_the_answer_of_the_store(#[case] case: NoWait) {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 2).await;
+    store.hold(Op::Read);
+    let mut opts = StartOpts::new(&store);
+    // A try deadline after the read limit of 250 ms.
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_millis(300));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![read(1, "s", &[], Duration::ZERO).into()],
+            _ => vec![complete()],
+        }
+    };
+    let release = async {
+        if case == NoWait::AnswersLate {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            store.release();
+        }
+    };
+    let drive = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow));
+    let (live, ()) = tokio::join!(drive, release);
+    let live = live.expect("The read never ended");
+    let [Job::ResolveStreamRead(result)] = &live[1][..] else {
+        panic!("{live:?}");
+    };
+    match case {
+        NoWait::AnswersLate => {
+            let page = page_of(result).expect("The read got a page");
+            assert_eq!(page.records, store.records("s"), "{live:?}");
+        }
+        NoWait::NeverAnswers => {
+            let Some(resolve_stream_read::Status::Failed(failure)) = &result.status else {
+                panic!("{result:?}");
+            };
+            let Some(FailureInfo::ApplicationFailureInfo(info)) = &failure.failure_info else {
+                panic!("{failure:?}");
+            };
+            assert_eq!(info.r#type, "stream_store_unavailable");
+        }
+    }
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    store.release();
+    assert_eq!(run.replay(workflow).await, live);
+}
+
 /// How History reaches a Worker that doesn't have the run.
 #[derive(Clone, Copy, Debug)]
 enum Path {

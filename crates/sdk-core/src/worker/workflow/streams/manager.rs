@@ -258,7 +258,7 @@ async fn run(
         Op::Read(read) => {
             let stream = (read.request.r#ref.clone()).expect("A read has the ref of its command");
             let from_offset = read.request.from_offset.clone();
-            let page = read_page(runtime, read, settings, note).await;
+            let page = read_page(runtime, read, settings).await;
             let page = page.map_err(|error| recorded(&error));
             Outcome::Read(ReadDone::new(&stream, seq, from_offset, page))
         }
@@ -266,14 +266,14 @@ async fn run(
 }
 
 /// Reads the page of Records after the `from_offset` of `read`, and waits up to its wait for the
-/// first Record. A try that fails with `StoreUnavailable`, or gets no answer by its deadline, notes
-/// an outage, and the read asks again from where it is after a backoff. The run ends a read that
-/// has no answer at the read limit of its task.
+/// first Record. A try that fails with `StoreUnavailable`, or gets no answer by its deadline, is
+/// the last try of the read, and the read asks again from where it is after a backoff. The run ends
+/// a read that has no answer at the read limit of its task. A read notes no outage in the manager,
+/// since it never holds its task to the heartbeat.
 async fn read_page(
     runtime: &StreamRuntime,
     read: ReadCall,
     settings: StreamSettings,
-    note: &Note,
 ) -> Result<ReadRecordsResponse, ReadError> {
     let ReadCall {
         mut request,
@@ -307,13 +307,11 @@ async fn read_page(
         let page = match answer {
             Ok(page) => page,
             Err(error) => {
-                note.set(Some(&error));
                 *last_try.lock() = Some(recorded(&error));
                 tokio::time::sleep(next_wait(&mut waits)).await;
                 continue;
             }
         };
-        note.set(None);
         *last_try.lock() = None;
         waits = retry_waits(&settings);
         if !page.records.is_empty() || page.done {
@@ -848,11 +846,10 @@ mod tests {
                     tokio::select! {
                         resolution = results.recv() => break resolution.unwrap(),
                         () = tokio::time::sleep(look) => {
-                            // The failure of the last try is there exactly while the read waits
-                            // to try again.
-                            let outage = manager.outage("r");
-                            assert_eq!(outage.is_some(), last_try.lock().is_some(), "seed {seed}");
-                            outages += usize::from(outage.is_some());
+                            // A read keeps the failure of its last try while it waits to try
+                            // again, and notes no outage that could fail its task at the heartbeat.
+                            assert_eq!(manager.outage("r"), None, "seed {seed}");
+                            outages += usize::from(last_try.lock().is_some());
                         }
                     }
                 };

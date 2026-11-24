@@ -150,6 +150,8 @@ enum CloseState {
 struct Read {
     stream: StreamRef,
     from_offset: Vec<u8>,
+    /// True if the read asks the Store to wait for a Record.
+    waits: bool,
     state: ReadState,
 }
 
@@ -363,6 +365,7 @@ impl StreamCalls {
         let read = Read {
             stream,
             from_offset,
+            waits: !wait.is_zero(),
             state,
         };
         self.reads.insert(seq, read);
@@ -693,8 +696,9 @@ impl StreamCalls {
             && (self.reads.values()).any(|read| matches!(read.state, ReadState::Running(..)))
     }
 
-    /// Ends the task's reads that have no answer, at its read limit. Each later read of the task
-    /// asks the Store not to wait, and doesn't hold the task.
+    /// Ends the task's reads that have no answer, at its read limit, but a read that doesn't wait
+    /// and whose try waits for the answer. From the limit on no read holds the task, and each later
+    /// read of the task asks the Store not to wait.
     pub(crate) fn read_limit(&mut self) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
@@ -757,6 +761,25 @@ impl StreamCalls {
             return Some(WorkflowTaskStreamCalls::default());
         }
         ledger
+    }
+
+    /// Makes each read that starts ask the Store to wait at most `max_wait`, and notes the reads
+    /// that then don't wait.
+    pub(crate) fn limit_read_waits(&mut self, max_wait: Duration) {
+        for request in &mut self.requests {
+            let Request::Run(Call {
+                seq,
+                op: Op::Read(call),
+                ..
+            }) = request
+            else {
+                continue;
+            };
+            call.wait = call.wait.min(max_wait);
+            if let Some(read) = self.reads.get_mut(seq) {
+                read.waits = !call.wait.is_zero();
+            }
+        }
     }
 
     /// Returns the calls that the Worker must start or stop.
@@ -898,7 +921,8 @@ impl StreamCalls {
     }
 
     /// Ends each read of `calls` that has no answer. Its result is the failure of its last try if
-    /// that try failed, or else a page with no Record.
+    /// that try failed, or else a page with no Record. A read that doesn't wait, and whose last try
+    /// didn't fail, goes on.
     fn end_reads(&mut self, calls: &[CallKey]) {
         for call in calls {
             let CallKey::Read(seq) = *call else {
@@ -908,13 +932,17 @@ impl StreamCalls {
                 continue;
             };
             let failure = match &read.state {
-                ReadState::Running(call_id, last_try) => {
-                    stop_call(&mut self.requests, *call_id);
-                    last_try.lock().clone()
-                }
+                ReadState::Running(_, last_try) => last_try.lock().clone(),
                 ReadState::Waiting(_) => None,
                 ReadState::Done(_) | ReadState::Replayed => continue,
             };
+            // Only the Store can say that the Stream has no Record after the offset of such a read.
+            if failure.is_none() && !read.waits {
+                continue;
+            }
+            if let ReadState::Running(call_id, _) = read.state {
+                stop_call(&mut self.requests, call_id);
+            }
             let from_offset = read.from_offset.clone();
             read.state = ReadState::Done(ReadDone::cut(&read.stream, seq, from_offset, failure));
             self.done.insert(*call);
@@ -1816,6 +1844,8 @@ mod tests {
         /// a read had no answer.
         ended_reads: usize,
         reads_left_running: usize,
+        /// The reads with no wait that went on at the read limit.
+        kept_reads: usize,
     }
 
     /// The first run of a generated script. It writes History, and checks a replay of it at each
@@ -1952,10 +1982,32 @@ mod tests {
                         self.run.calls.resolve(resolution);
                         self.dispatch();
                     }
-                    // The read limit ends each read with no answer.
+                    // The read limit ends each read with no answer, but a read that doesn't wait
+                    // and whose last try didn't fail. Some tries in flight failed for an outage.
                     36 if self.run.calls.read_runs() => {
                         self.seen.ended_reads += 1;
+                        for at in 0..self.in_flight.len() {
+                            if let Op::Read(read) = &self.in_flight[at].op
+                                && self.rng.random_bool(0.3)
+                            {
+                                *read.last_try.lock() = Some(refused("The Store is down"));
+                            }
+                        }
+                        let running: Vec<(u32, bool)> = (self.run.calls.reads.iter())
+                            .filter_map(|(seq, read)| match &read.state {
+                                ReadState::Running(_, last_try) => {
+                                    Some((*seq, read.waits || last_try.lock().is_some()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         self.run.calls.read_limit();
+                        for (seq, ends) in running {
+                            let state = &self.run.calls.reads[&seq].state;
+                            let ended = matches!(state, ReadState::Done(_));
+                            assert_eq!(ended, ends, "seed {}: read {seq}", self.seed);
+                            self.seen.kept_reads += usize::from(!ended);
+                        }
                         self.dispatch();
                     }
                     36..=38 => {
@@ -2041,7 +2093,11 @@ mod tests {
                     }
                     73..=79 | 90..=94 => {
                         self.last_read += 1;
-                        commands.push(Command::Read(read(self.last_read, &id)));
+                        let mut command = read(self.last_read, &id);
+                        if self.rng.random_bool(0.5) {
+                            command.wait = Some(Duration::from_secs(60).try_into().unwrap());
+                        }
+                        commands.push(Command::Read(command));
                     }
                     70..=72 => {
                         self.seen.invalid += 1;
@@ -2276,6 +2332,7 @@ mod tests {
             bad_seqs,
             ended_reads,
             reads_left_running,
+            kept_reads,
         } = seen;
         let counts = [
             full_ledgers,
@@ -2286,6 +2343,7 @@ mod tests {
             bad_seqs,
             ended_reads,
             reads_left_running,
+            kept_reads,
         ];
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
     }

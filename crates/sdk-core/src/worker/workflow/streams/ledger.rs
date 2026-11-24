@@ -98,8 +98,8 @@ impl ReadDone {
     }
 
     /// Returns the result of read `seq` of `stream` that its task ended with no answer. That's the
-    /// failure of its last try if that try failed. Otherwise it's a page with no Record that ends
-    /// at `from_offset`, so the next read from there skips no Record.
+    /// failure of its last try if that try failed. Otherwise the read waited, and it's a page with
+    /// no Record that ends at `from_offset`, so the next read from there skips no Record.
     pub(crate) fn cut(
         stream: &StreamRef,
         seq: u32,

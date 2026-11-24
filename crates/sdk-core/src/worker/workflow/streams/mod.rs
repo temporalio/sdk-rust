@@ -11,7 +11,6 @@ mod test_store;
 
 pub(crate) use calls::{Phase, StreamCalls, is_stream_replay_failure, set_replay_failure_type};
 pub(crate) use ledger::{has_ledger, peeked_ledger};
-use manager::{Call, Op, Request};
 pub(crate) use manager::{StreamManager, StreamResolution};
 pub(super) use replay::StreamRecordsReq;
 pub(crate) use replay::{LedgerReads, ReplayReader, ReplayReads};
@@ -94,7 +93,9 @@ pub struct StreamSettings {
     pub try_deadline: Duration,
     /// How long the reads of a Workflow Task can wait, from the start of the task. With `None` it's
     /// half the Workflow Task timeout. The read limit is always before the heartbeat of the task,
-    /// so a read alone never makes Core send a heartbeat. Appends and closes have no such limit.
+    /// so a read alone never makes Core send a heartbeat. At the limit a read with a wait ends, and
+    /// a read with no wait goes on, but holds the task no longer. Appends and closes have no such
+    /// limit.
     pub read_time: Option<Duration>,
     /// How long a replay goes on trying a Store after its first try of that Store fails, each time
     /// it reads a part of the Records of History, 3 s by default. No try or wait goes past that
@@ -258,18 +259,10 @@ impl RunStreams {
     /// Store to wait at most a share of `time_left`, the time that its task has left to its read
     /// limit.
     pub(super) fn dispatch(&self, calls: &mut StreamCalls, time_left: Duration) {
-        let mut requests = calls.take_requests();
+        calls.limit_read_waits(time_left.mul_f32(READ_WAIT_SHARE));
+        let requests = calls.take_requests();
         if requests.is_empty() {
             return;
-        }
-        let max_wait = time_left.mul_f32(READ_WAIT_SHARE);
-        for request in &mut requests {
-            if let Request::Run(Call {
-                op: Op::Read(read), ..
-            }) = request
-            {
-                read.wait = read.wait.min(max_wait);
-            }
         }
         self.streams.manager.dispatch(&self.run_id, requests);
     }
@@ -292,7 +285,7 @@ impl RunStreams {
     /// Sends the read limit of the task in hand to the run when the limit comes, once per task. It
     /// must be called on the thread of the runs.
     pub(super) fn read_limit_at(&self, limit: &mut ReadLimit) {
-        let Some(at) = limit.at.filter(|_| limit.timer.is_none()) else {
+        let Some(at) = limit.at.filter(|_| limit.timer.is_none() && !limit.passed) else {
             return;
         };
         let (abort, registration) = AbortHandle::new_pair();
@@ -334,6 +327,8 @@ pub(super) struct ReadLimit {
     /// Counts the tasks, so that the timer of an earlier task ends nothing.
     generation: u64,
     timer: Option<AbortHandle>,
+    /// True once the limit came. A read that goes on after it doesn't start the timer again.
+    passed: bool,
 }
 
 impl ReadLimit {
@@ -360,11 +355,16 @@ impl ReadLimit {
         }
         self.at = None;
         self.generation += 1;
+        self.passed = false;
     }
 
     /// Returns true for the timer of the task in hand.
     pub(super) fn expires(&mut self, generation: u64) -> bool {
-        generation == self.generation && self.timer.take().is_some()
+        if generation != self.generation || self.timer.take().is_none() {
+            return false;
+        }
+        self.passed = true;
+        true
     }
 }
 
