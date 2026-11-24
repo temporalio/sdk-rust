@@ -110,12 +110,14 @@ message WorkflowActivityProducer {
     string workflow_id = 2;
     // Required.
     string run_id = 3;
-    // Required. An Activity task doesn't have the scheduled event id, so this id identifies the
-    // Activity. A run can use an Activity id again after the first Activity ended. The second
-    // Activity is then a later attempt of the same Producer.
-    string activity_id = 4;
     // Required.
-    ActivityAttempt attempt = 5;
+    string activity_id = 4;
+    // The id of the `ActivityTaskScheduled` event of the Activity in the History of its run. A run
+    // can use an Activity id again after the first Activity ended, and this id separates the two
+    // Activities, so they are separate Producers. It's zero when the SDK doesn't have it.
+    int64 scheduled_event_id = 5;
+    // Required.
+    ActivityAttempt attempt = 6;
 }
 
 // Experimental. Might change in the future.
