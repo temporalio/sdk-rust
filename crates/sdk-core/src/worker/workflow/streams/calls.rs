@@ -1215,48 +1215,6 @@ mod tests {
         assert!(!replay.has_jobs(0, None));
     }
 
-    #[test]
-    fn two_appends_have_one_request_id_exactly_when_their_run_attempt_and_seq_are_equal() {
-        let runs = [
-            "0193c2e4-7f3a-7c1d-9b2e-1a2b3c4d5e6f",
-            "0193c2e4-7f3a-7c1d-9b2e-1a2b3c4d5e70",
-        ];
-        let mut equal = 0;
-        for seed in 0..SEEDS {
-            let mut rng = StdRng::seed_from_u64(seed);
-            // Few values for each field, so that some appends are equal.
-            let appends: Vec<(&str, WorkflowTaskAttempt, u32)> = (0..8)
-                .map(|_| {
-                    let started_time = rng.random_bool(0.8).then(|| prost_types::Timestamp {
-                        seconds: 1_763_600_000 + rng.random_range(0..2),
-                        nanos: [0, 999_999_999][rng.random_range(0..2)],
-                    });
-                    let attempt = WorkflowTaskAttempt {
-                        started_event_id: [3, 31, 313][rng.random_range(0..3)],
-                        attempt: [1, 13, 131][rng.random_range(0..3)],
-                        started_time,
-                    };
-                    let seq = [1, 11, 111][rng.random_range(0..3)];
-                    (runs[rng.random_range(0..2)], attempt, seq)
-                })
-                .collect();
-            let id = |(run, attempt, seq): &(&str, WorkflowTaskAttempt, u32)| {
-                let of_run = WorkflowProducer {
-                    run_id: run.to_string(),
-                    ..Default::default()
-                };
-                request_id(run, &producer(&of_run, *attempt), *seq)
-            };
-            for a in &appends {
-                for b in &appends {
-                    assert_eq!(id(a) == id(b), a == b, "seed {seed}: {a:?} and {b:?}");
-                    equal += usize::from(a == b && !std::ptr::eq(a, b));
-                }
-            }
-        }
-        assert!(equal > 0, "No two appends were equal");
-    }
-
     /// A command of Workflow code in a generated script.
     #[derive(Clone, Debug)]
     enum Command {

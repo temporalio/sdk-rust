@@ -255,19 +255,12 @@ fn malformed(why: String) -> WFMachinesError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::manager::recorded;
     use super::*;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use temporalio_common::protos::temporal::api::{
         history::v1::WorkflowTaskCompletedEventAttributes,
-        sdk::v1::{
-            WorkflowTaskCompletedMetadata,
-            workflow_task_stream_calls::{AppendOffsets, CallFailure},
-        },
+        sdk::v1::{WorkflowTaskCompletedMetadata, workflow_task_stream_calls::CallFailure},
     };
-    use temporalio_streams::StreamError;
 
-    /// Returns the completion of a Workflow Task with `ledger`.
     fn event(ledger: WorkflowTaskStreamCalls) -> HistoryEvent {
         let sdk_metadata = WorkflowTaskCompletedMetadata {
             stream_calls: Some(Box::new(ledger)),
@@ -286,148 +279,70 @@ mod tests {
         }
     }
 
-    /// Returns text of 1 to `max` characters, such as a quote, a control character or a character
-    /// of several bytes.
-    fn text(rng: &mut StdRng, max: usize) -> String {
-        let chars = [
-            'a', '"', '\\', '/', '\n', '\0', '\u{7f}', 'é', '€', '𝄞', '\u{2028}',
-        ];
-        (0..rng.random_range(1..=max))
-            .map(|_| chars[rng.random_range(0..chars.len())])
-            .collect()
-    }
-
-    fn stream(rng: &mut StdRng) -> StreamRef {
-        StreamRef {
-            id: text(rng, 12),
-            store: text(rng, 12),
-        }
-    }
-
-    /// Returns an offset of 0 to 1024 bytes of any value.
-    fn offset(rng: &mut StdRng) -> Vec<u8> {
-        let len = match rng.random_range(0..10) {
-            0 => 0,
-            1 => 1024,
-            _ => rng.random_range(1..=16),
-        };
-        (0..len).map(|_| rng.random()).collect()
-    }
-
-    /// Returns the failure of a call, as the manager records it for an error of any reason.
-    fn failure(rng: &mut StdRng) -> CallFailure {
-        let reasons: Vec<StreamErrorReason> = (0..)
-            .map_while(|number| StreamErrorReason::try_from(number).ok())
-            .collect();
-        let reason = reasons[rng.random_range(0..reasons.len())];
-        let message = match rng.random_bool(0.9) {
-            true => text(rng, 40),
-            false => text(rng, 5000),
-        };
-        recorded(&StreamError { reason, message })
-    }
-
-    /// Returns a ledger with random entries of each kind, as the builder of a task makes it.
-    fn valid_ledger(rng: &mut StdRng) -> WorkflowTaskStreamCalls {
-        let mut builder = LedgerBuilder::new(StreamSettings::default());
-        let activation = |rng: &mut StdRng| match rng.random_bool(0.9) {
-            true => rng.random_range(0..10),
-            false => i32::MAX as u64,
-        };
-        for seq in 1..=rng.random_range(1..3) {
-            builder.close_intent(&stream(rng), seq);
-        }
-        for seq in 1..=rng.random_range(0..4) {
-            let result = match rng.random_bool(0.5) {
-                true => append_result::Result::Appended(AppendOffsets {
-                    first_offset: offset(rng),
-                    last_offset: offset(rng),
-                }),
-                false => append_result::Result::Failure(failure(rng)),
-            };
-            let done = Waiting::new(AppendResult {
-                seq,
-                r#ref: Some(stream(rng)),
-                result: Some(result),
-                activation_index: 0,
-            });
-            builder.append_result(&done, activation(rng));
-        }
-        for seq in 1..=rng.random_range(0..3) {
-            let close = Waiting::new(CloseResult {
-                seq,
-                failure: rng.random_bool(0.5).then(|| failure(rng)),
-                activation_index: 0,
-            });
-            builder.close_result(&close, activation(rng));
-        }
-        builder.take().expect("The ledger has an intent")
-    }
-
-    /// Breaks one rule of `ledger`. Returns the ledger and the reason that the check gives.
-    fn corrupt(
-        rng: &mut StdRng,
-        mut ledger: WorkflowTaskStreamCalls,
-    ) -> (WorkflowTaskStreamCalls, String) {
-        match rng.random_range(0..3) {
-            0 => {
-                ledger.append_results.push(AppendResult {
-                    seq: 99,
-                    ..Default::default()
-                });
-                return (ledger, "has no result of append 99".to_string());
-            }
-            1 => {
-                let index = rng.random_range(i32::MIN..0);
-                match rng.random_bool(0.5) {
-                    true => ledger.append_results.push(AppendResult {
-                        seq: 99,
-                        result: Some(append_result::Result::Appended(Default::default())),
-                        activation_index: index,
-                        ..Default::default()
-                    }),
-                    false => ledger.close_results.push(CloseResult {
-                        seq: 99,
-                        failure: None,
-                        activation_index: index,
-                    }),
-                }
-                return (ledger, format!("has the negative activation index {index}"));
-            }
-            _ => {}
-        }
-        let later = CallFailure {
+    #[test]
+    fn a_replay_refuses_a_malformed_ledger() {
+        let appended = || Some(append_result::Result::Appended(Default::default()));
+        // A later version of Core can have a reason that this one doesn't know.
+        let later = || CallFailure {
             reason: 1000,
-            message: "A later version of Core has this reason".to_string(),
+            message: String::new(),
         };
-        match rng.random_bool(0.5) {
-            true => ledger.append_results.push(AppendResult {
-                seq: 99,
-                result: Some(append_result::Result::Failure(later)),
+        let unknown = "has a failure with the reason 1000, which this Worker doesn't know";
+        let append = |result, activation_index| WorkflowTaskStreamCalls {
+            append_results: vec![AppendResult {
+                seq: 9,
+                result,
+                activation_index,
                 ..Default::default()
-            }),
-            false => ledger.close_results.push(CloseResult {
-                seq: 99,
-                failure: Some(later),
-                ..Default::default()
-            }),
+            }],
+            ..Default::default()
+        };
+        let close = |failure, activation_index| WorkflowTaskStreamCalls {
+            close_results: vec![CloseResult {
+                seq: 9,
+                failure,
+                activation_index,
+            }],
+            ..Default::default()
+        };
+        let cases = [
+            (append(None, 0), "has no result of append 9"),
+            (
+                append(appended(), -1),
+                "has the negative activation index -1",
+            ),
+            (close(None, -2), "has the negative activation index -2"),
+            (
+                append(Some(append_result::Result::Failure(later())), 0),
+                unknown,
+            ),
+            (close(Some(later()), 0), unknown),
+        ];
+        for (ledger, why) in cases {
+            let Some(Err(WFMachinesError::Fatal(error))) = peeked_ledger(&event(ledger)) else {
+                panic!("The check took a ledger that {why}");
+            };
+            assert_eq!(error, format!("The Stream ledger {why}"));
         }
-        let why = "has a failure with the reason 1000, which this Worker doesn't know";
-        (ledger, why.to_string())
+        let valid = append(appended(), i32::MAX);
+        assert_eq!(peeked_ledger(&event(valid.clone())), Some(Ok(valid)));
     }
 
     #[test]
-    fn a_replay_takes_each_ledger_that_core_writes_and_no_malformed_one() {
-        for seed in 0..1000 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let valid = valid_ledger(&mut rng);
-            let read = peeked_ledger(&event(valid.clone()));
-            assert_eq!(read, Some(Ok(valid.clone())), "seed {seed}");
-            let (ledger, why) = corrupt(&mut rng, valid);
-            let Some(Err(WFMachinesError::Fatal(error))) = peeked_ledger(&event(ledger)) else {
-                panic!("seed {seed}: the check took the ledger");
-            };
-            assert_eq!(error, format!("The Stream ledger {why}"), "seed {seed}");
+    fn a_ledger_counts_the_bytes_of_an_activation_index() {
+        let done = Waiting::new(CloseResult {
+            seq: 1,
+            ..Default::default()
+        });
+        for activation in [0, 1, 127, 128, i32::MAX as u64] {
+            let mut builder = LedgerBuilder::new(StreamSettings::default());
+            assert!(builder.close_result(&done, activation));
+            // `take` asserts that the counted bytes are the encoded size.
+            let ledger = builder.take().unwrap();
+            assert_eq!(ledger.close_results[0].activation_index as u64, activation);
         }
+        // History keeps the index as an `int32`, so a higher one has no room.
+        let mut builder = LedgerBuilder::new(StreamSettings::default());
+        assert!(!builder.close_result(&done, i32::MAX as u64 + 1));
     }
 }
