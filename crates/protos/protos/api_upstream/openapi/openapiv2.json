@@ -22975,7 +22975,7 @@
         },
         "streamCalls": {
           "$ref": "#/definitions/v1WorkflowTaskStreamCalls",
-          "description": "Experimental. Might change in the future.\nThe Stream calls of this Workflow Task. An SDK sets it if Workflow code got the result of a\nStream call in the task or asked for a close."
+          "description": "Experimental. Might change in the future.\nThe Stream calls of this Workflow Task. An SDK sets it if Workflow code got the result of a\nStream call in the task, asked for a close, or has a call with no result yet. So it can have\nno entry."
         }
       }
     },
