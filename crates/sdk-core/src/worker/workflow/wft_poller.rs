@@ -294,6 +294,7 @@ mod tests {
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
         pollers::MockPermittedPollBuffer,
+        pollers_v2::Poller,
         replay::TestHistoryBuilder,
         test_help::{ResponseType, hist_to_poll_resp, mock_poller, test_worker_cfg},
         worker::{
@@ -360,6 +361,7 @@ mod tests {
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(()));
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[tokio::test]
     async fn poll_timeouts_do_not_produce_responses() {
         let mut mock_poller = mock_poller();
@@ -370,6 +372,7 @@ mod tests {
         mock_poller.expect_poll().times(1).returning(|| None);
         mock_poller.expect_shutdown().times(1).returning(|| ());
         let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
+
         let stream = new_wft_poller(
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
@@ -378,8 +381,29 @@ mod tests {
         assert_matches!(stream.next().await, None);
     }
 
+    #[cfg(feature = "exp-poller-v2")]
+    #[tokio::test]
+    async fn poll_timeouts_do_not_produce_responses() {
+        use crate::pollers_v2::Poller;
+
+        let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
+        let stream = new_wft_poller(
+            crate::pollers_v2::from_stream(stream::once(async {
+                Ok((
+                    PollWorkflowTaskQueueResponse::default(),
+                    sem.acquire_owned().await,
+                ))
+            })),
+            MetricsContext::no_op(),
+        )
+        .into_stream_auto_shutdown();
+        pin_mut!(stream);
+        assert_matches!(stream.next().await, None);
+    }
+
     /// When the underlying poller returns None (indicating shutdown), the wrapping WFT stream
     /// should also return None to terminate.
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[tokio::test]
     async fn poller_returning_none_terminates_wft_stream() {
         let mut mock_poller = mock_poller();
@@ -392,6 +416,23 @@ mod tests {
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
         );
+        pin_mut!(stream);
+
+        assert_matches!(stream.next().await, None);
+    }
+
+    /// When the underlying poller returns None (indicating shutdown), the wrapping WFT stream
+    /// should also return None to terminate.
+    #[cfg(feature = "exp-poller-v2")]
+    #[tokio::test]
+    async fn poller_returning_none_terminates_wft_stream() {
+        use crate::pollers_v2::Poller;
+
+        let stream = new_wft_poller(
+            crate::pollers_v2::from_stream(stream::empty()),
+            MetricsContext::no_op(),
+        )
+        .into_stream_auto_shutdown();
         pin_mut!(stream);
 
         assert_matches!(stream.next().await, None);
@@ -454,7 +495,8 @@ mod tests {
             PollerHeartbeatState::default(),
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
-        );
+        )
+        .into_stream_auto_shutdown();
         pin_mut!(stream);
         let got = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
             .await
@@ -463,6 +505,7 @@ mod tests {
         assert!(got.is_ok());
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[tokio::test]
     async fn poll_errors_do_produce_responses() {
         let mut mock_poller = mock_poller();
@@ -475,6 +518,22 @@ mod tests {
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
         );
+        pin_mut!(stream);
+        assert_matches!(stream.next().await, Some(Err(_)));
+    }
+
+    #[cfg(feature = "exp-poller-v2")]
+    #[tokio::test]
+    async fn poll_errors_do_produce_responses() {
+        use crate::pollers_v2::Poller;
+
+        let stream = new_wft_poller(
+            crate::pollers_v2::from_stream(stream::once(std::future::ready(Err(
+                tonic::Status::internal("ahhh"),
+            )))),
+            MetricsContext::no_op(),
+        )
+        .into_stream_auto_shutdown();
         pin_mut!(stream);
         assert_matches!(stream.next().await, Some(Err(_)));
     }
