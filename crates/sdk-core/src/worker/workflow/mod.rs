@@ -22,6 +22,7 @@ use crate::{
     },
     internal_flags::InternalFlags,
     pollers::TrackedPermittedTqResp,
+    pollers_v2::Poller,
     protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage},
     telemetry::{VecDisplayer, metrics},
     worker::{
@@ -173,6 +174,7 @@ pub(crate) struct RunBasics<'a> {
 }
 
 impl Workflows {
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[allow(clippy::too_many_arguments)] // Not much worth combining here
     pub(super) fn new(
         basics: WorkflowBasics,
@@ -250,6 +252,131 @@ impl Workflows {
                         locals_stream,
                         local_activity_request_sink,
                     );
+
+                    while let Some(output) = stream.next().await {
+                        match output {
+                            Ok(o) => {
+                                for fetchreq in o.fetch_histories {
+                                    fetch_tx
+                                        .send(fetchreq)
+                                        .expect("Fetch channel must not be dropped");
+                                }
+                                for action in o.actions {
+                                    activation_tx
+                                        .send(Ok(action))
+                                        .expect("Activation processor channel not dropped");
+                                }
+                            }
+                            Err(e) => {
+                                let _ = activation_tx.send(Err(e)).inspect_err(|e| {
+                                    error!(activation=?e.0, "Activation processor channel dropped");
+                                });
+                            }
+                        }
+                    }
+                });
+            })
+            .expect("Must be able to spawn workflow processing thread");
+        Self {
+            task_queue,
+            local_tx,
+            processing_task: TakeCell::new(processing_task),
+            activation_stream: tokio::sync::Mutex::new((
+                UnboundedReceiverStream::new(activation_rx).boxed(),
+                Some(start_polling_tx),
+            )),
+            client,
+            sticky_attrs,
+            activity_tasks_handle,
+            max_eager_activity_reservations_per_workflow_task,
+            wft_semaphore,
+            local_act_mgr,
+            ever_polled: AtomicBool::new(false),
+            default_versioning_behavior,
+            namespace_capabilities,
+            shutdown_token,
+        }
+    }
+
+    #[cfg(feature = "exp-poller-v2")]
+    #[allow(clippy::too_many_arguments)] // Not much worth combining here
+    pub(super) fn new(
+        basics: WorkflowBasics,
+        sticky_attrs: Option<StickyExecutionAttributes>,
+        client: Arc<dyn WorkerClient>,
+        wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
+        wft_poller: impl crate::pollers_v2::Poller<Item = WFTStreamIn> + Send + 'static,
+        local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        local_act_mgr: Option<Arc<LocalActivityManager>>,
+        la_notify_rx: Option<UnboundedReceiver<LocalActivityNotification>>,
+        activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
+        tracing_sub: Option<Arc<dyn Subscriber + Send + Sync>>,
+    ) -> Self {
+        let (local_tx, local_rx) = unbounded_channel();
+        let (fetch_tx, fetch_rx) = unbounded_channel();
+        let shutdown_tok = basics.shutdown_token.clone();
+        let task_queue = basics.worker_config.task_queue.clone();
+        let max_eager_activity_reservations_per_workflow_task = basics
+            .worker_config
+            .max_eager_activity_reservations_per_workflow_task;
+        let default_versioning_behavior = basics.default_versioning_behavior;
+        let namespace_capabilities = basics.namespace_capabilities.clone();
+        let shutdown_token = basics.shutdown_token.clone();
+        let extracted_wft_poller = WFTExtractor::build(
+            client.clone(),
+            basics.worker_config.fetching_concurrency,
+            wft_poller,
+            fetch_rx,
+        );
+        let locals_poller = if let Some(la_notify_rx) = la_notify_rx {
+            // LA manager notifications go first so that one is never processed after an input lang
+            // could only have produced in reaction to it, such as the resolution of an attempt
+            // whose cancel delivery the notification announces
+            crate::pollers_v2::select_biased(
+                crate::pollers_v2::from_unbounded_receiver_drainable(la_notify_rx)
+                    .map(|_, n| n.into()),
+                crate::pollers_v2::from_unbounded_receiver_drainable(local_rx),
+            )
+            .left_poller()
+        } else {
+            crate::pollers_v2::from_unbounded_receiver_drainable(local_rx).right_poller()
+        };
+        let (activation_tx, activation_rx) = unbounded_channel();
+        let (start_polling_tx, start_polling_rx) = oneshot::channel();
+        // We must spawn a task to constantly poll the activation stream, because otherwise
+        // activation completions would not cause anything to happen until the next poll.
+        let processing_task = thread::Builder::new()
+            .name("workflow-processing".to_string())
+            .spawn(move || {
+                if let Some(ts) = tracing_sub {
+                    set_trace_subscriber_for_current_thread(ts);
+                }
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let local = LocalSet::new();
+                local.block_on(&rt, async move {
+                    // However, we want to avoid plowing ahead until we've been asked to poll at
+                    // least once. This supports activity-only workers.
+                    let do_poll = tokio::select! {
+                        sp = start_polling_rx => {
+                            sp.is_ok()
+                        }
+                        _ = shutdown_tok.cancelled() => {
+                            false
+                        }
+                    };
+                    if !do_poll {
+                        return;
+                    }
+
+                    let mut stream = std::pin::pin!(WFStream::build(
+                        basics,
+                        extracted_wft_poller,
+                        locals_poller,
+                        local_activity_request_sink,
+                    ));
 
                     while let Some(output) = stream.next().await {
                         match output {
@@ -730,7 +857,9 @@ impl Workflows {
 
     /// Send a `BumpStream` message to the workflow stream. This ensures that any pending
     /// workflow activation polls will resolve, like during shutdown, even if there are no other inputs.
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) fn bump_stream(&self) {
+        // BumpStream breaks poller v2, making it no-op works
         self.send_local(LocalInputs::BumpStream);
     }
 
@@ -748,6 +877,7 @@ impl Workflows {
         self.wft_semaphore.unused_permits()
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) async fn shutdown(&self) -> Result<(), anyhow::Error> {
         if let Some(jh) = self.processing_task.take_once() {
             // This serves to drive the stream if it is still alive and wouldn't otherwise receive
@@ -768,6 +898,17 @@ impl Workflows {
                 })
             );
             jh_res?.map_err(|e| {
+                let as_str = e.downcast::<&str>();
+                anyhow!("Error joining workflow processing thread: {as_str:?}")
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "exp-poller-v2")]
+    pub(super) async fn shutdown(&self) -> Result<(), anyhow::Error> {
+        if let Some(jh) = self.processing_task.take_once() {
+            spawn_blocking(move || jh.join()).await?.map_err(|e| {
                 let as_str = e.downcast::<&str>();
                 anyhow!("Error joining workflow processing thread: {as_str:?}")
             })?;
@@ -819,7 +960,9 @@ impl Workflows {
     fn send_local(&self, msg: impl Into<LocalInputs>) -> bool {
         let msg = msg.into();
         let print_err = match &msg {
-            LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => false,
+            LocalInputs::GetStateInfo(_) => false,
+            #[cfg(not(feature = "exp-poller-v2"))]
+            LocalInputs::BumpStream => false,
             LocalInputs::LocalResolution(lr) if lr.res.is_la_cancel_confirmation() => false,
             _ => true,
         };

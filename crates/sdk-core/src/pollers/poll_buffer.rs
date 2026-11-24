@@ -11,11 +11,12 @@ use crate::{
 };
 use backon::{BackoffBuilder, ExponentialBuilder};
 use crossbeam_utils::atomic::AtomicCell;
+use futures::stream;
 use futures_util::{FutureExt, StreamExt, future::BoxFuture};
 use std::{
     cmp,
     fmt::Debug,
-    future::Future,
+    future::{self, Future},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -513,6 +514,29 @@ where
     async fn shutdown_box(self: Box<Self>) {
         let this = *self;
         this.shutdown().await;
+    }
+}
+
+impl<T, SK: SlotKind> LongPollBuffer<T, SK> {
+    pub(crate) fn to_v2(
+        self,
+    ) -> impl crate::pollers_v2::Poller<Item = Result<(T, OwnedMeteredSemPermit<SK>), tonic::Status>>
+    {
+        use crate::pollers_v2::Poller;
+
+        let stream = stream::once(async move {
+            let _ = self.starter.send(());
+            None
+        })
+        .filter_map(future::ready)
+        .chain(UnboundedReceiverStream::new(
+            self.buffered_polls.into_inner(),
+        ));
+        crate::pollers_v2::from_stream(stream).on_shutdown(move |_| async move {
+            self.shutdown.cancel();
+            handle_task_panic(self.poller_task).await;
+            Ok(())
+        })
     }
 }
 

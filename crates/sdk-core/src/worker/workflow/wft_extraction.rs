@@ -1,5 +1,6 @@
 use crate::{
     abstractions::OwnedMeteredSemPermit,
+    pollers_v2,
     protosext::ValidPollWFTQResponse,
     worker::{
         WorkflowSlotKind,
@@ -13,6 +14,7 @@ use crate::{
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
 use std::{future, sync::Arc};
 use temporalio_common::protos::coresdk::WorkflowSlotInfo;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -24,19 +26,28 @@ pub(super) enum WFTExtractorOutput {
     FetchResult(
         PermittedWFT,
         // Field isn't read, but we need to hold on to it.
-        #[allow(dead_code)] Arc<HistfetchRC>,
+        #[cfg(not(feature = "exp-poller-v2"))]
+        #[allow(dead_code)]
+        Arc<HistfetchRC>,
+        #[cfg(feature = "exp-poller-v2")]
+        #[allow(dead_code)]
+        (),
     ),
     NextPage {
         paginator: HistoryPaginator,
         update: HistoryUpdate,
         span: Span,
+        #[cfg(not(feature = "exp-poller-v2"))]
         rc: Arc<HistfetchRC>,
+        #[cfg(feature = "exp-poller-v2")]
+        rc: (),
     },
     FailedFetch {
         run_id: String,
         err: tonic::Status,
         auto_reply_fail: Option<UnstoredWftFailInfo>,
     },
+    #[cfg(not(feature = "exp-poller-v2"))]
     PollerDead,
 }
 
@@ -47,16 +58,29 @@ pub(crate) type WFTStreamIn = Result<
     ),
     tonic::Status,
 >;
+
+#[cfg(not(feature = "exp-poller-v2"))]
 #[derive(derive_more::From, Debug)]
 pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
 }
+
+// TODO: after removing old poller code, remove the unit 2nd field
+#[cfg(feature = "exp-poller-v2")]
+#[derive(derive_more::From, Debug)]
+pub(super) enum HistoryFetchReq {
+    Full(Box<CacheMissFetchReq>, ()),
+    NextPage(Box<NextPageReq>, ()),
+}
+
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
+#[cfg(not(feature = "exp-poller-v2"))]
 #[derive(Debug)]
 pub(super) struct HistfetchRC {}
 
 impl WFTExtractor {
+    #[cfg(not(feature = "exp-poller-v2"))]
     pub(super) fn build(
         client: Arc<dyn WorkerClient>,
         max_fetch_concurrency: usize,
@@ -154,5 +178,98 @@ impl WFTExtractor {
             |_: &mut ()| PollNext::Right,
         )
         .buffer_unordered(max_fetch_concurrency)
+    }
+
+    #[cfg(feature = "exp-poller-v2")]
+    pub(super) fn build(
+        client: Arc<dyn WorkerClient>,
+        max_fetch_concurrency: usize,
+        wft_poller: impl pollers_v2::Poller<Item = WFTStreamIn> + Send + 'static,
+        fetch_receiver: UnboundedReceiver<HistoryFetchReq>,
+    ) -> impl pollers_v2::Poller<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static
+    {
+        use pollers_v2::Poller;
+
+        let fetch_client = client.clone();
+        let wft_poller = wft_poller.map(move |_, stream_in| {
+            let client = client.clone();
+            async move {
+                match stream_in {
+                    Ok((wft, permit)) => {
+                        let run_id = wft.workflow_execution.run_id.clone();
+                        let fail_info = UnstoredWftFailInfo {
+                            task_token: wft.task_token.clone(),
+                            workflow_id: wft.workflow_execution.workflow_id.clone(),
+                            attempt: wft.attempt,
+                            workflow_type: wft.workflow_type.clone(),
+                        };
+                        Ok(match HistoryPaginator::from_poll(wft, client).await {
+                            Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
+                                permit: permit.into_used(WorkflowSlotInfo {
+                                    workflow_type: prep.workflow_type.clone(),
+                                    is_sticky: prep.is_incremental(),
+                                }),
+                                work: prep,
+                                paginator: pag,
+                            }),
+                            Err(err) => WFTExtractorOutput::FailedFetch {
+                                run_id,
+                                err,
+                                auto_reply_fail: Some(fail_info),
+                            },
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            .left_future()
+        });
+
+        let fetch_poller = pollers_v2::from_unbounded_receiver_drainable(fetch_receiver).map(
+            move |_, fetchreq: HistoryFetchReq| {
+                let client = fetch_client.clone();
+                async move {
+                    Ok(match fetchreq {
+                        // It's OK to simply drop the refcounters in the event of fetch
+                        // failure. We'll just proceed with shutdown.
+                        HistoryFetchReq::Full(req, rc) => {
+                            let run_id = req.original_wft.work.execution.run_id.clone();
+                            let fail_info = UnstoredWftFailInfo {
+                                task_token: req.original_wft.work.task_token.clone(),
+                                workflow_id: req.original_wft.work.execution.workflow_id.clone(),
+                                attempt: req.original_wft.work.attempt,
+                                workflow_type: req.original_wft.work.workflow_type.clone(),
+                            };
+                            match HistoryPaginator::from_fetchreq(req, client).await {
+                                Ok(r) => WFTExtractorOutput::FetchResult(r, rc),
+                                Err(err) => WFTExtractorOutput::FailedFetch {
+                                    run_id,
+                                    err,
+                                    auto_reply_fail: Some(fail_info),
+                                },
+                            }
+                        }
+                        HistoryFetchReq::NextPage(mut req, rc) => {
+                            match req.paginator.extract_next_update().await {
+                                Ok(update) => WFTExtractorOutput::NextPage {
+                                    paginator: req.paginator,
+                                    update,
+                                    span: req.span,
+                                    rc,
+                                },
+                                Err(err) => WFTExtractorOutput::FailedFetch {
+                                    run_id: req.paginator.run_id,
+                                    err,
+                                    auto_reply_fail: None,
+                                },
+                            }
+                        }
+                    })
+                }
+                .right_future()
+            },
+        );
+
+        pollers_v2::select_biased(fetch_poller, wft_poller).buffer_unordered(max_fetch_concurrency)
     }
 }

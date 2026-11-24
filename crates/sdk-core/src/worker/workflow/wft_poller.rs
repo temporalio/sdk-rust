@@ -14,6 +14,7 @@ use std::sync::Arc;
 use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(feature = "exp-poller-v2"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
@@ -91,6 +92,89 @@ pub(crate) fn make_wft_poller(
     new_wft_poller(wf_task_poll_buffer, metrics.clone())
 }
 
+#[cfg(feature = "exp-poller-v2")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_wft_poller(
+    config: &WorkerConfig,
+    sticky_queue_name: &Option<String>,
+    client: &Arc<dyn WorkerClient>,
+    metrics: &MetricsContext,
+    shutdown_token: &CancellationToken,
+    wft_slots: &MeteredPermitDealer<WorkflowSlotKind>,
+    heartbeat_state: PollerHeartbeatState,
+    sticky_heartbeat_state: PollerHeartbeatState,
+    capabilities: Arc<NamespaceCapabilities>,
+) -> impl crate::pollers_v2::Poller<
+    Item = Result<
+        (
+            ValidPollWFTQResponse,
+            OwnedMeteredSemPermit<WorkflowSlotKind>,
+        ),
+        tonic::Status,
+    >,
+> + Sized
++ 'static {
+    use crate::pollers_v2::Poller;
+
+    let wft_metrics = metrics.with_new_attrs([workflow_poller()]);
+    let effective_behavior = crate::worker::resolve_effective_behavior(
+        config.workflow_task_poller_behavior,
+        &capabilities,
+    );
+    let wft_poller_shared = if sticky_queue_name.is_some() {
+        // Balance on the limit `acquire_owned` actually enforces (min of slot supplier and cache
+        // size). Using only the slot supplier lets a small cache starve the non-sticky poller.
+        let balance_limit = [wft_slots.available_permits(), wft_slots.max_permits()]
+            .into_iter()
+            .flatten()
+            .min();
+        Some(Arc::new(StickyPollerShared::new(balance_limit)))
+    } else {
+        None
+    };
+    let wf_task_poll_buffer = LongPollBuffer::new_workflow_task(
+        client.clone(),
+        config.task_queue.clone(),
+        None,
+        sticky_poller_behavior(effective_behavior, config, false),
+        wft_slots.clone(),
+        shutdown_token.child_token(),
+        Some(move |np| {
+            wft_metrics.record_num_pollers(np);
+        }),
+        WorkflowTaskOptions {
+            wft_poller_shared: wft_poller_shared.clone(),
+        },
+        heartbeat_state,
+        capabilities.clone(),
+    )
+    .to_v2();
+    let sticky_queue_poller = sticky_queue_name.as_ref().map(|sqn| {
+        let sticky_metrics = metrics.with_new_attrs([workflow_sticky_poller()]);
+        LongPollBuffer::new_workflow_task(
+            client.clone(),
+            config.task_queue.clone(),
+            Some(sqn.clone()),
+            sticky_poller_behavior(effective_behavior, config, true),
+            wft_slots.clone().into_sticky(),
+            shutdown_token.child_token(),
+            Some(move |np| {
+                sticky_metrics.record_num_pollers(np);
+            }),
+            WorkflowTaskOptions { wft_poller_shared },
+            sticky_heartbeat_state,
+            capabilities,
+        )
+        .to_v2()
+    });
+    let wf_task_poll_buffer = match sticky_queue_poller {
+        Some(sp) => crate::pollers_v2::select(wf_task_poll_buffer, sp).left_poller(),
+        None => wf_task_poll_buffer.right_poller(),
+    };
+    new_wft_poller(wf_task_poll_buffer, metrics.clone())
+}
+
+#[cfg(not(feature = "exp-poller-v2"))]
 fn new_wft_poller(
     poller: BoxedWFPoller,
     metrics: MetricsContext,
@@ -143,6 +227,55 @@ fn new_wft_poller(
     })
 }
 
+#[cfg(feature = "exp-poller-v2")]
+fn new_wft_poller(
+    poller: impl crate::pollers_v2::Poller<
+        Item = Result<
+            (
+                PollWorkflowTaskQueueResponse,
+                OwnedMeteredSemPermit<WorkflowSlotKind>,
+            ),
+            tonic::Status,
+        >,
+    >,
+    metrics: MetricsContext,
+) -> impl crate::pollers_v2::Poller<
+    Item = Result<
+        (
+            ValidPollWFTQResponse,
+            OwnedMeteredSemPermit<WorkflowSlotKind>,
+        ),
+        tonic::Status,
+    >,
+> {
+    poller.filter_map(move |_, x| match x {
+        Ok((wft, permit)) => {
+            if wft == PollWorkflowTaskQueueResponse::default() {
+                // We get the default proto in the event that the long poll times out.
+                debug!("Poll wft timeout");
+                metrics.wf_tq_poll_empty();
+                return None;
+            }
+            if let Some(dur) = wft.sched_to_start() {
+                metrics.wf_task_sched_to_start_latency(dur);
+            }
+            let work = match validate_wft(wft) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(error=?e, "Server returned an unparseable workflow task");
+                    return None;
+                }
+            };
+            metrics.wf_tq_poll_ok();
+            Some(Ok((work, permit)))
+        }
+        Err(e) => {
+            warn!(error=?e, "Error while polling for workflow tasks");
+            Some(Err(e))
+        }
+    })
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_wft(
     wft: PollWorkflowTaskQueueResponse,
@@ -161,6 +294,7 @@ mod tests {
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
         pollers::MockPermittedPollBuffer,
+        pollers_v2::Poller,
         replay::TestHistoryBuilder,
         test_help::{ResponseType, hist_to_poll_resp, mock_poller, test_worker_cfg},
         worker::{
@@ -227,6 +361,7 @@ mod tests {
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(()));
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[tokio::test]
     async fn poll_timeouts_do_not_produce_responses() {
         let mut mock_poller = mock_poller();
@@ -237,6 +372,7 @@ mod tests {
         mock_poller.expect_poll().times(1).returning(|| None);
         mock_poller.expect_shutdown().times(1).returning(|| ());
         let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
+
         let stream = new_wft_poller(
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
@@ -245,8 +381,29 @@ mod tests {
         assert_matches!(stream.next().await, None);
     }
 
+    #[cfg(feature = "exp-poller-v2")]
+    #[tokio::test]
+    async fn poll_timeouts_do_not_produce_responses() {
+        use crate::pollers_v2::Poller;
+
+        let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
+        let stream = new_wft_poller(
+            crate::pollers_v2::from_stream(stream::once(async {
+                Ok((
+                    PollWorkflowTaskQueueResponse::default(),
+                    sem.acquire_owned().await,
+                ))
+            })),
+            MetricsContext::no_op(),
+        )
+        .into_stream_auto_shutdown();
+        pin_mut!(stream);
+        assert_matches!(stream.next().await, None);
+    }
+
     /// When the underlying poller returns None (indicating shutdown), the wrapping WFT stream
     /// should also return None to terminate.
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[tokio::test]
     async fn poller_returning_none_terminates_wft_stream() {
         let mut mock_poller = mock_poller();
@@ -259,6 +416,23 @@ mod tests {
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
         );
+        pin_mut!(stream);
+
+        assert_matches!(stream.next().await, None);
+    }
+
+    /// When the underlying poller returns None (indicating shutdown), the wrapping WFT stream
+    /// should also return None to terminate.
+    #[cfg(feature = "exp-poller-v2")]
+    #[tokio::test]
+    async fn poller_returning_none_terminates_wft_stream() {
+        use crate::pollers_v2::Poller;
+
+        let stream = new_wft_poller(
+            crate::pollers_v2::from_stream(stream::empty()),
+            MetricsContext::no_op(),
+        )
+        .into_stream_auto_shutdown();
         pin_mut!(stream);
 
         assert_matches!(stream.next().await, None);
@@ -321,7 +495,8 @@ mod tests {
             PollerHeartbeatState::default(),
             PollerHeartbeatState::default(),
             Arc::new(NamespaceCapabilities::default()),
-        );
+        )
+        .into_stream_auto_shutdown();
         pin_mut!(stream);
         let got = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
             .await
@@ -330,6 +505,7 @@ mod tests {
         assert!(got.is_ok());
     }
 
+    #[cfg(not(feature = "exp-poller-v2"))]
     #[tokio::test]
     async fn poll_errors_do_produce_responses() {
         let mut mock_poller = mock_poller();
@@ -342,6 +518,22 @@ mod tests {
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
         );
+        pin_mut!(stream);
+        assert_matches!(stream.next().await, Some(Err(_)));
+    }
+
+    #[cfg(feature = "exp-poller-v2")]
+    #[tokio::test]
+    async fn poll_errors_do_produce_responses() {
+        use crate::pollers_v2::Poller;
+
+        let stream = new_wft_poller(
+            crate::pollers_v2::from_stream(stream::once(std::future::ready(Err(
+                tonic::Status::internal("ahhh"),
+            )))),
+            MetricsContext::no_op(),
+        )
+        .into_stream_auto_shutdown();
         pin_mut!(stream);
         assert_matches!(stream.next().await, Some(Err(_)));
     }
