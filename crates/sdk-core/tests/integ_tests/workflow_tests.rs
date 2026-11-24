@@ -23,7 +23,7 @@ mod replay;
 mod resets;
 mod signals;
 mod stickyness;
-mod streams;
+pub(crate) mod streams;
 mod timers;
 mod upsert_search_attrs;
 

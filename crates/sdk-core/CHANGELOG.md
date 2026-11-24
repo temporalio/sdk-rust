@@ -71,6 +71,18 @@ relevant information.
   the new `StreamSettings::replay_retry_bound`, 3 s by default. If the Store doesn't have the same
   Records, the task fails. With the new `WorkflowErrorType::StreamReplay` variant in
   `workflow_failure_errors`, the Workflow fails in its place, on the first attempt of the task.
+* [lang-internal] The Worker's metrics count each try of a Stream call of Workflow code when it
+  starts, as they count each attempt of a Local Activity, with the attribute `stream_store`. An
+  append has `stream_append_total`, `stream_append_execution_failed` and
+  `stream_append_execution_latency`, and a close has the same three with `close`. A try that ends
+  has its latency, and a try that Core stops has only its count. A read has no latency. Its
+  `stream_read_total` counts each time the read asks the Store, also when it asks again after an
+  outage or after an answer with no Record. It also has `stream_read_execution_failed`, and
+  `stream_read_records`, which counts the Records that the Store gave, also those of a page that
+  Core dropped. A try of a replay's Store read that ends has
+  `stream_replay_read_execution_latency`, and a try that `replay_retry_bound` stops has no sample.
+  Each `_execution_failed` counter has the attribute `failure_reason` with the reason of the
+  Stream error, such as `stream_closed`, or `stream_store_unavailable` for a try in an outage.
 
 ## [0.12.0] - 2026-11-23
 

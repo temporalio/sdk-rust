@@ -54,6 +54,16 @@ struct Instruments {
     la_exec_latency: HistogramDuration,
     la_exec_succeeded_latency: HistogramDuration,
     la_total: Counter,
+    stream_append_total: Counter,
+    stream_append_execution_failed: Counter,
+    stream_append_exec_latency: HistogramDuration,
+    stream_close_total: Counter,
+    stream_close_execution_failed: Counter,
+    stream_close_exec_latency: HistogramDuration,
+    stream_read_total: Counter,
+    stream_read_execution_failed: Counter,
+    stream_read_records: Counter,
+    stream_replay_read_exec_latency: HistogramDuration,
     nexus_poll_no_task: Counter,
     nexus_task_schedule_to_start_latency: HistogramDuration,
     nexus_task_e2e_latency: HistogramDuration,
@@ -269,6 +279,48 @@ impl MetricsContext {
 
     pub(crate) fn la_executed(&self) {
         self.instruments.la_total.adds(1);
+    }
+
+    pub(crate) fn stream_append_executed(&self) {
+        self.instruments.stream_append_total.adds(1);
+    }
+
+    pub(crate) fn stream_append_execution_failed(&self) {
+        self.instruments.stream_append_execution_failed.adds(1);
+    }
+
+    pub(crate) fn stream_append_exec_latency(&self, dur: Duration) {
+        self.instruments.stream_append_exec_latency.records(dur);
+    }
+
+    pub(crate) fn stream_close_executed(&self) {
+        self.instruments.stream_close_total.adds(1);
+    }
+
+    pub(crate) fn stream_close_execution_failed(&self) {
+        self.instruments.stream_close_execution_failed.adds(1);
+    }
+
+    pub(crate) fn stream_close_exec_latency(&self, dur: Duration) {
+        self.instruments.stream_close_exec_latency.records(dur);
+    }
+
+    pub(crate) fn stream_read_executed(&self) {
+        self.instruments.stream_read_total.adds(1);
+    }
+
+    pub(crate) fn stream_read_execution_failed(&self) {
+        self.instruments.stream_read_execution_failed.adds(1);
+    }
+
+    pub(crate) fn stream_read_records(&self, count: u64) {
+        self.instruments.stream_read_records.adds(count);
+    }
+
+    pub(crate) fn stream_replay_read_exec_latency(&self, dur: Duration) {
+        self.instruments
+            .stream_replay_read_exec_latency
+            .records(dur);
     }
 
     /// A nexus long poll timed out
@@ -493,6 +545,56 @@ impl Instruments {
                 description: "Count of local activities executed".into(),
                 unit: "".into(),
             }),
+            stream_append_total: meter.counter(MetricParameters {
+                name: "stream_append_total".into(),
+                description: "Count of Stream append tries".into(),
+                unit: "".into(),
+            }),
+            stream_append_execution_failed: meter.counter(MetricParameters {
+                name: "stream_append_execution_failed".into(),
+                description: "Count of Stream append tries that failed".into(),
+                unit: "".into(),
+            }),
+            stream_append_exec_latency: meter.histogram_duration(MetricParameters {
+                name: "stream_append_execution_latency".into(),
+                unit: "duration".into(),
+                description: "Histogram of Stream append try latencies".into(),
+            }),
+            stream_close_total: meter.counter(MetricParameters {
+                name: "stream_close_total".into(),
+                description: "Count of Stream close tries".into(),
+                unit: "".into(),
+            }),
+            stream_close_execution_failed: meter.counter(MetricParameters {
+                name: "stream_close_execution_failed".into(),
+                description: "Count of Stream close tries that failed".into(),
+                unit: "".into(),
+            }),
+            stream_close_exec_latency: meter.histogram_duration(MetricParameters {
+                name: "stream_close_execution_latency".into(),
+                unit: "duration".into(),
+                description: "Histogram of Stream close try latencies".into(),
+            }),
+            stream_read_total: meter.counter(MetricParameters {
+                name: "stream_read_total".into(),
+                description: "Count of the requests that Stream reads sent to a Store".into(),
+                unit: "".into(),
+            }),
+            stream_read_execution_failed: meter.counter(MetricParameters {
+                name: "stream_read_execution_failed".into(),
+                description: "Count of Stream read tries that failed".into(),
+                unit: "".into(),
+            }),
+            stream_read_records: meter.counter(MetricParameters {
+                name: "stream_read_records".into(),
+                description: "Count of Records that Stores gave to Stream reads".into(),
+                unit: "".into(),
+            }),
+            stream_replay_read_exec_latency: meter.histogram_duration(MetricParameters {
+                name: "stream_replay_read_execution_latency".into(),
+                unit: "duration".into(),
+                description: "Histogram of Stream replay read try latencies".into(),
+            }),
             nexus_poll_no_task: meter.counter(MetricParameters {
                 name: "nexus_poll_no_task".into(),
                 description: "Count of nexus task queue poll timeouts (no new task)".into(),
@@ -616,6 +718,26 @@ impl Instruments {
         self.la_exec_succeeded_latency
             .update_attributes(new_attributes.clone());
         self.la_total.update_attributes(new_attributes.clone());
+        self.stream_append_total
+            .update_attributes(new_attributes.clone());
+        self.stream_append_execution_failed
+            .update_attributes(new_attributes.clone());
+        self.stream_append_exec_latency
+            .update_attributes(new_attributes.clone());
+        self.stream_close_total
+            .update_attributes(new_attributes.clone());
+        self.stream_close_execution_failed
+            .update_attributes(new_attributes.clone());
+        self.stream_close_exec_latency
+            .update_attributes(new_attributes.clone());
+        self.stream_read_total
+            .update_attributes(new_attributes.clone());
+        self.stream_read_execution_failed
+            .update_attributes(new_attributes.clone());
+        self.stream_read_records
+            .update_attributes(new_attributes.clone());
+        self.stream_replay_read_exec_latency
+            .update_attributes(new_attributes.clone());
         self.nexus_poll_no_task
             .update_attributes(new_attributes.clone());
         self.nexus_task_schedule_to_start_latency
@@ -750,6 +872,7 @@ const KEY_POLLER_TYPE: &str = "poller_type";
 const KEY_WORKER_TYPE: &str = "worker_type";
 const KEY_EAGER: &str = "eager";
 const KEY_TASK_FAILURE_TYPE: &str = "failure_reason";
+const KEY_STREAM_STORE: &str = "stream_store";
 
 pub(crate) fn workflow_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "workflow_task")
@@ -771,6 +894,9 @@ pub(crate) fn activity_type(ty: String) -> MetricKeyValue {
 }
 pub(crate) fn workflow_type(ty: String) -> MetricKeyValue {
     MetricKeyValue::new(KEY_WF_TYPE, ty)
+}
+pub(crate) fn stream_store(store: String) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_STREAM_STORE, store)
 }
 pub(crate) fn workflow_worker_type() -> MetricKeyValue {
     MetricKeyValue::new(KEY_WORKER_TYPE, "WorkflowWorker")
@@ -798,6 +924,7 @@ pub(crate) enum FailureReason {
     PayloadsTooLarge,
     ExternalStorageError,
     RequestTooLarge,
+    StreamError(String),
 }
 impl Display for FailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -812,6 +939,7 @@ impl Display for FailureReason {
             FailureReason::PayloadsTooLarge => "PayloadsTooLarge".to_owned(),
             FailureReason::ExternalStorageError => "ExternalStorageError".to_owned(),
             FailureReason::RequestTooLarge => "RequestTooLarge".to_owned(),
+            FailureReason::StreamError(token) => token.clone(),
         };
         write!(f, "{str}")
     }
@@ -1281,7 +1409,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 35;
+        let num_metrics = 45;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],

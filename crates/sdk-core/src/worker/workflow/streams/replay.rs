@@ -8,12 +8,15 @@ use super::{
     ledger::{has_ledger, peeked_ledger},
     manager::{cut, is_outage, next_wait, retry_waits},
 };
-use crate::worker::{
-    WorkerConfig,
-    workflow::{
-        NextPageReq, PermittedWFT,
-        history_update::{HistoryPaginator, HistoryUpdate},
-        wft_extraction::{FetchedPage, HistfetchRC, WFTExtractorOutput},
+use crate::{
+    telemetry::metrics::{MetricsContext, stream_store},
+    worker::{
+        WorkerConfig,
+        workflow::{
+            NextPageReq, PermittedWFT,
+            history_update::{HistoryPaginator, HistoryUpdate},
+            wft_extraction::{FetchedPage, HistfetchRC, WFTExtractorOutput},
+        },
     },
 };
 use futures_util::{
@@ -177,16 +180,26 @@ struct UnreadEntry {
 
 /// A reader of the Records of read entries, for the replay of one run. It keeps the ledgers of
 /// History that it hasn't read yet, and reads them a part at a time.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub(crate) struct ReplayReader {
     runtimes: StreamRuntimes,
     unread: VecDeque<UnreadLedger>,
+    #[debug(skip)]
+    metrics: MetricsContext,
+    /// The metrics of each Store that the reader read, by its name.
+    #[debug(skip)]
+    store_metrics: HashMap<String, MetricsContext>,
 }
 
 impl ReplayReader {
-    pub(crate) fn new(runtimes: StreamRuntimes) -> Self {
-        let unread = VecDeque::new();
-        Self { runtimes, unread }
+    /// Creates a reader with the Stream runtimes and the metrics of a Worker.
+    pub(crate) fn new(runtimes: StreamRuntimes, metrics: MetricsContext) -> Self {
+        Self {
+            runtimes,
+            unread: VecDeque::new(),
+            metrics,
+            store_metrics: HashMap::new(),
+        }
     }
 
     /// Queues each ledger in `events` that has a read entry with Records.
@@ -247,6 +260,13 @@ impl ReplayReader {
         let deadlines: HashMap<String, Deadline> = (entries.iter())
             .map(|(_, entry)| (entry.stream.store.clone(), Deadline::default()))
             .collect();
+        // History can have any Store name, so only a Store of this Worker gets metrics.
+        for store in deadlines.keys() {
+            if self.runtimes.get(store).is_some() {
+                let new = || self.metrics.with_new_attrs([stream_store(store.clone())]);
+                (self.store_metrics.entry(store.clone())).or_insert_with(new);
+            }
+        }
         let (reader, deadlines) = (&*self, &deadlines);
         let mut read = stream::iter(entries)
             .map(|(event_id, entry)| async move {
@@ -267,9 +287,13 @@ impl ReplayReader {
 
     /// Makes `paginator` read the Records of the ledgers of its History, for a run new to
     /// the cache.
-    pub(crate) fn add_to(paginator: &mut HistoryPaginator, config: &WorkerConfig) {
+    pub(crate) fn add_to(
+        paginator: &mut HistoryPaginator,
+        config: &WorkerConfig,
+        metrics: &MetricsContext,
+    ) {
         let runtimes = config.stream_runtimes.clone();
-        paginator.stream_reader = Some(ReplayReader::new(runtimes));
+        paginator.stream_reader = Some(ReplayReader::new(runtimes, metrics.clone()));
     }
 
     /// Reads the first part of the Records of the ledgers of `update`, which has the whole
@@ -325,6 +349,7 @@ impl ReplayReader {
         let gone = |why: String| {
             ReplayError::Gone(cut(format!("The Store doesn't have {}: {why}", range())))
         };
+        let metrics = &self.store_metrics[&stream.store];
         let settings = self.runtimes.settings;
         let recorded = usize::try_from(entry.record_bytes).unwrap_or(usize::MAX);
         let mut records: Vec<StreamRecord> = vec![];
@@ -342,6 +367,7 @@ impl ReplayReader {
                 max_bytes: i64::try_from(recorded.saturating_sub(bytes)).unwrap_or(i64::MAX),
                 ..Default::default()
             };
+            let asked = Instant::now();
             let read = runtime.read_records(request);
             let read = tokio::time::timeout(settings.try_deadline, read);
             // Once the deadline passed, no try starts, and one in flight stops.
@@ -356,6 +382,7 @@ impl ReplayReader {
                 }
                 Either::Right((answer, _)) => answer,
             };
+            metrics.stream_replay_read_exec_latency(asked.elapsed());
             let error = match answer {
                 Ok(Ok(page)) => {
                     waits = retry_waits(&settings);
@@ -758,7 +785,7 @@ mod tests {
             let recorded: usize = needing.iter().map(|(_, bytes)| bytes).sum();
             runtimes.settings.bounds.max_task_record_bytes = rng.random_range(1..=2 * recorded + 1);
             let max_bytes = runtimes.settings.bounds.max_task_record_bytes;
-            let mut reader = ReplayReader::new(runtimes);
+            let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
             reader.queue(events.iter());
             // The reader gives each ledger in one part, in the order of History.
             let mut results = HashMap::<i64, LedgerReads>::new();
@@ -933,7 +960,7 @@ mod tests {
         let runtime = StreamRuntime::new(Arc::new(model), StoreLimits::default());
         let mut runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
         runtimes.settings = settings;
-        let mut reader = ReplayReader::new(runtimes);
+        let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
         reader.queue([event].iter());
         (given, reader.read_next().await.take(1))
     }

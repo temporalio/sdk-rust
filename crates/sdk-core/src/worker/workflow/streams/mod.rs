@@ -17,6 +17,7 @@ pub(crate) use replay::{LedgerReads, ReplayReader, ReplayReads};
 
 use crate::{
     WorkerConfig,
+    telemetry::metrics::{MetricsContext, stream_store},
     worker::workflow::{
         LocalResolution, LocalResolutionMsg, RunBasics, WFT_HEARTBEAT_TIMEOUT_FRACTION,
         WorkflowTaskInfo,
@@ -241,10 +242,13 @@ impl Streams {
     }
 }
 
-/// The Stream manager of a Worker for one run, with the id of that run.
+/// The Stream manager of a Worker for one run, with the id and the metrics of that run.
 pub(super) struct RunStreams {
     streams: Arc<Streams>,
     run_id: String,
+    metrics: MetricsContext,
+    /// The metrics of each Store that the run called, by its name.
+    store_metrics: HashMap<String, MetricsContext>,
 }
 
 impl RunStreams {
@@ -252,19 +256,31 @@ impl RunStreams {
         Self {
             streams,
             run_id: basics.run_id.clone(),
+            metrics: basics.metrics.clone(),
+            store_metrics: HashMap::new(),
         }
     }
 
     /// Starts and stops the Stream calls that the machines decided on. A read that starts asks the
     /// Store to wait at most a share of `time_left`, the time that its task has left to its read
     /// limit.
-    pub(super) fn dispatch(&self, calls: &mut StreamCalls, time_left: Duration) {
+    pub(super) fn dispatch(&mut self, calls: &mut StreamCalls, time_left: Duration) {
         calls.limit_read_waits(time_left.mul_f32(READ_WAIT_SHARE));
         let requests = calls.take_requests();
         if requests.is_empty() {
             return;
         }
-        self.streams.manager.dispatch(&self.run_id, requests);
+        let (of_run, of_stores) = (&self.metrics, &mut self.store_metrics);
+        let metrics = |store: &str| {
+            let new = || of_run.with_new_attrs([stream_store(store.to_string())]);
+            of_stores
+                .entry(store.to_string())
+                .or_insert_with(new)
+                .clone()
+        };
+        self.streams
+            .manager
+            .dispatch(&self.run_id, requests, metrics);
     }
 
     pub(super) fn stop(&self, calls: &mut StreamCalls) {
