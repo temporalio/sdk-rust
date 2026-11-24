@@ -1,0 +1,1 @@
+Lambda telemetry accepts the shared `OtelCollectorOptions` for metrics and an independently configured OTLP span exporter, exposing the full exporter settings without duplicating them in Lambda options.

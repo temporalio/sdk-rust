@@ -87,10 +87,47 @@ Enable `otel` and call `open_telemetry(OpenTelemetryOptions::default())` to conf
 tracing through an AWS Distro for OpenTelemetry (ADOT) Collector Lambda extension. This creates the
 SDK runtime and cannot be combined with `runtime`.
 
-The OTLP gRPC endpoint defaults to `OTEL_EXPORTER_OTLP_ENDPOINT`, then `http://localhost:4317`.
-HTTPS uses system trust roots. The service name defaults to `OTEL_SERVICE_NAME`, then
-`AWS_LAMBDA_FUNCTION_NAME`, then `temporal-lambda-worker`. Metric export interval is 10 seconds;
-each collector request has a configurable 1-second timeout.
+By default, both exporters use OTLP gRPC at `OTEL_EXPORTER_OTLP_ENDPOINT`, then
+`http://localhost:4317`, with native certificate roots for HTTPS. Metrics are exported every
+10 seconds and collector requests have a 1-second timeout.
+
+For custom metrics, set `OpenTelemetryOptions::metrics` to the shared
+`temporalio_common::telemetry::OtelCollectorOptions`. All its exporter settings are honored,
+including headers, HTTP/gRPC protocol selection, temporality, histogram configuration, and
+resource attributes. Explicit options retain their own defaults; the helper does not replace
+their interval or timeout with Lambda defaults.
+
+For custom tracing, set `OpenTelemetryOptions::span_exporter` to an
+`opentelemetry_otlp::SpanExporter` built using the standard OTLP exporter API. Metrics and tracing
+are configured independently: changing the metric endpoint, protocol, headers, or timeout does not
+change the trace exporter. For example, to use separate collector endpoints:
+
+```rust,no_run
+use std::time::Duration;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use temporalio_client::Url;
+use temporalio_common::telemetry::OtelCollectorOptions;
+use temporalio_sdk_aws_lambda::otel::OpenTelemetryOptions;
+
+# fn options() -> Result<OpenTelemetryOptions, lambda_runtime::Error> {
+let mut options = OpenTelemetryOptions::default();
+options.metrics = Some(OtelCollectorOptions::builder()
+    .url(Url::parse("http://metrics-collector:4317")?)
+    .export_timeout(Duration::from_secs(1))
+    .build());
+options.span_exporter = Some(SpanExporter::builder()
+    .with_tonic()
+    .with_endpoint("http://trace-collector:4317")
+    .with_timeout(Duration::from_secs(1))
+    .build()?);
+# Ok(options)
+# }
+```
+
+The service name defaults to `OTEL_SERVICE_NAME`, then `AWS_LAMBDA_FUNCTION_NAME`, then
+`temporal-lambda-worker`, and can be overridden by `OpenTelemetryOptions::service_name`.
+An explicit `service.name` in the metric options' `global_tags` is preserved rather than replaced.
+Keep custom export timeouts shorter than the shutdown hook budget.
 
 The helper uses the SDK's OpenTelemetry plugin, deterministic Workflow IDs, replay-suppressing span
 processor, and cross-SDK W3C context propagation. Instrument Workflow-starting clients with the SDK's

@@ -1,6 +1,7 @@
 use crate::common::{get_integ_server_options, integ_namespace};
 use lambda_runtime::{Context, LambdaEvent};
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_proto::tonic::{
     collector::{
         metrics::v1::{
@@ -12,10 +13,12 @@ use opentelemetry_proto::tonic::{
             trace_service_server::{TraceService, TraceServiceServer},
         },
     },
+    common::v1::any_value::Value as OtelValue,
     trace::v1::Span,
 };
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor};
 use std::{
+    collections::HashMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -34,6 +37,7 @@ use temporalio_common::{
             DescribeWorkerDeploymentRequest, SetWorkerDeploymentCurrentVersionRequest,
         },
     },
+    telemetry::OtelCollectorOptions,
     worker::{VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion},
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
@@ -51,7 +55,7 @@ use tokio::{
     sync::{Notify, oneshot},
 };
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{IntoRequest, Request, Response, Status, transport::Server};
+use tonic::{IntoRequest, Request, Response, Status, metadata::MetadataMap, transport::Server};
 use url::Url;
 use uuid::Uuid;
 
@@ -68,6 +72,15 @@ impl TraceService for Collector {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        if request
+            .metadata()
+            .get("x-lambda-trace-test")
+            .and_then(|value| value.to_str().ok())
+            != Some("trace-only")
+            || request.metadata().contains_key("x-lambda-metrics-test")
+        {
+            return Err(Status::unauthenticated("unexpected trace export headers"));
+        }
         if self.unavailable.load(Ordering::Relaxed) {
             return Err(Status::unavailable("collector unavailable"));
         }
@@ -89,13 +102,42 @@ impl MetricsService for Collector {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        if request
+            .metadata()
+            .get("x-lambda-metrics-test")
+            .and_then(|value| value.to_str().ok())
+            != Some("metrics-only")
+            || request.metadata().contains_key("x-lambda-trace-test")
+        {
+            return Err(Status::unauthenticated("unexpected metric export headers"));
+        }
         if self.unavailable.load(Ordering::Relaxed) {
             return Err(Status::unavailable("collector unavailable"));
         }
-        self.metrics.fetch_add(
-            request.into_inner().resource_metrics.len(),
-            Ordering::Relaxed,
-        );
+        let resources = request.into_inner().resource_metrics;
+        if resources.iter().any(|resource| {
+            !resource.resource.as_ref().is_some_and(|resource| {
+                [
+                    ("service.name", "metric-service"),
+                    ("lambda.test", "preserved"),
+                ]
+                .iter()
+                .all(|(key, value)| {
+                    resource.attributes.iter().any(|attribute| {
+                        attribute.key == *key
+                            && matches!(
+                                attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                                Some(OtelValue::StringValue(actual)) if actual == *value
+                            )
+                    })
+                })
+            })
+        }) {
+            return Err(Status::invalid_argument(
+                "metric resource options were not preserved",
+            ));
+        }
+        self.metrics.fetch_add(resources.len(), Ordering::Relaxed);
         Ok(Response::new(ExportMetricsServiceResponse::default()))
     }
 }
@@ -255,16 +297,26 @@ async fn lambda_validation_failure_runs_hooks_and_prevents_reuse() {
 #[case::auto_upgrade_override(true)]
 #[tokio::test]
 async fn lambda_warm_invocations_finalize_flush_propagate_and_replay(#[case] auto_upgrade: bool) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let metric_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let trace_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metric_endpoint =
+        Url::parse(&format!("http://{}", metric_listener.local_addr().unwrap())).unwrap();
+    let trace_endpoint = format!("http://{}", trace_listener.local_addr().unwrap());
     let collector = Collector::default();
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let collector_task = tokio::spawn(
+    let (stop_metrics_tx, stop_metrics_rx) = oneshot::channel();
+    let (stop_traces_tx, stop_traces_rx) = oneshot::channel();
+    let metric_task = tokio::spawn(
+        Server::builder()
+            .add_service(MetricsServiceServer::new(collector.clone()))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(metric_listener), async {
+                let _ = stop_metrics_rx.await;
+            }),
+    );
+    let trace_task = tokio::spawn(
         Server::builder()
             .add_service(TraceServiceServer::new(collector.clone()))
-            .add_service(MetricsServiceServer::new(collector.clone()))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-                let _ = stop_rx.await;
+            .serve_with_incoming_shutdown(TcpListenerStream::new(trace_listener), async {
+                let _ = stop_traces_rx.await;
             }),
     );
     let exporter = InMemorySpanExporter::default();
@@ -297,9 +349,33 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay(#[case] aut
     let key = Arc::new(Mutex::new(None::<Uuid>));
     let hook_key = key.clone();
     let mut telemetry = OpenTelemetryOptions::default();
-    telemetry.endpoint = Some(endpoint);
-    telemetry.metric_export_interval = Duration::from_secs(3600);
-    telemetry.export_timeout = Duration::from_millis(200);
+    telemetry.metrics = Some(
+        OtelCollectorOptions::builder()
+            .url(metric_endpoint)
+            .metric_periodicity(Duration::from_secs(3600))
+            .export_timeout(Duration::from_millis(200))
+            .headers(HashMap::from([(
+                "x-lambda-metrics-test".to_owned(),
+                "metrics-only".to_owned(),
+            )]))
+            .global_tags(HashMap::from([
+                ("service.name".to_owned(), "metric-service".to_owned()),
+                ("lambda.test".to_owned(), "preserved".to_owned()),
+            ]))
+            .build(),
+    );
+    let mut trace_headers = MetadataMap::new();
+    trace_headers.insert("x-lambda-trace-test", "trace-only".parse().unwrap());
+    telemetry.span_exporter = Some(
+        SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(trace_endpoint)
+            .with_metadata(trace_headers)
+            .with_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap(),
+    );
+    telemetry.service_name = Some("trace-service".to_owned());
     let mut limits = LambdaWorkerOptions::default();
     limits.graceful_shutdown_period = Duration::from_millis(100);
     let conflicts = Arc::new(AtomicUsize::new(0));
@@ -464,8 +540,10 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay(#[case] aut
         .unwrap();
         assert_eq!(exporter.get_finished_spans().unwrap().len(), before_replay);
     }
-    stop_tx.send(()).unwrap();
-    collector_task.await.unwrap().unwrap();
+    stop_metrics_tx.send(()).unwrap();
+    stop_traces_tx.send(()).unwrap();
+    metric_task.await.unwrap().unwrap();
+    trace_task.await.unwrap().unwrap();
 }
 
 #[workflow]
