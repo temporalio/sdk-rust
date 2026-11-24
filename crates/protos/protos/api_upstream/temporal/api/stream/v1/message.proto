@@ -15,13 +15,17 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/stream.proto";
 
 // Experimental. Might change in the future.
-// A reference to one Stream, which code passes to other code as data. Only an SDK uses this
-// message. A request to a Store or to the server has the `id` alone.
+// A reference to one Stream, which code passes to other code as data. Callers treat the `id` as
+// opaque. An id is never used for a second Stream while the Store remembers the first one, so a
+// create for a closed or expired Stream fails. A Store can forget an expired Stream after a time
+// of its choice, and a create for its id succeeds after that. Every SDK encodes a ref in a
+// Payload with this message, so a ref that one SDK writes decodes in another.
 message StreamRef {
     string id = 1;
     // The name under which the client and Worker config registered the Store of this Stream. An
     // SDK uses it to send a call on this ref to the right Store. When it's empty, the SDK picks
-    // the Store from its config.
+    // the Store from its config. Only an SDK sets and reads this field. The server and a Store
+    // ignore it.
     string store = 2;
 }
 
@@ -89,7 +93,9 @@ message LocalActivityProducer {
     string workflow_id = 2;
     // Required.
     string run_id = 3;
-    // Required.
+    // Required. The id that the SDK gives the call, because a Local Activity has no scheduled
+    // event. Two Local Activities of one run must not share it, or the Store takes them as one
+    // Producer. Each SDK makes it from a counter of its own, unless the user sets it.
     string activity_id = 4;
     // Required.
     LocalActivityAttempt attempt = 5;
@@ -104,7 +110,8 @@ message WorkflowActivityProducer {
     string workflow_id = 2;
     // Required.
     string run_id = 3;
-    // Required. A run can use an Activity id again after the first Activity ended. The second
+    // Required. An Activity task doesn't have the scheduled event id, so this id identifies the
+    // Activity. A run can use an Activity id again after the first Activity ended. The second
     // Activity is then a later attempt of the same Producer.
     string activity_id = 4;
     // Required.
