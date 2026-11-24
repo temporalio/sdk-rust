@@ -5,6 +5,44 @@
 //! A [`LambdaWorker`] creates a fresh client and Worker for every invocation, polls until the
 //! reserved shutdown window, drains and finalizes the Worker, and runs cleanup hooks.
 //! Invocation payloads are ignored: Temporal tasks are obtained by polling the configured queue.
+//!
+//! # Example
+//!
+//! An Activity-only Lambda Worker using the normal SDK Activity registration API:
+//!
+//! ```no_run
+//! use temporalio_common::worker::WorkerDeploymentVersion;
+//! use temporalio_macros::activities;
+//! use temporalio_sdk::activities::{ActivityContext, ActivityError};
+//! use temporalio_sdk_aws_lambda::LambdaWorker;
+//!
+//! struct GreetingActivities;
+//!
+//! #[activities]
+//! impl GreetingActivities {
+//!     #[activity]
+//!     async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
+//!         Ok(format!("Hello, {name}!"))
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), lambda_runtime::Error> {
+//!     lambda_runtime::tracing::init_default_subscriber();
+//!     let version = WorkerDeploymentVersion::builder()
+//!         .deployment_name("greeting-worker")
+//!         .build_id("v1")
+//!         .build();
+//!     let mut options = LambdaWorker::worker_options("greeting-task-queue");
+//!     options.register_activities(GreetingActivities);
+//!
+//!     LambdaWorker::builder(version, options).build()?.run().await
+//! }
+//! ```
+//!
+//! Connection settings are loaded from environment variables and an optional `temporal.toml`.
+//! The deployment name and build ID must match the serverless deployment configured in Temporal.
+//! Register Workflows on the same [`WorkerOptions`] to run both Workflows and Activities.
 
 #[cfg(feature = "otel")]
 pub mod otel;
