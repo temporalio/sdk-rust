@@ -23,7 +23,9 @@ mod metrics;
 #[cfg(feature = "experimental")]
 pub mod nexus;
 #[cfg(feature = "experimental")]
-pub use nexus::NexusOperationStartOptions;
+pub use nexus::{
+    NexusOperationCountOptions, NexusOperationListOptions, NexusOperationStartOptions,
+};
 mod options_structs;
 #[cfg(feature = "experimental")]
 /// Experimental APIs for configuring clients with reusable plugins.

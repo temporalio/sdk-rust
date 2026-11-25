@@ -37,11 +37,15 @@ async fn charge(client: &Client, input: String) -> Result<String, temporalio_cli
 ```
 
 `start` returns once Temporal accepts the execution, not when the handler starts. Use
-`handle.operation_token()` to wait for handler start, `cancel()` to request cancellation, and
-`describe()` for a codec-decoded description. Dropping a handle or waiting future does not cancel
-the durable operation. Persist both `operation_id()` and `run_id()`, then reconnect using
-`payments.get_handle(PaymentService::charge, operation_id, run_id)`. Handles always target an exact
-run, including when a start's conflict policy returns an existing execution.
+`handle.operation_token()` to wait for handler start. A handle also supports `describe()` for a
+codec-decoded description, `cancel()` to request cancellation, and `terminate()` to end the
+execution without waiting for the handler. Dropping a handle or waiting future does not cancel
+the durable operation.
+
+On the main `Client`, use `get_nexus_operation_handle::<Output>(operation_id, run_id)` to
+reconnect without an endpoint or service definition. Pass `Some(run_id)` to reconnect to the
+exact run, or `None` to target the latest run for the operation ID. Use `list_nexus_operations()`
+or `count_nexus_operations()` on the main client for namespace-wide visibility queries.
 
 Start options accept timeouts, ID reuse/conflict policies, search attributes, UI metadata, and
 `RpcOptions`. By default, closed IDs can be reused and a running operation with the same ID

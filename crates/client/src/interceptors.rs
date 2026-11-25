@@ -20,8 +20,10 @@ use futures_util::future::BoxFuture;
 use std::{any::Any, sync::Arc};
 #[cfg(feature = "experimental")]
 use temporalio_common::protos::temporal::api::workflowservice::v1::{
-    DescribeNexusOperationExecutionResponse, PollNexusOperationExecutionResponse,
+    CountNexusOperationExecutionsResponse, DescribeNexusOperationExecutionResponse,
+    ListNexusOperationExecutionsResponse, PollNexusOperationExecutionResponse,
     RequestCancelNexusOperationExecutionResponse, StartNexusOperationExecutionResponse,
+    TerminateNexusOperationExecutionResponse,
 };
 use temporalio_common::{
     data_converters::{
@@ -1323,6 +1325,48 @@ pub trait ClientInterceptor: Send + Sync + 'static {
         next.run(input)
     }
 
+    /// Intercept a standalone Nexus termination request.
+    #[cfg(feature = "experimental")]
+    fn terminate_nexus_operation<'a>(
+        &'a self,
+        input: TerminateNexusOperationInput,
+        next: Next<
+            'a,
+            TerminateNexusOperationInput,
+            BoxFuture<'a, Result<TerminateNexusOperationExecutionResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<TerminateNexusOperationExecutionResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a page of standalone Nexus visibility results.
+    #[cfg(feature = "experimental")]
+    fn list_nexus_operations_page<'a>(
+        &'a self,
+        input: ListNexusOperationsPageInput,
+        next: Next<
+            'a,
+            ListNexusOperationsPageInput,
+            BoxFuture<'a, Result<ListNexusOperationExecutionsResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<ListNexusOperationExecutionsResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a standalone Nexus visibility count.
+    #[cfg(feature = "experimental")]
+    fn count_nexus_operations<'a>(
+        &'a self,
+        input: CountNexusOperationsInput,
+        next: Next<
+            'a,
+            CountNexusOperationsInput,
+            BoxFuture<'a, Result<CountNexusOperationExecutionsResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<CountNexusOperationExecutionsResponse, NexusClientError>> {
+        next.run(input)
+    }
+
     /// Intercept a `start_workflow` operation.
     fn start_workflow<'a>(
         &'a self,
@@ -1709,6 +1753,30 @@ nexus_interceptor!(
     DescribeNexusOperationExecutionResponse,
     call_describe_nexus_operation,
     describe_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    TerminateNexusOperationInput,
+    TerminateNexusOperationExecutionRequest,
+    TerminateNexusOperationExecutionResponse,
+    call_terminate_nexus_operation,
+    terminate_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    ListNexusOperationsPageInput,
+    ListNexusOperationExecutionsRequest,
+    ListNexusOperationExecutionsResponse,
+    call_list_nexus_operations_page,
+    list_nexus_operations_page
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    CountNexusOperationsInput,
+    CountNexusOperationExecutionsRequest,
+    CountNexusOperationExecutionsResponse,
+    call_count_nexus_operations,
+    count_nexus_operations
 );
 
 interceptor_chain!(

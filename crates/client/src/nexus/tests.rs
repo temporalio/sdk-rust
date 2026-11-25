@@ -20,7 +20,8 @@ use temporalio_common::{
         },
         nexus::v1::NexusOperationExecutionInfo,
         workflowservice::v1::{
-            RequestCancelNexusOperationExecutionResponse, StartNexusOperationExecutionResponse,
+            ListNexusOperationExecutionsResponse, RequestCancelNexusOperationExecutionResponse,
+            StartNexusOperationExecutionResponse, count_nexus_operation_executions_response,
             describe_nexus_operation_execution_response,
         },
     },
@@ -109,8 +110,9 @@ impl PayloadCodec for CheckedCodec {
     }
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn request_codec_and_run_pinned_result() {
+async fn request_codec_and_run_pinned_result(#[values(false, true)] latest_run: bool) {
     let converter = PayloadConverter::default();
     let plain = converter
         .to_payload(
@@ -165,12 +167,19 @@ async fn request_codec_and_run_pinned_result() {
                 "PollNexusOperationExecution" => {
                     let request =
                         PollNexusOperationExecutionRequest::decode(request.proto).unwrap();
+                    let mut count = poll_count.lock();
                     assert_eq!(
                         (&*request.operation_id, &*request.run_id),
-                        ("charge-123", "run-1")
+                        (
+                            "charge-123",
+                            if latest_run && *count == 0 {
+                                ""
+                            } else {
+                                "run-1"
+                            }
+                        )
                     );
                     assert_eq!(request.wait_stage, NexusOperationWaitStage::Closed as i32);
-                    let mut count = poll_count.lock();
                     *count += 1;
                     PollNexusOperationExecutionResponse {
                         run_id: "run-1".into(),
@@ -216,8 +225,12 @@ async fn request_codec_and_run_pinned_result() {
         .await
         .unwrap();
     assert_eq!(handle.operation_id(), "charge-123");
-    let resumed = payments
-        .get_handle(Payments::charge, handle.operation_id(), handle.run_id())
+    assert_eq!(handle.run_id(), Some("run-1"));
+    let resumed = client
+        .get_nexus_operation_handle::<String>(
+            handle.operation_id(),
+            (!latest_run).then(|| handle.run_id().unwrap().to_owned()),
+        )
         .unwrap();
     assert_eq!(resumed.result().await.unwrap(), "order");
     assert_eq!(*poll_count.lock(), 2);
@@ -282,8 +295,7 @@ async fn describe_decodes_operation_payloads_but_preserves_ui_metadata() {
     )
     .await;
     let response = client
-        .nexus_client(Payments, "endpoint")
-        .get_handle(Payments::charge, "operation", "run")
+        .get_nexus_operation_handle::<RawValue>("operation", Some("run".into()))
         .unwrap()
         .describe()
         .await
@@ -335,8 +347,7 @@ async fn cancellation_retains_failure_and_targets_exact_run() {
     )
     .await;
     let handle = client
-        .nexus_client(Payments, "endpoint")
-        .get_handle(Payments::charge, "operation", "run")
+        .get_nexus_operation_handle::<RawValue>("operation", Some("run".into()))
         .unwrap();
     handle
         .cancel_with_options("stop", RpcOptions::default())
@@ -363,6 +374,8 @@ async fn failure_retains_handler_and_application_causes() {
     let client = client(
         |request| {
             assert_eq!(request.rpc, "PollNexusOperationExecution");
+            let request = PollNexusOperationExecutionRequest::decode(request.proto).unwrap();
+            assert!(request.run_id.is_empty());
             PollNexusOperationExecutionResponse {
                 run_id: "run".into(),
                 wait_stage: NexusOperationWaitStage::Closed as i32,
@@ -392,12 +405,13 @@ async fn failure_retains_handler_and_application_causes() {
     )
     .await;
     let handle = client
-        .nexus_client(Payments, "endpoint")
-        .get_handle(Payments::charge, "operation", "run")
+        .get_nexus_operation_handle::<RawValue>("operation", None)
         .unwrap();
-    let NexusClientError::Operation { source, .. } = handle.result().await.unwrap_err() else {
+    let NexusClientError::Operation { source, run_id, .. } = handle.result().await.unwrap_err()
+    else {
         panic!("expected operation failure");
     };
+    assert_eq!(run_id, "run");
     let Some(IncomingError::NexusHandler(handler)) = source.operation_failure().unwrap().cause()
     else {
         panic!("expected a Nexus handler error");
@@ -432,12 +446,95 @@ async fn rejects_run_drift_and_missing_terminal_outcome() {
         vec![],
     )
     .await;
-    let payments = client.nexus_client(Payments, "endpoint");
     for id in ["drift", "missing-outcome"] {
-        let handle = payments.get_handle(Payments::charge, id, "run").unwrap();
+        let handle = client
+            .get_nexus_operation_handle::<RawValue>(id, Some("run".into()))
+            .unwrap();
         assert!(matches!(
             handle.result().await,
             Err(NexusClientError::MalformedResponse(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn visibility_lists_across_empty_pages_and_preserves_count_groups() {
+    let client = client(
+        |request| match request.rpc.as_str() {
+            "ListNexusOperationExecutions" => {
+                assert_eq!(request.headers["call-meta"], "value");
+                let request = ListNexusOperationExecutionsRequest::decode(request.proto).unwrap();
+                assert_eq!(request.namespace, "test-namespace");
+                assert_eq!(request.query, "Service = 'Payments'");
+                assert_eq!(request.page_size, 1);
+                let (id, next_page_token) = match request.next_page_token.as_slice() {
+                    b"" => (Some("first"), b"page-2".to_vec()),
+                    b"page-2" => (None, b"page-3".to_vec()),
+                    b"page-3" => (Some("last"), vec![]),
+                    token => panic!("unexpected page token {token:?}"),
+                };
+                ListNexusOperationExecutionsResponse {
+                    operations: id
+                        .map(|id| NexusOperationExecutionListInfo {
+                            operation_id: id.into(),
+                            ..Default::default()
+                        })
+                        .into_iter()
+                        .collect(),
+                    next_page_token,
+                }
+                .encode_to_vec()
+            }
+            "CountNexusOperationExecutions" => {
+                assert_eq!(request.headers["call-meta"], "value");
+                let request = CountNexusOperationExecutionsRequest::decode(request.proto).unwrap();
+                assert_eq!(request.namespace, "test-namespace");
+                assert_eq!(request.query, "GROUP BY ExecutionStatus");
+                CountNexusOperationExecutionsResponse {
+                    count: 2,
+                    groups: vec![
+                        count_nexus_operation_executions_response::AggregationGroup {
+                            count: 2,
+                            group_values: vec![Payload {
+                                data: b"\"Completed\"".to_vec(),
+                                ..Default::default()
+                            }],
+                        },
+                    ],
+                }
+                .encode_to_vec()
+            }
+            other => panic!("unexpected RPC {other}"),
+        },
+        DataConverter::default(),
+        vec![],
+    )
+    .await;
+    let mut rpc_options = RpcOptions::default();
+    rpc_options.metadata.insert("call-meta", "value").unwrap();
+    let ids: Vec<_> = client
+        .list_nexus_operations(
+            "Service = 'Payments'",
+            NexusOperationListOptions::builder()
+                .page_size(1)
+                .rpc_options(rpc_options.clone())
+                .build(),
+        )
+        .map_ok(|execution| execution.operation_id)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(ids, ["first", "last"]);
+    let count = client
+        .count_nexus_operations(
+            "GROUP BY ExecutionStatus",
+            NexusOperationCountOptions::builder()
+                .rpc_options(rpc_options)
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.count, 2);
+    assert_eq!(count.groups[0].count, 2);
+    assert_eq!(count.groups[0].group_values[0].data, b"\"Completed\"");
 }

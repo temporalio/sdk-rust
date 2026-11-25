@@ -22,8 +22,10 @@
 //!         )
 //!         .await?;
 //!     // Persist both IDs to reconnect to this exact execution after a process restart.
-//!     let resumed =
-//!         payments.get_handle(Payments::charge, handle.operation_id(), handle.run_id())?;
+//!     let resumed = client.get_nexus_operation_handle::<String>(
+//!         handle.operation_id(),
+//!         handle.run_id().map(str::to_owned),
+//!     )?;
 //!     resumed.result().await
 //! }
 //! # fn main() {}
@@ -33,12 +35,15 @@ pub use nexus_rpc::{NexusOperation, NexusService};
 pub use temporalio_common::error::NexusOperationError;
 
 use crate::{Client, NamespacedClient, Next, RpcOptions, grpc::WorkflowService, interceptors};
-use futures_util::FutureExt;
+use futures_util::{
+    FutureExt, StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
+};
 use std::{marker::PhantomData, time::Duration};
 use temporalio_common::{
     data_converters::{
         GenericPayloadConverter, NexusOperationDecodeHint, NexusSerializationContext,
-        PayloadConversionError, SerializationContext, SerializationContextData,
+        PayloadConversionError, RawValue, SerializationContext, SerializationContextData,
         TemporalDeserializable, TemporalSerializable,
     },
     external_storage::{retrieve_external_payloads, store_external_payloads},
@@ -50,11 +55,14 @@ use temporalio_common::{
                 NexusOperationWaitStage,
             },
             errordetails::v1::NexusOperationExecutionAlreadyStartedFailure,
+            nexus::v1::NexusOperationExecutionListInfo,
             sdk::v1::UserMetadata,
             workflowservice::v1::{
+                CountNexusOperationExecutionsRequest, CountNexusOperationExecutionsResponse,
                 DescribeNexusOperationExecutionRequest, DescribeNexusOperationExecutionResponse,
-                PollNexusOperationExecutionRequest, PollNexusOperationExecutionResponse,
-                RequestCancelNexusOperationExecutionRequest, StartNexusOperationExecutionRequest,
+                ListNexusOperationExecutionsRequest, PollNexusOperationExecutionRequest,
+                PollNexusOperationExecutionResponse, RequestCancelNexusOperationExecutionRequest,
+                StartNexusOperationExecutionRequest, TerminateNexusOperationExecutionRequest,
                 poll_nexus_operation_execution_response::Outcome,
             },
         },
@@ -102,8 +110,8 @@ pub enum NexusClientError {
     /// The server returned an inconsistent or incomplete response.
     #[error("Malformed Nexus response: {0}")]
     MalformedResponse(&'static str),
-    /// A durable execution must identify both its operation and run.
-    #[error("Nexus operation ID and run ID must not be empty")]
+    /// The operation ID or an explicitly supplied run ID is empty.
+    #[error("Nexus operation ID and any supplied run ID must not be empty")]
     InvalidExecutionId,
     /// A supplied timeout cannot be represented in the Temporal API.
     #[error("Nexus {0} timeout is out of range")]
@@ -137,6 +145,27 @@ pub struct NexusOperationStartOptions {
     /// Fixed UI details, encoded with the default payload converter.
     pub static_details: Option<String>,
     /// Controls for the start RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for listing standalone Nexus executions.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct NexusOperationListOptions {
+    /// Maximum number of executions requested per page, or zero to use the server default.
+    #[builder(default)]
+    pub page_size: i32,
+    /// Controls for each list page RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for counting standalone Nexus executions.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct NexusOperationCountOptions {
+    /// Controls for the count RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
 }
@@ -191,6 +220,115 @@ impl Client {
             endpoint: endpoint.into(),
             service: PhantomData,
         }
+    }
+
+    /// Get a handle to an existing standalone Nexus operation without making an RPC.
+    ///
+    /// Supply a run ID to target that exact run, or `None` to target the latest run. Specify
+    /// the expected result type as `Output`, or use [`RawValue`] if the type is unknown.
+    pub fn get_nexus_operation_handle<Output>(
+        &self,
+        operation_id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> Result<NexusOperationHandle<Output>, NexusClientError> {
+        let operation_id = operation_id.into();
+        if operation_id.is_empty() || run_id.as_ref().is_some_and(String::is_empty) {
+            return Err(NexusClientError::InvalidExecutionId);
+        }
+        Ok(NexusOperationHandle {
+            client: self.clone(),
+            operation_id,
+            run_id,
+            output: PhantomData,
+        })
+    }
+
+    /// List standalone Nexus operations in this namespace that match a visibility query.
+    ///
+    /// The stream fetches pages lazily. An empty query matches all visible operations.
+    pub fn list_nexus_operations(
+        &self,
+        query: impl Into<String>,
+        options: NexusOperationListOptions,
+    ) -> BoxStream<'static, Result<NexusOperationExecutionListInfo, NexusClientError>> {
+        let client = self.clone();
+        let query = query.into();
+        stream::try_unfold(Some(Vec::new()), move |next_page_token| {
+            let client = client.clone();
+            let query = query.clone();
+            let options = options.clone();
+            async move {
+                let Some(next_page_token) = next_page_token else {
+                    return Ok(None);
+                };
+                let response = interceptors::call_list_nexus_operations_page(
+                    client.client_interceptors(),
+                    interceptors::ListNexusOperationsPageInput {
+                        request: ListNexusOperationExecutionsRequest {
+                            namespace: client.namespace(),
+                            query,
+                            page_size: options.page_size,
+                            next_page_token,
+                        },
+                        rpc_options: options.rpc_options,
+                    },
+                    Next::new(|input: interceptors::ListNexusOperationsPageInput| {
+                        let mut client = client.clone();
+                        async move {
+                            let mut request = tonic::Request::new(input.request);
+                            input.rpc_options.apply_to(&mut request);
+                            Ok(client
+                                .list_nexus_operation_executions(request)
+                                .await?
+                                .into_inner())
+                        }
+                        .boxed()
+                    }),
+                )
+                .await?;
+                let token =
+                    (!response.next_page_token.is_empty()).then_some(response.next_page_token);
+                Ok::<_, NexusClientError>(Some((
+                    stream::iter(response.operations.into_iter().map(Ok)),
+                    token,
+                )))
+            }
+        })
+        .try_flatten()
+        .boxed()
+    }
+
+    /// Count standalone Nexus operations in this namespace that match a visibility query.
+    ///
+    /// A `GROUP BY` clause returns individual group counts in addition to the approximate total.
+    pub async fn count_nexus_operations(
+        &self,
+        query: impl Into<String>,
+        options: NexusOperationCountOptions,
+    ) -> Result<CountNexusOperationExecutionsResponse, NexusClientError> {
+        interceptors::call_count_nexus_operations(
+            self.client_interceptors(),
+            interceptors::CountNexusOperationsInput {
+                request: CountNexusOperationExecutionsRequest {
+                    namespace: self.namespace(),
+                    query: query.into(),
+                },
+                rpc_options: options.rpc_options,
+            },
+            Next::new(|input: interceptors::CountNexusOperationsInput| {
+                async move {
+                    let mut request = tonic::Request::new(input.request);
+                    input.rpc_options.apply_to(&mut request);
+                    Ok(self
+                        .clone()
+                        .count_nexus_operation_executions(request)
+                        .await?
+                        .into_inner())
+                }
+                .boxed()
+            }),
+        )
+        .await
     }
 }
 
@@ -328,7 +466,8 @@ impl<S: NexusService> NexusClient<S> {
                 "start returned an empty run ID",
             ));
         }
-        self.get_handle(operation, operation_id, response.run_id)
+        self.client
+            .get_nexus_operation_handle(operation_id, Some(response.run_id))
     }
 
     /// Schedule an execution and await its typed result.
@@ -345,36 +484,14 @@ impl<S: NexusService> NexusClient<S> {
     {
         self.start(operation, input, options).await?.result().await
     }
-
-    /// Reconnect to an exact run without starting a new execution.
-    ///
-    /// Requiring a run ID prevents ID reuse from silently redirecting this handle.
-    pub fn get_handle<O: NexusOperation<Service = S>>(
-        &self,
-        _operation: O,
-        operation_id: impl Into<String>,
-        run_id: impl Into<String>,
-    ) -> Result<NexusOperationHandle<O::Output>, NexusClientError> {
-        let operation_id = operation_id.into();
-        let run_id = run_id.into();
-        if operation_id.is_empty() || run_id.is_empty() {
-            return Err(NexusClientError::InvalidExecutionId);
-        }
-        Ok(NexusOperationHandle {
-            client: self.client.clone(),
-            operation_id,
-            run_id,
-            output: PhantomData,
-        })
-    }
 }
 
-/// A durable execution reference pinned to one run. Dropping it does not cancel the operation.
+/// A durable execution reference. Dropping it does not cancel the operation.
 #[derive(Debug)]
-pub struct NexusOperationHandle<Output> {
+pub struct NexusOperationHandle<Output = RawValue> {
     client: Client,
     operation_id: String,
-    run_id: String,
+    run_id: Option<String>,
     output: PhantomData<fn() -> Output>,
 }
 
@@ -394,9 +511,9 @@ impl<Output> NexusOperationHandle<Output> {
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }
-    /// Exact server-assigned run ID.
-    pub fn run_id(&self) -> &str {
-        &self.run_id
+    /// Exact server-assigned run ID, or `None` if this handle targets the latest run.
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 
     async fn poll(
@@ -404,6 +521,7 @@ impl<Output> NexusOperationHandle<Output> {
         stage: NexusOperationWaitStage,
         options: RpcOptions,
     ) -> Result<PollNexusOperationExecutionResponse, NexusClientError> {
+        let mut run_id = self.run_id.clone().unwrap_or_default();
         loop {
             let response = interceptors::call_poll_nexus_operation(
                 self.client.client_interceptors(),
@@ -411,7 +529,7 @@ impl<Output> NexusOperationHandle<Output> {
                     request: PollNexusOperationExecutionRequest {
                         namespace: self.client.namespace(),
                         operation_id: self.operation_id.clone(),
-                        run_id: self.run_id.clone(),
+                        run_id: run_id.clone(),
                         wait_stage: stage as i32,
                     },
                     rpc_options: options.clone(),
@@ -431,7 +549,7 @@ impl<Output> NexusOperationHandle<Output> {
                 }),
             )
             .await?;
-            if response.run_id != self.run_id {
+            if response.run_id.is_empty() || (!run_id.is_empty() && response.run_id != run_id) {
                 return Err(NexusClientError::MalformedResponse(
                     "poll returned a different run ID",
                 ));
@@ -441,6 +559,8 @@ impl<Output> NexusOperationHandle<Output> {
             if actual as i32 >= stage as i32 {
                 return Ok(response);
             }
+            // An ID can be reused while waiting; keep polling the run selected by the first RPC.
+            run_id = response.run_id;
         }
     }
 
@@ -472,7 +592,7 @@ impl<Output> NexusOperationHandle<Output> {
             if let Some(Outcome::Failure(failure)) = response.outcome.take() {
                 return Err(NexusClientError::Operation {
                     operation_id: self.operation_id.clone(),
-                    run_id: self.run_id.clone(),
+                    run_id: response.run_id.clone(),
                     source: converter.to_error(
                         &context(),
                         failure,
@@ -484,7 +604,7 @@ impl<Output> NexusOperationHandle<Output> {
         Ok(())
     }
 
-    /// Request cancellation of this exact run. Completion remains observable through `result`.
+    /// Request cancellation. Completion remains observable through `result`.
     pub async fn cancel(&self) -> Result<(), NexusClientError> {
         self.cancel_with_options("", RpcOptions::default()).await
     }
@@ -501,7 +621,7 @@ impl<Output> NexusOperationHandle<Output> {
                 request: RequestCancelNexusOperationExecutionRequest {
                     namespace: self.client.namespace(),
                     operation_id: self.operation_id.clone(),
-                    run_id: self.run_id.clone(),
+                    run_id: self.run_id.clone().unwrap_or_default(),
                     identity: self.client.identity(),
                     request_id: Uuid::new_v4().to_string(),
                     reason: reason.into(),
@@ -526,14 +646,56 @@ impl<Output> NexusOperationHandle<Output> {
         Ok(())
     }
 
-    /// Describe this exact run, including codec-decoded input and outcome.
+    /// Terminate the execution without waiting for the Nexus handler to finish.
+    pub async fn terminate(&self) -> Result<(), NexusClientError> {
+        self.terminate_with_options("", RpcOptions::default()).await
+    }
+
+    /// Terminate the execution with a recorded reason and per-call RPC controls.
+    pub async fn terminate_with_options(
+        &self,
+        reason: impl Into<String>,
+        options: RpcOptions,
+    ) -> Result<(), NexusClientError> {
+        interceptors::call_terminate_nexus_operation(
+            self.client.client_interceptors(),
+            interceptors::TerminateNexusOperationInput {
+                request: TerminateNexusOperationExecutionRequest {
+                    namespace: self.client.namespace(),
+                    operation_id: self.operation_id.clone(),
+                    run_id: self.run_id.clone().unwrap_or_default(),
+                    identity: self.client.identity(),
+                    request_id: Uuid::new_v4().to_string(),
+                    reason: reason.into(),
+                },
+                rpc_options: options,
+            },
+            Next::new(|input: interceptors::TerminateNexusOperationInput| {
+                async move {
+                    let mut request = tonic::Request::new(input.request);
+                    input.rpc_options.apply_to(&mut request);
+                    Ok(self
+                        .client
+                        .clone()
+                        .terminate_nexus_operation_execution(request)
+                        .await?
+                        .into_inner())
+                }
+                .boxed()
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Describe the execution, including codec-decoded input and outcome.
     pub async fn describe(
         &self,
     ) -> Result<DescribeNexusOperationExecutionResponse, NexusClientError> {
         self.describe_with_options(RpcOptions::default()).await
     }
 
-    /// Describe this exact run with per-call RPC controls.
+    /// Describe the execution with per-call RPC controls.
     pub async fn describe_with_options(
         &self,
         options: RpcOptions,
@@ -544,7 +706,7 @@ impl<Output> NexusOperationHandle<Output> {
                 request: DescribeNexusOperationExecutionRequest {
                     namespace: self.client.namespace(),
                     operation_id: self.operation_id.clone(),
-                    run_id: self.run_id.clone(),
+                    run_id: self.run_id.clone().unwrap_or_default(),
                     include_input: true,
                     include_outcome: true,
                     ..Default::default()
@@ -566,7 +728,12 @@ impl<Output> NexusOperationHandle<Output> {
             }),
         )
         .await?;
-        if response.run_id != self.run_id {
+        if response.run_id.is_empty()
+            || self
+                .run_id
+                .as_ref()
+                .is_some_and(|id| id != &response.run_id)
+        {
             return Err(NexusClientError::MalformedResponse(
                 "describe returned a different run ID",
             ));
