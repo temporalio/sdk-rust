@@ -21808,13 +21808,6 @@ components:
           $ref: '#/components/schemas/WorkflowTaskStreamCalls_AppendOffsets'
         failure:
           $ref: '#/components/schemas/WorkflowTaskStreamCalls_CallFailure'
-        activationIndex:
-          type: integer
-          description: |-
-            The index of the activation of this Workflow Task in which Workflow code got the result,
-             from 0. A replay gives the result in the activation with this index. A Local Activity marker
-             has the same index for a result in the same activation.
-          format: int32
       description: The result of an append.
     WorkflowTaskStreamCalls_CallFailure:
       type: object
@@ -21859,10 +21852,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/WorkflowTaskStreamCalls_CallFailure'
           description: Unset if the Stream is closed.
-        activationIndex:
-          type: integer
-          description: The activation that gave the result, as `activation_index` of `AppendResult`.
-          format: int32
       description: The result of a close. The intent with the same `seq` has the ref of the Stream.
     WorkflowTaskStreamCalls_ReadPage:
       type: object
@@ -21914,10 +21903,6 @@ components:
           $ref: '#/components/schemas/WorkflowTaskStreamCalls_ReadPage'
         failure:
           $ref: '#/components/schemas/WorkflowTaskStreamCalls_CallFailure'
-        activationIndex:
-          type: integer
-          description: The activation that gave the result, as `activation_index` of `AppendResult`.
-          format: int32
       description: The result of a read.
     WorkflowTaskTimedOutEventAttributes:
       type: object

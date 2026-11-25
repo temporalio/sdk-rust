@@ -1082,6 +1082,36 @@ pub mod coresdk {
                     Ok(helper.map(|Helper(external)| external))
                 }
             }
+
+            // An offset is opaque bytes, which can only be compared. Hex keeps the order of
+            // two offsets.
+            pub(crate) mod hex_bytes {
+                use super::*;
+                use serde::de::Error;
+
+                pub(crate) fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    let hex: String = value.iter().map(|byte| format!("{byte:02x}")).collect();
+                    serializer.serialize_str(&hex)
+                }
+
+                pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    let hex = String::deserialize(deserializer)?;
+                    let digit = |digit: &u8| char::from(*digit).to_digit(16);
+                    let byte = |pair: &[u8]| match pair {
+                        [high, low] => Some((digit(high)? << 4 | digit(low)?) as u8),
+                        _ => None,
+                    };
+                    (hex.as_bytes().chunks(2))
+                        .map(|pair| byte(pair).ok_or_else(|| Error::custom("The bytes aren't hex")))
+                        .collect()
+                }
+            }
         }
     }
     pub mod workflow_activation {

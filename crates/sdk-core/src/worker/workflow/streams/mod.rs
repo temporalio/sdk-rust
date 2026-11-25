@@ -2,12 +2,12 @@
 //! writes with the attempt of a Workflow Task.
 
 mod calls;
-mod ledger;
 mod manager;
+mod marker;
 
 pub(crate) use calls::{Phase, StreamCalls};
-pub(crate) use ledger::{has_ledger, peeked_ledger};
 pub(crate) use manager::{StreamManager, StreamResolution};
+pub(crate) use marker::{is_stream_marker, marker_details, peeked_marker};
 
 use crate::{
     WorkerConfig,
@@ -26,10 +26,6 @@ use temporalio_common::protos::temporal::api::stream::v1::WorkflowTaskAttempt;
 use temporalio_streams::StreamRuntime;
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tracing::Span;
-
-/// Keeps a completion far below the gRPC message size limit and the size of one write to History
-/// on the server.
-const MAX_LEDGER_BYTES: usize = 256 * 1024;
 
 /// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
 /// with the settings of its Stream calls.
@@ -54,9 +50,10 @@ impl StreamRuntimes {
     }
 }
 
-/// The retry settings of a Worker's Stream calls. A call tries again, with no time limit, after
+/// The retry settings of a Worker's Stream calls. A call tries again after
 /// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable) or a try with
-/// no answer within `try_deadline`.
+/// no answer within `try_deadline`. If it still waits to try again at the heartbeat of its Workflow
+/// Task, the task fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the
@@ -67,9 +64,6 @@ pub struct StreamSettings {
     pub retry_max_interval: Duration,
     /// How long one try waits for the Store, 5 s by default. It must be more than 0.
     pub try_deadline: Duration,
-    /// The bounds that a test sets in place of the constants.
-    #[cfg(test)]
-    pub(crate) bounds: TestBounds,
 }
 
 impl Default for StreamSettings {
@@ -78,8 +72,6 @@ impl Default for StreamSettings {
             retry_initial_interval: Duration::from_millis(100),
             retry_max_interval: Duration::from_secs(2),
             try_deadline: Duration::from_secs(5),
-            #[cfg(test)]
-            bounds: TestBounds::default(),
         }
     }
 }
@@ -102,31 +94,6 @@ impl StreamSettings {
             ));
         }
         Ok(())
-    }
-
-    /// Returns [`MAX_LEDGER_BYTES`], or the bound that a test set.
-    pub(crate) fn max_ledger_bytes(&self) -> usize {
-        #[cfg(test)]
-        let max = self.bounds.max_ledger_bytes;
-        #[cfg(not(test))]
-        let max = MAX_LEDGER_BYTES;
-        max
-    }
-}
-
-/// The bounds of the Stream calls that a test sets in place of the constants.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TestBounds {
-    pub(crate) max_ledger_bytes: usize,
-}
-
-#[cfg(test)]
-impl Default for TestBounds {
-    fn default() -> Self {
-        Self {
-            max_ledger_bytes: MAX_LEDGER_BYTES,
-        }
     }
 }
 

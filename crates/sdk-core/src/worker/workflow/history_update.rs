@@ -3,7 +3,7 @@ use crate::{
     protosext::ValidPollWFTQResponse,
     worker::{
         client::WorkerClient,
-        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT, streams::has_ledger},
+        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
     },
 };
 use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
@@ -788,9 +788,7 @@ fn find_end_index_of_next_wft_seq_chunked(
             continue;
         }
 
-        // A Local Activity marker is a command event, so its task is never taken as a heartbeat.
-        // A ledger has no event, so its completion counts as a command here.
-        if e.is_command_event() || has_ledger(e) {
+        if e.is_command_event() {
             saw_command = true;
             saw_command_or_started = true;
         }
@@ -822,12 +820,11 @@ fn find_end_index_of_next_wft_seq_chunked(
                 } else if next_event_type == EventType::WorkflowTaskCompleted {
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
-                            && !has_ledger(next_event)
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
                         {
                             // If we've never seen an interesting event and the next two events are
-                            // a completion with no ledger followed immediately again by scheduled,
-                            // then this is a WFT heartbeat and also doesn't conclude the sequence.
+                            // a completion followed immediately again by scheduled, then this is a
+                            // WFT heartbeat and also doesn't conclude the sequence.
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
@@ -899,7 +896,6 @@ mod tests {
         worker::client::mocks::mock_worker_client,
     };
     use futures_util::TryStreamExt;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use temporalio_common::protos::temporal::api::{
         common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
         workflowservice::v1::GetWorkflowExecutionHistoryResponse,
@@ -1189,70 +1185,6 @@ mod tests {
         assert_eq!(seq.len(), 4);
         let seq = next_check_peek(&mut update, 27);
         assert_eq!(seq.len(), 2);
-    }
-
-    #[test]
-    fn a_ledger_ends_sequences_as_a_command_after_its_completion_does() {
-        let mut forced_ledgers = 0;
-        for seed in 0..300 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let chunking = rng.random_bool(0.5);
-            let (mut with_ledger, mut with_command) =
-                (TestHistoryBuilder::default(), TestHistoryBuilder::default());
-            for t in [&mut with_ledger, &mut with_command] {
-                t.add_by_type(EventType::WorkflowExecutionStarted);
-                t.add_workflow_task_scheduled_and_started();
-            }
-            // Maps each started event of `with_ledger` to the same event of `with_command`.
-            let mut ids = vec![];
-            for task in 0..rng.random_range(1..8) {
-                let (ledger, command) = (rng.random_bool(0.5), rng.random_bool(0.3));
-                let forced = rng.random_bool(0.6);
-                forced_ledgers += usize::from(ledger && !command && forced);
-                for t in [&mut with_ledger, &mut with_command] {
-                    t.add_workflow_task_completed();
-                    if task == 0 && !chunking {
-                        let unchunked = [CoreInternalFlags::DisableWorkflowTaskChunking];
-                        t.set_flags_last_wft(&unchunked, &[]);
-                    }
-                    if command {
-                        t.add_by_type(EventType::TimerStarted);
-                    }
-                }
-                if ledger {
-                    with_ledger.set_stream_calls_last_wft(Default::default());
-                    with_command.add_by_type(EventType::TimerStarted);
-                }
-                if !forced {
-                    for t in [&mut with_ledger, &mut with_command] {
-                        t.add_we_signaled("s", vec![]);
-                    }
-                }
-                for t in [&mut with_ledger, &mut with_command] {
-                    t.add_workflow_task_scheduled_and_started();
-                }
-                let started = with_ledger.current_event_id();
-                ids.push((started, with_command.current_event_id()));
-            }
-            let ends = |t: &TestHistoryBuilder| {
-                let mut update = t.as_history_update();
-                let (mut from_id, mut ends) = (0, vec![]);
-                while let NextWFT::WFT(events, _) = update.take_next_wft_sequence(from_id) {
-                    from_id = events.last().unwrap().event_id;
-                    ends.push(from_id);
-                }
-                ends
-            };
-            let to_command_ids = |ends: Vec<i64>| -> Vec<i64> {
-                let started = |end: i64| ids.iter().find(|(id, _)| *id == end).map(|ids| ids.1);
-                ends.into_iter()
-                    .map(|end| started(end).unwrap_or(end))
-                    .collect()
-            };
-            let expected = ends(&with_command);
-            assert_eq!(to_command_ids(ends(&with_ledger)), expected, "seed {seed}");
-        }
-        assert!(forced_ledgers > 0);
     }
 
     #[test]

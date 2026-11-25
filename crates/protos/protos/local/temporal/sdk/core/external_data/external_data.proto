@@ -40,3 +40,45 @@ message PatchedMarkerData {
   // Whether or not the patch is marked deprecated.
   bool deprecated = 2;
 }
+
+// The data of a `core_stream` marker. Core records one in each activation in which Workflow code
+// got the result of an append. A completion that leaves an append with no result, and that has no
+// such marker, gets one with no entry, so that a replay with chunking on keeps its task apart from
+// the next one. The `data` detail of the marker holds this message as JSON, with each `bytes` field
+// in lower-case hex.
+//
+// Every later version of Core must read the markers in History, so these rules apply to each
+// message of the marker.
+// * A field never changes its name, because the name is its key in the JSON.
+// * A new field is `optional`, because older markers don't have it.
+// * A new `repeated` field gets `#[serde(default)]` in `build.rs`, for the same reason.
+message StreamMarkerData {
+  repeated StreamAppendResult appends = 1;
+}
+
+message StreamAppendResult {
+  uint32 seq = 1;
+  string stream_id = 2;
+  // The Store name of the Stream's ref.
+  string store = 3;
+  // The index of the activation, within its Workflow Task, in which Workflow code got the result.
+  uint64 activation_index = 4;
+  oneof result {
+    StreamAppendOffsets appended = 5;
+    StreamFailure failure = 6;
+  }
+}
+
+message StreamAppendOffsets {
+  bytes first_offset = 1;
+  bytes last_offset = 2;
+}
+
+// Why a Stream call failed. Core builds the failure that Workflow code gets from these two.
+message StreamFailure {
+  // The name of the `temporal.api.enums.v1.StreamErrorReason`, such as
+  // `STREAM_ERROR_REASON_FENCED`. History stores the name, so a reason must never change its name.
+  string reason = 1;
+  // The message of the failure, of at most 4096 bytes.
+  string message = 2;
+}

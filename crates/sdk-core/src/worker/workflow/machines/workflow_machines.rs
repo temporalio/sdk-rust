@@ -8,7 +8,8 @@ use super::{
     continue_as_new_workflow_state_machine::continue_as_new,
     fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
     patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    timer_state_machine::new_timer, upsert_search_attributes_state_machine::upsert_search_attrs,
+    stream_marker_state_machine::stream_marker, timer_state_machine::new_timer,
+    upsert_search_attributes_state_machine::upsert_search_attrs,
     workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
@@ -38,7 +39,7 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
-            streams::{Phase, StreamCalls, has_ledger, peeked_ledger},
+            streams::{Phase, StreamCalls, is_stream_marker, peeked_marker},
         },
     },
 };
@@ -60,6 +61,7 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::StreamMarkerData,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -68,10 +70,10 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{CommandType, EventType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
-            sdk::v1::{WorkflowTaskCompletedMetadata, WorkflowTaskStreamCalls},
+            sdk::v1::WorkflowTaskCompletedMetadata,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -191,8 +193,6 @@ pub(crate) struct WorkflowMachines {
     local_activity_data: LocalActivityData,
     /// The Stream calls of the run
     pub(crate) stream_calls: StreamCalls,
-    /// True from a completion with a ledger until the end of the commands of that completion.
-    ledger_to_record: bool,
 
     /// The workflow that is being driven by this instance of the machines
     drive_me: DrivenWorkflow,
@@ -311,7 +311,6 @@ impl WorkflowMachines {
             } else {
                 Phase::Replaying
             },
-            basics.capabilities.sdk_metadata,
         );
         Self {
             last_history_from_server: basics.history,
@@ -352,7 +351,6 @@ impl WorkflowMachines {
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
             stream_calls,
-            ledger_to_record: false,
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
@@ -461,9 +459,20 @@ impl WorkflowMachines {
         self.outstanding_local_activity_count() + self.stream_calls.outstanding()
     }
 
-    /// Returns true once the ledger of the task has no room for a result that waits.
-    pub(crate) fn stream_must_complete(&self) -> bool {
-        self.stream_calls.must_complete(self.result_activations().0)
+    /// Adds the marker of a completion that leaves a live Stream call open with no marker in its
+    /// task. The task's last `prepare_commands` already ran, so the command goes in directly.
+    fn mark_open_stream_calls(&mut self) {
+        let Some(data) = self.stream_calls.take_completion_marker() else {
+            return;
+        };
+        let marker = self.add_new_command_machine(stream_marker(&data), Default::default());
+        self.machine_is_core_created.insert(marker.machine, ());
+        let responses = self
+            .machine_mut(marker.machine)
+            .handle_command(CommandType::RecordMarker)
+            .expect("A new Stream marker takes its command");
+        debug_assert!(responses.is_empty());
+        self.commands.push_back(marker);
     }
 
     /// Returns the index of the next activation of the task, and the one of the next Local
@@ -592,6 +601,12 @@ impl WorkflowMachines {
             let (activation, marker) = self.result_activations();
             let results = self.stream_calls.take_jobs(activation, marker);
             jobs.extend(results.into_iter().map(OutgoingJob::from));
+            // A replay places these results by the marker, so it must be where Workflow code gets
+            // them, before its commands of this activation.
+            if let Some(data) = self.stream_calls.take_marker() {
+                let marker = stream_marker(&data);
+                self.add_cmd_to_wf_task(marker, Default::default(), CommandIdKind::CoreInternal);
+            }
             jobs
         } else {
             vec![]
@@ -693,9 +708,7 @@ impl WorkflowMachines {
         {
             flags.try_use(CoreInternalFlags::DisableWorkflowTaskChunking, true);
         }
-        let mut metadata = flags.gather_for_wft_complete();
-        metadata.stream_calls = self.stream_calls.take_ledger().map(Box::new);
-        metadata
+        flags.gather_for_wft_complete()
     }
 
     pub(crate) fn add_lang_used_flags(&self, flags: Vec<u32>) {
@@ -976,7 +989,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamLedger(WorkflowTaskStreamCalls),
+            StreamMarker(StreamMarkerData),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -990,19 +1003,10 @@ impl WorkflowMachines {
         // Alternatively, lookahead can seemingly be avoided if we were to consider the commands
         // that follow a WFT to be _part of_ that wft rather than the next one. That change might
         // make sense to do, and maybe simplifies things slightly, but is a substantial alteration.
-        // The ledger of a completion is applied after the Local Activity markers and the accepted
-        // Updates of that completion, so that their resolutions are applied before Core holds the
-        // Stream results of the task.
-        let mut ledger = None;
         for e in self
             .last_history_from_server
             .peek_next_wft_sequence(last_handled_wft_started_id)
         {
-            if !e.is_command_event()
-                && let Some(data) = ledger.take()
-            {
-                delayed_actions.push(DelayedAction::StreamLedger(data));
-            }
             if let Some((patch_id, _)) = e.get_patch_marker_details() {
                 self.encountered_patch_markers.insert(
                     patch_id.clone(),
@@ -1021,8 +1025,8 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
-            } else if let Some(data) = peeked_ledger(e) {
-                ledger = Some(data?);
+            } else if let Some(data) = peeked_marker(e) {
+                delayed_actions.push(DelayedAction::StreamMarker(data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -1040,7 +1044,6 @@ impl WorkflowMachines {
                 ));
             }
         }
-        delayed_actions.extend(ledger.map(DelayedAction::StreamLedger));
         for action in delayed_actions {
             match action {
                 DelayedAction::LocalActivityMarker(la_dat) => {
@@ -1060,7 +1063,7 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
-                DelayedAction::StreamLedger(data) => self.stream_calls.peeked(data)?,
+                DelayedAction::StreamMarker(data) => self.stream_calls.peeked(data)?,
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -1108,14 +1111,6 @@ impl WorkflowMachines {
         next_event: Option<&HistoryEvent>,
     ) -> Result<EventHandlingOutcome> {
         let event = &event_dat.event;
-        // Core handles the Stream calls of a task after the commands of that task. So the ledger
-        // of a completion is checked against the calls only after its command events.
-        if self.ledger_to_record
-            && (!event.is_command_event() || event.is_final_wf_execution_event())
-        {
-            self.ledger_to_record = false;
-            self.stream_calls.ledger_recorded()?;
-        }
         if event.is_final_wf_execution_event() {
             self.have_seen_terminal_event = true;
         }
@@ -1162,12 +1157,6 @@ impl WorkflowMachines {
             self.suggest_continue_as_new_reasons = attrs.suggest_continue_as_new_reasons.clone();
             self.target_worker_deployment_version_changed =
                 attrs.target_worker_deployment_version_changed;
-        }
-
-        // History has the ledger of a task once it has the completion of that task. The server
-        // can drop a completion, so the ledger counts only from this event on, as a flag does.
-        if has_ledger(event) {
-            self.ledger_to_record = true;
         }
 
         if let Some(initial_cmd_id) = event.get_initial_command_event_id() {
@@ -1220,6 +1209,16 @@ impl WorkflowMachines {
                     "Encountered local activity marker but the associated machine was of the \
                      wrong type! {event:?}"
                 ));
+            }
+        }
+
+        // A replay sends no Stream marker, so only a cached run has a command for this event.
+        if is_stream_marker(event) {
+            self.stream_calls.marker_recorded()?;
+            let sent = (self.commands.iter())
+                .any(|c| matches!(self.machine(c.machine), Machines::StreamMarkerMachine(_)));
+            if !sent {
+                return Ok(EventHandlingOutcome::Normal);
             }
         }
 
@@ -2044,7 +2043,11 @@ impl MachinesWFTResponseContent<'_> {
     pub(crate) fn only_rejects_updates(&self) -> bool {
         self.commands().peek().is_none()
             && self.has_messages()
-            && self.me.message_outbox.iter().all(is_update_rejection)
+            && self.me.message_outbox.iter().all(|m| {
+                m.body
+                    .as_ref()
+                    .is_some_and(|b| b.type_url == REJECTION_TYPE_URL)
+            })
     }
 
     pub(crate) fn messages(&mut self) -> Vec<ProtocolMessage> {
@@ -2054,11 +2057,12 @@ impl MachinesWFTResponseContent<'_> {
     pub(crate) fn metadata_for_complete(&mut self) -> WorkflowTaskCompletedMetadata {
         self.me.get_metadata_for_wft_complete()
     }
-}
 
-/// Returns true if `message` rejects an Update.
-pub(crate) fn is_update_rejection(message: &ProtocolMessage) -> bool {
-    (message.body.as_ref()).is_some_and(|body| body.type_url == REJECTION_TYPE_URL)
+    /// Adds a Stream marker with no entry if the task leaves a live call open and has no marker.
+    /// Call it only for a completion that goes to the server.
+    pub(crate) fn mark_open_stream_calls(&mut self) {
+        self.me.mark_open_stream_calls();
+    }
 }
 
 fn str_to_randomness_seed(run_id: &str) -> u64 {

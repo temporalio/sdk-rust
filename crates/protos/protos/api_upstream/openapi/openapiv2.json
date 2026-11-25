@@ -13567,11 +13567,6 @@
         },
         "failure": {
           "$ref": "#/definitions/WorkflowTaskStreamCallsCallFailure"
-        },
-        "activationIndex": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The index of the activation of this Workflow Task in which Workflow code got the result,\nfrom 0. A replay gives the result in the activation with this index. A Local Activity marker\nhas the same index for a result in the same activation."
         }
       },
       "description": "The result of an append."
@@ -13612,11 +13607,6 @@
         "failure": {
           "$ref": "#/definitions/WorkflowTaskStreamCallsCallFailure",
           "description": "Unset if the Stream is closed."
-        },
-        "activationIndex": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The activation that gave the result, as `activation_index` of `AppendResult`."
         }
       },
       "description": "The result of a close. The intent with the same `seq` has the ref of the Stream."
@@ -13672,11 +13662,6 @@
         },
         "failure": {
           "$ref": "#/definitions/WorkflowTaskStreamCallsCallFailure"
-        },
-        "activationIndex": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The activation that gave the result, as `activation_index` of `AppendResult`."
         }
       },
       "description": "The result of a read."

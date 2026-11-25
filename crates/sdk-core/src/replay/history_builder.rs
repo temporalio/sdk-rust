@@ -23,7 +23,6 @@ use temporalio_common::protos::{
         enums::v1::{EventType, TaskQueueKind, WorkflowTaskFailedCause},
         failure::v1::{CanceledFailureInfo, Failure, failure},
         history::v1::{history_event::Attributes, *},
-        sdk::v1::WorkflowTaskStreamCalls,
         taskqueue::v1::TaskQueue,
         update,
         update::v1::outcome,
@@ -617,21 +616,6 @@ impl TestHistoryBuilder {
             &core.iter().map(|f| *f as u32).collect::<Vec<_>>(),
             lang,
         )
-    }
-
-    /// Sets the Stream calls of the most recent WFT complete event
-    pub fn set_stream_calls_last_wft(&mut self, calls: WorkflowTaskStreamCalls) {
-        let completed = self.events.iter_mut().rev().find_map(|e| {
-            if let Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) = e.attributes.as_mut()
-            {
-                Some(a)
-            } else {
-                None
-            }
-        });
-        let completed = completed.expect("History has a WFT complete event");
-        let sdk_dat = completed.sdk_metadata.get_or_insert_with(Default::default);
-        sdk_dat.stream_calls = Some(Box::new(calls));
     }
 
     /// Get the event ID of the most recently added event

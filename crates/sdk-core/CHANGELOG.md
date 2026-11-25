@@ -43,16 +43,14 @@ relevant information.
   append of client code against them with `StoreLimits::validate_append`.
 * [lang-internal] Workflow code can append to a Stream with the experimental `AppendToStream`
   command, on a Store in `WorkerConfig::stream_runtimes`. Each append writes with the Producer and
-  the attempt of its Workflow Task. Its result comes back in a `ResolveStreamAppend` job and goes
-  into the ledger of the task, which Core puts on the completion as the new `stream_calls` of
-  `sdk_metadata`, so a replay doesn't make a Store call. A result comes in the next activation after
-  the Store answers, and the ledger keeps the index of that activation, which a replay counts as for
-  a Local Activity result. A Stream call adds no event to History. If the
-  server doesn't take `sdk_metadata`, a Stream call fails its task. Core drops a call that has no
-  result when the Workflow's last command arrives, as it drops a Local Activity. If a call is
-  waiting to try again at the task's heartbeat, because a try failed with `StoreUnavailable` or got
-  no answer within `try_deadline`, the task fails, and its failure message starts with
-  `StreamStoreUnavailable:`.
+  the attempt of its Workflow Task. Its result comes back in a `ResolveStreamAppend` job. Each
+  activation that gives results records them in a `core_stream` marker, with the index of the
+  activation, which a replay counts as for a Local Activity result. So a replay doesn't make a
+  Store call. A completion that leaves an append with no result, and has no such marker, records
+  one with no entry, so that a replay with chunking on keeps its task apart from the next one. Core drops a call that has no result when the Workflow's last command arrives, as it
+  drops a Local Activity. If a call is waiting to try again at the task's heartbeat, because a try
+  failed with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its
+  failure message starts with `StreamStoreUnavailable:`.
 
 ## [0.12.0] - 2026-11-23
 

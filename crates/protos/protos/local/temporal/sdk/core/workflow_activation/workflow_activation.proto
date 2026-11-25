@@ -440,9 +440,10 @@ message RemoveFromCache {
 }
 
 // The result of an `AppendToStream`. Core gives it in the next activation after the Store answers.
-// History keeps the index of that activation with the result, counted as for the marker of a local
-// activity, so a replay gives both kinds of result in the order of the first run. A result that
-// arrives while the task completes comes in the first activation of the next task.
+// The `core_stream` marker of that activation keeps the result with the index of the activation,
+// counted as for the marker of a local activity, so a replay gives both kinds of result in the
+// order of the first run. A result that arrives while the task completes comes in the first
+// activation of the next task.
 //
 // As for a local activity, a replay gives the result in the same activation as the first run only
 // if workflow task chunking is off. With chunking, a replay can give the jobs of several
