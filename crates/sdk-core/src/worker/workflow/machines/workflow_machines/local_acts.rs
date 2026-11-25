@@ -141,7 +141,7 @@ impl LocalActivityData {
     }
 
     /// Advances to the next peeked resolution, or to the Stream result at index `stream` if that
-    /// one is lower. It does nothing when no peeked resolution has an index.
+    /// one is lower. It does nothing when the next peeked resolution has no index.
     ///
     /// Stream results share this counter, because a replay must give both kinds of result in the
     /// order of the first run.

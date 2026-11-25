@@ -225,8 +225,8 @@ impl StreamCalls {
     }
 
     /// Returns true if activation `activation` of the task has a Stream result to give. A result
-    /// from History is held back while the next Local Activity marker, at index `marker`, is due in
-    /// the same activation or an earlier one, so that the Local Activity result goes first.
+    /// from History is held back while the index of the next Local Activity marker, `marker`, is at
+    /// or below the result's own index, so that the Local Activity result goes first.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -478,9 +478,9 @@ impl StreamCalls {
         Some(job)
     }
 
-    /// Starts the call at the head of each queue, once the run is live and its task is open. Only a
-    /// task that opens and go-live need this, because any other change starts the head of its own
-    /// queue.
+    /// Starts the call at the head of each queue, once the run is live and its task is open. It
+    /// runs only when the task opens and at go-live, because any other change starts the head of
+    /// its own queue.
     fn start_heads(&mut self) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
