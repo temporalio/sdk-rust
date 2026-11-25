@@ -234,8 +234,9 @@ impl Drop for StreamManager {
 }
 
 /// Runs the call `seq` on `runtime`, and returns its outcome. The metrics count each try when it
-/// starts, as those of a Local Activity count each attempt. They time a try of an append once it
-/// ends, so a try that is stopped has only its count, and a read has no latency.
+/// starts, as those of a Local Activity count each attempt, and a check is one try. They time a
+/// try of an append once it ends, so a try that is stopped has only its count, and a read has no
+/// latency.
 async fn run(
     runtime: &StreamRuntime,
     seq: u32,
@@ -300,12 +301,18 @@ async fn read_page(
     if check {
         request.wait = None;
         let deadline = settings.read_check_deadline;
-        return match tokio::time::timeout(deadline, runtime.read_records_with_more(request)).await {
+        metrics.stream_read_executed();
+        let read = runtime.read_records_with_more(request);
+        let answer = match tokio::time::timeout(deadline, read).await {
             Ok(answer) => answer,
             Err(_) => Err(StreamError::store_unavailable(format!(
                 "The Store gave no answer in {deadline:?}"
             ))),
         };
+        if let Err(error) = &answer {
+            failed(metrics, error).stream_read_execution_failed();
+        }
+        return answer;
     }
     // A time past the end of the clock never ends the wait.
     let wait_until = Instant::now().checked_add(wait);
@@ -535,11 +542,28 @@ mod tests {
         test_store::{Entry, Fault, Model, ModelStore, client},
     };
     use super::*;
-    use crate::test_help::stream_store::{MemoryStore, Op as StoreOp};
+    use crate::{
+        telemetry::metrics::{MetricsCallBuffer, stream_store},
+        test_help::stream_store::{MemoryStore, Op as StoreOp},
+    };
     use prost::Message;
     use prost_types::Timestamp;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
-    use temporalio_common::protos::coresdk::external_data::stream_read_result;
+    use std::any::Any;
+    use temporalio_common::{
+        protos::coresdk::external_data::stream_read_result,
+        telemetry::{
+            TelemetryOptions,
+            metrics::{
+                CoreMeter,
+                core::{
+                    BufferAttributes, BufferInstrumentRef, CustomMetricAttributes,
+                    MetricCallBufferer, MetricEvent, MetricUpdateVal,
+                },
+            },
+            telemetry_init,
+        },
+    };
     use temporalio_streams::{
         AnyError, ReadReason, StreamStore,
         proto::{
@@ -660,6 +684,146 @@ mod tests {
         let after = store.requests().len();
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert_eq!(store.requests().len(), after);
+    }
+
+    /// The labels of an attribute set of the metrics buffer.
+    #[derive(Debug)]
+    struct Labels(HashMap<String, String>);
+
+    impl CustomMetricAttributes for Labels {
+        fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    /// The name of an instrument of the metrics buffer.
+    #[derive(Clone, Debug)]
+    struct Instrument(String);
+
+    impl BufferInstrumentRef for Instrument {}
+
+    fn labels(attributes: &BufferAttributes) -> Arc<Labels> {
+        (attributes.get().clone().as_any().downcast::<Labels>()).unwrap()
+    }
+
+    /// Returns the sum of each Stream counter and the sample count of each Stream histogram in
+    /// `buffer`, by the name of the metric and its `failure_reason`.
+    fn totals(buffer: &MetricsCallBuffer<Instrument>) -> HashMap<(String, String), u64> {
+        let mut totals = HashMap::new();
+        for event in buffer.retrieve() {
+            match event {
+                MetricEvent::Create {
+                    params,
+                    populate_into,
+                    ..
+                } => populate_into
+                    .set(Instrument(params.name.to_string()))
+                    .unwrap(),
+                MetricEvent::CreateAttributes {
+                    populate_into,
+                    append_from,
+                    attributes,
+                } => {
+                    let mut set =
+                        append_from.map_or_else(HashMap::new, |from| labels(&from).0.clone());
+                    set.extend((attributes.into_iter()).map(|kv| (kv.key, kv.value.to_string())));
+                    populate_into.set(Arc::new(Labels(set))).unwrap();
+                }
+                MetricEvent::Update {
+                    instrument,
+                    attributes,
+                    update,
+                } => {
+                    let name = instrument.get().0.strip_prefix("temporal_");
+                    let Some(name) = name.filter(|name| name.starts_with("stream_")) else {
+                        continue;
+                    };
+                    let name = name.to_string();
+                    let set = labels(&attributes);
+                    assert_eq!(set.0["stream_store"], "mem", "{name}");
+                    let reason = set.0.get("failure_reason").cloned().unwrap_or_default();
+                    let value = match update {
+                        MetricUpdateVal::Delta(value) => value,
+                        MetricUpdateVal::Duration(_) => 1,
+                        other => panic!("{name} has the update {other:?}"),
+                    };
+                    *totals.entry((name, reason)).or_default() += value;
+                }
+            }
+        }
+        totals
+    }
+
+    fn read(call_id: u64, stream: StreamRef, check: bool) -> Request {
+        let request = ReadRecordsRequest {
+            r#ref: Some(stream),
+            max_records: 10,
+            max_bytes: 1000,
+            ..Default::default()
+        };
+        Request::Run(Call {
+            call_id,
+            seq: call_id as u32,
+            store: "mem".to_string(),
+            op: Op::Read(ReadCall {
+                request,
+                wait: Duration::ZERO,
+                check,
+                last_try: LastTry::default(),
+            }),
+        })
+    }
+
+    // Each try of a call counts for its Store when it starts, and a check is one try. Only a try
+    // of an append has a latency, and a failed try has the token of its reason.
+    #[tokio::test(start_paused = true)]
+    async fn the_metrics_count_each_try_of_a_call() {
+        let (store, manager, mut results) = manager().await;
+        let buffer = Arc::new(MetricsCallBuffer::<Instrument>::new(1000));
+        let meter: Arc<dyn CoreMeter> = buffer.clone();
+        let telemetry = telemetry_init(TelemetryOptions::builder().metrics(meter).build()).unwrap();
+        let metrics = MetricsContext::top_level("n".to_string(), "q".to_string(), &telemetry);
+        let of_store = |store: &str| metrics.with_new_attrs([stream_store(store.to_string())]);
+        let down = || AnyError::store_unavailable("The Store is down");
+        let missing = StreamRef {
+            id: "missing".to_string(),
+            ..stream()
+        };
+        // The first try of the append and of the read meet an outage, and so does the first check.
+        let calls = [
+            (Some(StoreOp::Append), append(1)),
+            (Some(StoreOp::Read), read(2, stream(), false)),
+            (Some(StoreOp::Read), read(3, stream(), true)),
+            (None, read(4, missing, true)),
+        ];
+        for (outage, call) in calls {
+            if let Some(op) = outage {
+                store.fail(op, down(), 1);
+            }
+            manager.dispatch("r", vec![call], of_store);
+            results.recv().await.unwrap();
+        }
+        let expected = [
+            ("stream_append_total", "", 2),
+            (
+                "stream_append_execution_failed",
+                "stream_store_unavailable",
+                1,
+            ),
+            ("stream_append_execution_latency", "", 2),
+            ("stream_read_total", "", 4),
+            (
+                "stream_read_execution_failed",
+                "stream_store_unavailable",
+                2,
+            ),
+            ("stream_read_execution_failed", "stream_not_found", 1),
+            ("stream_read_records", "", 1),
+        ];
+        let expected = (expected.into_iter())
+            .map(|(name, reason, value)| ((name.to_string(), reason.to_string()), value))
+            .collect();
+        assert_eq!(totals(&buffer), expected);
     }
 
     /// Returns a failure message of at least `bytes` bytes. Its characters have 1 to 4 bytes, so
