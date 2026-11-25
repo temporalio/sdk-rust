@@ -193,7 +193,7 @@ impl NexusContext {
 pub struct TemporalNexusClient {
     client: Client,
     request: proto::StartOperationRequest,
-    outbound_links: Arc<Mutex<Vec<proto::Link>>>,
+    outbound_links: Arc<Mutex<Vec<Link>>>,
 }
 
 /// Information about the Nexus request currently being served.
@@ -240,13 +240,7 @@ impl TemporalNexusClient {
         let token =
             WorkflowOperationToken::new(self.client.namespace(), options.workflow_id.clone())
                 .encode_token();
-        let workflow_event_type = link::WorkflowEvent::full_name();
-        let links = self
-            .request
-            .links
-            .iter()
-            .filter(|link| link.r#type == workflow_event_type)
-            .map(proto::workflow_event_link_from_nexus)
+        let links = workflow_event_links_from_nexus(&self.request.links)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| TemporalOperationError::handler("BAD_REQUEST", error, false))?;
         options.links.extend(links.clone());
@@ -271,7 +265,7 @@ impl TemporalNexusClient {
         )
         .await
         .map_err(TemporalOperationError::from)?;
-        if let Some(link) = workflow_event_link_to_nexus(response_link)? {
+        if let Some(link) = response_link {
             self.outbound_links.lock().push(link);
         }
         Ok(TemporalOperationResult::Async(TemporalOperationToken {
@@ -281,10 +275,18 @@ impl TemporalNexusClient {
     }
 }
 
-fn workflow_event_link_to_nexus(
-    link: Option<Link>,
-) -> Result<Option<proto::Link>, TemporalOperationError> {
-    let Some(link::Variant::WorkflowEvent(event)) = link.and_then(|link| link.variant) else {
+fn workflow_event_links_from_nexus(
+    links: &[proto::Link],
+) -> impl Iterator<Item = anyhow::Result<Link>> {
+    let workflow_event_type = link::WorkflowEvent::full_name();
+    links
+        .iter()
+        .filter(move |link| link.r#type == workflow_event_type)
+        .map(proto::workflow_event_link_from_nexus)
+}
+
+fn workflow_event_link_to_nexus(link: Link) -> Result<Option<proto::Link>, TemporalOperationError> {
+    let Some(link::Variant::WorkflowEvent(event)) = link.variant else {
         return Ok(None);
     };
     let mut url = Url::parse("temporal:///").expect("valid Temporal link base");
@@ -469,8 +471,48 @@ impl<S: NexusService> NexusServiceHandler<S> {
                             payload,
                         )
                         .map_err(TemporalOperationError::input_conversion_error)?;
-                    let outbound_links = client.outbound_links.clone();
-                    match handler(context, client, input).await? {
+                    let request_links = workflow_event_links_from_nexus(&client.request.links)
+                        .filter_map(|link| match link {
+                            Ok(link) => Some(link),
+                            Err(error) => {
+                                tracing::warn!(%error, "Ignoring invalid inbound Nexus link");
+                                None
+                            }
+                        })
+                        .collect();
+                    let TemporalNexusClient {
+                        client,
+                        request,
+                        outbound_links,
+                    } = client;
+                    let result = temporalio_client::__internal::scope_nexus_links(
+                        client,
+                        request_links,
+                        outbound_links.clone(),
+                        |client| {
+                            handler(
+                                context,
+                                TemporalNexusClient {
+                                    client,
+                                    request,
+                                    outbound_links: outbound_links.clone(),
+                                },
+                                input,
+                            )
+                        },
+                    )
+                    .await?;
+                    let links = mem::take(&mut *outbound_links.lock())
+                        .into_iter()
+                        .filter_map(|link| match workflow_event_link_to_nexus(link) {
+                            Ok(link) => link,
+                            Err(error) => {
+                                tracing::warn!(%error, "Ignoring invalid workflow link in Nexus response");
+                                None
+                            }
+                        })
+                        .collect();
+                    match result {
                         TemporalOperationResult::Sync(output) => {
                             let payload = converter
                                 .payload_converter()
@@ -485,7 +527,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
                             Ok(start_operation_response::Variant::SyncSuccess(
                                 start_operation_response::Sync {
                                     payload: Some(payload),
-                                    links: mem::take(&mut *outbound_links.lock()),
+                                    links,
                                 },
                             ))
                         }
@@ -495,7 +537,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
                                 start_operation_response::Async {
                                     operation_id: token.token.clone(),
                                     operation_token: token.token,
-                                    links: mem::take(&mut *outbound_links.lock()),
+                                    links,
                                 },
                             ))
                         }
@@ -1064,7 +1106,7 @@ mod tests {
     use prost::Message;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temporalio_client::{
-        ClientOptions, Connection, ConnectionOptions,
+        ClientOptions, Connection, ConnectionOptions, UntypedSignal, UntypedWorkflow,
         callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
         tonic::Status,
     };
@@ -1072,7 +1114,7 @@ mod tests {
         WorkflowDefinition,
         data_converters::{
             DefaultFailureConverter, ExternalStorage, FailureConverter, PayloadCodec,
-            PayloadConversionError, PayloadConverter, StorageDriver, StorageDriverClaim,
+            PayloadConversionError, PayloadConverter, RawValue, StorageDriver, StorageDriverClaim,
             StorageDriverError, StorageDriverRetrieveContext, StorageDriverStoreContext,
         },
         error::IncomingError,
@@ -1081,6 +1123,7 @@ mod tests {
             enums::v1::NexusHandlerErrorRetryBehavior,
             workflowservice::v1::{
                 RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
+                SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
                 StartWorkflowExecutionRequest, StartWorkflowExecutionResponse,
             },
         },
@@ -1107,9 +1150,7 @@ mod tests {
                 )),
             })),
         };
-        let encoded = workflow_event_link_to_nexus(Some(link.clone()))
-            .unwrap()
-            .unwrap();
+        let encoded = workflow_event_link_to_nexus(link.clone()).unwrap().unwrap();
         assert_eq!(
             proto::workflow_event_link_from_nexus(&encoded).unwrap(),
             link
@@ -1296,41 +1337,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_links_are_request_local_for_sync_and_async_results() {
+    async fn signal_links_are_request_local_for_sync_and_async_results() {
+        let link_type = link::WorkflowEvent::full_name();
+        let mut options = ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+            .dns_load_balancing(None)
+            .service_override(CallbackBasedGrpcService {
+                callback: Arc::new(|request| {
+                    assert_eq!(request.rpc, "SignalWorkflowExecution");
+                    let request = SignalWorkflowExecutionRequest::decode(request.proto).unwrap();
+                    let workflow_id = request.workflow_execution.unwrap().workflow_id;
+                    if workflow_id == "unscoped-client" {
+                        assert!(request.links.is_empty());
+                    } else {
+                        assert_eq!(
+                            request.links,
+                            [Link {
+                                variant: Some(link::Variant::WorkflowEvent(link::WorkflowEvent {
+                                    namespace: "test".to_owned(),
+                                    workflow_id: format!("caller-{workflow_id}"),
+                                    run_id: "caller-run".to_owned(),
+                                    reference: Some(link::workflow_event::Reference::EventRef(
+                                        link::workflow_event::EventReference {
+                                            event_id: 7,
+                                            event_type: EventType::NexusOperationScheduled as i32,
+                                        },
+                                    )),
+                                })),
+                            }],
+                        );
+                    }
+                    let link = (request.signal_name != "no-backlink").then(|| Link {
+                        variant: Some(link::Variant::WorkflowEvent(link::WorkflowEvent {
+                            namespace: "test".to_owned(),
+                            workflow_id,
+                            run_id: "signal-run".to_owned(),
+                            reference: Some(link::workflow_event::Reference::RequestIdRef(
+                                link::workflow_event::RequestIdReference {
+                                    request_id: request.signal_name,
+                                    event_type: EventType::WorkflowExecutionSignaled as i32,
+                                },
+                            )),
+                        })),
+                    });
+                    Box::pin(async move {
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto: SignalWorkflowExecutionResponse { link }.encode_to_vec(),
+                        })
+                    })
+                }),
+            })
+            .build();
+        options.set_skip_get_system_info(true);
+        let client = Client::new(
+            Connection::connect(options).await.unwrap(),
+            ClientOptions::new("test").build(),
+        )
+        .unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let mut services = NexusServices::default();
+        let unscoped_client = client.clone();
         services
             .register(
                 NexusServiceHandler::new(Payments)
-                    .operation(Payments::quote, move |ctx, client, input: String| {
+                    .operation(Payments::quote, move |_, client, input: String| {
+                        let handle = client
+                            .client()
+                            .get_workflow_handle::<UntypedWorkflow>(&input);
+                        let unscoped = unscoped_client
+                            .get_workflow_handle::<UntypedWorkflow>("unscoped-client");
                         let barrier = barrier.clone();
                         async move {
-                            for suffix in ["first", "second"] {
-                                client.outbound_links.lock().push(proto::Link {
-                                    url: format!("{}/{suffix}", ctx.info().request_id),
-                                    r#type: "test".to_owned(),
-                                });
-                            }
-                            barrier.wait().await;
-                            Ok(if input == "sync" {
-                                TemporalOperationResult::Sync(input)
+                            unscoped
+                                .signal(
+                                    UntypedSignal::new("unlinked"),
+                                    RawValue::empty(),
+                                    Default::default(),
+                                )
+                                .await?;
+                            let signal = async move {
+                                for signal in ["first", "second", "no-backlink"] {
+                                    handle
+                                        .signal(
+                                            UntypedSignal::new(signal),
+                                            RawValue::empty(),
+                                            Default::default(),
+                                        )
+                                        .await?;
+                                    barrier.wait().await;
+                                }
+                                Ok::<_, WorkflowInteractionError>(())
+                            };
+                            if input == "sync" {
+                                signal.await?;
+                                Ok(TemporalOperationResult::Sync(input))
                             } else {
-                                TemporalOperationResult::Async(TemporalOperationToken {
+                                tokio::spawn(signal).await.unwrap()?;
+                                Ok(TemporalOperationResult::Async(TemporalOperationToken {
                                     token: "operation-token".to_owned(),
                                     output: PhantomData,
-                                })
-                            })
+                                }))
+                            }
                         }
                     })
                     .unwrap(),
             )
             .unwrap();
-        let client = client().await;
         let converter = DataConverter::default();
         let requests = ["sync", "async"].into_iter().map(|mode| {
             let services = services.clone();
             let client = client.clone();
             let converter = converter.clone();
+            let link_type = link_type.clone();
             async move {
                 let payload = converter
                     .to_payload(&serialization_context(), &mode.to_owned())
@@ -1346,6 +1464,10 @@ mod tests {
                                 service: Payments::name().to_owned(),
                                 operation: "quote".to_owned(),
                                 request_id: mode.to_owned(),
+                                links: vec![proto::Link {
+                                    url: format!("temporal:///namespaces/test/workflows/caller-{mode}/caller-run/history?eventID=7&eventType=NexusOperationScheduled"),
+                                    r#type: link_type.clone(),
+                                }],
                                 payload: Some(payload),
                                 ..Default::default()
                             },
@@ -1377,8 +1499,11 @@ mod tests {
                     result => panic!("unexpected response: {result:?}"),
                 };
                 assert_eq!(
-                    links.into_iter().map(|link| link.url).collect::<Vec<_>>(),
-                    [format!("{mode}/first"), format!("{mode}/second")],
+                    links,
+                    ["first", "second"].map(|signal| proto::Link {
+                        url: format!("temporal:///namespaces/test/workflows/{mode}/signal-run/history?requestID={signal}&eventType=WorkflowExecutionSignaled&referenceType=RequestIdReference"),
+                        r#type: link_type.clone(),
+                    }),
                 );
             }
         });

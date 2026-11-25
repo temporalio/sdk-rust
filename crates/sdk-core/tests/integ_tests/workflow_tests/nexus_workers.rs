@@ -5,13 +5,15 @@ use crate::{
 use nexus_rpc::service;
 use std::time::Duration;
 use temporalio_client::WorkflowStartOptions;
+use temporalio_common::protos::temporal::api::{common::v1::link, enums::v1::EventType};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
-    WorkflowTermination,
+    Runtime, SyncWorkflowContext, Worker, WorkerOptions, WorkflowContext, WorkflowContextView,
+    WorkflowResult, WorkflowTermination,
     nexus::{
-        NexusContext, NexusOperationOptions, NexusServiceClientOptions, TemporalNexusClient,
-        TemporalOperationError, TemporalOperationResult, temporal_nexus_service_handler,
+        NexusContext, NexusOperationOptions, NexusServiceClientOptions, NexusServiceHandler,
+        TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
+        temporal_nexus_service_handler,
     },
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
@@ -208,4 +210,114 @@ async fn nexus_worker(#[values(Outcome::Sync, Outcome::Async, Outcome::Cancel)] 
     )
     .unwrap();
     replayer.replay_workflow(history).await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct SignalTarget {
+    received: bool,
+}
+
+#[workflow_methods]
+impl SignalTarget {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|wf| wf.received).await?;
+        Ok(())
+    }
+
+    #[signal]
+    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.received = true;
+    }
+}
+
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
+#[tokio::test]
+async fn nexus_worker_signal_links() {
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let client = get_integ_client(integ_namespace(), None).await;
+    let task_queue = format!("nexus-signal-{}", rand_6_chars());
+    let caller_id = format!("{task_queue}-caller");
+    let target_id = format!("{task_queue}-target");
+    let target = client
+        .start_workflow(
+            SignalTarget::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), target_id.clone())
+                .execution_timeout(Duration::from_secs(60))
+                .build(),
+        )
+        .await
+        .unwrap();
+    let service = NexusServiceHandler::new(PaymentService)
+        .operation(PaymentService::quote, move |_, client, input| {
+            let target = client
+                .client()
+                .get_workflow_handle::<signal_target::Run>(&target_id);
+            async move {
+                tokio::spawn(async move {
+                    target
+                        .signal(SignalTarget::finish, (), Default::default())
+                        .await
+                })
+                .await
+                .unwrap()?;
+                Ok(TemporalOperationResult::Sync(ChargeOutput {
+                    receipt: format!("quote-{}", input.amount),
+                }))
+            }
+        })
+        .unwrap();
+    let options = WorkerOptions::new(task_queue.clone())
+        .register_workflow::<PaymentCaller>()
+        .unwrap()
+        .register_workflow::<SignalTarget>()
+        .unwrap()
+        .register_nexus_service(service)
+        .unwrap()
+        .build();
+    let endpoint = mk_nexus_endpoint_for_client(&client, &task_queue).await;
+    let worker = Worker::new(&runtime, client.clone(), options).unwrap();
+    let caller = client
+        .start_workflow(
+            PaymentCaller::run,
+            (endpoint, Outcome::Sync),
+            WorkflowStartOptions::new(task_queue, caller_id.clone())
+                .execution_timeout(Duration::from_secs(60))
+                .build(),
+        )
+        .await
+        .unwrap();
+    worker
+        .run_until(async {
+            caller.get_result(Default::default()).await.unwrap();
+            target.get_result(Default::default()).await.unwrap();
+        })
+        .await
+        .unwrap();
+
+    let history = target
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    let signal = history
+        .iter()
+        .find(|event| event.event_type() == EventType::WorkflowExecutionSignaled)
+        .unwrap();
+    let [signal_link] = signal.links.as_slice() else {
+        panic!("expected one caller link, got {:?}", signal.links);
+    };
+    let Some(link::Variant::WorkflowEvent(event)) = &signal_link.variant else {
+        panic!("expected a link to the calling workflow");
+    };
+    assert_eq!(event.workflow_id, caller_id);
+    let Some(link::workflow_event::Reference::EventRef(reference)) = &event.reference else {
+        panic!("expected a link to the Nexus scheduled event");
+    };
+    assert_eq!(reference.event_type(), EventType::NexusOperationScheduled);
 }
