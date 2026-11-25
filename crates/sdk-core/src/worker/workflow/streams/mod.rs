@@ -111,8 +111,7 @@ pub struct StreamSettings {
     pub read_check_deadline: Duration,
     /// The number of read results after which a Workflow Task starts no new read, 256 by default.
     /// A read that runs still gives its result. A read that the budget keeps back starts when the
-    /// next task opens, and only a page that Core knows of asks for that task. It must be 1 or
-    /// more.
+    /// next task opens, and Core asks for that task at once. It must be 1 or more.
     pub max_task_read_results: usize,
     /// How long a replay goes on trying a Store after its first try of that Store fails, each time
     /// it reads a part of the Records of History, 3 s by default. No try or wait goes past that

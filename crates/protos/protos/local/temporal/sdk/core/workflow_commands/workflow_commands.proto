@@ -479,8 +479,9 @@ message AppendToStream {
 //
 // Core asks for a new task when it knows that the Stream has Records for an open read. It knows
 // that when the Store gave Records after the page that the read continues from, or when the task
-// holds back the read's page. A query answer and the heartbeat of a Local Activity or an append
-// ask for a new task whatever the reads say.
+// holds back the read's page. It also asks for a new task when the read result budget of the task
+// holds back a read. A query answer and the heartbeat of a Local Activity or an append ask for a
+// new task whatever the reads say.
 //
 // A Store outage fails the Workflow Task, as for an append, and never reaches lang as a read
 // result. That's the case if a check fails or gets no answer by its deadline, or if a read has had
@@ -489,7 +490,8 @@ message AppendToStream {
 //
 // One Workflow Task gives at most 16 MiB of Records. A page that doesn't fit comes in the first
 // activation of the next task. Once a task gave `StreamSettings::max_task_read_results` read
-// results, 256 by default, its new reads start when the next task opens.
+// results, 256 by default, its new reads get no check and start when the next task opens, which
+// Core asks for at once.
 //
 // No command cancels a read, so lang must accept the job of a read that nothing awaits. Core drops
 // a read that has no result when lang sends the Workflow's last command.

@@ -62,9 +62,11 @@ relevant information.
   `StreamSettings::read_check_deadline`. Its Records come in the task, or first in the next task if
   the task has a command. With no Record a read with a `wait` starts again in the next task, so an
   idle Stream makes no new task. Core asks for a new task only if it knows that the Stream has
-  Records for an open read. A Store outage at a read fails the Workflow Task with a message that
-  starts with `StreamStoreUnavailable:`, as for an append. A task gives at most 16 MiB of Records,
-  and starts no new read once it gave the new `StreamSettings::max_task_read_results` results.
+  Records for an open read, or if the result budget holds back a read. A Store outage at a read
+  fails the Workflow Task with a message that starts with `StreamStoreUnavailable:`, as for an
+  append. A task gives at most 16 MiB of Records, and starts no new read once it gave the new
+  `StreamSettings::max_task_read_results` results. A read that this budget holds back starts in
+  the next task.
   Each activation that gives pages records their offsets, their count and a digest of their
   Records in a `core_stream_read` marker. A replay, also the replay for a query of a closed
   Workflow, reads the Records from the Store again, with `StreamSettings::replay_concurrency` reads

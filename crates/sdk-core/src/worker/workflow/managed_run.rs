@@ -1481,7 +1481,7 @@ impl ManagedRun {
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         // An evicted run with an open Stream call completes its task, and doesn't let it time out.
         // Other runs ask for a new task for an open append, and for a read only if its Stream has
-        // more Records for it.
+        // more Records for it or the read result budget of the task holds it back.
         let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
