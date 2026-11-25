@@ -1,6 +1,6 @@
-//! The machine of a `core_stream_append` marker, which an activation records when Workflow code
-//! gets the result of an append, or a completion records with no entry when it leaves an append
-//! open. A cached run matches the marker event to its command, as it does for any other command.
+//! The machine of a Stream marker, which an activation records when Workflow code gets the result
+//! of an append or a read, or a completion records with no entry when it leaves a call open. A
+//! cached run matches the marker event to its command, as it does for any other command.
 
 use super::{
     EventInfo, HistEventData, NewMachineWithCommand, StateMachine, TransitionResult,
@@ -8,11 +8,10 @@ use super::{
 };
 use crate::worker::workflow::{
     nondeterminism,
-    streams::{is_stream_marker, marker_details},
+    streams::{PeekedMarker, is_stream_marker, marker_details},
 };
 use temporalio_common::protos::{
-    constants::STREAM_APPEND_MARKER_NAME,
-    coresdk::external_data::StreamAppendMarkerData,
+    constants::{STREAM_APPEND_MARKER_NAME, STREAM_READ_MARKER_NAME},
     temporal::api::{command::v1::RecordMarkerCommandAttributes, enums::v1::CommandType},
 };
 
@@ -51,10 +50,14 @@ impl From<CommandSent> for Recorded {
 }
 
 /// Creates the marker command that records `data`, with its machine.
-pub(super) fn stream_marker(data: &StreamAppendMarkerData) -> NewMachineWithCommand {
+pub(super) fn stream_marker(data: &PeekedMarker) -> NewMachineWithCommand {
+    let (marker_name, details) = match data {
+        PeekedMarker::Append(data) => (STREAM_APPEND_MARKER_NAME, marker_details(data)),
+        PeekedMarker::Read(data) => (STREAM_READ_MARKER_NAME, marker_details(data)),
+    };
     let command = RecordMarkerCommandAttributes {
-        marker_name: STREAM_APPEND_MARKER_NAME.to_string(),
-        details: marker_details(data),
+        marker_name: marker_name.to_string(),
+        details,
         header: None,
         failure: None,
     };

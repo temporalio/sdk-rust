@@ -15,7 +15,11 @@ use crate::{
             WFTReportStatus, WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
-            streams::{RunStreams, Streams, TaskState, is_stream_marker, task_attempt},
+            streams::{
+                ReadLimit, ReplayReader, RunStreams, Streams, TaskState, is_stream_marker,
+                is_stream_replay_failure, task_attempt,
+            },
+            wft_extraction::FetchedPage,
         },
     },
 };
@@ -74,6 +78,8 @@ pub(super) struct ManagedRun {
     /// This field is `None` when `WorkerTaskTypes.enable_local_activities` is false.
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
     streams: RunStreams,
+    /// The read limit of the task in hand.
+    read_limit: ReadLimit,
     /// Set if the run is currently waiting on the execution of some local activities.
     waiting_on_la: Option<WaitingOnLAs>,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
@@ -119,6 +125,7 @@ impl ManagedRun {
             wfm,
             local_activity_request_sink,
             streams,
+            read_limit: ReadLimit::default(),
             waiting_on_la: None,
             am_broken: false,
             wft: None,
@@ -232,6 +239,7 @@ impl ManagedRun {
         if !was_legacy_query {
             let task = TaskState::Open(task_attempt(&wft_info));
             self.wfm.machines.stream_calls.set_task(task);
+            self.read_limit.reset();
         }
         self.wft = Some(OutstandingTask {
             info: wft_info,
@@ -274,7 +282,7 @@ impl ManagedRun {
             }
             r
         };
-        self.streams.dispatch(&mut self.wfm.machines.stream_calls);
+        self.dispatch_stream_calls();
 
         if activation.jobs.is_empty() {
             if self.wfm.machines.outstanding_local_work() > 0 {
@@ -535,7 +543,9 @@ impl ManagedRun {
             // Verify we can actually apply the next workflow task, which will happen as part of
             // applying the completion to machines. If we can't, return early indicating we need
             // to fetch a page.
-            if !self.wfm.ready_to_apply_next_wft() {
+            if !self.fails_before_stream_records(is_forced_failure)
+                && !self.wfm.ready_to_apply_next_wft()
+            {
                 return if let Some(paginator) = self.paginator.take() {
                     debug!("Need to fetch a history page before next WFT can be applied");
                     self.completion_waiting_on_page_fetch = Some(rac);
@@ -555,8 +565,15 @@ impl ManagedRun {
                 };
             }
 
-            Ok(self.process_completion(rac))
+            self.process_completion(rac)
         }
+    }
+
+    /// Returns true for a completion that fails the Workflow while its replay has Stream Records
+    /// left to read. It's the last one of the run, so it applies no next task and reads none.
+    fn fails_before_stream_records(&self, is_forced_failure: bool) -> bool {
+        let paginator = self.paginator.as_ref();
+        is_forced_failure && paginator.is_some_and(ReplayReader::has_unread_in)
     }
 
     /// Core has received from lang a sequence containing all commands generated
@@ -597,15 +614,15 @@ impl ManagedRun {
     /// attached with another fetch request if needed.
     pub(super) fn fetched_page_completion(
         &mut self,
-        update: HistoryUpdate,
+        update: FetchedPage,
         paginator: HistoryPaginator,
-    ) -> RunUpdateAct {
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let res = self._fetched_page_completion(update, paginator);
-        self.update_to_acts(res.map(Into::into))
+        self.finish_completion(res)
     }
     fn _fetched_page_completion(
         &mut self,
-        update: HistoryUpdate,
+        update: FetchedPage,
         paginator: HistoryPaginator,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
         self.paginator = Some(paginator);
@@ -676,18 +693,32 @@ impl ManagedRun {
             WftFailureKind::LegacyQuery
         };
 
+        // A lang failure of the type of a Stream replay error doesn't count as one.
+        let error_type = if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError) {
+            Some(WorkflowErrorType::Nondeterminism)
+        } else if is_auto_fail && is_stream_replay_failure(&failure) {
+            Some(WorkflowErrorType::StreamReplay)
+        } else {
+            None
+        };
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
         // Only done on the first attempt: if that attempt's completion didn't reach the server,
         // later attempts fall through to the normal task failure path, which won't re-report.
         if kind == WftFailureKind::Task
             && attempt <= 1
-            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-            && self.config.should_fail_workflow(
-                &self.wfm.machines.workflow_type,
-                &WorkflowErrorType::Nondeterminism,
-            )
+            && let Some(error_type) = error_type
+            && self
+                .config
+                .should_fail_workflow(&self.wfm.machines.workflow_type, &error_type)
         {
-            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            match error_type {
+                WorkflowErrorType::Nondeterminism => {
+                    warn!(failure=?failure, "Failing workflow due to nondeterminism error")
+                }
+                WorkflowErrorType::StreamReplay => {
+                    warn!(failure=?failure, "Failing workflow due to a Stream replay error")
+                }
+            }
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -775,15 +806,42 @@ impl ManagedRun {
         self.update_to_acts(res.map(Into::into))
     }
 
-    fn process_completion(&mut self, completion: RunActivationCompletion) -> RunUpdateAct {
+    fn process_completion(
+        &mut self,
+        completion: RunActivationCompletion,
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let res = self._process_completion(completion, None);
-        self.update_to_acts(res.map(Into::into))
+        self.finish_completion(res)
+    }
+
+    /// Returns the request for the page that a completion stopped for, if it did. Otherwise turns
+    /// `res`, the result of the completion, into the next actions of the run.
+    fn finish_completion(
+        &mut self,
+        res: Result<Option<FulfillableActivationComplete>, RunUpdateErr>,
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
+        if self.completion_waiting_on_page_fetch.is_some() {
+            let Some(paginator) = self.paginator.take() else {
+                let waiting = self.completion_waiting_on_page_fetch.take();
+                return Ok(self.update_to_acts(Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(
+                        "Run's paginator was absent when attempting to fetch next history \
+                            page. This is a Core SDK bug."
+                            .to_string(),
+                    ),
+                    complete_resp_chan: waiting.and_then(|completion| completion.resp_chan),
+                })));
+            };
+            let span = Span::current();
+            return Err(Box::new(NextPageReq { paginator, span }));
+        }
+        Ok(self.update_to_acts(res.map(Into::into)))
     }
 
     fn _process_completion(
         &mut self,
         completion: RunActivationCompletion,
-        update_from_new_page: Option<HistoryUpdate>,
+        update_from_new_page: Option<FetchedPage>,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
         let completing_heartbeat_autocomplete =
             matches!(self.activation, Some(OutstandingActivation::Autocomplete))
@@ -813,30 +871,59 @@ impl ManagedRun {
             )));
         }
 
+        let mut waits_for_page = false;
+        let fails_before_records = self.fails_before_stream_records(data.is_forced_failure);
+        let unread_records = (self.paginator.as_ref()).is_some_and(ReplayReader::has_unread_in);
+        // A heartbeat, and a query answer while work is open, force the next task, so they stop no
+        // read.
+        let forces_next_task = completing_la_heartbeat || !data.query_responses.is_empty();
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;
-            if let Some(update) = update_from_new_page {
-                self.wfm.feed_history_from_new_page(update)?;
+            match update_from_new_page {
+                Some(FetchedPage::History(update)) => {
+                    self.wfm.feed_history_from_new_page(update)?
+                }
+                Some(FetchedPage::StreamRecords(reads)) => {
+                    self.wfm.machines.add_stream_reads(reads)
+                }
+                None => {}
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
             // or are otherwise broken.
-            if !completion.activation_was_eviction && !self.am_broken {
-                self.wfm.apply_next_task_if_ready()?;
+            if !completion.activation_was_eviction && !self.am_broken && !fails_before_records {
+                self.wfm.apply_next_task_if_ready(unread_records)?;
+                waits_for_page = unread_records
+                    && !self.wfm.machines.activation_needed()
+                    && !self.wfm.ready_to_apply_next_wft();
+                if waits_for_page {
+                    return Ok(None);
+                }
             }
             let mut new_local_acts = self.wfm.drain_queued_local_activities();
             self.stamp_dispatching_task(&mut new_local_acts);
             self.sink_la_requests(new_local_acts)?;
-            self.streams.dispatch(&mut self.wfm.machines.stream_calls);
 
+            if !forces_next_task {
+                let hold = self.wfm.machines.has_work_for_server();
+                self.wfm.machines.stream_calls.hold_check_pages(hold);
+                if self.wfm.machines.outstanding_local_work() == 0 {
+                    self.wfm.machines.stream_calls.check_open_reads()?;
+                }
+            }
+            // A read of a task that completes now starts only if the completion lets it go on.
             if self.wfm.machines.outstanding_local_work() == 0 {
                 Ok(None)
             } else {
+                self.dispatch_stream_calls();
                 // A forced task for a call that waits on a Store in an outage would only add
                 // events. So the task fails at its heartbeat, and the server retries it.
-                if heartbeat_timeout_pending && let Some(outage) = self.streams.outage() {
-                    return Err(WFMachinesError::Stream(outage));
+                if heartbeat_timeout_pending {
+                    if let Some(outage) = self.streams.outage() {
+                        return Err(WFMachinesError::Stream(outage));
+                    }
+                    self.wfm.machines.stream_calls.check_read_outage()?;
                 }
                 let wft_timeout: Duration = self
                     .wfm
@@ -852,6 +939,22 @@ impl ManagedRun {
                 Ok(Some((completion.start_time, wft_timeout)))
             }
         })();
+
+        if waits_for_page {
+            self.completion_waiting_on_page_fetch = Some(RunActivationCompletion {
+                task_token: data.task_token,
+                start_time: completion.start_time,
+                commands: vec![],
+                activation_was_eviction: false,
+                has_pending_query: data.has_pending_query,
+                query_responses: data.query_responses,
+                used_flags: vec![],
+                is_forced_failure: data.is_forced_failure,
+                resp_chan: completion.resp_chan,
+                versioning_behavior: data.versioning_behavior,
+            });
+            return Ok(None);
+        }
 
         match outcome {
             Ok(None) => {
@@ -940,12 +1043,59 @@ impl ManagedRun {
             return self._check_more_activations();
         }
         self.wfm.notify_of_local_result(res)?;
-        self.streams.dispatch(&mut self.wfm.machines.stream_calls);
+        self.dispatch_stream_calls();
         if self.activation.is_none() {
             self._check_more_activations()
         } else {
             Ok(None)
         }
+    }
+
+    /// Ends the reads of the task in hand that have no answer, at the timer of its read limit.
+    pub(super) fn read_limit_reached(&mut self, generation: u64) -> RunUpdateAct {
+        if !self.read_limit.expires(generation) {
+            return None;
+        }
+        if let Err(error) = self.wfm.machines.stream_calls.read_limit() {
+            return self.update_to_acts(Err(error.into()));
+        }
+        self.dispatch_stream_calls();
+        let res = if self.activation.is_none() {
+            self._check_more_activations()
+        } else {
+            Ok(None)
+        };
+        self.update_to_acts(res.map(Into::into))
+    }
+
+    /// Runs the timer of the read limit of the task in hand while one of its reads has no answer.
+    fn sync_read_limit(&mut self) {
+        if self.wft.is_none() || self.am_broken || !self.wfm.machines.stream_calls.read_runs() {
+            return;
+        }
+        self.set_read_limit();
+        self.streams.read_limit_at(&mut self.read_limit);
+    }
+
+    /// Gives the task in hand its read limit, once the run is live and knows its Workflow Task
+    /// timeout.
+    fn set_read_limit(&mut self) {
+        if self.wfm.machines.stream_calls.is_live()
+            && let Some(wft) = self.wft.as_ref()
+            && let Some(timeout) =
+                (self.wfm.machines.get_started_info()).and_then(|attrs| attrs.workflow_task_timeout)
+        {
+            let settings = self.wfm.machines.stream_calls.settings();
+            self.read_limit.set(settings, wft.start_time, timeout);
+        }
+    }
+
+    /// Starts and stops the Stream calls that the machines decided on. A read waits for the Store
+    /// at most the time that the task has left to its read limit.
+    fn dispatch_stream_calls(&mut self) {
+        self.set_read_limit();
+        let time_left = self.read_limit.left();
+        (self.streams).dispatch(&mut self.wfm.machines.stream_calls, time_left);
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
@@ -1073,6 +1223,9 @@ impl ManagedRun {
         // then make sure we allow the completion to proceed, otherwise we're stuck waiting forever.
         if self.completion_waiting_on_page_fetch.is_some()
             && matches!(info.reason, EvictionReason::PaginationOrHistoryFetch)
+            // An eviction request with a task to fail is for the failed fetch of another task of
+            // the run, so the completion still waits for its own page.
+            && info.auto_reply_fail.is_none()
         {
             // We just checked it is some, unwrap OK.
             let c = self.completion_waiting_on_page_fetch.take().unwrap();
@@ -1096,7 +1249,7 @@ impl ManagedRun {
                     "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are cancelled and will be re-executed on replay"
                 );
             }
-            let outstanding_stream_calls = self.wfm.machines.stream_calls.outstanding();
+            let outstanding_stream_calls = self.wfm.machines.stream_calls.outstanding(false);
             if outstanding_stream_calls > 0 && self.config.max_cached_workflows == 0 {
                 warn!(
                     run_id=%info.run_id,
@@ -1232,7 +1385,7 @@ impl ManagedRun {
                     f.fulfill();
                 }
 
-                match r {
+                let act = match r {
                     // After each run update, check if it's ready to handle any buffered task
                     None | Some(ActivationOrAuto::Autocomplete { .. })
                         if !self.has_any_pending_work(true) =>
@@ -1248,7 +1401,9 @@ impl ManagedRun {
                         Some(r)
                     }
                     None => None,
-                }
+                };
+                self.sync_read_limit();
+                act
             }
             Err(fail) => {
                 self.am_broken = true;
@@ -1325,6 +1480,8 @@ impl ManagedRun {
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         // An evicted run with an open Stream call completes its task, and doesn't let it time out.
+        // Other runs ask for a new task for an open append, and for a read only if its Stream has
+        // more Records for it.
         let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
@@ -1377,7 +1534,7 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                machines_wft_response.mark_open_stream_calls();
+                machines_wft_response.end_stream_calls_of_task(force_new_wft);
                 (
                     machines_wft_response.commands().collect(),
                     machines_wft_response.messages(),
@@ -1406,6 +1563,9 @@ impl ManagedRun {
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
             self.wfm.hold_local_resolutions_until_next_wft();
             self.wfm.machines.stream_calls.set_task(TaskState::NoTask);
+            // The task is over, so a read that starts now asks the Store not to wait.
+            self.streams
+                .dispatch(&mut self.wfm.machines.stream_calls, Duration::ZERO);
         }
         if evict_after_report {
             // The activation is still outstanding, so the eviction is only issued once the
@@ -1759,7 +1919,7 @@ impl WorkflowManager {
 
     /// If no activation is needed, apply the next workflow task and check again.
     /// Importantly, does not *drain* jobs.
-    fn apply_next_task_if_ready(&mut self) -> Result<()> {
+    fn apply_next_task_if_ready(&mut self, unread_stream_records: bool) -> Result<()> {
         if self.machines.activation_needed() {
             return Ok(());
         }
@@ -1770,6 +1930,10 @@ impl WorkflowManager {
             {
                 // Keep applying tasks while there are events, we are still replaying, and no
                 // activation is needed
+                break;
+            }
+            // The caller reads the Stream Records that the task after this one waits for.
+            if unread_stream_records && !self.machines.ready_to_apply_next_wft() {
                 break;
             }
         }

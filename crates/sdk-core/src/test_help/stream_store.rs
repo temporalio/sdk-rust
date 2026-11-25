@@ -2,11 +2,14 @@
 //! faults.
 
 use futures_util::future::BoxFuture;
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use parking_lot::{Condvar, Mutex};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 use temporalio_streams::{
     AnyError, AnyReason, AppendError, AppendReason, CreateError, DescribeError, ReadError,
-    StreamError, StreamStore,
+    ReadReason, StreamError, StreamStore,
     attempt::{ATTEMPT_KEY_LEN, attempt_key, producer_key},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, CreateStreamResponse,
@@ -16,17 +19,19 @@ use temporalio_streams::{
 };
 use tokio::sync::watch;
 
-/// A kind of write that a test can set a fault on.
+/// A kind of Store call that a test can set a fault on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Op {
     Append,
+    Read,
 }
 
-/// A write that the Store got, in the order that it arrived.
+/// A call that the Store got, in the order that it arrived.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     /// An append, with the request id of its call.
     Append(AppendRecordsRequest, String),
+    Read(ReadRecordsRequest),
 }
 
 /// A batch that the Store remembers, with the key of its attempt.
@@ -56,20 +61,34 @@ struct State {
     streams: HashMap<String, Stream>,
     requests: Vec<Request>,
     held: HashSet<Op>,
+    /// The held calls of each kind that may go on, one for each.
+    passes: HashMap<Op, usize>,
     held_streams: HashSet<String>,
     failures: HashMap<Op, (AnyError, usize)>,
     lost_answers: HashMap<Op, usize>,
+    /// Whether each read that arrives waits at the gate.
+    gating: bool,
+    /// The reads that wait at the gate, by their place in `requests`.
+    gated: HashSet<usize>,
+    /// The number of reads that the gate let go.
+    let_go: usize,
+    /// Whether each read keeps its thread until [`MemoryStore::unblock`].
+    blocking: bool,
 }
 
 /// The number of the last batches of each Producer of a Stream that the Store remembers.
 const WINDOW: usize = 4;
 
 /// A Store in memory. It fences an earlier attempt of a Producer, and writes nothing for a resend
-/// of one of the last `WINDOW` batches of a Producer of a Stream.
+/// of one of the last `WINDOW` batches of a Producer of a Stream. A read with no Record to give
+/// waits for one up to its `wait`.
 #[derive(Default)]
 pub struct MemoryStore {
     state: Mutex<State>,
     released: watch::Sender<u64>,
+    /// Counts the writes, so that a read that waits wakes at each one.
+    written: watch::Sender<u64>,
+    unblocked: Condvar,
 }
 
 impl MemoryStore {
@@ -78,18 +97,28 @@ impl MemoryStore {
         self.state.lock().held.insert(op);
     }
 
-    /// Lets each held call go on, and ends the holds.
-    pub fn release(&self) {
-        self.state.lock().held.clear();
+    /// Lets `count` held calls of `op` go on, each that arrives while the hold lasts. A call that
+    /// stops while it waits takes none.
+    pub fn pass(&self, op: Op, count: usize) {
+        *self.state.lock().passes.entry(op).or_default() += count;
         self.released.send_modify(|count| *count += 1);
     }
 
-    /// Makes each write to the Stream `id` wait for [`Self::release_stream`].
+    /// Lets each held call go on, and ends the holds.
+    pub fn release(&self) {
+        let mut state = self.state.lock();
+        state.held.clear();
+        state.passes.clear();
+        drop(state);
+        self.released.send_modify(|count| *count += 1);
+    }
+
+    /// Makes each call of the Stream `id` wait for [`Self::release_stream`].
     pub fn hold_stream(&self, id: &str) {
         self.state.lock().held_streams.insert(id.to_string());
     }
 
-    /// Lets each held write to the Stream `id` go on.
+    /// Lets each held call of the Stream `id` go on.
     pub fn release_stream(&self, id: &str) {
         self.state.lock().held_streams.remove(id);
         self.released.send_modify(|count| *count += 1);
@@ -103,6 +132,34 @@ impl MemoryStore {
     /// Makes the next `times` calls of `op` write, and then fail with `StoreUnavailable`.
     pub fn lose_answers(&self, op: Op, times: usize) {
         self.state.lock().lost_answers.insert(op, times);
+    }
+
+    /// Makes each read that arrives while `on` is true wait for [`Self::let_go`], so that a test
+    /// decides the order in which reads of one Stream end.
+    pub fn gate_reads(&self, on: bool) {
+        self.state.lock().gating = on;
+    }
+
+    /// Lets the reads at the places `reads` of [`Self::requests`] pass the gate.
+    pub fn let_go(&self, reads: std::ops::Range<usize>) {
+        (self.state.lock().gated).retain(|at| !reads.contains(at));
+        self.released.send_modify(|count| *count += 1);
+    }
+
+    /// Makes each read keep its thread until [`Self::unblock`], as a Store with a client that
+    /// blocks does.
+    pub fn block_reads(&self) {
+        self.state.lock().blocking = true;
+    }
+
+    pub fn unblock(&self) {
+        self.state.lock().blocking = false;
+        self.unblocked.notify_all();
+    }
+
+    /// Returns the number of reads that passed the gate.
+    pub fn reads_let_go(&self) -> usize {
+        self.state.lock().let_go
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -119,18 +176,57 @@ impl MemoryStore {
             .unwrap_or_default()
     }
 
+    /// Removes the Stream `id`, as its Retention does, so that a replay finds its Records gone.
+    pub fn forget(&self, id: &str) {
+        self.state.lock().streams.remove(id);
+    }
+
+    /// Returns the reads that the Store got.
+    pub fn reads(&self) -> Vec<ReadRecordsRequest> {
+        (self.requests().into_iter())
+            .filter_map(|request| match request {
+                Request::Read(read) => Some(read),
+                Request::Append(..) => None,
+            })
+            .collect()
+    }
+
     /// Takes the request, and then holds or fails it as the faults say.
     async fn arrive(&self, op: Op, request: Request) -> Result<(), AnyError> {
-        let Request::Append(append, _) = &request;
-        let id = append.stream_id.clone();
+        let id = match &request {
+            Request::Append(append, _) => append.stream_id.clone(),
+            Request::Read(read) => read.stream_id.clone(),
+        };
         let mut released = self.released.subscribe();
-        let held = {
+        let (held, gated) = {
             let mut state = self.state.lock();
             state.requests.push(request);
-            state.held.contains(&op)
+            let at = state.requests.len() - 1;
+            let gated = (state.gating && op == Op::Read).then_some(at);
+            state.gated.extend(gated);
+            (state.held.contains(&op), gated)
         };
         if held {
-            let _ = released.changed().await;
+            loop {
+                {
+                    let mut state = self.state.lock();
+                    if !state.held.contains(&op) {
+                        break;
+                    }
+                    let passes = state.passes.entry(op).or_default();
+                    if *passes > 0 {
+                        *passes -= 1;
+                        break;
+                    }
+                }
+                let _ = released.changed().await;
+            }
+        }
+        if let Some(at) = gated {
+            while self.state.lock().gated.contains(&at) {
+                let _ = released.changed().await;
+            }
+            self.state.lock().let_go += 1;
         }
         while self.state.lock().held_streams.contains(&id) {
             let _ = released.changed().await;
@@ -250,15 +346,53 @@ impl StreamStore for MemoryStore {
             let arrived = Request::Append(request.clone(), request_id.clone());
             self.arrive(Op::Append, arrived).await?;
             let appended = self.state.lock().append(request, request_id);
+            self.written.send_modify(|count| *count += 1);
             self.answer(Op::Append, appended)
         })
     }
 
     fn read_records(
         &self,
-        _: ReadRecordsRequest,
+        request: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
-        unimplemented!("No test reads this Store")
+        Box::pin(async move {
+            self.arrive(Op::Read, Request::Read(request.clone()))
+                .await?;
+            {
+                let mut state = self.state.lock();
+                while state.blocking {
+                    self.unblocked.wait(&mut state);
+                }
+            }
+            let wait = (request.wait).map_or(Duration::ZERO, |wait| wait.try_into().unwrap());
+            let until = tokio::time::Instant::now() + wait;
+            let mut written = self.written.subscribe();
+            loop {
+                let page = {
+                    let state = self.state.lock();
+                    let stream = state.streams.get(&request.stream_id);
+                    let reason = ReadReason::NotFound;
+                    let stream = stream.ok_or_else(|| ReadError::operation(reason, NOT_CREATED))?;
+                    let records: Vec<StreamRecord> = (stream.records.iter())
+                        .filter(|record| record.offset > request.from_offset)
+                        .take(request.max_records.max(1) as usize)
+                        .cloned()
+                        .collect();
+                    ReadRecordsResponse {
+                        last_offset: (records.last())
+                            .map_or(request.from_offset.clone(), |r| r.offset.clone()),
+                        records,
+                    }
+                };
+                if !page.records.is_empty() {
+                    return Ok(page);
+                }
+                let changed = tokio::time::timeout_at(until, written.changed()).await;
+                if changed.is_err() {
+                    return Ok(page);
+                }
+            }
+        })
     }
 
     fn describe_stream(

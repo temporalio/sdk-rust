@@ -5,8 +5,8 @@ use crate::{
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
-        streams::Streams,
-        wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
+        streams::{ReplayReader, ReplayReads, StreamRecordsReq, Streams},
+        wft_extraction::{FetchedPage, HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
         *,
     },
 };
@@ -33,9 +33,12 @@ pub(super) struct WFStream {
     /// Is filled with runs that we decided need to have their history fetched during state
     /// manipulation. Must be drained after handling each input.
     runs_needing_fetching: VecDeque<HistoryFetchReq>,
+    /// The reads of Stream Records that replays need. Must be drained after handling each input.
+    stream_records_reads: VecDeque<StreamRecordsReq>,
 
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
+    worker_config: Arc<WorkerConfig>,
 
     metrics: MetricsContext,
 }
@@ -90,6 +93,7 @@ impl WFStream {
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
+            worker_config: basics.worker_config.clone(),
             runs: RunCache::new(
                 basics.worker_config.clone(),
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
@@ -101,6 +105,7 @@ impl WFStream {
             shutdown_token: basics.shutdown_token,
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
+            stream_records_reads: Default::default(),
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
         };
         all_inputs
@@ -142,6 +147,10 @@ impl WFStream {
                             LocalInputs::HeartbeatTimeout(hbt) => {
                                 state.process_heartbeat_timeout(hbt)
                             }
+                            LocalInputs::ReadLimit(run_id, generation) => state
+                                .runs
+                                .get_mut(&run_id)
+                                .and_then(|rh| rh.read_limit_reached(generation)),
                             LocalInputs::LocalActivityCancelProcessed(run_id) => state
                                 .runs
                                 .get_mut(&run_id)
@@ -224,6 +233,7 @@ impl WFStream {
                 Ok(WFStreamOutput {
                     actions: actions.into(),
                     fetch_histories: std::mem::take(&mut state.runs_needing_fetching),
+                    read_stream_records: std::mem::take(&mut state.stream_records_reads),
                 })
             })
             .inspect(|o| {
@@ -256,11 +266,13 @@ impl WFStream {
 
     fn _instantiate_or_update(
         &mut self,
-        pwft: PermittedWFT,
+        mut pwft: PermittedWFT,
     ) -> Result<RunUpdateAct, HistoryFetchReq> {
         // If the run already exists, possibly buffer the work and return early if we can't handle
         // it yet.
-        let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
+        let mut pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
+            // The task read Records for a new run, if no run existed when it came.
+            ReplayReader::forget(&mut pwft.paginator, &mut pwft.work.update);
             if rh.stream_work_is_stale_for(&pwft.work) {
                 return Ok(rh.evict_for_stale_stream_work(pwft));
             }
@@ -293,6 +305,14 @@ impl WFStream {
                 self.history_fetch_refcounter.clone(),
             ));
         }
+        // A run new to the cache replays its History, so it first reads the Records of its read
+        // markers.
+        if !self.runs.has_run(&run_id) && ReplayReads::needed_by(&pwft.work.update) {
+            ReplayReader::add_to(&mut pwft.paginator, &self.worker_config);
+            let rc = self.history_fetch_refcounter.clone();
+            (self.stream_records_reads).push_back(StreamRecordsReq::NewRun(Box::new(pwft), rc));
+            return Ok(None);
+        }
 
         let rur = self.runs.instantiate_or_update(pwft);
         Ok(rur)
@@ -306,6 +326,16 @@ impl WFStream {
             dbg_panic!("Run missing during completion {:?}", complete);
             return vec![];
         };
+        let mut fetch_page = |npr: Box<NextPageReq>| {
+            let rc = self.history_fetch_refcounter.clone();
+            // A replay first reads the Records that its next task needs, and then more History.
+            if ReplayReader::has_unread_in(&npr.paginator) {
+                (self.stream_records_reads).push_back(StreamRecordsReq::NextPart(npr, rc));
+            } else {
+                (self.runs_needing_fetching).push_back(HistoryFetchReq::NextPage(npr, rc));
+            }
+            None
+        };
         let mut acts: Vec<_> = match complete {
             NewOrFetchedComplete::New(complete) => match complete.completion {
                 ValidatedCompletion::Success {
@@ -313,23 +343,15 @@ impl WFStream {
                     used_flags,
                     versioning_behavior,
                     ..
-                } => match rh.successful_completion(
-                    commands,
-                    used_flags,
-                    versioning_behavior,
-                    complete.response_tx,
-                    false,
-                ) {
-                    Ok(acts) => acts,
-                    Err(npr) => {
-                        self.runs_needing_fetching
-                            .push_back(HistoryFetchReq::NextPage(
-                                npr,
-                                self.history_fetch_refcounter.clone(),
-                            ));
-                        None
-                    }
-                },
+                } => rh
+                    .successful_completion(
+                        commands,
+                        used_flags,
+                        versioning_behavior,
+                        complete.response_tx,
+                        false,
+                    )
+                    .unwrap_or_else(&mut fetch_page),
                 ValidatedCompletion::Fail {
                     failure,
                     is_autocomplete,
@@ -353,9 +375,9 @@ impl WFStream {
                     )
                 }
             },
-            NewOrFetchedComplete::Fetched(update, paginator) => {
-                rh.fetched_page_completion(update, *paginator)
-            }
+            NewOrFetchedComplete::Fetched(update, paginator) => rh
+                .fetched_page_completion(update, *paginator)
+                .unwrap_or_else(&mut fetch_page),
         }
         .into_iter()
         .collect();
@@ -692,12 +714,14 @@ pub(super) enum LocalInputs {
     Completion(WFActCompleteMsg),
     FetchedPageCompletion {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        update: FetchedPage,
     },
     LocalResolution(LocalResolutionMsg),
     PostActivation(Box<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
+    /// The read limit of the run's task came, at the timer of that task.
+    ReadLimit(String, u64),
     /// A queued cancel was handed to lang, so the run may be ready to evict
     #[from(ignore)]
     LocalActivityCancelProcessed(String),
@@ -713,6 +737,7 @@ impl LocalInputs {
             LocalInputs::PostActivation(pa) => &pa.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(run_id)
+            | LocalInputs::ReadLimit(run_id, _)
             | LocalInputs::LocalActivityCancelProcessed(run_id) => run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })
@@ -727,7 +752,7 @@ enum ExternalPollerInputs {
     FetchedUpdate(PermittedWFT),
     NextPage {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        update: FetchedPage,
         span: Span,
     },
     FailedFetch {
@@ -797,7 +822,7 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
 #[derive(Debug)]
 enum NewOrFetchedComplete {
     New(Box<WFActCompleteMsg>),
-    Fetched(HistoryUpdate, Box<HistoryPaginator>),
+    Fetched(FetchedPage, Box<HistoryPaginator>),
 }
 impl NewOrFetchedComplete {
     fn run_id(&self) -> &str {

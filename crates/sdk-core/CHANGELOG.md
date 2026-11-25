@@ -52,6 +52,27 @@ relevant information.
   Local Activity. If a call is waiting to try again at the task's heartbeat, because a try failed
   with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
   message starts with `StreamStoreUnavailable:`.
+* [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. A
+  read gives one page, which is one answer of the Store, in a `ResolveStreamRead` job. The page has
+  the Records that the Store has at once. A read with no Record waits up to its `wait`, but at most
+  to the read limit of its task, and then gives a page with no Record whose new `wait_cut` says if
+  the limit cut the wait. The new `StreamSettings::read_time` sets that limit, which is half the
+  Workflow Task timeout by default, from the end of a replay. Before a task completes, each read
+  with no answer in it gets one Store call with no wait, within the new
+  `StreamSettings::read_check_deadline`. Its Records come in the task, or first in the next task if
+  the task has a command. With no Record a read with a `wait` starts again in the next task, so an
+  idle Stream makes no new task. Core asks for a new task only if it knows that the Stream has
+  Records for an open read. A Store outage at a read fails the Workflow Task with a message that
+  starts with `StreamStoreUnavailable:`, as for an append. A task gives at most 16 MiB of Records,
+  and starts no new read once it gave the new `StreamSettings::max_task_read_results` results.
+  Each activation that gives pages records their offsets, their count and a digest of their
+  Records in a `core_stream_read` marker. A replay, also the replay for a query of a closed
+  Workflow, reads the Records from the Store again, with `StreamSettings::replay_concurrency` reads
+  at a time, for at most `StreamSettings::replay_read_runs` runs of the Worker at a time. It tries a
+  Store in an outage for at most `StreamSettings::replay_retry_bound`. So the Retention of a Stream
+  must cover the life of each Workflow that reads it and the time in which that Workflow gets
+  queries. A replay whose Store lost the Records fails with the new
+  `WorkflowErrorType::StreamReplay`.
 
 ## [0.12.0] - 2026-11-23
 

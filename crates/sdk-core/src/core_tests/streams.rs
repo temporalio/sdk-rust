@@ -917,7 +917,10 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
 /// Returns the Stream of each call that reached the Store, once for each call.
 fn calls_at(store: &MemoryStore) -> Vec<String> {
     let mut calls: Vec<String> = (store.requests().into_iter())
-        .map(|Request::Append(append, _)| append.stream_id)
+        .filter_map(|request| match request {
+            Request::Append(append, _) => Some(append.stream_id),
+            Request::Read(_) => None,
+        })
         .collect();
     calls.sort();
     calls.dedup();
@@ -933,6 +936,7 @@ fn fast_tries(wc: &mut WorkerConfig) {
         retry_initial_interval: Duration::from_millis(10),
         retry_max_interval: Duration::from_millis(20),
         try_deadline: Duration::from_millis(50),
+        ..Default::default()
     };
 }
 
@@ -1304,7 +1308,10 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     assert_eq!(writers(&store, "s"), expected);
     // A request id is unique to one append call, and the append of a later attempt is another call.
     let mut attempts = HashMap::new();
-    for Request::Append(append, request_id) in store.requests() {
+    for request in store.requests() {
+        let Request::Append(append, request_id) = request else {
+            continue;
+        };
         let (_, task, attempt) = writer(append.producer);
         let first = *attempts.entry(request_id).or_insert((task, attempt));
         assert_eq!(first, (task, attempt), "{earlier:?}");
