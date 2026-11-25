@@ -129,16 +129,17 @@ use temporalio_common::telemetry::OtelCollectorOptions;
 use temporalio_sdk_aws_lambda::otel::LambdaOpenTelemetryOptions;
 
 # fn options() -> Result<LambdaOpenTelemetryOptions, lambda_runtime::Error> {
-let mut options = LambdaOpenTelemetryOptions::default();
-options.metrics = Some(OtelCollectorOptions::builder()
-    .url(Url::parse("http://metrics-collector:4317")?)
-    .export_timeout(Duration::from_secs(1))
-    .build());
-options.span_exporter = Some(SpanExporter::builder()
-    .with_tonic()
-    .with_endpoint("http://trace-collector:4317")
-    .with_timeout(Duration::from_secs(1))
-    .build()?);
+let options = LambdaOpenTelemetryOptions::builder()
+    .metrics(OtelCollectorOptions::builder()
+        .url(Url::parse("http://metrics-collector:4317")?)
+        .export_timeout(Duration::from_secs(1))
+        .build())
+    .span_exporter(SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint("http://trace-collector:4317")
+        .with_timeout(Duration::from_secs(1))
+        .build()?)
+    .build();
 # Ok(options)
 # }
 ```

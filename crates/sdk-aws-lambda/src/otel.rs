@@ -28,7 +28,7 @@ const DEFAULT_ENDPOINT: &str = "http://localhost:4317";
 const DEFAULT_SERVICE_NAME: &str = "temporal-lambda-worker";
 
 /// Lambda telemetry setup using the shared metric options and an independent span exporter.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
 #[non_exhaustive]
 pub struct LambdaOpenTelemetryOptions {
     /// Metric exporter configuration, passed to [`build_otlp_metric_exporter`].
