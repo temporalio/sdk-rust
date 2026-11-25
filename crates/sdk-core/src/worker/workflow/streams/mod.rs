@@ -12,6 +12,8 @@ mod test_store;
 
 pub(crate) use calls::{Phase, StreamCalls, is_stream_replay_failure, set_replay_failure_type};
 pub(crate) use manager::{StreamManager, StreamResolution};
+#[cfg(test)]
+pub(crate) use marker::peeked_read_marker;
 pub(crate) use marker::{PeekedMarker, is_stream_marker, marker_details, peeked_marker};
 pub(super) use replay::StreamRecordsReq;
 pub(crate) use replay::{MarkerReads, ReplayReader, ReplayReads};
