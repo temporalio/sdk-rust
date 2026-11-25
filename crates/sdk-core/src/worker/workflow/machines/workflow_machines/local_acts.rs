@@ -132,10 +132,6 @@ impl LocalActivityData {
             .is_some_and(|group| group > self.activation_index)
     }
 
-    pub(super) fn has_executing_or_preresolutions(&self) -> bool {
-        !self.executing.is_empty() || !self.preresolutions.is_empty()
-    }
-
     pub(super) fn wft_applied(&mut self) {
         self.activation_index = 0;
     }

@@ -110,10 +110,36 @@ fn lang(act: &WorkflowActivation) -> Vec<workflow_command::Variant> {
     cmds
 }
 
+/// Like [lang], but once the signal is acknowledged it records progress only if history is still
+/// shorter than the next workflow task's started event, and starts a timer otherwise, as a workflow
+/// branching on its current history length would.
+fn lang_reading_history_length(act: &WorkflowActivation) -> Vec<workflow_command::Variant> {
+    let mut cmds = lang(act);
+    if act.history_length >= NEXT_WFT_STARTED_ID {
+        for cmd in &mut cmds {
+            if matches!(cmd, workflow_command::Variant::ModifyWorkflowProperties(_)) {
+                *cmd = StartTimer {
+                    seq: 2,
+                    start_to_fire_timeout: Some(prost_dur!(from_secs(60))),
+                }
+                .into();
+            }
+        }
+    }
+    cmds
+}
+
+/// The started event id of the next workflow task when no signal precedes it.
+const NEXT_WFT_STARTED_ID: u32 = 8;
+
+type Lang = fn(&WorkflowActivation) -> Vec<workflow_command::Variant>;
+
 #[derive(Default)]
 struct Observed {
     /// Job names of every activation, in order, including evictions.
     activations: Vec<Vec<String>>,
+    /// History length of every activation delivering the signal acknowledgement.
+    ack_history_lengths: Vec<u32>,
     completions: Vec<(Vec<Command>, Vec<ProtocolMessage>)>,
     wft_failures: Vec<String>,
     legacy_query_responses: usize,
@@ -162,7 +188,11 @@ impl Server {
 /// Each task is delivered only after the mocked server has answered the previous one when its
 /// flag is set, so legacy queries and workflow tasks reach the worker in the order a server that
 /// had already received the prior completion would hand them out.
-async fn run(tasks: Vec<(bool, PollWorkflowTaskQueueResponse)>, cache: usize) -> Observed {
+async fn run(
+    tasks: Vec<(bool, PollWorkflowTaskQueueResponse)>,
+    cache: usize,
+    lang: Lang,
+) -> Observed {
     let server = Server {
         obs: Arc::new(Mutex::new(Observed::default())),
         answered: Arc::new(Notify::new()),
@@ -241,7 +271,13 @@ async fn run(tasks: Vec<(bool, PollWorkflowTaskQueueResponse)>, cache: usize) ->
         } else {
             WorkflowActivationCompletion::from_cmds(act.run_id.clone(), lang(&act))
         };
-        server.obs.lock().unwrap().activations.push(jobs);
+        {
+            let mut obs = server.obs.lock().unwrap();
+            if jobs.iter().any(|j| j == "ResolveSignalExternal") {
+                obs.ack_history_lengths.push(act.history_length);
+            }
+            obs.activations.push(jobs);
+        }
         core.complete_workflow_activation(completion).await.unwrap();
     }
     core.drain_pollers_and_shutdown().await;
@@ -250,6 +286,25 @@ async fn run(tasks: Vec<(bool, PollWorkflowTaskQueueResponse)>, cache: usize) ->
 
 fn poll(t: &TestHistoryBuilder) -> PollWorkflowTaskQueueResponse {
     hist_to_poll_resp(t, WFID, ResponseType::AllHistory).resp
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Queries {
+    /// One legacy query dispatched before the acknowledgement, so preparing it runs no workflow
+    /// code.
+    BeforeAck,
+    /// This many legacy queries dispatched after the acknowledgement, each preparing one that
+    /// advances the workflow.
+    Advancing(usize),
+}
+
+impl Queries {
+    fn count(self) -> usize {
+        match self {
+            Queries::BeforeAck => 1,
+            Queries::Advancing(n) => n,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -264,9 +319,9 @@ enum NextWft {
 
 /// History: 1 started, 2-4 WFT1, 5 signal initiated, 6 signal acknowledged, 7 WFT2 scheduled, then
 /// optional signals and WFT2 started. Each legacy query is dispatched with the history up to that
-/// point, after WFT1 completed, so the first one already sees the acknowledgement.
+/// point, after WFT1 completed.
 fn scenario(
-    advancing_queries: usize,
+    queries: Queries,
     next: NextWft,
 ) -> (
     Vec<(bool, PollWorkflowTaskQueueResponse)>,
@@ -283,22 +338,30 @@ fn scenario(
         t.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
     }
     let initiated = t.add_signal_wf("wake", "signal-target", "");
-    t.add_external_signal_completed(initiated);
-    t.add_workflow_task_scheduled();
-    for i in 0..advancing_queries {
-        if i > 0 {
-            t.add_we_signaled("poke", vec![]);
-        }
-        // A non-sticky legacy query carries the full history read when it is dispatched, with no
-        // started event of its own and the last started workflow task as the previous one.
-        let mut query = poll(&t);
+    // A non-sticky legacy query carries the full history read when it is dispatched, with no
+    // started event of its own and the last started workflow task as the previous one.
+    let legacy_query = |t: &TestHistoryBuilder| {
+        let mut query = poll(t);
         query.query = Some(WorkflowQuery {
             query_type: "progress".to_owned(),
             ..Default::default()
         });
         query.started_event_id = 0;
         query.previous_started_event_id = 3;
-        tasks.push((true, query));
+        (true, query)
+    };
+    if queries == Queries::BeforeAck {
+        tasks.push(legacy_query(&t));
+    }
+    t.add_external_signal_completed(initiated);
+    t.add_workflow_task_scheduled();
+    if let Queries::Advancing(n) = queries {
+        for i in 0..n {
+            if i > 0 {
+                t.add_we_signaled("poke", vec![]);
+            }
+            tasks.push(legacy_query(&t));
+        }
     }
     if next == NextWft::Signal {
         t.add_we_signaled("poke", vec![]);
@@ -351,28 +414,30 @@ fn commit(t: &mut TestHistoryBuilder, commands: &[Command], messages: &[Protocol
 
 /// Runs the scenario on a cached worker, commits what the worker reported for the second workflow
 /// task, and replays the result on a fresh worker.
-async fn live_then_replay(advancing_queries: usize, next: NextWft) -> (Observed, Observed) {
-    let (tasks, mut history) = scenario(advancing_queries, next);
-    let live = run(tasks, 1).await;
+async fn live_then_replay(queries: Queries, next: NextWft, lang: Lang) -> (Observed, Observed) {
+    let (tasks, mut history) = scenario(queries, next);
+    let live = run(tasks, 1, lang).await;
     assert_eq!(live.wft_failures, Vec::<String>::new());
     assert_eq!(live.completions.len(), 2);
-    assert_eq!(live.legacy_query_responses, advancing_queries);
-    let memos = live
+    assert_eq!(live.legacy_query_responses, queries.count());
+    let progress = live
         .completions
         .iter()
         .flat_map(|(cmds, _)| cmds)
-        .filter(|c| {
-            matches!(
-                c.attributes,
-                Some(CmdAttrs::ModifyWorkflowPropertiesCommandAttributes(_))
-            )
+        .filter(|c| match &c.attributes {
+            Some(CmdAttrs::ModifyWorkflowPropertiesCommandAttributes(_)) => true,
+            Some(CmdAttrs::StartTimerCommandAttributes(a)) => a.timer_id == "2",
+            _ => false,
         })
         .count();
-    assert_eq!(memos, 1, "workflow progress must be committed exactly once");
+    assert_eq!(
+        progress, 1,
+        "workflow progress must be committed exactly once"
+    );
 
     let (cmds, msgs) = &live.completions[1];
     commit(&mut history, cmds, msgs);
-    let replay = run(vec![(false, poll(&history))], 1).await;
+    let replay = run(vec![(false, poll(&history))], 1, lang).await;
     assert!(
         replay.wft_failures.is_empty(),
         "committed history must replay: {:?}\nlive activations: {:?}\nreplay activations: {:?}",
@@ -388,7 +453,7 @@ async fn live_then_replay(advancing_queries: usize, next: NextWft) -> (Observed,
 /// does on replay, so the run is rebuilt before the update is delivered (exactly once).
 #[tokio::test]
 async fn update_after_query_advanced_workflow_commits_replayable_history() {
-    let (live, _) = live_then_replay(1, NextWft::Update).await;
+    let (live, _) = live_then_replay(Queries::Advancing(1), NextWft::Update, lang).await;
     assert_eq!(live.count("Evict"), 1);
     assert!(live.position("Evict") < live.position("DoUpdate"));
     assert_eq!(live.count("DoUpdate"), 1);
@@ -399,23 +464,51 @@ async fn update_after_query_advanced_workflow_commits_replayable_history() {
 /// Same as above, but the next task brings new work through history instead of a message.
 #[tokio::test]
 async fn signal_after_query_advanced_workflow_commits_replayable_history() {
-    let (live, _) = live_then_replay(1, NextWft::Signal).await;
+    let (live, _) = live_then_replay(Queries::Advancing(1), NextWft::Signal, lang).await;
     assert_eq!(live.count("Evict"), 1);
     assert!(live.position("Evict") < live.position("Signal"));
 }
 
-/// When the next task adds nothing that replay would group with the query's work, the cached run
-/// is reused rather than rebuilt.
+/// Even when the next task adds no work of its own, the run is rebuilt rather than reused: what
+/// workflow code observed during the query, such as the history length, need not match replay.
 #[tokio::test]
-async fn task_without_new_work_after_query_advanced_workflow_reuses_run() {
-    let (live, _) = live_then_replay(1, NextWft::NothingNew).await;
-    assert_eq!(live.count("Evict"), 0);
+async fn task_without_new_work_after_query_advanced_workflow_rebuilds_run() {
+    let (live, _) = live_then_replay(Queries::Advancing(1), NextWft::NothingNew, lang).await;
+    assert_eq!(live.count("Evict"), 1);
+}
+
+/// Preparing the query delivered the acknowledgement at history length 7, but replay delivers it
+/// at 8, after the next task's started event. A workflow branching on its history length would
+/// commit a decision replay cannot reproduce if the run were reused.
+#[tokio::test]
+async fn history_length_seen_while_preparing_query_is_not_committed() {
+    let (live, replay) = live_then_replay(
+        Queries::Advancing(1),
+        NextWft::NothingNew,
+        lang_reading_history_length,
+    )
+    .await;
+    assert_eq!(live.count("Evict"), 1);
+    assert_eq!(
+        live.ack_history_lengths,
+        [NEXT_WFT_STARTED_ID - 1, NEXT_WFT_STARTED_ID]
+    );
+    assert_eq!(replay.ack_history_lengths, [NEXT_WFT_STARTED_ID]);
 }
 
 /// Two queries each advanced the workflow in their own activation, while replay runs that work in
 /// a single activation, so the run must be rebuilt even though the next task adds nothing.
 #[tokio::test]
 async fn task_after_two_queries_advanced_workflow_commits_replayable_history() {
-    let (live, _) = live_then_replay(2, NextWft::NothingNew).await;
+    let (live, _) = live_then_replay(Queries::Advancing(2), NextWft::NothingNew, lang).await;
     assert_eq!(live.count("Evict"), 1);
+}
+
+/// A legacy query whose history holds nothing new runs no workflow code, so the cached run keeps
+/// serving the next task.
+#[tokio::test]
+async fn query_that_runs_no_workflow_code_keeps_cached_run() {
+    let (live, _) = live_then_replay(Queries::BeforeAck, NextWft::NothingNew, lang).await;
+    assert_eq!(live.count("Evict"), 0);
+    assert!(live.position("Query") < live.position("ResolveSignalExternal"));
 }

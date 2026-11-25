@@ -125,8 +125,8 @@ pub(crate) struct WorkflowMachines {
     /// side effects, like dispatching LA requests.
     preparing_legacy_query: bool,
     /// Set when preparing a legacy query applied events newer than the last started workflow task.
-    /// Workflow code reacting to those events has no task to commit its effects in, so a cached run
-    /// carrying them would later split one replay activation into two.
+    /// Workflow code reacting to those events runs at a point no workflow task records, which
+    /// replay cannot reproduce.
     legacy_query_applied_uncommitted_events: bool,
     /// Rejection-only tasks can be discarded, so they must not release LAs waiting on replay.
     update_only_task: bool,
@@ -435,10 +435,6 @@ impl WorkflowMachines {
             .take_all_reqs(&self.workflow_type, &self.workflow_id, &self.run_id)
     }
 
-    pub(crate) fn has_executing_or_preresolved_local_activities(&self) -> bool {
-        self.local_activity_data.has_executing_or_preresolutions()
-    }
-
     /// Returns the number of local activities we know we need to execute but have not yet finished
     pub(crate) fn outstanding_local_activity_count(&self) -> usize {
         self.local_activity_data.outstanding_la_count()
@@ -630,12 +626,6 @@ impl WorkflowMachines {
                     workflow_activation_job::Variant::NotifyHasPatch(_)
                 )
         })
-    }
-
-    /// Unlike [Self::activation_needed], counts jobs that are only patch notifications too, which
-    /// unchunked replay leaves queued without activating lang.
-    pub(crate) fn has_pending_jobs(&self) -> bool {
-        !self.drive_me.peek_pending_jobs().is_empty()
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {

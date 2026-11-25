@@ -40,7 +40,7 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        enums::v1::{EventType, VersioningBehavior, WorkflowTaskFailedCause},
+        enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
@@ -91,11 +91,11 @@ pub(super) struct ManagedRun {
     task_buffer: BufferedTasks,
     /// Is set if an eviction has been requested for this run
     trying_to_evict: Option<RequestEvictMsg>,
-    /// Counts activations in which lang ran workflow code against history a legacy query was
-    /// prepared with, since the last workflow task this run applied. Their effects are not yet
-    /// committed, so the next workflow task may only reuse this run if replay would group the
-    /// same work into the same activation.
-    legacy_query_effect_activations: u32,
+    /// Set once lang has run workflow code against history a legacy query was prepared with. That
+    /// code ran at a point no workflow task records, so neither its commands nor what it observed
+    /// (jobs, history length, time) can be reproduced by replay, and the run must not be reused
+    /// for the next workflow task.
+    legacy_query_ran_workflow_code: bool,
 
     /// We track if we have recorded useful debugging values onto a certain span yet, to overcome
     /// duplicating field values. Remove this once https://github.com/tokio-rs/tracing/issues/2334
@@ -125,7 +125,7 @@ impl ManagedRun {
             activation: None,
             task_buffer: Default::default(),
             trying_to_evict: None,
-            legacy_query_effect_activations: 0,
+            legacy_query_ran_workflow_code: false,
             recorded_span_ids: Default::default(),
             metrics,
             paginator: None,
@@ -186,15 +186,10 @@ impl ManagedRun {
         if self.wft.is_some() {
             dbg_panic!("Trying to send a new WFT for a run which already has one!");
         }
-        // Applying a real workflow task on top of workflow code that ran for a legacy query can
-        // commit an activation boundary that replay cannot reproduce. Unless the task provably
-        // adds no work of its own, hand it to a fresh run.
-        if self.legacy_query_effect_activations > 0 && pwft.work.legacy_query.is_none() {
-            if self.can_reuse_after_legacy_query_effects(&pwft) {
-                self.legacy_query_effect_activations = 0;
-            } else {
-                return Ok(self.evict_for_legacy_query_effects(pwft));
-            }
+        // Applying a real workflow task on top of workflow code that ran for a legacy query would
+        // commit decisions made at a point replay cannot reproduce, so hand it to a fresh run.
+        if self.legacy_query_ran_workflow_code && pwft.work.legacy_query.is_none() {
+            return Ok(self.evict_for_legacy_query_effects(pwft));
         }
         let start_time = Instant::now();
 
@@ -1003,48 +998,6 @@ impl ManagedRun {
         self.task_buffer.has_tasks()
     }
 
-    /// True only when applying `pwft` to this run produces exactly the activations a cold replay
-    /// would: the uncommitted work came from a single activation and the task brings no new
-    /// work that replay would group into that same activation.
-    ///
-    /// Applying a task can only create jobs from history events past `last_processed_event`,
-    /// protocol messages, lookahead into the following task's events, local activity resolutions,
-    /// and jobs that are already pending. A live task has no following task to look ahead into,
-    /// and every other source is ruled out below, so any new source of jobs must be ruled out here
-    /// as well.
-    fn can_reuse_after_legacy_query_effects(&self, pwft: &PermittedWFT) -> bool {
-        // With two or more such activations, replay merges their work into one activation, which
-        // reusing this run can never reproduce.
-        if self.legacy_query_effect_activations != 1 {
-            return false;
-        }
-        let work = &pwft.work;
-        if !work.messages.is_empty() || !work.update.is_real() {
-            return false;
-        }
-        let processed = self.wfm.machines.last_processed_event;
-        let events = work.update.get_events();
-        if events.first().is_none_or(|e| e.event_id > processed + 1)
-            || !events
-                .iter()
-                .any(|e| e.event_id == work.update.wft_started_id)
-        {
-            return false;
-        }
-        let only_own_started_is_new = events.iter().filter(|e| e.event_id > processed).all(|e| {
-            e.event_id == work.update.wft_started_id
-                && e.event_type() == EventType::WorkflowTaskStarted
-        });
-        only_own_started_is_new
-            && !self.wfm.machines.has_pending_jobs()
-            && self.wfm.deferred_local_resolutions.is_empty()
-            && self.waiting_on_la.is_none()
-            && !self
-                .wfm
-                .machines
-                .has_executing_or_preresolved_local_activities()
-    }
-
     fn evict_for_legacy_query_effects(&mut self, pwft: PermittedWFT) -> Option<ActivationOrAuto> {
         self.task_buffer.buffer(pwft);
         if self.trying_to_evict.is_none() {
@@ -1288,7 +1241,7 @@ impl ManagedRun {
             && self.pending_work_is_legacy_query()
             && self.wfm.machines.legacy_query_applied_uncommitted_events()
         {
-            self.legacy_query_effect_activations += 1;
+            self.legacy_query_ran_workflow_code = true;
         }
         if let Some(old_act) = self.activation {
             // This is a panic because we have screwed up core logic if this is violated. It must be

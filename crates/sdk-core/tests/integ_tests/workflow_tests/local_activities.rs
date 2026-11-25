@@ -3294,46 +3294,51 @@ async fn legacy_query_must_not_execute_local_activity(
     mock.worker_cfg(|wc| wc.max_cached_workflows = usize::from(cached));
     let core = mock_worker(mock);
 
-    let activation = core.poll_workflow_activation().await.unwrap();
-    assert!(activation.is_replaying);
-    assert_matches!(
-        activation.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
-        }]
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-        activation.run_id,
-        schedule_activity_cmd(
-            1,
-            "task-queue",
-            "remote",
-            ProtoActivityCancellationType::TryCancel,
-            Duration::from_secs(60),
-            Duration::ZERO,
-        ),
-    ))
-    .await
-    .unwrap();
-    let activation = core.poll_workflow_activation().await.unwrap();
-    assert!(activation.is_replaying);
-    assert_matches!(
-        activation.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
-        }]
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-        activation.run_id,
-        schedule_local_activity_cmd(
-            2,
-            "local",
-            ProtoActivityCancellationType::TryCancel,
-            Duration::from_secs(60),
-        ),
-    ))
-    .await
-    .unwrap();
+    // Drives the workflow up to scheduling its local activity: a remote activity on start, then the
+    // local one once that resolves. The resolution is replayed only while preparing the query.
+    let run_until_local_activity_scheduled = async |resolution_replaying: bool| {
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert!(activation.is_replaying);
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            activation.run_id,
+            schedule_activity_cmd(
+                1,
+                "task-queue",
+                "remote",
+                ProtoActivityCancellationType::TryCancel,
+                Duration::from_secs(60),
+                Duration::ZERO,
+            ),
+        ))
+        .await
+        .unwrap();
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert_eq!(activation.is_replaying, resolution_replaying);
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            activation.run_id,
+            schedule_local_activity_cmd(
+                2,
+                "local",
+                ProtoActivityCancellationType::TryCancel,
+                Duration::from_secs(60),
+            ),
+        ))
+        .await
+        .unwrap();
+    };
+    run_until_local_activity_scheduled(true).await;
 
     // Dispatch must lose to query handling without relying on a timing window.
     let query_and_eviction = async {
@@ -3388,6 +3393,21 @@ async fn legacy_query_must_not_execute_local_activity(
             .unwrap();
         };
         let finish_workflow = async {
+            // Preparing the query ran workflow code on history no workflow task has committed, so
+            // the run is rebuilt from history before the workflow task is applied.
+            let activation = core.poll_workflow_activation().await.unwrap();
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
+                }]
+            );
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(
+                activation.run_id,
+            ))
+            .await
+            .unwrap();
+            run_until_local_activity_scheduled(false).await;
             let activation = core.poll_workflow_activation().await.unwrap();
             assert!(!activation.is_replaying);
             assert_matches!(

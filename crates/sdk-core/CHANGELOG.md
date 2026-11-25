@@ -50,10 +50,10 @@ relevant information.
 
 ### Fixed
 * When a legacy query runs workflow code on history no workflow task has committed yet, Core now
-  evicts and rebuilds the run before the next workflow task, unless that task brings no new work,
-  so it no longer commits history that fails replay with errors like `[TMPRL1100] Update machine
-  does not handle this event: WorkflowPropertiesModified`. Histories already recorded that way
-  still fail to replay.
+  evicts and rebuilds the run before the next workflow task, so it no longer commits history that
+  fails replay with errors like `[TMPRL1100] Update machine does not handle this event:
+  WorkflowPropertiesModified`. A local activity whose result was held for that task may run
+  again. Histories already recorded that way still fail to replay.
 * Nexus operations cancelled or timed out before starting retain their cancellation or timeout
   failure type even when the corresponding history event omits its failure.
 * A Nexus operation cancelled with the `ABANDON` cancellation type that later completes, fails, or
