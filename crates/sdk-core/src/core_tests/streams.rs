@@ -18,6 +18,7 @@ use crate::{
 };
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex;
+use prost::Message;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::{
     cell::Cell,
@@ -51,10 +52,14 @@ use temporalio_common::protos::{
     temporal::api::{
         command::v1::command::Attributes,
         common::v1::Payload,
-        enums::v1::{CommandType, WorkflowTaskFailedCause},
+        enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
         failure::v1::Failure,
-        history::v1::MarkerRecordedEventAttributes,
+        history::v1::{
+            MarkerRecordedEventAttributes, WorkflowExecutionUpdateAcceptedEventAttributes,
+            WorkflowExecutionUpdateCompletedEventAttributes,
+        },
         query::v1::WorkflowQuery,
+        update::v1::{Acceptance, Response as UpdateOutcome},
         workflowservice::v1::{
             PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
         },
@@ -377,6 +382,7 @@ fn appended(seq: u32, id: &str, offset: Vec<u8>, activation: u64) -> StreamAppen
 fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) {
     history.add_workflow_task_completed();
     let completed = history.current_event_id();
+    let mut accepted = HashMap::new();
     for command in &completion.commands {
         match command.attributes.as_ref() {
             Some(Attributes::RecordMarkerCommandAttributes(marker)) => {
@@ -402,10 +408,51 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(_)) => {
                 history.add_continued_as_new();
             }
-            // No test replays an Update.
-            Some(Attributes::ProtocolMessageCommandAttributes(_)) => {}
+            Some(Attributes::ProtocolMessageCommandAttributes(message)) => {
+                write_update(history, completion, &message.message_id, &mut accepted);
+            }
             other => panic!("The mock server can't write {other:?}"),
         }
+    }
+}
+
+/// Adds the event of the Update message `id` of `completion`, at the place of its command, as the
+/// server does. `accepted` has the event id of each Update that the completion accepted.
+fn write_update(
+    history: &mut TestHistoryBuilder,
+    completion: &WorkflowTaskCompletion,
+    id: &str,
+    accepted: &mut HashMap<String, i64>,
+) {
+    let message = (completion.messages.iter())
+        .find(|message| message.id == id)
+        .expect("A protocol message command has its message");
+    let instance = message.protocol_instance_id.clone();
+    let body = message.body.as_ref().unwrap();
+    let kind = body.type_url.rsplit('.').next().unwrap();
+    match kind {
+        "Acceptance" => {
+            let acceptance = Acceptance::decode(&body.value[..]).unwrap();
+            let event = history.add(WorkflowExecutionUpdateAcceptedEventAttributes {
+                protocol_instance_id: instance.clone(),
+                accepted_request_message_id: acceptance.accepted_request_message_id,
+                accepted_request_sequencing_event_id: acceptance
+                    .accepted_request_sequencing_event_id,
+                accepted_request: acceptance.accepted_request,
+            });
+            accepted.insert(instance, event);
+        }
+        "Response" => {
+            let response = UpdateOutcome::decode(&body.value[..]).unwrap();
+            let accepted_event_id = *(accepted.get(&instance))
+                .expect("The mock server can't write the result of an Update of an earlier task");
+            history.add(WorkflowExecutionUpdateCompletedEventAttributes {
+                meta: response.meta,
+                accepted_event_id,
+                outcome: response.outcome,
+            });
+        }
+        other => panic!("The mock server can't write the Update message {other}"),
     }
 }
 
@@ -1554,6 +1601,102 @@ async fn a_call_of_an_update_handler_runs_after_the_update_is_accepted(#[case] c
             .all(|completion| !completion.force_create_new_workflow_task)
     );
     run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+#[rstest::rstest]
+#[case::with_chunking(true)]
+#[case::with_no_chunking(false)]
+#[tokio::test]
+async fn an_update_whose_append_has_its_result_in_its_task_replays_as_its_first_run(
+    #[case] chunking: bool,
+) {
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    // The server answers task 1 with the task of an Update. Task 1 has no command, so with chunking
+    // on only the rule for an accepted Update keeps it apart from task 2.
+    opts.eager = Some(Box::new(|completion, t| {
+        if !completion.commands.is_empty() {
+            return None;
+        }
+        let mut task = next_task(t);
+        task.add_update_request("u", t.current_event_id() - 1);
+        Some(task)
+    }));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![],
+        Some(Job::DoUpdate(_)) => {
+            let accepted = update_response::Response::Accepted(());
+            vec![update_response(activation, accepted), append(1, "s")]
+        }
+        _ => {
+            let completed = UpdateResponse {
+                protocol_instance_id: "u".to_string(),
+                response: Some(update_response::Response::Completed(Payload::default())),
+            };
+            vec![completed.into(), complete()]
+        }
+    };
+    let live = run.drive(workflow).await;
+    let offset = store.records("s")[0].offset.clone();
+    let appended = ResolveStreamAppend {
+        seq: 1,
+        status: Some(resolve_stream_append::Status::Appended(StreamAppended {
+            first_offset: offset.clone(),
+            last_offset: offset.clone(),
+        })),
+    };
+    assert!(matches!(live[1][..], [Job::DoUpdate(_)]), "{live:?}");
+    assert_eq!(live[2], [Job::ResolveStreamAppend(appended)]);
+    // Task 2 accepts the Update, records the result of its append and completes it.
+    let sent = run.sent();
+    assert_eq!(sent.len(), 2);
+    let expected = StreamAppendMarkerData {
+        appends: vec![self::appended(1, "s", offset, 1)],
+    };
+    assert_eq!(markers(&sent[1]), [expected]);
+    let types = [
+        CommandType::ProtocolMessage,
+        CommandType::RecordMarker,
+        CommandType::ProtocolMessage,
+        CommandType::CompleteWorkflowExecution,
+    ];
+    assert_eq!(command_types(&sent[1]), types);
+    let events: Vec<EventType> = (run.history.lock().get_full_history_info().unwrap().events())
+        .iter()
+        .map(|event| event.event_type())
+        .collect();
+    let task = [
+        EventType::WorkflowTaskScheduled,
+        EventType::WorkflowTaskStarted,
+        EventType::WorkflowTaskCompleted,
+    ];
+    let expected = [
+        &[EventType::WorkflowExecutionStarted][..],
+        &task,
+        &task,
+        &[
+            EventType::WorkflowExecutionUpdateAccepted,
+            EventType::MarkerRecorded,
+            EventType::WorkflowExecutionUpdateCompleted,
+            EventType::WorkflowExecutionCompleted,
+        ],
+    ]
+    .concat();
+    assert_eq!(events, expected);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+
+    let writes = store.requests().len();
+    let mut replayed = run.replay_with(chunking, workflow).await;
+    // Only a live run asks lang to validate an Update.
+    for job in replayed.iter_mut().flatten() {
+        if let Job::DoUpdate(update) = job {
+            assert!(!update.run_validator);
+            update.run_validator = true;
+        }
+    }
+    assert_eq!(replayed, live);
+    assert_eq!(store.requests().len(), writes);
 }
 
 /// The kind of a call of a first run that [`replay_calls`] replays. In one activation the first
