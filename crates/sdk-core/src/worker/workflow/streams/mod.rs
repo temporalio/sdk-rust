@@ -209,3 +209,42 @@ pub(super) fn task_attempt(info: &WorkflowTaskInfo) -> WorkflowTaskAttempt {
         started_time: info.started_time.map(Into::into),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_settings_check_refuses_each_value_out_of_its_bounds() {
+        let settings = StreamSettings::default();
+        assert_eq!(settings.check(), Ok(()));
+        let first_at_max = StreamSettings {
+            retry_initial_interval: settings.retry_max_interval,
+            ..settings
+        };
+        assert_eq!(first_at_max.check(), Ok(()));
+        let retry = Err(
+            "The Stream setting `retry_initial_interval` must be more than 0 and at most \
+             `retry_max_interval`"
+                .to_string(),
+        );
+        let zero_first = StreamSettings {
+            retry_initial_interval: Duration::ZERO,
+            ..settings
+        };
+        assert_eq!(zero_first.check(), retry);
+        let first_above_max = StreamSettings {
+            retry_initial_interval: settings.retry_max_interval + Duration::from_millis(1),
+            ..settings
+        };
+        assert_eq!(first_above_max.check(), retry);
+        let zero_deadline = StreamSettings {
+            try_deadline: Duration::ZERO,
+            ..settings
+        };
+        assert_eq!(
+            zero_deadline.check(),
+            Err("The Stream setting `try_deadline` must be more than 0".to_string())
+        );
+    }
+}
