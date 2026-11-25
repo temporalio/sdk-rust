@@ -44,8 +44,8 @@ mod store;
 mod test_store;
 
 pub use error::{
-    AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
-    CreateReason, DescribeError, DescribeReason, ReadError, ReadReason, StreamError, WireReason,
+    AnyError, AnyReason, AppendError, AppendReason, CreateError, CreateReason, DescribeError,
+    DescribeReason, ReadError, ReadReason, StreamError, WireReason,
 };
 pub use runtime::StreamRuntime;
 pub use store::StreamStore;
@@ -54,7 +54,7 @@ pub use store::StreamStore;
 /// requests that [`StreamRuntime`] takes are in [`sdk`](crate::proto::sdk).
 pub mod proto {
     pub use temporalio_common::protos::temporal::api::{
-        enums::v1::{StreamErrorReason, StreamIdConflictPolicy, StreamStatus},
+        enums::v1::{StreamErrorReason, StreamIdConflictPolicy},
         stream::v1::*,
         streamservice::v1::*,
     };

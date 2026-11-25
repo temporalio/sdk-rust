@@ -1,11 +1,11 @@
 use crate::{
-    AppendError, CloseError, CreateError, DescribeError, ReadError, StreamRuntime, StreamStore,
+    AppendError, CreateError, DescribeError, ReadError, StreamRuntime, StreamStore,
     proto::{
         ActivityAttempt, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
-        CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
-        DescribeStreamRequest, DescribeStreamResponse, LocalActivityAttempt, LocalActivityProducer,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StandaloneActivityProducer,
-        WorkflowActivityProducer, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
+        LocalActivityAttempt, LocalActivityProducer, Producer, ReadRecordsRequest,
+        ReadRecordsResponse, StandaloneActivityProducer, WorkflowActivityProducer,
+        WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
     },
     record::StoreLimits,
 };
@@ -49,13 +49,6 @@ impl StreamStore for Scripted {
         _: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
         Box::pin(async move { Ok(self.answers.lock().page.clone()) })
-    }
-
-    fn close_stream(
-        &self,
-        _: CloseStreamRequest,
-    ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
-        Box::pin(async move { Ok(CloseStreamResponse {}) })
     }
 
     fn describe_stream(

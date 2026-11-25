@@ -1,11 +1,10 @@
 use crate::{
-    AnyReason, AppendError, CloseError, CreateError, DescribeError, ReadError, StreamError,
-    StreamStore,
-    ids::{validate_offset, validate_producer, validate_stream_id},
+    AnyReason, AppendError, CreateError, DescribeError, ReadError, StreamError, StreamStore,
+    ids::{validate_offset, validate_stream_id},
     proto::{
-        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
-        CreateStreamRequest, DescribeStreamRequest, DescribeStreamResponse, ReadRecordsRequest,
-        ReadRecordsResponse, StreamIdConflictPolicy, StreamStatus, sdk,
+        AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, DescribeStreamRequest,
+        DescribeStreamResponse, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy,
+        sdk,
     },
     record::{StoreLimits, field_len, producer_len, stored_len},
 };
@@ -41,7 +40,7 @@ impl StreamRuntime {
         Self { store, limits }
     }
 
-    /// Creates a Stream. If an open Stream already has the id, the create fails, or it returns
+    /// Creates a Stream. If a Stream already has the id, the create fails, or it returns
     /// `created` false with the `UseExisting` policy. Every try of one create passes the same
     /// `request_id`, so a retry after a lost response returns `created` true. The response has the
     /// ref of the request, since the Store gets only its id.
@@ -104,10 +103,10 @@ impl StreamRuntime {
 
     /// Reads one page of Records after `from_offset`. The Store gets `max_records` and `wait` as
     /// the caller set them, and a `max_records` of 0 leaves the page size to the Store. If the
-    /// Store returns more than the read asked for, the page is trimmed and is no longer `done`. The
-    /// first Record is always kept, so a read makes progress whenever the Store has something to
-    /// return. `max_bytes` counts each Record as the page encodes it, with the tag and the length
-    /// of its field. The runtime checks only the Records that are left after the trim.
+    /// Store returns more than the read asked for, the page is trimmed. The first Record is always
+    /// kept, so a read makes progress whenever the Store has something to return. `max_bytes`
+    /// counts each Record as the page encodes it, with the tag and the length of its field. The
+    /// runtime checks only the Records that are left after the trim.
     pub async fn read_records(
         &self,
         request: sdk::ReadRecordsRequest,
@@ -150,17 +149,7 @@ impl StreamRuntime {
         fit_page(page, &from_offset, max_records, max_bytes, max_record_bytes)
     }
 
-    /// Closes a Stream.
-    pub async fn close_stream(
-        &self,
-        request: CloseStreamRequest,
-    ) -> Result<CloseStreamResponse, CloseError> {
-        validate_ref(request.r#ref.as_ref())?;
-        validate_producer(request.producer.as_ref())?;
-        self.store.close_stream(request).await
-    }
-
-    /// Returns the status of a Stream, and the offset of its newest Record as `last_offset`.
+    /// Returns the offset of the newest Record of a Stream as `last_offset`.
     pub async fn describe_stream(
         &self,
         request: sdk::DescribeStreamRequest,
@@ -175,13 +164,6 @@ impl StreamRuntime {
             "The last offset from the Store",
             AnyReason::StoreCorrupt,
         )?;
-        // A newer Store may return a status that this build doesn't know. The caller decides what
-        // to do with it.
-        if described.status == StreamStatus::Unspecified as i32 {
-            return Err(StreamError::store_corrupt(
-                "The Store answered a describe with no status",
-            ));
-        }
         Ok(described)
     }
 }
@@ -214,7 +196,6 @@ fn fit_page(
     if keep < page.records.len() {
         page.records.truncate(keep);
         page.last_offset = page.records[keep - 1].offset.clone();
-        page.done = false;
     }
     let mut newest = from_offset;
     for (at, record) in page.records.iter().enumerate() {
@@ -328,13 +309,6 @@ mod tests {
         }
     }
 
-    fn valid_close() -> CloseStreamRequest {
-        CloseStreamRequest {
-            r#ref: stream_ref("s", "x"),
-            producer: Some(client()),
-        }
-    }
-
     fn valid_describe() -> sdk::DescribeStreamRequest {
         sdk::DescribeStreamRequest {
             r#ref: stream_ref("s", "x"),
@@ -345,7 +319,7 @@ mod tests {
         Some(prost_types::Duration { seconds, nanos: 0 })
     }
 
-    fn page(offsets: &[&str], last_offset: &str, done: bool) -> ReadRecordsResponse {
+    fn page(offsets: &[&str], last_offset: &str) -> ReadRecordsResponse {
         let record = |offset: &&str| StreamRecord {
             producer: Some(client()),
             body: Some(Payload::default()),
@@ -354,7 +328,6 @@ mod tests {
         ReadRecordsResponse {
             records: offsets.iter().map(record).collect(),
             last_offset: last_offset.as_bytes().to_vec(),
-            done,
         }
     }
 
@@ -397,15 +370,6 @@ mod tests {
             change(&mut request);
             runtime
                 .read_records(request)
-                .await
-                .map(drop)
-                .map_err(|e| e.to_string())
-        };
-        let close = async |change: fn(&mut CloseStreamRequest)| {
-            let mut request = valid_close();
-            change(&mut request);
-            runtime
-                .close_stream(request)
                 .await
                 .map(drop)
                 .map_err(|e| e.to_string())
@@ -469,11 +433,6 @@ mod tests {
                 read(|r| r.wait = seconds(-1)).await,
                 invalid("wait must be 0 or more"),
             ),
-            (close(|r| r.r#ref = None).await, no_id()),
-            (
-                close(|r| r.producer = None).await,
-                invalid("The request has no Producer"),
-            ),
             (describe(|r| r.r#ref = None).await, no_id()),
         ];
         for (result, error) in cases {
@@ -493,7 +452,7 @@ mod tests {
                 true => "z",
                 false => offsets[..count].last().copied().unwrap_or(""),
             };
-            let mut answer = page(&offsets[..count], last_offset, rng.random_bool(0.5));
+            let mut answer = page(&offsets[..count], last_offset);
             for record in &mut answer.records {
                 record.body.as_mut().unwrap().data = vec![0; rng.random_range(0..200)];
             }
@@ -529,7 +488,6 @@ mod tests {
             if keep < count {
                 expected.records.truncate(keep);
                 expected.last_offset = expected.records[keep - 1].offset.clone();
-                expected.done = false;
             }
             store.answers.lock().page = answer;
             let read = sdk::ReadRecordsRequest {
@@ -569,7 +527,7 @@ mod tests {
                           from_offset of the read";
         let incomplete = "The Store gave Record 1 with no Producer or no body";
         let broken = |change: fn(&mut StreamRecord)| {
-            let mut answer = page(&["a", "b"], "b", false);
+            let mut answer = page(&["a", "b"], "b");
             change(&mut answer.records[1]);
             answer
         };
@@ -580,11 +538,11 @@ mod tests {
         };
         let size = stored.encoded_len();
         let reads = [
-            ("", page(&["a", "b"], "b", false), None),
-            ("a", page(&["b"], "z", true), None),
-            ("m", page(&[], "m", false), None),
-            ("m", page(&[], "z", true), None),
-            ("", page(&[&longest], &longest, false), None),
+            ("", page(&["a", "b"], "b"), None),
+            ("a", page(&["b"], "z"), None),
+            ("m", page(&[], "m"), None),
+            ("m", page(&[], "z"), None),
+            ("", page(&[&longest], &longest), None),
             (
                 "",
                 broken(|r| r.producer.as_mut().unwrap().kind = None),
@@ -592,16 +550,16 @@ mod tests {
             ),
             (
                 "",
-                page(&[""], "", false),
+                page(&[""], ""),
                 Some("The Store gave a Record with no offset"),
             ),
-            ("", page(&[&long], &long, false), Some(long_offset)),
-            ("", page(&["a"], &long, false), Some(long_last)),
-            ("a", page(&["a"], "a", false), Some(first)),
-            ("", page(&["b", "a"], "b", false), Some(second)),
-            ("", page(&["a", "a"], "a", false), Some(second)),
-            ("", page(&["a", "b"], "a", false), Some(below_record)),
-            ("m", page(&[], "a", false), Some(below_from)),
+            ("", page(&[&long], &long), Some(long_offset)),
+            ("", page(&["a"], &long), Some(long_last)),
+            ("a", page(&["a"], "a"), Some(first)),
+            ("", page(&["b", "a"], "b"), Some(second)),
+            ("", page(&["a", "a"], "a"), Some(second)),
+            ("", page(&["a", "b"], "a"), Some(below_record)),
+            ("m", page(&[], "a"), Some(below_from)),
             ("", broken(|r| r.producer = None), Some(incomplete)),
             ("", broken(|r| r.body = None), Some(incomplete)),
         ];
@@ -616,12 +574,12 @@ mod tests {
         // A Store can leave last_offset empty. The page then ends at its last Record, or where its
         // read started.
         for (offsets, ends_at) in [(&[][..], "m"), (&["n", "o"][..], "o")] {
-            store.answers.lock().page = page(offsets, "", false);
+            store.answers.lock().page = page(offsets, "");
             let read = sdk::ReadRecordsRequest {
                 from_offset: b"m".to_vec(),
                 ..valid_read()
             };
-            let filled = page(offsets, ends_at, false);
+            let filled = page(offsets, ends_at);
             assert_eq!(runtime.read_records(read).await, Ok(filled));
         }
         // The Record size is the limit of the runtime, so a Record over the default is one that
@@ -661,20 +619,13 @@ mod tests {
                 corrupt,
             );
         }
-        let open = StreamStatus::Open as i32;
         let describes = [
-            (99, "", None),
-            (open, longest.as_str(), None),
-            (
-                StreamStatus::Unspecified as i32,
-                "",
-                Some("The Store answered a describe with no status"),
-            ),
-            (open, long.as_str(), Some(long_last)),
+            ("", None),
+            (longest.as_str(), None),
+            (long.as_str(), Some(long_last)),
         ];
-        for (status, last_offset, corrupt) in describes {
+        for (last_offset, corrupt) in describes {
             let answer = DescribeStreamResponse {
-                status,
                 last_offset: last_offset.as_bytes().to_vec(),
             };
             store.answers.lock().described = answer.clone();
