@@ -41,6 +41,10 @@ and an optional TOML file. File lookup order is `TEMPORAL_CONFIG_FILE`,
 error. `TEMPORAL_TASK_QUEUE` supplies the queue when the initial Worker options have an empty queue.
 Use `client_options` for explicit connection/client options.
 
+TLS uses ring by default. To select AWS-LC instead, disable default features and enable
+`tls-aws-lc`. The selected provider applies to both Temporal connections and the optional
+OpenTelemetry integration.
+
 ## Versioning and defaults
 
 Worker Deployment Versioning is required and always enabled with the supplied deployment name and

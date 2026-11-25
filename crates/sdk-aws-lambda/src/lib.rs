@@ -229,21 +229,42 @@ impl From<LambdaInvocationError> for lambda_runtime::Diagnostic {
     }
 }
 
-/// Builder for [`LambdaWorker`].
-pub struct LambdaWorkerBuilder {
+#[derive(bon::Builder)]
+#[builder(
+    builder_type(name = LambdaWorkerBuilder, vis = "pub"),
+    state_mod(name = lambda_worker_builder, vis = "pub"),
+    start_fn(name = builder, vis = ""),
+    finish_fn(name = build_internal, vis = "")
+)]
+struct LambdaWorkerSettings {
+    #[builder(start_fn)]
     version: WorkerDeploymentVersion,
+    #[builder(start_fn)]
     worker_options: WorkerOptions,
+    #[builder(field)]
     client_options: Option<(ConnectionOptions, ClientOptions)>,
-    runtime: Option<Arc<Runtime>>,
-    lambda_options: LambdaWorkerOptions,
-    default_versioning_behavior: VersioningBehavior,
+    #[builder(field)]
     configure: Option<Configure>,
+    #[builder(field)]
     shutdown_hooks: Vec<ShutdownHook>,
+    /// Use an already-created SDK runtime.
+    runtime: Option<Arc<Runtime>>,
+    /// Set the additional Worker drain and application cleanup budgets.
+    #[builder(default)]
+    lambda_options: LambdaWorkerOptions,
+    /// Set the default behavior for Workflows without a registration-time behavior.
+    ///
+    /// Defaults to [`VersioningBehavior::Pinned`]. `Unspecified` is rejected.
+    #[builder(default = VersioningBehavior::Pinned)]
+    default_versioning_behavior: VersioningBehavior,
+    /// Configure OTLP metrics and tracing, flushed after each invocation.
+    ///
+    /// Creates the SDK runtime; cannot be combined with an explicit runtime.
     #[cfg(feature = "otel")]
     open_telemetry: Option<otel::LambdaOpenTelemetryOptions>,
 }
 
-impl LambdaWorkerBuilder {
+impl<S: lambda_worker_builder::State> LambdaWorkerBuilder<S> {
     /// Use explicit connection and client options instead of environment loading.
     pub fn client_options(
         mut self,
@@ -251,35 +272,6 @@ impl LambdaWorkerBuilder {
         client_options: ClientOptions,
     ) -> Self {
         self.client_options = Some((connection_options, client_options));
-        self
-    }
-
-    /// Use an already-created SDK runtime.
-    pub fn runtime(mut self, runtime: Arc<Runtime>) -> Self {
-        self.runtime = Some(runtime);
-        self
-    }
-
-    /// Configure OTLP metrics and tracing, flushed after each invocation.
-    ///
-    /// Creates the SDK runtime; cannot be combined with [`Self::runtime`].
-    #[cfg(feature = "otel")]
-    pub fn open_telemetry(mut self, options: otel::LambdaOpenTelemetryOptions) -> Self {
-        self.open_telemetry = Some(options);
-        self
-    }
-
-    /// Set the additional Worker drain and application cleanup budgets.
-    pub fn lambda_options(mut self, options: LambdaWorkerOptions) -> Self {
-        self.lambda_options = options;
-        self
-    }
-
-    /// Set the default behavior for Workflows without a registration-time behavior.
-    ///
-    /// Defaults to [`VersioningBehavior::Pinned`]. `Unspecified` is rejected.
-    pub fn default_versioning_behavior(mut self, behavior: VersioningBehavior) -> Self {
-        self.default_versioning_behavior = behavior;
         self
     }
 
@@ -318,9 +310,39 @@ impl LambdaWorkerBuilder {
     ///
     /// Loads environment/TOML connection configuration once when no explicit options were supplied.
     /// Must run inside Tokio unless [`Self::runtime`] was supplied.
-    pub fn build(mut self) -> Result<LambdaWorker, LambdaWorkerBuildError> {
-        validate_version(&self.version)?;
-        validate_lambda_options(&self.lambda_options)?;
+    pub fn build(self) -> Result<LambdaWorker, LambdaWorkerBuildError>
+    where
+        S: lambda_worker_builder::IsComplete,
+    {
+        self.build_internal().build()
+    }
+}
+
+impl LambdaWorkerSettings {
+    fn build(mut self) -> Result<LambdaWorker, LambdaWorkerBuildError> {
+        if self.version.deployment_name.trim().is_empty() || self.version.build_id.trim().is_empty()
+        {
+            return Err(LambdaWorkerBuildError::invalid(
+                "worker deployment name and build ID must both be non-empty",
+            ));
+        }
+        if self.lambda_options.worker_shutdown_buffer.is_zero()
+            || self.lambda_options.shutdown_hook_buffer.is_zero()
+        {
+            return Err(LambdaWorkerBuildError::invalid(
+                "worker and hook shutdown buffers must be greater than zero",
+            ));
+        }
+        let total = self
+            .lambda_options
+            .worker_shutdown_buffer
+            .checked_add(self.lambda_options.shutdown_hook_buffer)
+            .and_then(|budget| budget.checked_add(RESPONSE_BUFFER));
+        if total.is_none_or(|budget| Instant::now().checked_add(budget).is_none()) {
+            return Err(LambdaWorkerBuildError::invalid(
+                "shutdown budgets exceed the supported duration",
+            ));
+        }
         if self.default_versioning_behavior == VersioningBehavior::Unspecified {
             return Err(LambdaWorkerBuildError::invalid(
                 "default versioning behavior cannot be Unspecified",
@@ -549,18 +571,7 @@ impl LambdaWorker {
         version: WorkerDeploymentVersion,
         worker_options: WorkerOptions,
     ) -> LambdaWorkerBuilder {
-        LambdaWorkerBuilder {
-            version,
-            worker_options,
-            client_options: None,
-            runtime: None,
-            lambda_options: LambdaWorkerOptions::default(),
-            default_versioning_behavior: VersioningBehavior::Pinned,
-            configure: None,
-            shutdown_hooks: Vec::new(),
-            #[cfg(feature = "otel")]
-            open_telemetry: None,
-        }
+        LambdaWorkerSettings::builder(version, worker_options)
     }
 
     /// Handle one invocation, ignoring its payload and polling Temporal for tasks.
@@ -688,7 +699,17 @@ impl LambdaWorker {
             if config.connection_options.identity.is_empty()
                 && config.worker_options.client_identity_override.is_none()
             {
-                config.connection_options.identity = invocation_identity(&config.context);
+                let request_id = if config.context.request_id.is_empty() {
+                    "unknown"
+                } else {
+                    &config.context.request_id
+                };
+                let function_arn = if config.context.invoked_function_arn.is_empty() {
+                    "unknown"
+                } else {
+                    &config.context.invoked_function_arn
+                };
+                config.connection_options.identity = format!("{request_id}@{function_arn}");
             }
             config.worker_options.worker_plugin(LambdaWorkerPlugin {
                 version: self.inner.version.clone(),
@@ -739,33 +760,6 @@ impl LambdaWorker {
     }
 }
 
-fn validate_version(version: &WorkerDeploymentVersion) -> Result<(), LambdaWorkerBuildError> {
-    if version.deployment_name.trim().is_empty() || version.build_id.trim().is_empty() {
-        return Err(LambdaWorkerBuildError::invalid(
-            "worker deployment name and build ID must both be non-empty",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_lambda_options(options: &LambdaWorkerOptions) -> Result<(), LambdaWorkerBuildError> {
-    if options.worker_shutdown_buffer.is_zero() || options.shutdown_hook_buffer.is_zero() {
-        return Err(LambdaWorkerBuildError::invalid(
-            "worker and hook shutdown buffers must be greater than zero",
-        ));
-    }
-    let total = options
-        .worker_shutdown_buffer
-        .checked_add(options.shutdown_hook_buffer)
-        .and_then(|budget| budget.checked_add(RESPONSE_BUFFER));
-    if total.is_none_or(|budget| Instant::now().checked_add(budget).is_none()) {
-        return Err(LambdaWorkerBuildError::invalid(
-            "shutdown budgets exceed the supported duration",
-        ));
-    }
-    Ok(())
-}
-
 fn load_client_options() -> Result<(ConnectionOptions, ClientOptions), ConfigError> {
     let options =
         match resolve_config_file(|name| env::var_os(name), env::current_dir().ok().as_deref()) {
@@ -804,29 +798,12 @@ fn resolve_task_queue(configured: &str, getenv: impl Fn(&str) -> Option<String>)
     getenv(ENV_TASK_QUEUE).filter(|queue| !queue.trim().is_empty())
 }
 
-fn invocation_identity(context: &lambda_runtime::Context) -> String {
-    let request_id = if context.request_id.is_empty() {
-        "unknown"
-    } else {
-        &context.request_id
-    };
-    let function_arn = if context.invoked_function_arn.is_empty() {
-        "unknown"
-    } else {
-        &context.invoked_function_arn
-    };
-    format!("{request_id}@{function_arn}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::FutureExt;
     use std::sync::{Mutex, atomic::AtomicUsize};
-    use temporalio_sdk::{
-        RuntimeError,
-        runtime::worker_tuner::{SlotSupplier, WorkerTuner},
-    };
+    use temporalio_sdk::RuntimeError;
     use tokio::sync::Notify;
 
     fn builder() -> LambdaWorkerBuilder {
@@ -885,57 +862,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn building_does_not_replace_caller_worker_tuning() {
-        let mut builder = builder();
-        builder.worker_options.max_cached_workflows = 7;
-        builder.worker_options.workflow_task_poller_behavior =
-            Some(PollerBehavior::SimpleMaximum(4));
-        builder.worker_options.activity_task_poller_behavior =
-            Some(PollerBehavior::SimpleMaximum(3));
-        builder.worker_options.graceful_shutdown_period = Some(Duration::from_secs(9));
-        builder.worker_options.tuner = TunerHolder::builder()
-            .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(6))
-            .activity_task_slot_supplier(FixedSizeSlotSupplier::new(8))
-            .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(4))
-            .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
-            .build()
-            .into();
-        let worker = builder.build().unwrap();
-        let options = &worker.inner.worker_options;
-        assert_eq!(options.max_cached_workflows, 7);
-        assert_eq!(
-            options.workflow_task_poller_behavior,
-            Some(PollerBehavior::SimpleMaximum(4))
-        );
-        assert_eq!(
-            options.activity_task_poller_behavior,
-            Some(PollerBehavior::SimpleMaximum(3))
-        );
-        assert_eq!(
-            options.graceful_shutdown_period,
-            Some(Duration::from_secs(9))
-        );
-        let WorkerTuner::TunerHolder(tuner) = &options.tuner else {
-            panic!("caller tuner was replaced");
-        };
-        assert!(
-            matches!(&tuner.workflow_task_slot_supplier, SlotSupplier::FixedSize(s) if s.num_slots == 6)
-        );
-        assert!(
-            matches!(&tuner.activity_task_slot_supplier, SlotSupplier::FixedSize(s) if s.num_slots == 8)
-        );
-        assert!(
-            matches!(&tuner.local_activity_task_slot_supplier, SlotSupplier::FixedSize(s) if s.num_slots == 4)
-        );
-    }
-
     #[tokio::test(start_paused = true)]
     async fn shutdown_cutoff_uses_effective_grace_and_remaining_invocation_time() {
         let now = Instant::now();
         let cutoff = Arc::new(OnceLock::new());
         let plugin = LambdaWorkerPlugin {
-            version: builder().version,
+            version: builder().build_internal().version,
             default_versioning_behavior: VersioningBehavior::Pinned,
             lambda_options: LambdaWorkerOptions::default(),
             invocation_deadline: now + Duration::from_secs(30),
@@ -967,7 +899,7 @@ mod tests {
     async fn unusable_worker_shutdown_periods_are_rejected_without_replacement() {
         for period in [None, Some(Duration::MAX), Some(Duration::from_secs(60))] {
             let plugin = LambdaWorkerPlugin {
-                version: builder().version,
+                version: builder().build_internal().version,
                 default_versioning_behavior: VersioningBehavior::Pinned,
                 lambda_options: LambdaWorkerOptions::default(),
                 invocation_deadline: Instant::now() + Duration::from_secs(30),

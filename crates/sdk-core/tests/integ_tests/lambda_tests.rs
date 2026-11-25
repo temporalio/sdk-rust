@@ -487,11 +487,12 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay(#[case] aut
             async { Ok(()) }
         });
     let worker = if auto_upgrade {
-        builder.default_versioning_behavior(VersioningBehavior::AutoUpgrade)
-    } else {
         builder
+            .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+            .build()
+    } else {
+        builder.build()
     }
-    .build()
     .unwrap();
     worker.handle(event("register-version")).await.unwrap();
     let description = client
