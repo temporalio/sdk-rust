@@ -601,8 +601,8 @@ impl WorkflowMachines {
             let (activation, marker) = self.result_activations();
             let results = self.stream_calls.take_jobs(activation, marker);
             jobs.extend(results.into_iter().map(OutgoingJob::from));
-            // A replay places these results by the marker, so it must be where Workflow code gets
-            // them, before its commands of this activation.
+            // A replay places these results by their marker, so the marker must go where Workflow
+            // code gets them, before the commands of this activation.
             if let Some(data) = self.stream_calls.take_marker() {
                 let marker = stream_marker(&data);
                 self.add_cmd_to_wf_task(marker, Default::default(), CommandIdKind::CoreInternal);

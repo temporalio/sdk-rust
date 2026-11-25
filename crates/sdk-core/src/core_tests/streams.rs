@@ -2022,7 +2022,8 @@ fn with_events(jobs: &[Vec<Job>]) -> Vec<Vec<String>> {
     kept.filter(|jobs| !jobs.is_empty()).collect()
 }
 
-/// Completes each Local Activity of `worker` after a random wait, and each cancel of one at once.
+/// Completes each Local Activity of `worker` after a random wait, and each cancel of one
+/// immediately.
 async fn complete_local_activities(worker: &Worker, rng: &mut StdRng) {
     while let Ok(task) = worker.poll_activity_task().await {
         let result = match task.variant {

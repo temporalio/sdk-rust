@@ -25,7 +25,7 @@ const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
 /// of a client call has the same value.
 const RETRY_RANDOMIZATION: f64 = 0.2;
 
-/// A call of a run to start or to stop.
+/// A request to start or stop a call of a run.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Most requests start a call
 pub(crate) enum Request {
@@ -50,7 +50,7 @@ pub(crate) enum Op {
     Append(AppendRecordsRequest, String),
 }
 
-/// The result of a call, for its run.
+/// The result of a call, sent to its run.
 #[derive(Debug)]
 pub(crate) struct StreamResolution {
     pub(crate) call_id: u64,
@@ -101,8 +101,8 @@ impl StreamManager {
 
     /// Starts and stops calls of the run `run_id`.
     pub(crate) fn dispatch(&self, run_id: &str, requests: Vec<Request>) {
-        // The lock is held across each spawn, so a call's entry exists even if the call ends at
-        // once.
+        // The lock is held across each spawn, so a call's entry exists even if the call ends
+        // immediately.
         let mut tasks = self.tasks.lock();
         for request in requests {
             match request {
@@ -265,7 +265,7 @@ fn next_wait(waits: &mut ExponentialBackoff) -> Duration {
     Duration::try_from_secs_f64(wait.as_secs_f64() * jitter).unwrap_or(wait)
 }
 
-/// The handle of one call to its entry in the manager.
+/// A call's handle to its own entry in the manager.
 struct Note {
     tasks: Tasks,
     run_id: String,

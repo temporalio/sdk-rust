@@ -424,24 +424,19 @@ message RequestCancelNexusOperation {
 }
 
 // Appends Records to a Stream as the Workflow's Producer. Core calls the Store while the Workflow
-// Task is open, and sends the result in a `ResolveStreamAppend` job. As for a Local Activity, Core
-// keeps the task open while an append runs. History keeps the result in the `core_stream_append`
-// marker of the activation that gets it.
+// Task is open, keeps the task open as it does for a Local Activity, and sends the result in a
+// `ResolveStreamAppend` job.
 //
-// An append is at-least-once. If History has no result of it, a later attempt of the Workflow Task
-// writes the batch again.
-//
-// No command cancels an append, so lang must accept the job of an append that nothing awaits.
-// Core drops an append that has no result when lang sends the Workflow's last command.
-//
-// Core sends the appends of one Stream to the Store one at a time, in the order of their commands.
-//
-// A bad `seq` or `stream`, or a Store that the Worker has no runtime for, fails the Workflow Task.
-// So does a Store that is still unavailable at the task's heartbeat. The failure message then
-// starts with `StreamStoreUnavailable:`. An empty batch, or one over the limits of its Store,
-// gives lang a `failed` job.
-//
-// A replay compares the `seq` and the `stream` of the command with History, not the `bodies`.
+// * An append is at-least-once. If History has no result for it, a later attempt of the Workflow
+//   Task writes the batch again.
+// * No command cancels an append. Lang must accept the result of an append that nothing awaits,
+//   and Core drops an append that has no result at the Workflow's last command.
+// * The appends of one Stream go to the Store one at a time, in the order of their commands.
+// * A bad `seq` or `stream`, or a Store that the Worker has no runtime for, fails the Workflow
+//   Task. So does a Store that is still unavailable at the task's heartbeat, with a failure
+//   message that starts with `StreamStoreUnavailable:`.
+// * An empty batch, or one over the limits of its Store, gives lang a `failed` job.
+// * A replay compares the `seq` and the `stream` of the command with History, not the `bodies`.
 message AppendToStream {
     // Lang's incremental sequence number for appends, starting at 1.
     uint32 seq = 1;

@@ -52,7 +52,7 @@ pub(crate) enum Phase {
     Stopped,
 }
 
-/// A call by its kind and seq. Core gives the results of one activation in this order.
+/// The kind and seq of a call. Core gives the results of one activation in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CallKey {
     Append(u32),
@@ -84,7 +84,7 @@ enum AppendState {
     Replayed,
 }
 
-/// The entries of History's markers whose calls Workflow code hasn't issued yet, by seq.
+/// Marker entries from History whose calls Workflow code hasn't issued yet, by seq.
 #[derive(Default)]
 struct Held {
     appends: HashMap<u32, StreamAppendResult>,
@@ -113,13 +113,13 @@ pub(crate) struct StreamCalls {
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
-    /// History's results whose calls Workflow code issued, by the activation that gets them.
+    /// Results from History whose calls Workflow code has issued, by the activation that gets them.
     ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
-    /// The live results of the activation in hand, which its marker records.
+    /// The live results of the current activation, which its marker records.
     marker: StreamAppendMarkerData,
-    /// True once the task in hand gave a live result, until the task completes.
+    /// True once the current task gave a live result, until the task completes.
     marked: bool,
     requests: Vec<Request>,
 }
@@ -224,9 +224,9 @@ impl StreamCalls {
         self.leave_queue(&queue, call);
     }
 
-    /// Returns true if the activation at index `activation` of the task gets a result. A result
-    /// from History waits for the Local Activity result of the next marker, at index `marker`, if
-    /// the first run gave that one before it or with it.
+    /// Returns true if activation `activation` of the task has a Stream result to give. A result
+    /// from History is held back while the next Local Activity marker, at index `marker`, is due in
+    /// the same activation or an earlier one, so that the Local Activity result goes first.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -349,8 +349,8 @@ impl StreamCalls {
         !self.appends.is_empty()
     }
 
-    /// Returns true if the task in hand gave a live result, so it has a marker that History
-    /// doesn't have yet.
+    /// Returns true if the current task gave a live result, so it has a marker that History doesn't
+    /// have yet.
     pub(crate) fn has_marker(&self) -> bool {
         self.marked
     }
@@ -381,9 +381,10 @@ impl StreamCalls {
         self.next_ready_activation().into_iter().chain(held).min()
     }
 
-    /// Releases the results from History for the next activation, whatever their index, in the
-    /// order of the first run, up to the first one whose call Workflow code hasn't issued. A replay
-    /// with chunking on and no job to give does the same for Local Activity results.
+    /// Releases the results from History to the next activation in the order of the first run,
+    /// regardless of their index. It stops at the first result whose call Workflow code hasn't
+    /// issued. A replay with chunking on does the same for Local Activity results when it has no
+    /// other job to give.
     pub(crate) fn release_ready(&mut self) {
         let held = self.held.first_result();
         let comes = |key: &&(u64, CallKey)| held.is_none_or(|held| **key < held);
@@ -477,8 +478,9 @@ impl StreamCalls {
         Some(job)
     }
 
-    /// Starts the call at the head of each queue, once the run is live and its task is open. It
-    /// runs only when the task opens and at go-live, since every other change starts its own head.
+    /// Starts the call at the head of each queue, once the run is live and its task is open. Only a
+    /// task that opens and go-live need this, because any other change starts the head of its own
+    /// queue.
     fn start_heads(&mut self) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
@@ -1321,7 +1323,7 @@ mod tests {
             dispatch(&mut self.run.calls, &mut self.in_flight);
         }
 
-        /// Completes the task in hand, and checks that the run tracks exactly the calls whose
+        /// Completes the current task, and checks that the run tracks exactly the calls whose
         /// result no marker has.
         fn complete(&mut self) {
             let open = self.run.calls.take_completion_marker();
@@ -1365,7 +1367,7 @@ mod tests {
             }
         }
 
-        /// Fails the task in hand. A new run replays History and goes live in the next attempt.
+        /// Fails the current task. A new run replays History and goes live in the next attempt.
         fn retry(&mut self) {
             self.seen.failed_tasks += 1;
             self.run.calls.stop();

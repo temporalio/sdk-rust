@@ -77,7 +77,8 @@ impl Default for StreamSettings {
 }
 
 impl StreamSettings {
-    /// Checks the lower bounds of the settings. Nothing bounds a setting from above.
+    /// Checks the settings. Each has a lower bound, and `retry_initial_interval` can't be more than
+    /// `retry_max_interval`.
     pub(crate) fn check(&self) -> Result<(), String> {
         let first = self.retry_initial_interval;
         if first.is_zero() || first > self.retry_max_interval {
