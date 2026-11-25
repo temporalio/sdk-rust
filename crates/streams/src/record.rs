@@ -3,7 +3,7 @@
 
 use crate::{
     AnyError, AppendError, AppendReason, StreamError,
-    ids::{validate_producer, validate_ref},
+    ids::{validate_producer, validate_stream_id},
     proto::{AppendRecordsRequest, Producer},
 };
 use prost::{Message, length_delimiter_len};
@@ -80,13 +80,13 @@ impl StoreLimits {
         })
     }
 
-    /// Checks the ref, the Producer and the Records of an append, and its sizes against these
+    /// Checks the Stream id, the Producer and the Records of an append, and its sizes against these
     /// limits, with no Store call. The runtime checks each append with it before the Store gets the
     /// append. A lang bridge calls it for an append of client code, which reaches its Store through
     /// no runtime with these limits. It computes the stored size of each Record without encoding
     /// it, since a batch can be megabytes long.
     pub fn validate_append(&self, request: &AppendRecordsRequest) -> Result<(), AppendError> {
-        validate_ref(request.r#ref.as_ref())?;
+        validate_stream_id(&request.stream_id)?;
         let producer = validate_producer(request.producer.as_ref())?;
         let records = &request.records;
         if records.is_empty() {
@@ -162,7 +162,7 @@ pub(crate) fn stored_len(producer_len: usize, body: Option<&Payload>) -> usize {
 mod tests {
     use super::*;
     use crate::{
-        proto::{AppendRecord, ClientProducer, StreamRecord, StreamRef, producer::Kind},
+        proto::{AppendRecord, ClientProducer, StreamRecord, producer::Kind},
         test_store::{activity, client, local_activity, standalone_activity, task, workflow},
     };
 
@@ -231,10 +231,7 @@ mod tests {
         let producer = client();
         let check = |limits: StoreLimits, records: &[AppendRecord]| {
             limits.validate_append(&AppendRecordsRequest {
-                r#ref: Some(StreamRef {
-                    id: "s".to_string(),
-                    ..Default::default()
-                }),
+                stream_id: "s".to_string(),
                 producer: Some(producer.clone()),
                 records: records.to_vec(),
             })

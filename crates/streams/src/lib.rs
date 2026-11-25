@@ -6,8 +6,9 @@
 //! A Store implements [`StreamStore`], whose docs have the contract of a Store. [`StreamRuntime`]
 //! wraps a Store and validates every request before the Store sees it, and every response on the
 //! way back. So every Store gets the same valid requests, and no caller gets a malformed response.
-//! Each operation fails with its own error type, such as [`AppendError`], which has only the
-//! reasons that the operation can return.
+//! The runtime takes the requests of an SDK, which have the ref of a Stream, and calls the Store
+//! with only the Stream id of the ref. Each operation fails with its own error type, such as
+//! [`AppendError`], which has only the reasons that the operation can return.
 //!
 //! The docs of this crate use these terms:
 //!
@@ -49,11 +50,21 @@ pub use error::{
 pub use runtime::StreamRuntime;
 pub use store::StreamStore;
 
-/// Re-exports the Stream protos from `temporalio-common`, so a Store can use them as they are.
+/// Re-exports the Stream protos from `temporalio-common`, so a Store can use them as they are. The
+/// requests that [`StreamRuntime`] takes are in [`sdk`](crate::proto::sdk).
 pub mod proto {
     pub use temporalio_common::protos::temporal::api::{
         enums::v1::{StreamErrorReason, StreamIdConflictPolicy, StreamStatus},
         stream::v1::*,
         streamservice::v1::*,
     };
+
+    /// The requests of an SDK, which have the ref of a Stream in place of its id, and the create
+    /// response with the ref.
+    pub mod sdk {
+        pub use temporalio_common::protos::temporal::api::sdk::v1::{
+            AppendRecordsRequest, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
+            ReadRecordsRequest, StreamRef,
+        };
+    }
 }

@@ -69,9 +69,8 @@ use futures_util::future::BoxFuture;
 ///
 /// [`StreamRuntime`](crate::StreamRuntime) wraps a Store. It checks each response against the parts
 /// of the contract that one response shows, and fails a response that breaks them with
-/// [`AnyReason::StoreCorrupt`](crate::AnyReason::StoreCorrupt). Those are the parts about 1) the
-/// Stream id of the ref of a create, 2) offsets, 3) the body and the Producer of a Record, and 4)
-/// the status of a describe.
+/// [`AnyReason::StoreCorrupt`](crate::AnyReason::StoreCorrupt). Those are the parts about 1)
+/// offsets, 2) the body and the Producer of a Record, and 3) the status of a describe.
 /// It can't check a part that needs more than one response, such as the resend rule, or that a
 /// page skips no Record. A read that gives a Record larger than the Record size of the runtime's
 /// [`StoreLimits`](crate::record::StoreLimits), in its stored form, fails with
@@ -79,9 +78,8 @@ use futures_util::future::BoxFuture;
 /// size may take it.
 /// The runtime also validates each request first, so a Store can assume that:
 ///
-/// - The request has a ref, and its `id` is 1 to
-///   [`MAX_STREAM_ID_BYTES`](crate::ids::MAX_STREAM_ID_BYTES) bytes. The runtime ignores the
-///   `store` of the ref, which only an SDK reads. There's no bound for the request id.
+/// - The `stream_id` is 1 to [`MAX_STREAM_ID_BYTES`](crate::ids::MAX_STREAM_ID_BYTES) bytes.
+///   There's no bound for the request id.
 /// - `from_offset` is at most [`MAX_OFFSET_BYTES`](crate::ids::MAX_OFFSET_BYTES) bytes.
 /// - The Producer of an append or a close has a kind, every text id of that kind, and the fields
 ///   of its attempt. Its scheduled event id, for an Activity that a Workflow scheduled, is 0 or
@@ -98,7 +96,6 @@ pub trait StreamStore: Send + Sync + 'static {
     /// has the same `request_id`.
     ///
     /// - A create for an id that has no Stream yet makes the Stream and returns `created` true.
-    /// - A create returns the ref as the request had it.
     /// - A retry is a create with the same `request_id` as the create that made the Stream. The
     ///   caller sends it when the answer of that create got lost, so the Store returns `created`
     ///   true, as it did for the first try. Any other create for an existing Stream, including one

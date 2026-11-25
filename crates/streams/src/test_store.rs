@@ -33,7 +33,7 @@ impl StreamStore for Scripted {
         _: CreateStreamRequest,
         _: String,
     ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
-        Box::pin(async move { Ok(self.answers.lock().created.clone()) })
+        Box::pin(async move { Ok(self.answers.lock().created) })
     }
 
     fn append_records(
