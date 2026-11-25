@@ -453,7 +453,7 @@ message ResolveStreamAppend {
     uint32 seq = 1;
     oneof status {
         StreamAppended appended = 2;
-        // An `ApplicationFailureInfo` of the type `stream_<reason>`, such as `stream_closed`, with
+        // An `ApplicationFailureInfo` of the type `stream_<reason>`, such as `stream_fenced`, with
         // `non_retryable` set. Its details have one `binary/protobuf` payload of a
         // `temporal.api.stream.v1.StreamErrorDetails`.
         temporal.api.failure.v1.Failure failed = 3;

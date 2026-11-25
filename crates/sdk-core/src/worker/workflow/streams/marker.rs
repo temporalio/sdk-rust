@@ -149,8 +149,8 @@ mod tests {
             first_offset: offset(42),
             last_offset: offset(43),
         });
-        let closed = AppendError::operation(AppendReason::Closed, "The Stream is closed");
-        let failed = stream_append_result::Result::Failure(recorded(&closed));
+        let fenced = AppendError::operation(AppendReason::Fenced, "A later attempt wrote");
+        let failed = stream_append_result::Result::Failure(recorded(&fenced));
         let entry = |seq, stream_id: &str, result| StreamAppendResult {
             seq,
             stream_id: stream_id.to_string(),
@@ -175,8 +175,8 @@ mod tests {
             r#""result":{"appended":{"first_offset":"000000000000002a","#,
             r#""last_offset":"000000000000002b"}}},"#,
             r#"{"seq":4,"stream_id":"audit","store":"redis","activation_index":1,"#,
-            r#""result":{"failure":{"reason":"STREAM_ERROR_REASON_CLOSED","#,
-            r#""message":"The Stream is closed"}}}]}"#,
+            r#""result":{"failure":{"reason":"STREAM_ERROR_REASON_FENCED","#,
+            r#""message":"A later attempt wrote"}}}]}"#,
         ];
         assert_eq!(std::str::from_utf8(&data.data).unwrap(), json.concat());
         assert_eq!(peeked_marker(&event(details)), Some(Ok(marker)));
@@ -193,7 +193,6 @@ mod tests {
             "STREAM_ERROR_REASON_UNSPECIFIED",
             "STREAM_ERROR_REASON_NOT_FOUND",
             "STREAM_ERROR_REASON_EXPIRED",
-            "STREAM_ERROR_REASON_CLOSED",
             "STREAM_ERROR_REASON_FENCED",
             "STREAM_ERROR_REASON_FORMAT_TOO_NEW",
             "STREAM_ERROR_REASON_OFFSET_TOO_HIGH",

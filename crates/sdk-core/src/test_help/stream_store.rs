@@ -5,13 +5,13 @@ use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use temporalio_streams::{
-    AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
-    DescribeError, ReadError, StreamError, StreamStore,
+    AnyError, AnyReason, AppendError, AppendReason, CreateError, DescribeError, ReadError,
+    StreamError, StreamStore,
     attempt::{ATTEMPT_KEY_LEN, attempt_key, producer_key},
     proto::{
-        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
-        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        ReadRecordsRequest, ReadRecordsResponse, StreamRecord, StreamRef,
+        AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, CreateStreamResponse,
+        DescribeStreamRequest, DescribeStreamResponse, ReadRecordsRequest, ReadRecordsResponse,
+        StreamRecord,
     },
 };
 use tokio::sync::watch;
@@ -20,7 +20,6 @@ use tokio::sync::watch;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Op {
     Append,
-    Close,
 }
 
 /// A write that the Store got, in the order that it arrived.
@@ -28,7 +27,6 @@ pub enum Op {
 pub enum Request {
     /// An append, with the request id of its call.
     Append(AppendRecordsRequest, String),
-    Close(CloseStreamRequest),
 }
 
 /// A batch that the Store remembers, with the key of its attempt.
@@ -43,7 +41,6 @@ struct Stream {
     /// before it.
     base: u64,
     records: Vec<StreamRecord>,
-    closed: bool,
     /// The last batches of each Producer, by its key, oldest first.
     producers: HashMap<Vec<u8>, VecDeque<Written>>,
 }
@@ -122,18 +119,10 @@ impl MemoryStore {
             .unwrap_or_default()
     }
 
-    pub fn is_closed(&self, id: &str) -> bool {
-        let state = self.state.lock();
-        state.streams.get(id).is_some_and(|stream| stream.closed)
-    }
-
     /// Takes the request, and then holds or fails it as the faults say.
     async fn arrive(&self, op: Op, request: Request) -> Result<(), AnyError> {
-        let id = match &request {
-            Request::Append(append, _) => stream_id(append.r#ref.as_ref()),
-            Request::Close(close) => stream_id(close.r#ref.as_ref()),
-        }
-        .to_string();
+        let Request::Append(append, _) = &request;
+        let id = append.stream_id.clone();
         let mut released = self.released.subscribe();
         let held = {
             let mut state = self.state.lock();
@@ -171,11 +160,6 @@ impl MemoryStore {
 }
 
 const NOT_CREATED: &str = "Nobody created the Stream";
-
-/// Returns the Stream id of the ref of a request.
-fn stream_id(stream_ref: Option<&StreamRef>) -> &str {
-    &stream_ref.expect("A request has a ref").id
-}
 const FENCED: &str = "A later attempt of the Producer wrote";
 
 impl State {
@@ -184,7 +168,7 @@ impl State {
         request: AppendRecordsRequest,
         request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
-        let stream = self.streams.get_mut(stream_id(request.r#ref.as_ref()));
+        let stream = self.streams.get_mut(&request.stream_id);
         let stream =
             stream.ok_or_else(|| AppendError::operation(AppendReason::NotFound, NOT_CREATED))?;
         let producer = request.producer.expect("The runtime checks the Producer");
@@ -204,10 +188,6 @@ impl State {
             if batches.back().is_some_and(|last| key < last.key) {
                 return Err(AppendError::operation(AppendReason::Fenced, FENCED));
             }
-        }
-        if stream.closed {
-            let reason = AppendReason::Closed;
-            return Err(AppendError::operation(reason, "The Stream is closed"));
         }
         let first = stream.records.len();
         for record in &request.records {
@@ -237,24 +217,6 @@ impl State {
             last_offset: offsets.1,
         })
     }
-
-    fn close(&mut self, request: &CloseStreamRequest) -> Result<CloseStreamResponse, CloseError> {
-        let stream = self.streams.get_mut(stream_id(request.r#ref.as_ref()));
-        let stream =
-            stream.ok_or_else(|| CloseError::operation(CloseReason::NotFound, NOT_CREATED))?;
-        let producer = request.producer.as_ref().expect("The runtime checks it");
-        let id = producer_key(producer).expect("The runtime checks the kind");
-        let key = attempt_key(producer.kind.as_ref());
-        if stream.closed {
-            return Ok(CloseStreamResponse {});
-        }
-        let last = stream.producers.get(&id).and_then(VecDeque::back);
-        if last.is_some_and(|last| key < last.key) {
-            return Err(CloseError::operation(CloseReason::Fenced, FENCED));
-        }
-        stream.closed = true;
-        Ok(CloseStreamResponse {})
-    }
 }
 
 impl StreamStore for MemoryStore {
@@ -266,18 +228,16 @@ impl StreamStore for MemoryStore {
         Box::pin(async move {
             let mut state = self.state.lock();
             let base = (state.streams.len() as u64 + 1) << 20;
-            let id = stream_id(request.stream_ref.as_ref()).to_string();
-            let created = !state.streams.contains_key(&id);
-            state.streams.entry(id).or_insert_with(|| Stream {
-                base,
-                records: vec![],
-                closed: false,
-                producers: HashMap::new(),
-            });
-            Ok(CreateStreamResponse {
-                r#ref: request.stream_ref,
-                created,
-            })
+            let created = !state.streams.contains_key(&request.stream_id);
+            state
+                .streams
+                .entry(request.stream_id)
+                .or_insert_with(|| Stream {
+                    base,
+                    records: vec![],
+                    producers: HashMap::new(),
+                });
+            Ok(CreateStreamResponse { created })
         })
     }
 
@@ -299,18 +259,6 @@ impl StreamStore for MemoryStore {
         _: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
         unimplemented!("No test reads this Store")
-    }
-
-    fn close_stream(
-        &self,
-        request: CloseStreamRequest,
-    ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
-        Box::pin(async move {
-            self.arrive(Op::Close, Request::Close(request.clone()))
-                .await?;
-            let closed = self.state.lock().close(&request);
-            self.answer(Op::Close, closed)
-        })
     }
 
     fn describe_stream(

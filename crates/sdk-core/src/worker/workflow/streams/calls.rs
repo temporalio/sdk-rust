@@ -25,8 +25,9 @@ use temporalio_streams::{
     attempt::attempt_key,
     ids::validate_stream_id,
     proto::{
-        AppendRecord, AppendRecordsRequest, Producer, StreamRef, WorkflowProducer,
-        WorkflowTaskAttempt, producer::Kind,
+        AppendRecord, Producer, WorkflowProducer, WorkflowTaskAttempt,
+        producer::Kind,
+        sdk::{AppendRecordsRequest, StreamRef},
     },
 };
 
@@ -1686,11 +1687,8 @@ mod tests {
             manager.dispatch("r", sent);
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             for (name, store) in &served {
-                for request in store.requests() {
-                    let StoreRequest::Append(append, _) = request else {
-                        panic!("seed {seed}: {request:?}");
-                    };
-                    let id = append.r#ref.unwrap().id;
+                for StoreRequest::Append(append, _) in store.requests() {
+                    let id = append.stream_id;
                     assert_eq!(store_of[&id], *name, "seed {seed}: Stream {id}");
                 }
             }

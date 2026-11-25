@@ -47,10 +47,11 @@ relevant information.
   activation that gives results records them in a `core_stream` marker, with the index of the
   activation, which a replay counts as for a Local Activity result. So a replay doesn't make a
   Store call. A completion that leaves an append with no result, and has no such marker, records
-  one with no entry, so that a replay with chunking on keeps its task apart from the next one. Core drops a call that has no result when the Workflow's last command arrives, as it
-  drops a Local Activity. If a call is waiting to try again at the task's heartbeat, because a try
-  failed with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its
-  failure message starts with `StreamStoreUnavailable:`.
+  one with no entry, so that a replay with chunking on keeps its task apart from the next one.
+  Core drops a call that has no result when the Workflow's last command arrives, as it drops a
+  Local Activity. If a call is waiting to try again at the task's heartbeat, because a try failed
+  with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
+  message starts with `StreamStoreUnavailable:`.
 
 ## [0.12.0] - 2026-11-23
 

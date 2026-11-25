@@ -65,8 +65,8 @@ use temporalio_streams::{
     StreamError, StreamRuntime, StreamStore,
     attempt::producer_key,
     proto::{
-        AppendRecord, AppendRecordsRequest, CreateStreamRequest, Producer, StreamRef,
-        WorkflowProducer, WorkflowTaskAttempt, producer::Kind as ProducerKind,
+        AppendRecord, AppendRecordsRequest, CreateStreamRequest, Producer, WorkflowProducer,
+        WorkflowTaskAttempt, producer::Kind as ProducerKind, sdk::StreamRef,
     },
     record::StoreLimits,
 };
@@ -90,7 +90,7 @@ async fn store(ids: &[&str]) -> Arc<MemoryStore> {
     let store = Arc::new(MemoryStore::default());
     for id in ids {
         let create = CreateStreamRequest {
-            stream_ref: Some(stream(id)),
+            stream_id: id.to_string(),
             ..Default::default()
         };
         store.create_stream(create, id.to_string()).await.unwrap();
@@ -917,10 +917,7 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
 /// Returns the Stream of each call that reached the Store, once for each call.
 fn calls_at(store: &MemoryStore) -> Vec<String> {
     let mut calls: Vec<String> = (store.requests().into_iter())
-        .map(|request| match request {
-            Request::Append(append, _) => append.r#ref.unwrap().id,
-            Request::Close(close) => panic!("{close:?}"),
-        })
+        .map(|Request::Append(append, _)| append.stream_id)
         .collect();
     calls.sort();
     calls.dedup();
@@ -1210,7 +1207,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
             started_time: None,
         };
         let write = AppendRecordsRequest {
-            r#ref: Some(stream("s")),
+            stream_id: "s".to_string(),
             producer: Some(producer(&run_id, attempt)),
             records: vec![AppendRecord::default()],
         };
@@ -1307,12 +1304,10 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     assert_eq!(writers(&store, "s"), expected);
     // A request id is unique to one append call, and the append of a later attempt is another call.
     let mut attempts = HashMap::new();
-    for request in store.requests() {
-        if let Request::Append(append, request_id) = request {
-            let (_, task, attempt) = writer(append.producer);
-            let first = *attempts.entry(request_id).or_insert((task, attempt));
-            assert_eq!(first, (task, attempt), "{earlier:?}");
-        }
+    for Request::Append(append, request_id) in store.requests() {
+        let (_, task, attempt) = writer(append.producer);
+        let first = *attempts.entry(request_id).or_insert((task, attempt));
+        assert_eq!(first, (task, attempt), "{earlier:?}");
     }
     run.worker.drain_pollers_and_shutdown_ref().await;
 }

@@ -13,7 +13,7 @@ use temporalio_common::protos::{
 };
 use temporalio_streams::{
     AnyReason, StreamError, StreamRuntime,
-    proto::{AppendRecordsRequest, StreamErrorReason},
+    proto::{StreamErrorReason, sdk::AppendRecordsRequest},
 };
 use tokio::{runtime::Handle, task::AbortHandle};
 
@@ -377,8 +377,8 @@ mod tests {
     use temporalio_streams::{
         AnyError, StreamStore,
         proto::{
-            AppendRecord, CreateStreamRequest, Producer, StreamErrorDetails, StreamRef,
-            WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+            AppendRecord, CreateStreamRequest, Producer, StreamErrorDetails, WorkflowProducer,
+            WorkflowTaskAttempt, producer::Kind, sdk::StreamRef,
         },
         record::StoreLimits,
     };
@@ -390,7 +390,7 @@ mod tests {
     async fn manager() -> (Arc<MemoryStore>, StreamManager, Results) {
         let store = Arc::new(MemoryStore::default());
         let create = CreateStreamRequest {
-            stream_ref: Some(stream()),
+            stream_id: "s".to_string(),
             ..Default::default()
         };
         store.create_stream(create, "c".to_string()).await.unwrap();
