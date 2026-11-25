@@ -206,6 +206,11 @@ impl Workflows {
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
             UnboundedReceiverStream::new(records_rx),
+            basics
+                .worker_config
+                .stream_runtimes
+                .settings
+                .replay_read_runs,
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang
@@ -1083,8 +1088,6 @@ impl PreparedWFT {
 #[derive(Debug)]
 struct OutstandingTask {
     info: WorkflowTaskInfo,
-    /// True if the task came with an Update request, so the server may have made it speculative.
-    has_update_request: bool,
     /// Set if the outstanding task has quer(ies) which must be fulfilled upon finishing replay
     pending_queries: Vec<QueryWorkflow>,
     start_time: Instant,
@@ -1653,7 +1656,6 @@ enum WFCommandVariant {
     RequestCancelNexusOperation(RequestCancelNexusOperation),
     ReadStream(ReadStream),
     AppendToStream(AppendToStream),
-    CloseStream(CloseStream),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1717,7 +1719,6 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::ReadStream(s) => WFCommandVariant::ReadStream(s),
             workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
-            workflow_command::Variant::CloseStream(s) => WFCommandVariant::CloseStream(s),
         };
         Ok(Self {
             variant,
@@ -1960,7 +1961,6 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::DoUpdate(_) => 3,
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
                 workflow_activation_job::Variant::ResolveStreamAppend(_)
-                | workflow_activation_job::Variant::ResolveStreamClose(_)
                 | workflow_activation_job::Variant::ResolveStreamRead(_) => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is

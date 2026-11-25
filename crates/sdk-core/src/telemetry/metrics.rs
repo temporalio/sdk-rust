@@ -57,9 +57,6 @@ struct Instruments {
     stream_append_total: Counter,
     stream_append_execution_failed: Counter,
     stream_append_exec_latency: HistogramDuration,
-    stream_close_total: Counter,
-    stream_close_execution_failed: Counter,
-    stream_close_exec_latency: HistogramDuration,
     stream_read_total: Counter,
     stream_read_execution_failed: Counter,
     stream_read_records: Counter,
@@ -291,18 +288,6 @@ impl MetricsContext {
 
     pub(crate) fn stream_append_exec_latency(&self, dur: Duration) {
         self.instruments.stream_append_exec_latency.records(dur);
-    }
-
-    pub(crate) fn stream_close_executed(&self) {
-        self.instruments.stream_close_total.adds(1);
-    }
-
-    pub(crate) fn stream_close_execution_failed(&self) {
-        self.instruments.stream_close_execution_failed.adds(1);
-    }
-
-    pub(crate) fn stream_close_exec_latency(&self, dur: Duration) {
-        self.instruments.stream_close_exec_latency.records(dur);
     }
 
     pub(crate) fn stream_read_executed(&self) {
@@ -560,21 +545,6 @@ impl Instruments {
                 unit: "duration".into(),
                 description: "Histogram of Stream append try latencies".into(),
             }),
-            stream_close_total: meter.counter(MetricParameters {
-                name: "stream_close_total".into(),
-                description: "Count of Stream close tries".into(),
-                unit: "".into(),
-            }),
-            stream_close_execution_failed: meter.counter(MetricParameters {
-                name: "stream_close_execution_failed".into(),
-                description: "Count of Stream close tries that failed".into(),
-                unit: "".into(),
-            }),
-            stream_close_exec_latency: meter.histogram_duration(MetricParameters {
-                name: "stream_close_execution_latency".into(),
-                unit: "duration".into(),
-                description: "Histogram of Stream close try latencies".into(),
-            }),
             stream_read_total: meter.counter(MetricParameters {
                 name: "stream_read_total".into(),
                 description: "Count of the requests that Stream reads sent to a Store".into(),
@@ -723,12 +693,6 @@ impl Instruments {
         self.stream_append_execution_failed
             .update_attributes(new_attributes.clone());
         self.stream_append_exec_latency
-            .update_attributes(new_attributes.clone());
-        self.stream_close_total
-            .update_attributes(new_attributes.clone());
-        self.stream_close_execution_failed
-            .update_attributes(new_attributes.clone());
-        self.stream_close_exec_latency
             .update_attributes(new_attributes.clone());
         self.stream_read_total
             .update_attributes(new_attributes.clone());
@@ -1409,7 +1373,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 45;
+        let num_metrics = 42;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],

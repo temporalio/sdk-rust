@@ -4,28 +4,27 @@
 //! before.
 
 use super::*;
-use crate::worker::{
-    WorkflowErrorType,
-    streams::{has_ledger, peeked_ledger},
-};
+use crate::worker::{WorkflowErrorType, streams::peeked_read_marker};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::collections::{HashSet, VecDeque};
 use temporalio_common::protos::{
-    constants::{LOCAL_ACTIVITY_MARKER_NAME, PATCH_MARKER_NAME},
+    constants::{LOCAL_ACTIVITY_MARKER_NAME, PATCH_MARKER_NAME, STREAM_READ_MARKER_NAME},
     coresdk::{
         ActivityTaskCompletion,
         activity_result::ActivityExecutionResult,
+        external_data::{
+            StreamReadMarkerData, StreamReadPage, StreamReadResult, stream_read_result,
+        },
         workflow_activation::{FireTimer, ResolveStreamRead, StreamPage, resolve_stream_read},
-        workflow_commands::{SetPatchMarker, UpsertWorkflowSearchAttributes},
+        workflow_commands::{self, SetPatchMarker, UpsertWorkflowSearchAttributes},
         workflow_completion::workflow_activation_completion::Status,
     },
-    temporal::api::{
-        common::v1::SearchAttributes,
-        failure::v1::failure::FailureInfo,
-        sdk::v1::workflow_task_stream_calls::{ReadPage, ReadResult, read_result},
-    },
+    temporal::api::{common::v1::SearchAttributes, failure::v1::failure::FailureInfo},
 };
-use temporalio_streams::proto::{ClientProducer, ReadRecordsRequest, StreamRecord};
+use temporalio_streams::{
+    proto::{ClientProducer, ReadRecordsRequest, StreamRecord},
+    record::field_len,
+};
 
 fn client() -> Option<Producer> {
     Some(Producer {
@@ -49,7 +48,7 @@ async fn fill(store: &MemoryStore, id: &str, count: usize) {
         })
         .collect();
     let append = AppendRecordsRequest {
-        r#ref: Some(stream(id)),
+        stream_id: id.to_string(),
         producer: client(),
         records,
     };
@@ -63,7 +62,7 @@ async fn append_sized(store: &MemoryStore, id: &str, size: usize) {
         ..Default::default()
     };
     let append = AppendRecordsRequest {
-        r#ref: Some(stream(id)),
+        stream_id: id.to_string(),
         producer: client(),
         records: vec![AppendRecord { body: Some(body) }],
     };
@@ -80,6 +79,21 @@ fn read(seq: u32, id: &str, from_offset: &[u8], wait: Duration) -> ReadStream {
         wait: Some(wait.try_into().unwrap()),
         ..Default::default()
     }
+}
+
+/// Returns the data of each read marker of `completion`, in order.
+fn read_markers(completion: &WorkflowTaskCompletion) -> Vec<StreamReadMarkerData> {
+    (completion.commands.iter())
+        .filter_map(|command| match command.attributes.as_ref() {
+            Some(Attributes::RecordMarkerCommandAttributes(marker))
+                if marker.marker_name == STREAM_READ_MARKER_NAME =>
+            {
+                let data = &marker.details["data"].payloads[0];
+                Some(StreamReadMarkerData::from_json_payload(data).unwrap())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn jobs_of(activation: &WorkflowActivation) -> Vec<Job> {
@@ -106,7 +120,7 @@ fn page_of(read: &ResolveStreamRead) -> Option<&StreamPage> {
 /// Returns the read that goes on after the page of `read`, with the next seq. Returns `None` if
 /// the read gave no Record, or the last one of its Stream, so Workflow code stops reading.
 fn next_read(read: &ResolveStreamRead, wait: Duration) -> Option<ReadStream> {
-    let page = page_of(read).filter(|page| !page.records.is_empty() && !page.done)?;
+    let page = page_of(read).filter(|page| !page.records.is_empty())?;
     Some(self::read(read.seq + 1, "s", &page.last_offset, wait))
 }
 
@@ -131,31 +145,35 @@ fn records_of(jobs: &[Vec<Job>]) -> Vec<StreamRecord> {
 enum NoAnswer {
     /// The Store holds the read.
     StoreHolds,
-    /// Each try of the read fails with `StoreUnavailable`.
-    StoreDown,
-    /// The Store holds the read, and Workflow code starts a timer with it.
+    /// The Stream has no Record when Workflow code starts a timer with the read. The Record comes
+    /// once the task completed.
     WithATimer,
 }
 
-// At the read limit of its task, a read with no answer gives a page with no Record, or a failure
-// while the Store is down. A command for the server never waits for a read, so the task completes
-// and the page comes in the next task.
+// At the read limit of its task, a read with no answer gives a page with no Record that ends at
+// its `from_offset`, with `wait_cut`. A command for the server waits for one check of a read with
+// a wait. A check with no Record parks the read, so the task completes with no new task, and the
+// read starts again in the next task, which the timer makes.
 #[rstest::rstest]
 #[case(NoAnswer::StoreHolds)]
-#[case(NoAnswer::StoreDown)]
 #[case(NoAnswer::WithATimer)]
 #[tokio::test]
 async fn a_read_with_no_answer_ends_at_its_limit_or_in_the_next_task(#[case] case: NoAnswer) {
     let store = store(&["s"]).await;
-    fill(&store, "s", 1).await;
-    match case {
-        NoAnswer::StoreDown => {
-            let down = StreamError::store_unavailable("The Store is down");
-            store.fail(Op::Read, down, usize::MAX);
-        }
-        _ => store.hold(Op::Read),
+    if case == NoAnswer::StoreHolds {
+        fill(&store, "s", 1).await;
+        store.hold(Op::Read);
     }
-    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let mut opts = StartOpts::new(&store);
+    opts.eager = Some(Box::new(|completion, t| {
+        let types = command_types(completion);
+        if !types.contains(&CommandType::StartTimer) {
+            return None;
+        }
+        fire_last_timer(t);
+        Some(next_task(t))
+    }));
+    let run = start(history(Duration::from_secs(60)), opts);
     let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
         match &activation.jobs[0].variant {
             Some(Job::InitializeWorkflow(_)) => {
@@ -165,59 +183,130 @@ async fn a_read_with_no_answer_ends_at_its_limit_or_in_the_next_task(#[case] cas
                 }
                 commands
             }
+            Some(Job::FireTimer(_)) => vec![],
             _ => vec![complete()],
         }
     };
-    let release = async {
+    let comes = async {
         if case == NoAnswer::WithATimer {
             wait_until(|| !run.sent().is_empty()).await;
-            store.release();
+            fill(&store, "s", 1).await;
         }
     };
     // The heartbeat of each task is at 48 s.
     let drive = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow));
-    let (live, ()) = tokio::join!(drive, release);
+    let (live, ()) = tokio::join!(drive, comes);
     let live = live.expect("A read held its task to its heartbeat");
-    assert_eq!(live.len(), 2, "{live:?}");
-    let [Job::ResolveStreamRead(result)] = &live[1][..] else {
+    assert_eq!(
+        live.len(),
+        2 + usize::from(case == NoAnswer::WithATimer),
+        "{live:?}"
+    );
+    let [Job::ResolveStreamRead(result)] = &live[live.len() - 1][..] else {
         panic!("{live:?}");
     };
+    let page = page_of(result).unwrap();
     let sent = run.sent();
     match case {
         NoAnswer::StoreHolds => {
-            let page = page_of(result).unwrap();
-            assert!(page.records.is_empty() && page.last_offset.is_empty() && !page.done);
+            assert!(page.records.is_empty() && page.last_offset.is_empty());
+            assert!(page.wait_cut);
             assert_eq!(sent.len(), 1);
-        }
-        NoAnswer::StoreDown => {
-            let Some(resolve_stream_read::Status::Failed(failure)) = &result.status else {
-                panic!("{result:?}");
-            };
-            let Some(FailureInfo::ApplicationFailureInfo(info)) = &failure.failure_info else {
-                panic!("{failure:?}");
-            };
-            assert_eq!(info.r#type, "stream_store_unavailable");
-            assert_eq!(sent.len(), 1);
+            // The Store's wait leaves room for the answer before the read limit at 250 ms.
+            let wait: Duration = (store.reads()[0].wait).unwrap().try_into().unwrap();
+            assert!(
+                wait > Duration::ZERO && wait < Duration::from_millis(250),
+                "{wait:?}"
+            );
         }
         NoAnswer::WithATimer => {
-            // The first completion leaves the read with no result, so it has an empty ledger and
-            // asks for a new task.
+            // The task completes at once, so the check takes the place of the read that it
+            // didn't send yet. It parks the read, and the completion asks for no new task.
             assert_eq!(command_types(&sent[0]), [CommandType::StartTimer]);
-            assert_eq!(ledger(&sent[0]), Some(Default::default()));
-            assert!(sent[0].force_create_new_workflow_task);
-            assert_eq!(records_of(&live), store.records("s"));
+            assert!(!sent[0].force_create_new_workflow_task);
+            let waits: Vec<bool> = (store.reads().iter())
+                .map(|read| read.wait.is_some())
+                .collect();
+            assert_eq!(waits, [false, true]);
+            assert_eq!(page.records, store.records("s"));
+            assert!(!page.wait_cut);
+            let [marker] = &read_markers(&sent[1])[..] else {
+                panic!("{sent:?}");
+            };
+            assert_eq!(marker.reads[0].activation_index, 1);
             assert_eq!(sent.len(), 2);
         }
     }
-    // The Store's wait leaves room for the answer before the read limit at 250 ms.
-    let wait: Duration = (store.reads()[0].wait).unwrap().try_into().unwrap();
-    assert!(
-        wait > Duration::ZERO && wait < Duration::from_millis(250),
-        "{wait:?}"
-    );
     run.worker.drain_pollers_and_shutdown_ref().await;
     store.release();
     assert_eq!(run.replay(workflow).await, live);
+}
+
+/// Where a read meets a Store in an outage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Outage {
+    /// Each try fails with `StoreUnavailable`, and the read limit comes.
+    AtTheReadLimit,
+    /// The Store holds each read, and the check before the completion of a timer gets no answer
+    /// by its deadline.
+    AtACheck,
+}
+
+// A read outage fails the task as an append outage does, at the read limit and at a check. So
+// Workflow code gets no `StoreUnavailable`, History keeps no failure of the read, and the task
+// asks for no new task.
+#[rstest::rstest]
+#[case(Outage::AtTheReadLimit)]
+#[case(Outage::AtACheck)]
+#[tokio::test]
+async fn a_read_outage_at_a_decision_point_fails_the_task(#[case] case: Outage) {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 1).await;
+    match case {
+        Outage::AtTheReadLimit => {
+            let down = StreamError::store_unavailable("The Store is down");
+            store.fail(Op::Read, down, usize::MAX);
+        }
+        Outage::AtACheck => store.hold(Op::Read),
+    }
+    let mut opts = StartOpts::new(&store);
+    opts.fails = 1;
+    opts.configure = Box::new(|wc| {
+        wc.stream_runtimes.settings.read_check_deadline = Duration::from_millis(200);
+    });
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                let mut commands = vec![read(1, "s", &[], Duration::from_secs(60)).into()];
+                if case == Outage::AtACheck {
+                    commands.push(timer(1));
+                }
+                commands
+            }
+            _ => vec![complete()],
+        }
+    };
+    let (_, sequence) = drive_for(&run, Duration::from_secs(5), workflow).await;
+    let failed = run.failed.lock().clone();
+    let [(cause, message)] = &failed[..] else {
+        panic!("{sequence}");
+    };
+    assert_eq!(
+        *cause,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    let error = match case {
+        Outage::AtTheReadLimit => "The Store is down",
+        Outage::AtACheck => "The Store gave no answer in 200ms",
+    };
+    let expected = format!(
+        "StreamStoreUnavailable: read of Stream \"s\" on Store \"{STORE}\": \
+         stream_store_unavailable: {error}"
+    );
+    assert_eq!(*message, expected, "{sequence}");
+    assert!(run.sent().is_empty(), "{sequence}");
+    run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
 /// What a Store does with a read that doesn't wait.
@@ -225,14 +314,14 @@ async fn a_read_with_no_answer_ends_at_its_limit_or_in_the_next_task(#[case] cas
 enum NoWait {
     /// The Store answers after the read limit of the task.
     AnswersLate,
-    /// The Store never answers.
+    /// The Store never answers, and each try ends at a try deadline before the read limit.
     NeverAnswers,
 }
 
 // Only the Store can say that a Stream has no Record after the offset of a read that doesn't
-// wait. So the read limit doesn't end such a read while its try waits for the answer. Its page
-// comes when the Store answers, or its try fails at the try deadline, and the read then ends with
-// that failure at a read limit.
+// wait. So the read limit doesn't end such a read while its try waits for the answer. The read
+// then holds the task no longer, and before the completion stops it, it gets a check, whose answer
+// the task gives. A read whose last try failed fails the task at the read limit.
 #[rstest::rstest]
 #[case(NoWait::AnswersLate)]
 #[case(NoWait::NeverAnswers)]
@@ -242,9 +331,13 @@ async fn a_read_with_no_wait_gets_the_answer_of_the_store(#[case] case: NoWait) 
     fill(&store, "s", 2).await;
     store.hold(Op::Read);
     let mut opts = StartOpts::new(&store);
-    // A try deadline after the read limit of 250 ms.
-    opts.configure =
-        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_millis(300));
+    opts.fails = usize::from(case == NoWait::NeverAnswers);
+    opts.configure = Box::new(move |wc| {
+        wc.stream_runtimes.settings.try_deadline = match case {
+            NoWait::AnswersLate => Duration::from_millis(300),
+            NoWait::NeverAnswers => Duration::from_millis(100),
+        };
+    });
     let run = start(history(Duration::from_secs(60)), opts);
     let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
         match &activation.jobs[0].variant {
@@ -252,36 +345,62 @@ async fn a_read_with_no_wait_gets_the_answer_of_the_store(#[case] case: NoWait) 
             _ => vec![complete()],
         }
     };
-    let release = async {
-        if case == NoWait::AnswersLate {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            store.release();
+    let (live, sequence) = match case {
+        NoWait::AnswersLate => {
+            let release = async {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                store.release();
+            };
+            let drive = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow));
+            let (live, ()) = tokio::join!(drive, release);
+            (live.expect("The read never ended"), String::new())
         }
+        NoWait::NeverAnswers => (
+            vec![],
+            drive_for(&run, Duration::from_secs(5), workflow).await.1,
+        ),
     };
-    let drive = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow));
-    let (live, ()) = tokio::join!(drive, release);
-    let live = live.expect("The read never ended");
-    let [Job::ResolveStreamRead(result)] = &live[1][..] else {
-        panic!("{live:?}");
-    };
+    let sent = run.sent();
+    let failed = run.failed.lock().clone();
     match case {
         NoWait::AnswersLate => {
-            let page = page_of(result).expect("The read got a page");
-            assert_eq!(page.records, store.records("s"), "{live:?}");
+            // The first task passed its read limit with no command, and the check before its
+            // completion got the page.
+            assert_eq!(
+                command_types(&sent[0]),
+                [
+                    CommandType::RecordMarker,
+                    CommandType::CompleteWorkflowExecution
+                ],
+                "{sequence}"
+            );
+            let [marker] = &read_markers(&sent[0])[..] else {
+                panic!("{sequence}");
+            };
+            let page = recorded_page(&marker.reads[0]).unwrap();
+            assert_eq!(page.record_count, 2, "{sequence}");
+            let waits: Vec<bool> = (store.reads().iter())
+                .map(|read| read.wait.is_some())
+                .collect();
+            assert_eq!(waits, [false, false], "{sequence}");
+            assert_eq!(failed, [], "{sequence}");
         }
         NoWait::NeverAnswers => {
-            let Some(resolve_stream_read::Status::Failed(failure)) = &result.status else {
-                panic!("{result:?}");
+            let [(_, message)] = &failed[..] else {
+                panic!("{sequence}");
             };
-            let Some(FailureInfo::ApplicationFailureInfo(info)) = &failure.failure_info else {
-                panic!("{failure:?}");
-            };
-            assert_eq!(info.r#type, "stream_store_unavailable");
+            assert!(
+                message.ends_with("stream_store_unavailable: The Store gave no answer in 100ms"),
+                "{message}"
+            );
+            assert!(sent.is_empty(), "{sequence}");
         }
     }
     run.worker.drain_pollers_and_shutdown_ref().await;
     store.release();
-    assert_eq!(run.replay(workflow).await, live);
+    if case == NoWait::AnswersLate {
+        assert_eq!(run.replay(workflow).await, live);
+    }
 }
 
 /// How History reaches a Worker that doesn't have the run.
@@ -291,7 +410,7 @@ enum Path {
     FullHistory,
     /// The poll has the last task, and Core fetches the History from the start.
     CacheMiss,
-    /// The poll has the whole History, and the replay reads the Records of each ledger in a part
+    /// The poll has the whole History, and the replay reads the Records of each marker in a part
     /// of its own, so those of the second read come while a completion waits.
     InALaterPart,
 }
@@ -327,6 +446,8 @@ enum Replay {
     StoreDownForAQuery,
     /// The Worker has no runtime for the Store.
     NoRuntime,
+    /// The Worker has no runtime for the Store. The task is a query.
+    NoRuntimeForAQuery,
 }
 
 fn fails_workflow(wc: &mut WorkerConfig) {
@@ -348,9 +469,9 @@ fn fails_workflow_with_no_runtime(wc: &mut WorkerConfig) {
     wc.stream_runtimes = StreamRuntimes::default();
 }
 
-fn fails_workflow_with_parts_of_one_ledger(wc: &mut WorkerConfig) {
+fn fails_workflow_with_parts_of_one_marker(wc: &mut WorkerConfig) {
     fails_workflow(wc);
-    wc.stream_runtimes.settings.bounds.max_task_record_bytes = 1;
+    wc.stream_runtimes.settings.max_task_record_bytes = 1;
 }
 
 /// Reads Stream `r` in task 2 and Stream `s` in task 4, with a timer in each task, and completes
@@ -383,6 +504,7 @@ fn read_in_the_second_and_fourth_tasks(activation: &WorkflowActivation) -> Vec<C
 #[case(Path::CacheMiss, Replay::StoreDown)]
 #[case(Path::FullHistory, Replay::StoreDownForAQuery)]
 #[case(Path::FullHistory, Replay::NoRuntime)]
+#[case(Path::FullHistory, Replay::NoRuntimeForAQuery)]
 #[tokio::test]
 async fn the_replay_rule_holds_on_each_history_path(#[case] path: Path, #[case] replay: Replay) {
     let store = store(&["r", "s"]).await;
@@ -437,9 +559,12 @@ async fn the_replay_rule_holds_on_each_history_path(#[case] path: Path, #[case] 
             StreamError::store_unavailable("The Store is down"),
             usize::MAX,
         ),
-        Replay::NoRuntime => {}
+        Replay::NoRuntime | Replay::NoRuntimeForAQuery => {}
     }
-    let is_query = matches!(replay, Replay::GoneForAQuery | Replay::StoreDownForAQuery);
+    let is_query = matches!(
+        replay,
+        Replay::GoneForAQuery | Replay::StoreDownForAQuery | Replay::NoRuntimeForAQuery
+    );
     if is_query {
         // The server gave out the query before timer 4 fired.
         whole = query_before(&whole, t.current_event_id() - 3);
@@ -456,10 +581,10 @@ async fn the_replay_rule_holds_on_each_history_path(#[case] path: Path, #[case] 
     })];
     opts.served = None;
     let configure: fn(&mut WorkerConfig) = match (path, replay) {
-        (Path::InALaterPart, _) => fails_workflow_with_parts_of_one_ledger,
+        (Path::InALaterPart, _) => fails_workflow_with_parts_of_one_marker,
         (_, Replay::GoneWithTheNondeterminismOptIn) => fails_workflow_for_nondeterminism,
         (_, Replay::StoreDown | Replay::StoreDownForAQuery) => fails_workflow_with_its_store_down,
-        (_, Replay::NoRuntime) => fails_workflow_with_no_runtime,
+        (_, Replay::NoRuntime | Replay::NoRuntimeForAQuery) => fails_workflow_with_no_runtime,
         _ => fails_workflow,
     };
     opts.configure = Box::new(configure);
@@ -467,7 +592,7 @@ async fn the_replay_rule_holds_on_each_history_path(#[case] path: Path, #[case] 
     let reports_nothing = is_query || matches!(replay, Replay::GoneOnALaterAttempt);
     let reason = match replay {
         Replay::StoreDown | Replay::StoreDownForAQuery => "The Store is unavailable",
-        Replay::NoRuntime => "This Worker has no Stream runtime",
+        Replay::NoRuntime | Replay::NoRuntimeForAQuery => "This Worker has no Stream runtime",
         _ => "The Store doesn't have the 3 Records",
     };
     opts.fails = usize::from(!fails_the_workflow && !reports_nothing);
@@ -511,6 +636,36 @@ async fn the_replay_rule_holds_on_each_history_path(#[case] path: Path, #[case] 
     }
 }
 
+/// Answers a forced completion with the next task. Answers one that starts a timer other than
+/// timer 1 with the firing of that timer and the next task, since Core asks for no new task for a
+/// read that it knows of no Record for.
+fn page_server() -> Eager {
+    Box::new(|completion, t| {
+        if completion.force_create_new_workflow_task {
+            return Some(next_task(t));
+        }
+        let timers: Vec<&str> = (completion.commands.iter())
+            .filter_map(|command| match &command.attributes {
+                Some(Attributes::StartTimerCommandAttributes(timer)) => Some(&*timer.timer_id),
+                _ => None,
+            })
+            .collect();
+        // A completion that also starts timer 1 ends the reads, and the test fires timer 1.
+        let fires = timers.iter().any(|id| *id != "1") && !timers.contains(&"1");
+        fires.then(|| {
+            fire_last_timer(t);
+            next_task(t)
+        })
+    })
+}
+
+/// Returns true if `activation` fires a timer that isn't the timer of a page. A page timer has the
+/// offset of a Record as its seq, which is far above the seq of each other timer.
+fn fires_a_last_timer(activation: &WorkflowActivation) -> bool {
+    (activation.jobs.iter())
+        .any(|job| matches!(&job.variant, Some(Job::FireTimer(fired)) if fired.seq < 1 << 20))
+}
+
 /// Returns Workflow code that reads Stream `s` in pages of `page_records` Records. At each page it
 /// starts a timer and the next read, so the task completes while that read runs, and each task
 /// gives one page. Once a read gives no Record it starts timer 1, and it completes once timer 1
@@ -530,7 +685,7 @@ fn read_with_a_timer_at_each_page(
     move |activation| match &activation.jobs[0].variant {
         Some(Job::QueryWorkflow(_)) => answer(activation).into_iter().collect(),
         Some(Job::InitializeWorkflow(_)) => vec![page(read(1, "s", &[], Duration::ZERO))],
-        Some(Job::FireTimer(_)) => vec![complete()],
+        _ if fires_a_last_timer(activation) => vec![complete()],
         _ => (results(activation))
             .flat_map(|result| match next_read(result, Duration::ZERO) {
                 Some(next) => vec![timer(seq(&next.from_offset) as u32), page(next)],
@@ -551,7 +706,9 @@ async fn first_run_with_a_timer_at_each_page(
     TestHistoryBuilder,
     PollWorkflowTaskQueueResponse,
 ) {
-    let first = start(history(Duration::from_secs(60)), StartOpts::new(store));
+    let mut opts = StartOpts::new(store);
+    opts.eager = Some(page_server());
+    let first = start(history(Duration::from_secs(60)), opts);
     let workflow = read_with_a_timer_at_each_page(page_records);
     let mut live = vec![];
     loop {
@@ -579,22 +736,22 @@ async fn evicted(worker: &Worker, activation: &WorkflowActivation) -> bool {
     evicts
 }
 
-fn recorded_page(entry: &ReadResult) -> Option<&ReadPage> {
+fn recorded_page(entry: &StreamReadResult) -> Option<&StreamReadPage> {
     match &entry.result {
-        Some(read_result::Result::Page(page)) => Some(page),
+        Some(stream_read_result::Result::Page(page)) => Some(page),
         _ => None,
     }
 }
 
-/// Returns the offset that the read entry of each ledger of `t` with Records starts after, and the
+/// Returns the offset that the read entry of each marker of `t` with Records starts after, and the
 /// bytes of its Records in Stream `s`.
-fn ledgers_of(t: &TestHistoryBuilder, store: &MemoryStore) -> Vec<(Vec<u8>, usize)> {
+fn markers_of(t: &TestHistoryBuilder, store: &MemoryStore) -> Vec<(Vec<u8>, usize)> {
     let records = store.records("s");
     let events = t.get_full_history_info().unwrap().into_events();
     (events.iter())
-        .filter_map(|event| peeked_ledger(event)?.ok())
-        .map(|ledger| {
-            let entry = &ledger.read_results[0];
+        .filter_map(|event| peeked_read_marker(event)?.ok())
+        .map(|marker| {
+            let entry = &marker.reads[0];
             let count = recorded_page(entry).map_or(0, |page| page.record_count);
             let bytes = (records.iter())
                 .filter(|record| record.offset > entry.from_offset)
@@ -607,12 +764,12 @@ fn ledgers_of(t: &TestHistoryBuilder, store: &MemoryStore) -> Vec<(Vec<u8>, usiz
         .collect()
 }
 
-/// Checks the reads of a replay of `ledgers`. The reads before an activation are those of a part,
-/// which reads the next ledgers in order, and whose Records fit `bound` unless it reads one
-/// ledger. The replay reads each ledger once. Returns the number of ledgers that each part reads.
+/// Checks the reads of a replay of `markers`. The reads before an activation are those of a part,
+/// which reads the next markers in order, and whose Records fit `bound` unless it reads one
+/// marker. The replay reads each marker once. Returns the number of markers that each part reads.
 fn check_parts(
     seed: u64,
-    ledgers: &[(Vec<u8>, usize)],
+    markers: &[(Vec<u8>, usize)],
     reads: &[Vec<ReadRecordsRequest>],
     bound: usize,
 ) -> Vec<usize> {
@@ -621,21 +778,21 @@ fn check_parts(
             .filter(|read| read.from_offset == after)
             .count()
     };
-    for (after, _) in ledgers {
+    for (after, _) in markers {
         assert_eq!(starts(&reads.concat(), after), 1, "seed {seed}: {after:?}");
     }
     let (mut next, mut parts) = (0, vec![]);
     for part in reads.iter().filter(|reads| !reads.is_empty()) {
-        let read = (ledgers[next..].iter())
+        let read = (markers[next..].iter())
             .take_while(|(after, _)| starts(part, after) > 0)
             .count();
-        assert!(read > 0, "seed {seed}: ledger {next}");
-        let held: usize = ledgers[next..next + read].iter().map(|(_, b)| b).sum();
+        assert!(read > 0, "seed {seed}: marker {next}");
+        let held: usize = markers[next..next + read].iter().map(|(_, b)| b).sum();
         assert!(read == 1 || held <= bound, "seed {seed}: {held}");
         next += read;
         parts.push(read);
     }
-    assert_eq!(next, ledgers.len(), "seed {seed}");
+    assert_eq!(next, markers.len(), "seed {seed}");
     parts
 }
 
@@ -670,7 +827,7 @@ async fn replay_with_reads(
 }
 
 // A replay reads the next part only once Workflow code got the Records of the part before it, but
-// for those of one ledger, which the machines peeked. So it never holds more than two parts.
+// for those of one marker, which the machines peeked. So it never holds more than two parts.
 #[tokio::test]
 async fn a_replay_holds_at_most_two_parts_of_records() {
     const PART: usize = 64 << 10;
@@ -679,7 +836,7 @@ async fn a_replay_holds_at_most_two_parts_of_records() {
         let _seed = SeedOnPanic(seed);
         let mut rng = StdRng::seed_from_u64(seed);
         let store = store(&["s"]).await;
-        // Each task of the first run gives one page, so each ledger has the Records of one.
+        // Each task of the first run gives one page, so each marker has the Records of one.
         let page_records = rng.random_range(1..=8);
         for _ in 0..page_records * rng.random_range(5..=40) {
             let size = match rng.random_bool(0.7) {
@@ -689,15 +846,15 @@ async fn a_replay_holds_at_most_two_parts_of_records() {
             append_sized(&store, "s", size).await;
         }
         let (live, t, whole) = first_run_with_a_timer_at_each_page(&store, page_records).await;
-        let ledgers = ledgers_of(&t, &store);
+        let markers = markers_of(&t, &store);
         let parts_of_64_kib =
-            |wc: &mut WorkerConfig| wc.stream_runtimes.settings.bounds.max_task_record_bytes = PART;
+            |wc: &mut WorkerConfig| wc.stream_runtimes.settings.max_task_record_bytes = PART;
         let (jobs, reads) =
             replay_with_reads(&store, &t, whole, page_records, parts_of_64_kib).await;
         assert_eq!(jobs[..live.len()], live[..], "seed {seed}");
         let fired = vec![Job::FireTimer(FireTimer { seq: 1 })];
         assert_eq!(jobs[live.len()..], [fired], "seed {seed}");
-        let parts = check_parts(seed, &ledgers, &reads, PART);
+        let parts = check_parts(seed, &markers, &reads, PART);
         most_parts = most_parts.max(parts.len());
         // The bytes that the replay read, and those that Workflow code got, before each activation.
         let size = |record: &StreamRecord| prost::Message::encoded_len(record);
@@ -705,9 +862,9 @@ async fn a_replay_holds_at_most_two_parts_of_records() {
         let mut last_two = [0, 0];
         for (part, jobs) in reads.iter().zip(&jobs) {
             if !part.is_empty() {
-                let ledgers = &ledgers[next..next + part.len()];
+                let markers = &markers[next..next + part.len()];
                 next += part.len();
-                let bytes: usize = ledgers.iter().map(|(_, bytes)| bytes).sum();
+                let bytes: usize = markers.iter().map(|(_, bytes)| bytes).sum();
                 last_two = [last_two[1], bytes];
                 read += bytes;
             }
@@ -891,7 +1048,7 @@ async fn first_run_with_peeked_results(
     let run = start(t, opts);
     let mut workflow = reads_with_peeked_results(plan.clone(), page_records);
     let mut live = vec![];
-    let (mut flags, mut released) = (0, 0);
+    let mut flags = 0;
     // The appends with no result yet, the Local Activities that the run didn't complete, and
     // whether a read waits for the Store.
     let (mut appends, mut local_activities, mut reading) = (0, 0, false);
@@ -943,10 +1100,9 @@ async fn first_run_with_peeked_results(
             };
             run.worker.complete_activity_task(completion).await.unwrap();
         } else if reading {
-            wait_until(|| store.reads().len() > released).await;
-            (released, reading) = (released + 1, false);
-            store.release();
-            store.hold(Op::Read);
+            // A read that the completion stopped takes no pass, so the one that goes on gets it.
+            reading = false;
+            store.pass(Op::Read, 1);
         }
     }
     run.worker.drain_pollers_and_shutdown_ref().await;
@@ -957,17 +1113,17 @@ async fn first_run_with_peeked_results(
 }
 
 /// Returns what the machines peek in the completion of the event `completed` of `events`.
-/// The machines take a ledger after the markers and the accepted Updates of its completion.
 fn peeked_in(events: &[HistoryEvent], completed: i64) -> Vec<&'static str> {
     let completion = (events.iter())
         .skip_while(|event| event.event_id <= completed)
         .take_while(|event| event.event_type() != EventType::WorkflowTaskScheduled);
-    let mut peeked: Vec<&'static str> = completion
+    completion
         .filter_map(|event| match &event.attributes {
             Some(history_event::Attributes::MarkerRecordedEventAttributes(marker)) => {
                 match marker.marker_name.as_str() {
                     LOCAL_ACTIVITY_MARKER_NAME => Some("local activity"),
                     PATCH_MARKER_NAME => Some("patch"),
+                    STREAM_READ_MARKER_NAME => Some("stream"),
                     _ => None,
                 }
             }
@@ -976,14 +1132,7 @@ fn peeked_in(events: &[HistoryEvent], completed: i64) -> Vec<&'static str> {
             }
             _ => None,
         })
-        .collect();
-    let completion = events.iter().find(|event| event.event_id == completed);
-    peeked.extend(
-        completion
-            .filter(|event| has_ledger(event))
-            .map(|_| "stream"),
-    );
-    peeked
+        .collect()
 }
 
 /// Turns workflow task chunking on or off for the replay of `t`, by the flags of its first
@@ -1010,13 +1159,76 @@ fn set_chunking(t: &mut TestHistoryBuilder, chunking: bool) {
     t.set_flags_first_wft(&core, &first.lang_used_flags);
 }
 
-fn recorded_ledgers(events: &[HistoryEvent]) -> Vec<(u64, i64)> {
+/// Why a replay never joins a task to the next one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NeverJoined {
+    /// History has the flag that turns chunking off.
+    ChunkingOff,
+    /// The task has a command event.
+    WithACommand,
+}
+
+// A replay joins a forced task with no command event to the next task only with chunking on. So a
+// forced completion with an open call and no result records no marker with no entry when its task
+// has a command event, or when History turns chunking off.
+#[rstest::rstest]
+#[case(NeverJoined::ChunkingOff)]
+#[case(NeverJoined::WithACommand)]
+#[tokio::test]
+async fn a_forced_completion_that_a_replay_never_joins_has_no_empty_marker(
+    #[case] case: NeverJoined,
+) {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let started = t.add_timer_started("1".to_string());
+    t.add_timer_fired(started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    set_chunking(&mut t, case == NeverJoined::WithACommand);
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    let run = start(t, opts);
+    let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![timer(1)],
+            _ if case == NeverJoined::WithACommand => vec![append(1, "s"), timer(2)],
+            _ => vec![append(1, "s")],
+        }
+    };
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    respond(&run.worker, &replayed, workflow).await;
+    let fired = run.worker.poll_workflow_activation().await.unwrap();
+    store.hold(Op::Append);
+    respond(&run.worker, &fired, workflow).await;
+    run.worker.request_workflow_eviction(&fired.run_id);
+    assert_eq!(run.drive(|_| vec![]).await.len(), 0);
+    let sent = run.sent();
+    let [last] = &sent[..] else {
+        panic!("{sent:?}");
+    };
+    assert!(last.force_create_new_workflow_task);
+    let types = match case {
+        NeverJoined::ChunkingOff => vec![],
+        NeverJoined::WithACommand => vec![CommandType::StartTimer],
+    };
+    assert_eq!(command_types(last), types);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    store.release();
+}
+
+/// Returns the recorded bytes of each read marker of `events` with Records, and the event id of
+/// the completion that has it.
+fn recorded_markers(events: &[HistoryEvent]) -> Vec<(u64, i64)> {
+    let mut completed = 0;
     (events.iter())
         .filter_map(|event| {
-            let ledger = peeked_ledger(event)?.ok()?;
-            let pages = ledger.read_results.iter().filter_map(recorded_page);
-            let recorded = pages.map(|page| page.record_bytes as u64).sum();
-            Some((recorded, event.event_id))
+            if event.event_type() == EventType::WorkflowTaskCompleted {
+                completed = event.event_id;
+            }
+            let marker = peeked_read_marker(event)?.ok()?;
+            let pages = marker.reads.iter().filter_map(recorded_page);
+            let recorded = pages.map(|page| page.record_bytes).sum();
+            Some((recorded, completed))
         })
         .filter(|(recorded, _)| *recorded > 0)
         .collect()
@@ -1071,8 +1283,7 @@ async fn replay_with_bound(
     let mut opts = StartOpts::new(store);
     opts.responses = vec![ResponseType::Raw(task.clone())];
     opts.pages = pages.clone();
-    opts.configure =
-        Box::new(move |wc| wc.stream_runtimes.settings.bounds.max_task_record_bytes = bound);
+    opts.configure = Box::new(move |wc| wc.stream_runtimes.settings.max_task_record_bytes = bound);
     opts.label = label.clone();
     let replay = start(t.clone(), opts);
     let mut flags = vec![];
@@ -1104,15 +1315,15 @@ async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
         let store = store(&["s", "a"]).await;
         let page_records = rng.random_range(1..=3);
         // At least four pages, so that the first part can end after the first, a middle or the
-        // next-to-last ledger.
+        // next-to-last marker.
         fill(&store, "s", rng.random_range(3 * page_records + 1..=20)).await;
         let records = store.records("s");
         let pages: Vec<u32> = (records.chunks(page_records))
             .map(|page| u64::from_be_bytes(page[page.len() - 1].offset[..].try_into().unwrap()))
             .map(|seq| seq as u32)
             .collect();
-        // The seed picks the last ledger of the first part, and what the completion of that
-        // ledger has. It's the ledger of page `last`.
+        // The seed picks the last marker of the first part, and what the completion of that
+        // marker has. It's the marker of page `last`.
         let kind = seed as usize % 3;
         let last = match (seed / 3) % 3 {
             0 => 1,
@@ -1133,31 +1344,31 @@ async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
         set_chunking(&mut t, chunking);
         let whole = next_task(&mut t);
         let events = whole.history.clone().unwrap().events;
-        let ledgers = recorded_ledgers(&events);
-        assert_eq!(ledgers.len(), pages.len(), "seed {seed}: {ledgers:?}");
-        // The first part takes the ledgers up to `last`, and the replay waits for the next one.
-        let bound = ledgers[..last]
+        let markers = recorded_markers(&events);
+        assert_eq!(markers.len(), pages.len(), "seed {seed}: {markers:?}");
+        // The first part takes the markers up to `last`, and the replay waits for the next one.
+        let bound = markers[..last]
             .iter()
             .map(|(recorded, _)| recorded)
             .sum::<u64>() as usize;
         let position = match last {
-            1 => "after the first ledger",
-            _ if last == ledgers.len() - 1 => "before the last ledger",
-            _ => "after a middle ledger",
+            1 => "after the first marker",
+            _ if last == markers.len() - 1 => "before the last marker",
+            _ => "after a middle marker",
         };
         *positions.entry(position).or_insert(0) += 1;
-        for kind in peeked_in(&events, ledgers[last - 1].1) {
+        for kind in peeked_in(&events, markers[last - 1].1) {
             *peeked.entry(kind).or_insert(0) += 1;
         }
         // The replay waits once it applied the task whose completion is two before the one of
-        // the first unread ledger. With chunking, a completion with no command joins two tasks.
+        // the first unread marker. With chunking, a completion with no command joins two tasks.
         let completions: Vec<i64> = (events.iter())
             .filter(|event| event.event_type() == EventType::WorkflowTaskCompleted)
             .map(|event| event.event_id)
             .collect();
         let unread = completions
             .iter()
-            .position(|id| *id == ledgers[last].1)
+            .position(|id| *id == markers[last].1)
             .unwrap();
         let no_command = unread >= 2
             && (events.iter())
@@ -1203,17 +1414,17 @@ async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
 }
 
 // The server gives a long History in pages. The poll has the first page and Core fetches the
-// others, or Core fetches all of them from the start when the run isn't in the cache. A ledger in
+// others, or Core fetches all of them from the start when the run isn't in the cache. A marker in
 // a later page has only its count and its digest too, so the replay must read its Records.
 #[tokio::test]
-async fn a_replay_reads_the_records_of_a_ledger_in_a_later_page_of_history() {
+async fn a_replay_reads_the_records_of_a_marker_in_a_later_page_of_history() {
     let store = store(&["s"]).await;
     fill(&store, "s", 6).await;
-    // Each task reads one Record, so each ledger has the count and the digest of one page.
+    // Each task reads one Record, so each marker has the count and the digest of one page.
     let (live, t, whole) = first_run_with_a_timer_at_each_page(&store, 1).await;
     let first_run = [live, vec![vec![Job::FireTimer(FireTimer { seq: 1 })]]].concat();
     let events = whole.history.clone().unwrap().events;
-    let ledgers = recorded_ledgers(&events).len();
+    let markers = recorded_markers(&events).len();
     // A page ends before the completion of task 2 or task 4. The server writes a completion in a
     // batch after the one of the task's started event, and a page holds whole batches.
     let completions: Vec<usize> = (events.iter().enumerate())
@@ -1221,7 +1432,7 @@ async fn a_replay_reads_the_records_of_a_ledger_in_a_later_page_of_history() {
         .map(|(at, _)| at)
         .collect();
     let (at, later) = (completions[1], completions[3]);
-    assert!(recorded_ledgers(&events[later..]).len() >= 2);
+    assert!(recorded_markers(&events[later..]).len() >= 2);
     let continued = |events: &[HistoryEvent]| GetWorkflowExecutionHistoryResponse {
         next_page_token: vec![1],
         ..page(events)
@@ -1247,8 +1458,8 @@ async fn a_replay_reads_the_records_of_a_ledger_in_a_later_page_of_history() {
             replay_with_bound(&store, &t, &poll, usize::MAX, label.to_string(), workflow).await;
         assert_eq!(replayed.jobs, job_names(&first_run), "{label}");
         assert_eq!(replayed.reads, read_jobs(&first_run), "{label}");
-        // The replay read the Records of each ledger from the Store once.
-        assert_eq!(store.reads().len() - before, ledgers, "{label}");
+        // The replay read the Records of each marker from the Store once.
+        assert_eq!(store.reads().len() - before, markers, "{label}");
     }
 }
 
@@ -1343,22 +1554,24 @@ async fn a_replay_goes_on_after_a_task_with_no_job_before_the_next_part(#[case] 
     }
     run.worker.drain_pollers_and_shutdown_ref().await;
     let sent = run.sent.lock().clone();
+    // Each heartbeat leaves the append open, so its completion has an append marker with no
+    // entry, unless the upsert keeps a replay from joining it to the next task.
     let no_job_commands = match no_job {
         NoJob::Upsert => vec![CommandType::UpsertWorkflowSearchAttributes],
-        NoJob::EmptyUnchunked => vec![],
+        NoJob::EmptyUnchunked => vec![CommandType::RecordMarker],
     };
     assert_eq!(command_types(&sent[1]), no_job_commands);
-    assert_eq!(command_types(&sent[2]), []);
+    assert_eq!(command_types(&sent[2]), [CommandType::RecordMarker]);
     let mut t = run.history.lock().clone();
     set_chunking(&mut t, matches!(no_job, NoJob::Upsert));
     fire_last_timer(&mut t);
     let whole = next_task(&mut t);
-    // The first ledger is a part, and the next one comes after the two tasks with no page.
-    let ledgers = recorded_ledgers(&whole.history.as_ref().unwrap().events);
-    assert_eq!(ledgers.len(), 2, "{ledgers:?}");
+    // The first marker is a part, and the next one comes after the two tasks with no page.
+    let markers = recorded_markers(&whole.history.as_ref().unwrap().events);
+    assert_eq!(markers.len(), 2, "{markers:?}");
     let poll = (whole, vec![]);
     let mut replays = vec![];
-    for bound in [usize::MAX, ledgers[0].0 as usize] {
+    for bound in [usize::MAX, markers[0].0 as usize] {
         let label = format!("{no_job:?} bound {bound}");
         replays.push(replay_with_bound(&store, &t, &poll, bound, label, reads_and_upserts()).await);
     }
@@ -1400,7 +1613,7 @@ async fn a_replay_fails_the_workflow_with_the_next_part_unread(
         }
     };
     let mut runs = vec![];
-    // With parts of one ledger, the first completion of the replay waits for the second part.
+    // With parts of one marker, the first completion of the replay waits for the second part.
     for bound in [usize::MAX, 1] {
         let mut opts = StartOpts::new(&store);
         opts.responses = vec![ResponseType::Raw(whole.clone())];
@@ -1408,7 +1621,7 @@ async fn a_replay_fails_the_workflow_with_the_next_part_unread(
         opts.label = label.clone();
         opts.configure = Box::new(move |wc| {
             fails_workflow_for_nondeterminism(wc);
-            wc.stream_runtimes.settings.bounds.max_task_record_bytes = bound;
+            wc.stream_runtimes.settings.max_task_record_bytes = bound;
         });
         let reads = store.reads().len();
         let replay = start(t.clone(), opts);
@@ -1457,12 +1670,11 @@ async fn a_replay_fails_the_workflow_with_the_next_part_unread(
             })
             .unwrap_or_else(|| panic!("{label}: the Workflow didn't fail"));
         // After lang's failure, Core applies the next task unless Records are unread. It then
-        // finds the timer that has no command, and fails the Workflow with that error.
-        let applied_next_task = message.starts_with(
-            "[TMPRL1100] Nondeterminism error: Fail workflow machine does not handle this event",
-        );
+        // finds the read marker or the timer that has no command, and fails the Workflow with
+        // that error in place of lang's, which has no message.
+        let applied_next_task = !message.is_empty();
         let applies_next_task = match nondeterminism {
-            Nondeterminism::FoundByCore => false,
+            Nondeterminism::FoundByCore => true,
             Nondeterminism::ReportedByLang => bound == usize::MAX,
             Nondeterminism::ReportedByLangWithNoStreamCall => true,
         };
@@ -1511,10 +1723,10 @@ async fn two_tasks_of_a_run_that_is_not_cached_each_get_their_result() {
         let before_timer_2 = t.current_event_id();
         t.add_timer_fired(started, "2".to_string());
         let last = next_task(&mut t);
-        let ledgers = recorded_ledgers(&last.history.as_ref().unwrap().events);
-        // A part has the Records of one ledger, or of some, or of all.
-        let first_part = rng.random_range(1..=ledgers.len());
-        let bound = (ledgers[..first_part].iter())
+        let markers = recorded_markers(&last.history.as_ref().unwrap().events);
+        // A part has the Records of one marker, or of some, or of all.
+        let first_part = rng.random_range(1..=markers.len());
+        let bound = (markers[..first_part].iter())
             .map(|(recorded, _)| recorded)
             .sum::<u64>() as usize;
         // The last Workflow Task and one or two queries, or two or three queries. One query can be
@@ -1564,8 +1776,8 @@ async fn two_tasks_of_a_run_that_is_not_cached_each_get_their_result() {
         opts.queries = queries;
         opts.label = format!("seed {seed}");
         opts.configure = Box::new(move |wc| {
-            wc.stream_runtimes.settings.bounds.max_task_record_bytes = bound;
-            // Each first part reads its ledgers at the same time.
+            wc.stream_runtimes.settings.max_task_record_bytes = bound;
+            // Each first part reads its markers at the same time.
             wc.stream_runtimes.settings.replay_concurrency = 64;
             // A read that waits at the gate must not count as a try with no answer.
             wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
@@ -1709,7 +1921,7 @@ async fn a_poll_passes_while_a_replay_waits_for_a_store(#[case] unanswered: Unan
     opts.served = None;
     opts.cache = 2;
     opts.configure = Box::new(|wc| {
-        wc.stream_runtimes.settings.bounds.max_task_record_bytes = 1;
+        wc.stream_runtimes.settings.max_task_record_bytes = 1;
         wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
     });
     let run = start(t, opts);
@@ -1769,7 +1981,7 @@ async fn a_failed_fetch_of_another_task_fails_no_completion_that_waits_for_recor
     opts.failed_fetches = 1;
     opts.fails = 1;
     opts.configure = Box::new(|wc| {
-        wc.stream_runtimes.settings.bounds.max_task_record_bytes = 1;
+        wc.stream_runtimes.settings.max_task_record_bytes = 1;
         wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
     });
     let mut run = start(t, opts);
@@ -1837,6 +2049,793 @@ async fn a_store_that_keeps_its_thread_in_a_replay_holds_up_no_other_workflow() 
     (completed.expect("The completion waited for the Store")).unwrap();
     while run.sent().len() < 2 {
         let activation = run.worker.poll_workflow_activation().await.unwrap();
+        respond(&run.worker, &activation, read_with_a_timer_at_each_page(1)).await;
+    }
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+/// Returns Workflow code that reads two pages of one Record of Stream `s` in its first task,
+/// starts timer 1 at the second page, and completes once timer 1 fires.
+fn two_pages_then_a_timer(activation: &WorkflowActivation) -> Vec<Command> {
+    let one = |read: ReadStream| -> Command {
+        ReadStream {
+            max_records: 1,
+            ..read
+        }
+        .into()
+    };
+    if let Some(Job::InitializeWorkflow(_)) = &activation.jobs[0].variant {
+        return vec![one(read(1, "s", &[], Duration::ZERO))];
+    }
+    if fires_a_last_timer(activation) {
+        return vec![complete()];
+    }
+    (results(activation))
+        .filter_map(|result| {
+            let page = page_of(result)?;
+            Some(match result.seq {
+                1 => one(read(2, "s", &page.last_offset, Duration::ZERO)),
+                _ => timer(1),
+            })
+        })
+        .collect()
+}
+
+// The first task of a replay peeks each read marker of the completion of the task before, so a
+// part of the pre-read must hold the Records of a whole task. Here the Record bound of a task is
+// one Record, so the second page waits for the next task, and its marker for the next completion.
+// The replay reads in parts of the same bound.
+#[tokio::test]
+async fn a_replay_reads_each_marker_that_the_first_look_ahead_peeks() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let bound = (store.records("s").iter())
+        .map(|record| field_len(prost::Message::encoded_len(record)))
+        .max()
+        .unwrap();
+    let mut opts = StartOpts::new(&store);
+    opts.configure = Box::new(move |wc| wc.stream_runtimes.settings.max_task_record_bytes = bound);
+    let first = start(history(Duration::from_secs(60)), opts);
+    let mut live = vec![];
+    for _ in 0..3 {
+        let activation = first.worker.poll_workflow_activation().await.unwrap();
+        live.push(jobs_of(&activation));
+        respond(&first.worker, &activation, two_pages_then_a_timer).await;
+    }
+    first.worker.drain_pollers_and_shutdown_ref().await;
+    let mut t = first.history.lock().clone();
+    fire_last_timer(&mut t);
+    let whole = next_task(&mut t);
+    let markers = recorded_markers(&whole.history.as_ref().unwrap().events);
+    assert_eq!(markers.len(), 2, "{markers:?}");
+    assert_ne!(markers[0].1, markers[1].1, "{markers:?}");
+    let label = format!(
+        "read markers {markers:?} (recorded bytes, completion), tasks and parts of {bound} bytes"
+    );
+    let replayed = replay_with_bound(
+        &store,
+        &t,
+        &(whole, vec![]),
+        bound,
+        label.clone(),
+        two_pages_then_a_timer,
+    )
+    .await;
+    let first_run = [live, vec![vec![Job::FireTimer(FireTimer { seq: 1 })]]].concat();
+    assert_eq!(replayed.jobs, job_names(&first_run), "{label}");
+}
+
+/// Drives `run` with `workflow` until the run leaves the cache or `limit` passes. Returns true if
+/// the run left the cache, and the sequence of the run for a failure message: the jobs of each
+/// activation, each completion, the events of History and the reads that the Store got.
+async fn drive_for(
+    run: &Run,
+    limit: Duration,
+    mut workflow: impl FnMut(&WorkflowActivation) -> Vec<Command>,
+) -> (bool, String) {
+    let seen = std::cell::RefCell::new(vec![]);
+    let watched = |activation: &WorkflowActivation| {
+        let jobs: Vec<String> = (activation.jobs.iter())
+            .filter_map(|job| job.variant.as_ref().map(summary))
+            .collect();
+        seen.borrow_mut().push(jobs);
+        workflow(activation)
+    };
+    let left = tokio::time::timeout(limit, run.drive(watched))
+        .await
+        .is_ok();
+    let completions: Vec<String> = (run.sent().iter())
+        .map(|sent| {
+            let forced = sent.force_create_new_workflow_task;
+            format!("{:?} forced {forced}", command_types(sent))
+        })
+        .collect();
+    let events: Vec<EventType> = (run.history.lock().get_full_history_info().unwrap())
+        .into_events()
+        .iter()
+        .map(HistoryEvent::event_type)
+        .collect();
+    let failed = run.failed.lock().clone();
+    let sequence = format!(
+        "activations {:?}, completions {completions:?}, failed tasks {failed:?}, History \
+         {events:?}, {} reads of the Store",
+        seen.borrow(),
+        run.store.reads().len()
+    );
+    (left, sequence)
+}
+
+/// Returns the number of Records in the pages of read results of `activation`.
+fn records_in(activation: &WorkflowActivation) -> Option<usize> {
+    results(activation)
+        .filter_map(page_of)
+        .map(|page| page.records.len())
+        .reduce(|sum, count| sum + count)
+}
+
+// A read in the same completion as a command doesn't hold the task. Here no later event comes for
+// the Workflow, so the Records of the Stream must still reach the read.
+#[tokio::test]
+async fn a_read_with_an_upsert_in_the_first_task_gets_its_page() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                let fields = HashMap::from([("k".to_string(), Payload::default())]);
+                let search_attributes = Some(SearchAttributes {
+                    indexed_fields: fields,
+                });
+                vec![
+                    UpsertWorkflowSearchAttributes { search_attributes }.into(),
+                    read(1, "s", &[], Duration::ZERO).into(),
+                ]
+            }
+            _ if records_in(activation).is_some() => vec![complete()],
+            _ => vec![],
+        }
+    };
+    let (left, sequence) = drive_for(&run, Duration::from_secs(3), workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert!(left, "The read got no page: {sequence}");
+}
+
+// Workflow code waits for a Signal with a timeout. At the Signal it cancels the timer and reads in
+// the same activation, so the completion has a command and the read doesn't hold the task. No
+// later event comes, so the Records of the Stream must still reach the read.
+#[tokio::test]
+async fn a_read_with_a_timer_cancel_at_a_signal_gets_its_page() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let mut opts = StartOpts::new(&store);
+    opts.eager = Some(Box::new(|completion, t| {
+        if completion.force_create_new_workflow_task {
+            return Some(next_task(t));
+        }
+        let starts_the_timer = command_types(completion).contains(&CommandType::StartTimer);
+        starts_the_timer.then(|| {
+            t.add_we_signaled("go", vec![]);
+            next_task(t)
+        })
+    }));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![timer(1)],
+            Some(Job::SignalWorkflow(_)) => vec![
+                workflow_commands::CancelTimer { seq: 1 }.into(),
+                read(1, "s", &[], Duration::ZERO).into(),
+            ],
+            _ if records_in(activation).is_some() => vec![complete()],
+            _ => vec![],
+        }
+    };
+    let (left, sequence) = drive_for(&run, Duration::from_secs(3), workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert!(left, "The read got no page: {sequence}");
+}
+
+// An Update handler reads a Stream. The acceptance is a message for the server, so the read
+// doesn't hold the task. No later event comes, so the handler must still get its page, and the
+// Update must complete.
+#[tokio::test]
+async fn a_read_of_an_update_handler_gets_its_page() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    t.add_timer_started("1".to_string());
+    let mut update = next_task(&mut t);
+    update.add_update_request("u", 6);
+    let mut opts = StartOpts::new(&store);
+    opts.responses = vec![ResponseType::Raw(update)];
+    let run = start(t, opts);
+    let mut instance = None;
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![timer(1)],
+            Some(Job::DoUpdate(update)) => {
+                instance = Some(update.protocol_instance_id.clone());
+                let accepted = update_response::Response::Accepted(());
+                vec![
+                    update_response(activation, accepted),
+                    read(1, "s", &[], Duration::ZERO).into(),
+                ]
+            }
+            _ if records_in(activation).is_some() => {
+                let completed = UpdateResponse {
+                    protocol_instance_id: instance.clone().unwrap_or_default(),
+                    response: Some(update_response::Response::Completed(Payload::default())),
+                };
+                vec![completed.into(), complete()]
+            }
+            _ => vec![],
+        }
+    };
+    let (left, sequence) = drive_for(&run, Duration::from_secs(3), workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert!(left, "The Update handler got no page: {sequence}");
+}
+
+// Workflow code drains a Stream. Its last page comes before the read limit of the task, and lang
+// answers after the limit with the next read, which is a check. With no wait the check's empty
+// page ends the drain in the same task. With a wait an empty page would make Workflow code read
+// again at once, so the check parks the read until the next task, and the completion asks for no
+// new task.
+#[rstest::rstest]
+#[case::with_no_wait(Duration::ZERO)]
+#[case::with_a_wait(Duration::from_secs(60))]
+#[tokio::test]
+async fn a_drain_that_crosses_the_read_limit_ends_with_no_wait(#[case] wait: Duration) {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 2).await;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![read(1, "s", &[], wait).into()],
+            _ => (results(activation))
+                .filter_map(|result| {
+                    let page = page_of(result)?;
+                    Some(match page.records.is_empty() {
+                        true => complete(),
+                        false => read(result.seq + 1, "s", &page.last_offset, wait).into(),
+                    })
+                })
+                .collect(),
+        }
+    };
+    let mut seen: Vec<Vec<String>> = vec![];
+    let mut ended = false;
+    for _ in 0..4 {
+        let poll = run.worker.poll_workflow_activation();
+        let Ok(Ok(activation)) = tokio::time::timeout(Duration::from_secs(3), poll).await else {
+            break;
+        };
+        if evicted(&run.worker, &activation).await {
+            ended = true;
+            break;
+        }
+        let jobs: Vec<String> = (activation.jobs.iter())
+            .filter_map(|job| job.variant.as_ref().map(summary))
+            .collect();
+        // The harness sets a read time of 250 ms, so lang answers the page after the limit.
+        if records_in(&activation).is_some_and(|count| count > 0) {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        seen.push(jobs);
+        respond(&run.worker, &activation, workflow).await;
+    }
+    let sent = run.sent();
+    let completions: Vec<String> = (sent.iter())
+        .map(|sent| {
+            let forced = sent.force_create_new_workflow_task;
+            format!("{:?} forced {forced}", command_types(sent))
+        })
+        .collect();
+    let waits: Vec<bool> = (store.reads().iter())
+        .map(|read| read.wait.is_some())
+        .collect();
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let first_page = seen
+        .get(1)
+        .is_some_and(|jobs| jobs.iter().any(|job| job.starts_with("read 1 2 ")));
+    assert!(
+        first_page,
+        "The first page didn't come in the first task: {seen:?}"
+    );
+    let outcome = format!(
+        "activations {seen:?}, completions {completions:?}, waits of the reads of the Store \
+         {waits:?}"
+    );
+    // The read after the limit asks the Store not to wait.
+    assert_eq!(waits, [!wait.is_zero(), false], "{outcome}");
+    if wait.is_zero() {
+        assert!(ended, "The drain got no last page: {outcome}");
+    } else {
+        assert!(!ended, "{outcome}");
+        let [completion] = &sent[..] else {
+            panic!("{outcome}");
+        };
+        assert!(!completion.force_create_new_workflow_task, "{outcome}");
+        let entries: Vec<usize> = (read_markers(completion).iter())
+            .map(|marker| marker.reads.len())
+            .collect();
+        assert_eq!(entries, [1], "{outcome}");
+    }
+}
+
+/// Returns the read entries of the read markers of `completion`, and whether one of them has a
+/// failure.
+fn read_entries(completion: &WorkflowTaskCompletion) -> (usize, bool) {
+    let entries: Vec<StreamReadResult> = (read_markers(completion).into_iter())
+        .flat_map(|marker| marker.reads)
+        .collect();
+    let failed = (entries.iter())
+        .any(|entry| matches!(entry.result, Some(stream_read_result::Result::Failure(_))));
+    (entries.len(), failed)
+}
+
+// Workflow code drains a Stream one Record at a time. The runtime cut the first page while the
+// Store had more, and then the Store gives no answer. A read outage fails the task as an append
+// outage does, so Core must not make a new task with an empty marker at each read limit while the
+// read tries again.
+#[tokio::test]
+async fn a_read_outage_after_a_cut_page_fails_the_task_and_forces_no_task() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 4).await;
+    // The Store answers the first read only.
+    store.hold(Op::Read);
+    store.pass(Op::Read, 1);
+    let mut opts = StartOpts::new(&store);
+    opts.fails = 1;
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(1));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let one = |seq, from_offset: &[u8]| -> Command {
+        ReadStream {
+            max_records: 1,
+            ..read(seq, "s", from_offset, Duration::ZERO)
+        }
+        .into()
+    };
+    let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
+        if let Some(Job::InitializeWorkflow(_)) = &activation.jobs[0].variant {
+            return vec![one(1, &[])];
+        }
+        (results(activation))
+            .map(|result| match page_of(result) {
+                Some(page) => one(result.seq + 1, &page.last_offset),
+                None => complete(),
+            })
+            .collect()
+    };
+    // About eight read limits of 250 ms.
+    let (_, sequence) = drive_for(&run, Duration::from_millis(2500), workflow).await;
+    let sent = run.sent();
+    let forced_empty = (sent.iter())
+        .filter(|completion| {
+            completion.force_create_new_workflow_task
+                && command_types(completion) == [CommandType::RecordMarker]
+                && read_entries(completion).0 == 0
+        })
+        .count();
+    let recorded_failure = sent.iter().any(|completion| read_entries(completion).1);
+    let failed = run.failed.lock().len();
+    let outcome = format!(
+        "{forced_empty} forced completions with an empty read marker, a read marker with a \
+         failure: {recorded_failure}, {failed} failed tasks. {sequence}"
+    );
+    assert!(
+        forced_empty == 0 && !recorded_failure && failed == 1,
+        "{outcome}"
+    );
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+// A read with a wait is open when the Store goes down. A read outage fails the task as an append
+// outage does, so Workflow code must get no `StoreUnavailable`, and History must keep no failure
+// of the read.
+#[tokio::test]
+async fn a_read_outage_during_a_wait_fails_the_task() {
+    let store = store(&["s"]).await;
+    let down = StreamError::store_unavailable("The Store is down");
+    store.fail(Op::Read, down, usize::MAX);
+    let mut opts = StartOpts::new(&store);
+    opts.fails = 1;
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                vec![read(1, "s", &[], Duration::from_secs(60)).into()]
+            }
+            _ if results(activation).next().is_some() => vec![complete()],
+            _ => vec![],
+        }
+    };
+    let (_, sequence) = drive_for(&run, Duration::from_secs(2), workflow).await;
+    let sent = run.sent();
+    let recorded_failure = sent.iter().any(|completion| read_entries(completion).1);
+    let failed = run.failed.lock().clone();
+    let outage = failed
+        .iter()
+        .any(|(_, message)| message.starts_with("StreamStoreUnavailable:"));
+    assert!(
+        !recorded_failure && outage,
+        "a read marker with a failure: {recorded_failure}, a task failed for the outage: \
+         {outage}. {sequence}"
+    );
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+// A Local Activity holds the task, and Workflow code reads an empty Stream in a loop with no wait.
+// Each read gets a page with no Record at once, so a budget bounds the read results of the task,
+// as the Record budget bounds its bytes. The read that the budget keeps back starts when the next
+// task opens, and only a page that Core knows of would ask for that task.
+#[tokio::test]
+async fn the_read_results_of_one_task_have_a_bound() {
+    const BOUND: usize = 256;
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    opts.eager = Some(Box::new(|completion, t| {
+        if completion.force_create_new_workflow_task {
+            return Some(next_task(t));
+        }
+        command_types(completion)
+            .contains(&CommandType::StartTimer)
+            .then(|| {
+                fire_last_timer(t);
+                next_task(t)
+            })
+    }));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let mut fired = false;
+    let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
+        let resolved = (activation.jobs.iter())
+            .any(|job| matches!(job.variant, Some(Job::ResolveActivity(_))));
+        fired |= fires_a_last_timer(activation);
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                vec![local_activity(1), read(1, "s", &[], Duration::ZERO).into()]
+            }
+            _ if resolved => vec![timer(1)],
+            _ if fired && results(activation).next().is_some() => vec![complete()],
+            _ => (results(activation))
+                .map(|result| read(result.seq + 1, "s", &[], Duration::ZERO).into())
+                .collect(),
+        }
+    };
+    let local_activity_ends = async {
+        let task = run.worker.poll_activity_task().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let completion = ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(ActivityExecutionResult::ok(Payload::default())),
+        };
+        run.worker.complete_activity_task(completion).await.unwrap();
+    };
+    let ((left, sequence), ()) = tokio::join!(
+        drive_for(&run, Duration::from_secs(10), workflow),
+        local_activity_ends
+    );
+    let sent = run.sent();
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert!(left, "The Workflow didn't complete: {sequence}");
+    let seqs = |completion: &WorkflowTaskCompletion| -> Vec<u32> {
+        (read_markers(completion).iter())
+            .flat_map(|marker| marker.reads.iter().map(|entry| entry.seq))
+            .collect()
+    };
+    let first = seqs(&sent[0]);
+    assert_eq!(first.len(), BOUND, "{sequence}");
+    assert!(command_types(&sent[0]).contains(&CommandType::StartTimer));
+    assert!(!sent[0].force_create_new_workflow_task, "{sequence}");
+    assert_eq!(seqs(&sent[1]), [BOUND as u32 + 1], "{sequence}");
+}
+
+/// Returns Workflow code that reads Stream `s` with `read` in its first task. At a page with
+/// Records it starts timer 1 and reads on with `read`, and it completes at the next page.
+fn reads_on_with_a_timer(
+    read: impl Fn(u32, &[u8]) -> ReadStream + Copy,
+) -> impl Fn(&WorkflowActivation) -> Vec<Command> + Copy {
+    move |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![read(1, &[]).into()],
+        _ => (results(activation))
+            .filter_map(|result| {
+                let page = page_of(result)?;
+                Some(match result.seq {
+                    1 if !page.records.is_empty() => {
+                        vec![timer(1), read(2, &page.last_offset).into()]
+                    }
+                    _ => vec![complete()],
+                })
+            })
+            .flatten()
+            .collect(),
+    }
+}
+
+// The runtime cuts a page by its bytes while the Store has more. The read from its end then has
+// Records, so the completion with the timer asks for a new task, whose first activation gives the
+// next page.
+#[tokio::test]
+async fn a_page_cut_by_bytes_with_more_records_forces_the_next_task() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let one = (store.records("s").iter())
+        .map(|record| field_len(prost::Message::encoded_len(record)))
+        .max()
+        .unwrap();
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let workflow = reads_on_with_a_timer(move |seq, from_offset| ReadStream {
+        max_bytes: one as i64,
+        ..read(seq, "s", from_offset, Duration::ZERO)
+    });
+    let live = run.drive(workflow).await;
+    let sent = run.sent();
+    assert!(sent[0].force_create_new_workflow_task, "{sent:?}");
+    let names: Vec<Vec<String>> = (live.iter())
+        .map(|jobs| jobs.iter().map(summary).collect())
+        .collect();
+    assert!(names[1][0].starts_with("read 1 1 "), "{names:?}");
+    assert!(names[2][0].starts_with("read 2 1 "), "{names:?}");
+    assert_eq!(names.len(), 3, "{names:?}");
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(run.replay(workflow).await, live);
+}
+
+// A page at its `max_records` with no Record after it tells Core that the Stream has no more. So
+// a read from its end with a wait gets a check with no Record, and the completion with the timer
+// asks for no new task.
+#[tokio::test]
+async fn a_full_page_with_nothing_after_it_forces_no_task() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 2).await;
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = reads_on_with_a_timer(|seq, from_offset| ReadStream {
+        max_records: 2,
+        ..read(seq, "s", from_offset, Duration::from_secs(60))
+    });
+    let (_, sequence) = drive_for(&run, Duration::from_secs(2), workflow).await;
+    let sent = run.sent();
+    let [completion] = &sent[..] else {
+        panic!("{sequence}");
+    };
+    assert!(!completion.force_create_new_workflow_task, "{sequence}");
+    // The runtime asked for one Record more than the page, and the Store had none.
+    let asked: Vec<(i32, bool)> = (store.reads().iter())
+        .map(|read| (read.max_records, read.wait.is_some()))
+        .collect();
+    assert_eq!(asked, [(3, true), (3, false)], "{sequence}");
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+// A page over the Record budget of its task waits for the next task. The completion asks for that
+// task, and its first activation gives the page.
+#[tokio::test]
+async fn a_held_page_forces_the_next_task_and_comes_first_in_it() {
+    let store = store(&["a", "b"]).await;
+    fill(&store, "a", 1).await;
+    fill(&store, "b", 1).await;
+    let one = (store.records("a").iter().chain(&store.records("b")))
+        .map(|record| field_len(prost::Message::encoded_len(record)))
+        .max()
+        .unwrap();
+    let mut opts = StartOpts::new(&store);
+    opts.configure = Box::new(move |wc| wc.stream_runtimes.settings.max_task_record_bytes = one);
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![
+                read(1, "a", &[], Duration::ZERO).into(),
+                read(2, "b", &[], Duration::ZERO).into(),
+            ],
+            _ if results(activation).any(|result| result.seq == 2) => vec![complete()],
+            _ => vec![timer(1)],
+        }
+    };
+    let live = run.drive(workflow).await;
+    let names: Vec<Vec<String>> = (live.iter())
+        .map(|jobs| jobs.iter().map(summary).collect())
+        .collect();
+    let sent = run.sent();
+    assert!(sent[0].force_create_new_workflow_task, "{names:?}");
+    assert!(
+        command_types(&sent[0]).contains(&CommandType::StartTimer),
+        "{names:?}"
+    );
+    assert!(names[1][0].starts_with("read 1 1 "), "{names:?}");
+    assert_eq!(names[2].len(), 1, "{names:?}");
+    assert!(names[2][0].starts_with("read 2 1 "), "{names:?}");
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(run.replay(workflow).await, live);
+}
+
+// A read with a wait on a Stream that gets no Record never makes a new task. At each completion
+// with a timer its check gets no Record, so the read starts again in the task that the timer
+// makes.
+#[tokio::test]
+async fn a_read_of_an_idle_stream_forces_no_task_over_several_tasks() {
+    const TASKS: usize = 4;
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    opts.eager = Some(Box::new(|completion, t| {
+        let starts_a_timer = command_types(completion).contains(&CommandType::StartTimer);
+        starts_a_timer.then(|| {
+            fire_last_timer(t);
+            next_task(t)
+        })
+    }));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                vec![read(1, "s", &[], Duration::from_secs(60)).into(), timer(1)]
+            }
+            Some(Job::FireTimer(fired)) if (fired.seq as usize) < TASKS => {
+                vec![timer(fired.seq + 1)]
+            }
+            _ => vec![complete()],
+        }
+    };
+    let (left, sequence) = drive_for(&run, Duration::from_secs(5), workflow).await;
+    assert!(left, "{sequence}");
+    let sent = run.sent();
+    assert_eq!(sent.len(), TASKS + 1, "{sequence}");
+    let forced = sent
+        .iter()
+        .filter(|c| c.force_create_new_workflow_task)
+        .count();
+    assert_eq!(forced, 0, "{sequence}");
+    let checks = (store.reads().iter())
+        .filter(|read| read.wait.is_none())
+        .count();
+    assert_eq!(checks, TASKS, "{sequence}");
+    assert!(
+        sent.iter().all(|c| read_markers(c).is_empty()),
+        "{sequence}"
+    );
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+// A query answer asks for a new task whatever the reads say. A read with no result in the task
+// then leaves one read marker with no entry, so a replay with chunking on doesn't join the task to
+// the next one.
+#[tokio::test]
+async fn a_forced_completion_with_an_open_read_and_no_result_has_one_empty_marker() {
+    let store = store(&["s"]).await;
+    let t = history(Duration::from_secs(60));
+    let mut task = hist_to_poll_resp(&t, "fake_wf_id", ResponseType::AllHistory).resp;
+    let question = WorkflowQuery {
+        query_type: "q".to_string(),
+        ..Default::default()
+    };
+    task.queries.insert("q1".to_string(), question);
+    let mut opts = StartOpts::new(&store);
+    opts.responses = vec![ResponseType::Raw(task)];
+    opts.served = None;
+    let run = start(t, opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                vec![read(1, "s", &[], Duration::from_secs(60)).into()]
+            }
+            Some(Job::QueryWorkflow(_)) => answer(activation).into_iter().collect(),
+            _ => vec![],
+        }
+    };
+    let (_, sequence) = drive_for(&run, Duration::from_secs(2), workflow).await;
+    let sent = run.sent();
+    let [completion] = &sent[..] else {
+        panic!("{sequence}");
+    };
+    assert!(completion.force_create_new_workflow_task, "{sequence}");
+    assert_eq!(completion.query_responses.len(), 1, "{sequence}");
+    assert_eq!(
+        command_types(completion),
+        [CommandType::RecordMarker],
+        "{sequence}"
+    );
+    assert_eq!(
+        read_markers(completion),
+        [StreamReadMarkerData::default()],
+        "{sequence}"
+    );
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+// A replay reads nothing in the read time of its task, so the read limit counts from the end of the
+// replay. Here Workflow code takes longer than the read time of 250 ms to replay the first task,
+// and the read of the live task still waits for the Store.
+#[tokio::test]
+async fn the_read_limit_counts_from_the_end_of_the_replay() {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let started = t.add_timer_started("1".to_string());
+    t.add_timer_fired(started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    let run = start(t, opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![timer(1)],
+            Some(Job::FireTimer(_)) => vec![read(1, "s", &[], Duration::from_secs(60)).into()],
+            _ => vec![complete()],
+        }
+    };
+    let replayed = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    respond(&run.worker, &replayed, workflow).await;
+    let live = run.worker.poll_workflow_activation().await.unwrap();
+    assert!(!live.is_replaying);
+    respond(&run.worker, &live, workflow).await;
+    let cut = run.worker.poll_workflow_activation().await.unwrap();
+    let [Job::ResolveStreamRead(result)] = &jobs_of(&cut)[..] else {
+        panic!("{cut:?}");
+    };
+    assert!(page_of(result).unwrap().wait_cut);
+    respond(&run.worker, &cut, workflow).await;
+    let waits: Vec<Option<Duration>> = (store.reads().iter())
+        .map(|read| read.wait.map(|wait| wait.try_into().unwrap()))
+        .collect();
+    let [Some(wait)] = waits[..] else {
+        panic!("{waits:?}");
+    };
+    assert!(
+        wait > Duration::from_millis(150) && wait < Duration::from_millis(250),
+        "{wait:?}"
+    );
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+// The replays of a Worker read their Records from the Stores for at most `replay_read_runs` runs
+// at a time, which bounds the Records that the Worker holds for them.
+#[rstest::rstest]
+#[case::one_run_at_a_time(1)]
+#[case::two_runs_at_a_time(2)]
+#[tokio::test]
+async fn the_replays_of_a_worker_read_for_a_bounded_number_of_runs(#[case] runs: usize) {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 1).await;
+    let (_, t, first) = first_run_with_a_timer_at_each_page(&store, 1).await;
+    let (_, _, second) = first_run_with_a_timer_at_each_page(&store, 1).await;
+    let reads = store.reads().len();
+    let (tasks, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut opts = StartOpts::new(&store);
+    opts.tasks = Some(receiver);
+    opts.served = None;
+    opts.cache = 2;
+    opts.configure = Box::new(move |wc| wc.stream_runtimes.settings.replay_read_runs = runs);
+    let run = start(t, opts);
+    store.hold(Op::Read);
+    tasks.send(first).unwrap();
+    tasks.send(second).unwrap();
+    drop(tasks);
+    // A poll drives the replays, so the test watches the Store while one waits.
+    let watch = async {
+        wait_until(|| store.reads().len() > reads).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let reading = store.reads().len() - reads;
+        store.release();
+        reading
+    };
+    let (reading, activation) = tokio::join!(watch, run.worker.poll_workflow_activation());
+    assert_eq!(reading, runs);
+    let mut activation = Some(activation.unwrap());
+    let mut completed = HashSet::new();
+    while completed.len() < 2 {
+        let activation = match activation.take() {
+            Some(activation) => activation,
+            None => run.worker.poll_workflow_activation().await.unwrap(),
+        };
+        if fires_a_last_timer(&activation) {
+            completed.insert(activation.run_id.clone());
+        }
         respond(&run.worker, &activation, read_with_a_timer_at_each_page(1)).await;
     }
     run.worker.drain_pollers_and_shutdown_ref().await;

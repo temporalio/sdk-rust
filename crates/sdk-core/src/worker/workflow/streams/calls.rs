@@ -2,12 +2,11 @@
 //! and the Worker's [`StreamManager`](super::StreamManager) runs the requests that they start.
 
 use super::{
-    DEFAULT_PAGE_BYTES, DEFAULT_PAGE_RECORDS, LedgerReads, StreamRuntimes, StreamSettings,
+    DEFAULT_PAGE_BYTES, DEFAULT_PAGE_RECORDS, MarkerReads, StreamRuntimes, StreamSettings,
     TaskState,
-    ledger::{
-        LedgerBuilder, ReadDone, Waiting, activation_of, append_job, close_job, read_job, seq_of,
-    },
     manager::{Call, LastTry, Op, Outcome, ReadCall, Request, StreamResolution},
+    marker::{PeekedMarker, append_job},
+    read::{After, ReadDone, read_job},
     replay::{ReplayError, needs_records, offset_text},
 };
 use crate::worker::workflow::WFMachinesError;
@@ -19,30 +18,29 @@ use std::{
 };
 use temporalio_common::protos::{
     coresdk::{
+        external_data::{
+            StreamAppendMarkerData, StreamAppendResult, StreamFailure, StreamReadMarkerData,
+            StreamReadResult, stream_read_result,
+        },
         workflow_activation::workflow_activation_job,
-        workflow_commands::{AppendToStream, CloseStream, ReadStream},
+        workflow_commands::{AppendToStream, ReadStream},
         workflow_completion,
     },
-    temporal::api::{
-        common::v1::Payload,
-        failure::v1::failure::FailureInfo,
-        sdk::v1::{
-            WorkflowTaskStreamCalls,
-            workflow_task_stream_calls::{AppendResult, CloseIntent, CloseResult, ReadResult},
-        },
-    },
+    temporal::api::{common::v1::Payload, failure::v1::failure::FailureInfo},
 };
 use temporalio_streams::{
-    AnyError, AnyReason,
+    AnyError, AnyReason, ReadError,
     attempt::attempt_key,
     ids::{validate_offset, validate_stream_id},
     proto::{
-        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, ReadRecordsRequest,
-        StreamRecord, StreamRef, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+        AppendRecord, Producer, StreamErrorReason, StreamRecord, WorkflowProducer,
+        WorkflowTaskAttempt,
+        producer::Kind,
+        sdk::{AppendRecordsRequest, ReadRecordsRequest, StreamRef},
     },
 };
 
-/// A ledger records the Store name of each call, so a longer name fails the Workflow Task.
+/// A marker records the Store name of each call, so a longer name fails the Workflow Task.
 const MAX_STORE_NAME_BYTES: usize = 4096;
 
 /// One counter for the whole process, so a late result of an evicted run never matches a call of
@@ -53,7 +51,9 @@ impl From<ReplayError> for WFMachinesError {
     fn from(error: ReplayError) -> Self {
         match error {
             ReplayError::Gone(message) => WFMachinesError::StreamReplay(message),
-            ReplayError::Unavailable(message) => WFMachinesError::Stream(message),
+            ReplayError::Unavailable(message) | ReplayError::NoRuntime(message) => {
+                WFMachinesError::Stream(message)
+            }
         }
     }
 }
@@ -81,7 +81,7 @@ pub(crate) fn is_stream_replay_failure(failure: &workflow_completion::Failure) -
 /// How far a run is through its History.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// The run replays History, so each call waits for its result in a ledger.
+    /// The run replays History, so each call waits for its result in a marker.
     Replaying,
     /// The replay is over, so calls run.
     Live,
@@ -96,7 +96,6 @@ pub(crate) enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CallKey {
     Append(u32),
-    Close(u32),
     Read(u32),
 }
 
@@ -104,7 +103,6 @@ impl fmt::Display for CallKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CallKey::Append(seq) => write!(f, "append {seq}"),
-            CallKey::Close(seq) => write!(f, "close {seq}"),
             CallKey::Read(seq) => write!(f, "read {seq}"),
         }
     }
@@ -122,100 +120,90 @@ enum AppendState {
         attempt: Option<WorkflowTaskAttempt>,
     },
     Running(u64),
-    /// The result waits for an activation, in the form that the ledger records it.
-    Done(Waiting<AppendResult>),
-    /// History has the result, which waits for its activation.
-    Replayed,
-}
-
-struct Close {
-    stream: StreamRef,
-    state: CloseState,
-}
-
-enum CloseState {
-    /// No ledger has the intent yet.
-    Asked,
-    /// The ledger of the task has the intent. A replayed close gets its attempt at go-live.
-    Sealed(Option<WorkflowTaskAttempt>),
-    /// History has the intent, so the close is in its queue.
-    Waiting(Option<WorkflowTaskAttempt>),
-    Running(u64),
-    /// The result waits for an activation, in the form that the ledger records it.
-    Done(Waiting<CloseResult>),
+    /// The result waits for an activation, in the form that the marker records it.
+    Done(StreamAppendResult),
     /// History has the result, which waits for its activation.
     Replayed,
 }
 
 struct Read {
     stream: StreamRef,
-    from_offset: Vec<u8>,
-    /// True if the read asks the Store to wait for a Record.
-    waits: bool,
+    /// The request of each start of the read, with the page size of the read.
+    request: ReadRecordsRequest,
+    /// How long the read waits for a Record, as its command asks.
+    wait: Duration,
+    /// How long the call that runs asks the Store to wait, which the read limit can cut.
+    sent_wait: Duration,
+    /// True once the read had a check in the task in hand. A read that its check parked doesn't
+    /// start again in that task.
+    checked: bool,
     state: ReadState,
 }
 
 enum ReadState {
-    /// The read hasn't started. A live one starts once its task is open, and a replayed one once
-    /// the replay is over.
-    Waiting(ReadCall),
-    /// The read runs, and has the failure of its last try while it waits to try again.
-    Running(u64, LastTry),
-    /// The result waits for an activation, in the form that the ledger records it.
+    /// The read hasn't started, or Core stopped it at the completion of a task. A live one starts
+    /// once its task is open, and a replayed one once the replay is over.
+    Waiting,
+    /// The read runs, and has the failure of its last try while it waits to try again. A check
+    /// (true) is one Store call with no wait.
+    Running(u64, LastTry, bool),
+    /// The result waits for an activation.
     Done(ReadDone),
     /// History has the result, which waits for its activation.
     Replayed,
 }
 
-/// The entries of History's ledgers whose calls Workflow code hasn't issued yet, by seq.
-#[derive(Default)]
-struct Held {
-    appends: HashMap<u32, AppendResult>,
-    intents: HashMap<u32, CloseIntent>,
-    closes: HashMap<u32, CloseResult>,
-    reads: HashMap<u32, HeldRead>,
+/// A read entry of History, with the Records that the replay read for its page.
+struct HeldRead {
+    entry: StreamReadResult,
+    records: Result<Vec<StreamRecord>, ReplayError>,
 }
 
-/// A read result of History, with the Records that the replay has for its page.
-struct HeldRead {
-    entry: ReadResult,
-    records: Result<Vec<StreamRecord>, ReplayError>,
+/// The entries of History's markers whose calls Workflow code hasn't issued yet, by seq.
+#[derive(Default)]
+struct Held {
+    appends: HashMap<u32, StreamAppendResult>,
+    reads: HashMap<u32, HeldRead>,
 }
 
 impl Held {
     /// Returns the activation and the call of the first result, in the order of the first run.
     fn first_result(&self) -> Option<(u64, CallKey)> {
-        let appends = (self.appends.iter())
-            .map(|(seq, a)| (activation_of(a.activation_index), CallKey::Append(*seq)));
-        let closes = (self.closes.iter())
-            .map(|(seq, c)| (activation_of(c.activation_index), CallKey::Close(*seq)));
-        let reads = (self.reads.iter())
-            .map(|(seq, r)| (activation_of(r.entry.activation_index), CallKey::Read(*seq)));
-        appends.chain(closes).chain(reads).min()
+        let appends =
+            (self.appends.iter()).map(|(seq, a)| (a.activation_index, CallKey::Append(*seq)));
+        let reads =
+            (self.reads.iter()).map(|(seq, r)| (r.entry.activation_index, CallKey::Read(*seq)));
+        appends.chain(reads).min()
     }
 }
 
-/// The Stream calls of one run. A call is removed from the run once its result is in a ledger.
+/// The Stream calls of one run. A call is removed from the run once its result is in a marker.
 pub(crate) struct StreamCalls {
     /// The Producer of the run. A write adds the attempt of its Workflow Task.
     producer: WorkflowProducer,
     runtimes: StreamRuntimes,
     phase: Phase,
-    /// True if the server keeps the `sdk_metadata` of a completion, which has the ledger of the
-    /// task.
-    keeps_ledgers: bool,
     task: TaskState,
     appends: HashMap<u32, Append>,
-    closes: HashMap<u32, Close>,
     reads: HashMap<u32, Read>,
-    /// The appends and closes of each Stream, in the order that they were queued. Only the head
-    /// runs.
+    /// The appends of each Stream, in the order that they were queued. Only the head runs.
     queues: HashMap<(String, String), VecDeque<CallKey>>,
     last_append: u32,
-    last_close: u32,
     last_read: u32,
     /// True once the task in hand passed its read limit, so its reads hold it no longer.
     read_limit_passed: bool,
+    /// The bytes of the Records that the task in hand gave Workflow code.
+    task_record_bytes: usize,
+    /// The number of read results that the task in hand gave Workflow code.
+    task_read_results: usize,
+    /// True if the task in hand completes with a command. A page with Records from a check then
+    /// waits for the next task, so that the command goes at once.
+    hold_checks: bool,
+    /// The reads whose page waits for the next task.
+    held_pages: BTreeSet<u32>,
+    /// For each Stream, the `last_offset` of the last page that Workflow code got if the Store had
+    /// Records after it. A read from there knows that the Stream has more.
+    more_after: HashMap<(String, String), Vec<u8>>,
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
@@ -223,7 +211,11 @@ pub(crate) struct StreamCalls {
     ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
-    ledger: LedgerBuilder,
+    /// The live results of the activation in hand, which its markers record.
+    marker: StreamAppendMarkerData,
+    read_marker: StreamReadMarkerData,
+    /// True once the task in hand recorded a Stream marker, until the task completes.
+    marked: bool,
     requests: Vec<Request>,
 }
 
@@ -235,10 +227,8 @@ impl StreamCalls {
         run_id: &str,
         runtimes: StreamRuntimes,
         phase: Phase,
-        keeps_ledgers: bool,
     ) -> Self {
         debug_assert_ne!(phase, Phase::Stopped);
-        let ledger = LedgerBuilder::new(runtimes.settings);
         Self {
             producer: WorkflowProducer {
                 namespace: namespace.to_string(),
@@ -248,29 +238,48 @@ impl StreamCalls {
             },
             runtimes,
             phase,
-            keeps_ledgers,
             task: TaskState::NoTask,
             appends: HashMap::new(),
-            closes: HashMap::new(),
             reads: HashMap::new(),
             queues: HashMap::new(),
             last_append: 0,
-            last_close: 0,
             last_read: 0,
             read_limit_passed: false,
+            task_record_bytes: 0,
+            task_read_results: 0,
+            hold_checks: false,
+            held_pages: BTreeSet::new(),
+            more_after: HashMap::new(),
             done: BTreeSet::new(),
             held: Held::default(),
             ready: BTreeMap::new(),
             released: None,
-            ledger,
+            marker: StreamAppendMarkerData::default(),
+            read_marker: StreamReadMarkerData::default(),
+            marked: false,
             requests: vec![],
         }
     }
 
-    /// When the task opens, the head of each queue starts.
+    /// When the task opens, the head of each queue and each waiting read start. A page that waits
+    /// for this task comes first.
     pub(crate) fn set_task(&mut self, state: TaskState) {
+        if state == TaskState::NoTask {
+            self.marked = false;
+            self.task_record_bytes = 0;
+            self.task_read_results = 0;
+        }
+        if !matches!(state, TaskState::Completing(_)) {
+            self.read_limit_passed = false;
+            self.hold_checks = false;
+        }
+        if state.is_open() {
+            self.held_pages.clear();
+            for read in self.reads.values_mut() {
+                read.checked = false;
+            }
+        }
         self.task = state;
-        self.read_limit_passed = false;
         self.start_heads();
     }
 
@@ -300,21 +309,6 @@ impl StreamCalls {
         self.match_append(seq)?;
         self.start_head(&queue);
         Ok(())
-    }
-
-    /// Records only the intent. The close runs once History has it, so a task that fails closes
-    /// nothing.
-    pub(crate) fn close(&mut self, command: CloseStream) -> Result<(), WFMachinesError> {
-        if self.phase == Phase::Stopped {
-            return Ok(());
-        }
-        let CloseStream { seq, stream } = command;
-        next_seq("close", seq, &mut self.last_close)?;
-        let stream = valid_stream(CallKey::Close(seq), stream)?;
-        self.check_runtime(&stream)?;
-        let state = CloseState::Asked;
-        self.closes.insert(seq, Close { stream, state });
-        self.match_intent(seq)
     }
 
     /// Handles a read command. A live read starts at once, and its Store waits at most the time
@@ -349,7 +343,7 @@ impl StreamCalls {
         };
         let request = ReadRecordsRequest {
             r#ref: Some(stream.clone()),
-            from_offset: from_offset.clone(),
+            from_offset,
             max_records: match max_records {
                 0 => DEFAULT_PAGE_RECORDS,
                 max => max,
@@ -357,16 +351,13 @@ impl StreamCalls {
             max_bytes: max_bytes.min(i64::try_from(room).unwrap_or(i64::MAX)),
             wait: None,
         };
-        let state = ReadState::Waiting(ReadCall {
-            request,
-            wait,
-            last_try: LastTry::default(),
-        });
         let read = Read {
             stream,
-            from_offset,
-            waits: !wait.is_zero(),
-            state,
+            request,
+            wait,
+            sent_wait: wait,
+            checked: false,
+            state: ReadState::Waiting,
         };
         self.reads.insert(seq, read);
         self.match_read(seq)?;
@@ -375,8 +366,11 @@ impl StreamCalls {
     }
 
     /// Handles the result of a running call, and starts the next call of its Stream. It ignores the
-    /// result of a call that was stopped.
-    pub(crate) fn resolve(&mut self, resolution: StreamResolution) {
+    /// result of a call that was stopped. A check of the task in hand that meets an outage fails
+    /// the task, as an append that meets one does at the heartbeat. A check of an earlier task that
+    /// met an outage, or a check with no Record of a read that waits, parks the read, which starts
+    /// again when a task opens.
+    pub(crate) fn resolve(&mut self, resolution: StreamResolution) -> Result<(), WFMachinesError> {
         let StreamResolution {
             call_id,
             seq,
@@ -384,49 +378,60 @@ impl StreamCalls {
         } = resolution;
         let (call, queue) = match outcome {
             // A read is in no queue.
-            Outcome::Read(result) => {
+            Outcome::Read(mut result) => {
                 let Some(read) = self.reads.get_mut(&seq) else {
-                    return;
+                    return Ok(());
                 };
-                if !matches!(read.state, ReadState::Running(id, _) if id == call_id) {
-                    return;
+                let ReadState::Running(id, _, check) = read.state else {
+                    return Ok(());
+                };
+                if id != call_id {
+                    return Ok(());
+                }
+                let outage = result.failure().filter(|failure| is_outage(failure));
+                if check && let Some(failure) = outage {
+                    if read.checked && self.task.is_open() {
+                        return Err(read_outage(&read.stream, failure));
+                    }
+                    read.state = ReadState::Waiting;
+                    self.run_read(seq);
+                    return Ok(());
+                }
+                if result.is_empty_page() && read.sent_wait < read.wait {
+                    result.set_wait_cut();
+                }
+                if check && result.is_empty_page() && !read.wait.is_zero() {
+                    read.state = ReadState::Waiting;
+                    self.run_read(seq);
+                    return Ok(());
+                }
+                if check && self.hold_checks && !result.records.is_empty() {
+                    self.held_pages.insert(seq);
                 }
                 read.state = ReadState::Done(result);
                 self.done.insert(CallKey::Read(seq));
-                return;
+                return Ok(());
             }
             Outcome::Append(result) => {
                 let Some(append) = self.appends.get_mut(&seq) else {
-                    return;
+                    return Ok(());
                 };
                 if !matches!(append.state, AppendState::Running(id) if id == call_id) {
-                    return;
+                    return Ok(());
                 }
-                append.state = AppendState::Done(Waiting::new(AppendResult {
-                    seq: seq as i32,
-                    r#ref: Some(append.stream.clone()),
+                append.state = AppendState::Done(StreamAppendResult {
+                    seq,
+                    stream_id: append.stream.id.clone(),
+                    store: append.stream.store.clone(),
+                    activation_index: 0,
                     result: Some(result),
-                    activation_index: 0,
-                }));
+                });
                 (CallKey::Append(seq), key(&append.stream))
-            }
-            Outcome::Close(failure) => {
-                let Some(close) = self.closes.get_mut(&seq) else {
-                    return;
-                };
-                if !matches!(close.state, CloseState::Running(id) if id == call_id) {
-                    return;
-                }
-                close.state = CloseState::Done(Waiting::new(CloseResult {
-                    seq: seq as i32,
-                    failure,
-                    activation_index: 0,
-                }));
-                (CallKey::Close(seq), key(&close.stream))
             }
         };
         self.done.insert(call);
         self.leave_queue(&queue, call);
+        Ok(())
     }
 
     /// Returns true if the activation at index `activation` of the task gets a result. A result
@@ -436,11 +441,12 @@ impl StreamCalls {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
             && ((self.ready.keys().next()).is_some_and(|key| self.is_due(key, activation, marker))
-                || self.next_result_fits(activation) == Some(true))
+                || (self.task.is_open() && self.done.first().is_some_and(|c| self.fits(*c))))
     }
 
     /// Returns the results for the activation at index `activation` of the task, as
-    /// [`Self::has_jobs`] decides them. The ledger records each live result with that index.
+    /// [`Self::has_jobs`] decides them. The markers of the activation record each live result with
+    /// that index, and [`Self::take_marker`] and [`Self::take_read_marker`] return them.
     pub(crate) fn take_jobs(
         &mut self,
         activation: u64,
@@ -469,125 +475,77 @@ impl StreamCalls {
         jobs
     }
 
-    /// Holds the entries of a ledger from History, each for its call, with the Records that the
-    /// replay read for its read entries.
+    /// Holds the entries of a marker from History, each for its call. `records` has the Records
+    /// that the replay read for the read entries of a read marker, by the index of each entry.
     pub(crate) fn peeked(
         &mut self,
-        data: WorkflowTaskStreamCalls,
-        mut replayed: LedgerReads,
+        data: PeekedMarker,
+        mut records: MarkerReads,
     ) -> Result<(), WFMachinesError> {
-        let WorkflowTaskStreamCalls {
-            close_intents,
-            append_results,
-            close_results,
-            read_results,
-        } = data;
-        for intent in close_intents {
-            let seq = seq_of(intent.seq)?;
-            if self.held.intents.insert(seq, intent).is_some() {
-                return Err(second("intent", CallKey::Close(seq)));
+        match data {
+            PeekedMarker::Append(data) => {
+                for append in data.appends {
+                    let seq = append.seq;
+                    if self.held.appends.insert(seq, append).is_some() {
+                        return Err(second("result", CallKey::Append(seq)));
+                    }
+                    self.match_append(seq)?;
+                }
             }
-            self.match_intent(seq)?;
-        }
-        for append in append_results {
-            let seq = seq_of(append.seq)?;
-            if self.held.appends.insert(seq, append).is_some() {
-                return Err(second("result", CallKey::Append(seq)));
+            PeekedMarker::Read(data) => {
+                for (index, entry) in data.reads.into_iter().enumerate() {
+                    let seq = entry.seq;
+                    let records = if needs_records(&entry) {
+                        (records.get_mut(index).and_then(Option::take)).unwrap_or_else(|| {
+                            Err(ReplayError::Unavailable(format!(
+                                "Core read no Records of Stream read {seq} for its replay"
+                            )))
+                        })
+                    } else {
+                        Ok(vec![])
+                    };
+                    let held = HeldRead { entry, records };
+                    if self.held.reads.insert(seq, held).is_some() {
+                        return Err(second("result", CallKey::Read(seq)));
+                    }
+                    self.match_read(seq)?;
+                }
             }
-            self.match_append(seq)?;
-        }
-        for close in close_results {
-            let seq = seq_of(close.seq)?;
-            if self.held.closes.insert(seq, close).is_some() {
-                return Err(second("result", CallKey::Close(seq)));
-            }
-            self.match_result(seq)?;
-        }
-        for (index, entry) in read_results.into_iter().enumerate() {
-            let seq = seq_of(entry.seq)?;
-            let records = if needs_records(&entry) {
-                (replayed.get_mut(index).and_then(Option::take)).unwrap_or_else(|| {
-                    Err(ReplayError::Unavailable(format!(
-                        "Core read no Records of Stream read {seq} for its replay"
-                    )))
-                })
-            } else {
-                Ok(vec![])
-            };
-            let held = HeldRead { entry, records };
-            if self.held.reads.insert(seq, held).is_some() {
-                return Err(second("result", CallKey::Read(seq)));
-            }
-            self.match_read(seq)?;
         }
         Ok(())
     }
 
-    /// Handles the completion in History that has a ledger. Each entry of the ledger must already
-    /// have its call, and each close whose intent the ledger has joins its queue.
-    pub(crate) fn ledger_recorded(&mut self) -> Result<(), WFMachinesError> {
-        let never = |what: &str, call: CallKey| {
-            WFMachinesError::Nondeterminism(format!(
-                "History has {what} of Stream {call} that Workflow code never issued"
-            ))
-        };
-        if let Some(seq) = self.held.intents.keys().min() {
-            return Err(never("an intent", CallKey::Close(*seq)));
-        }
-        if let Some(seq) = self.held.appends.keys().min() {
-            return Err(never("a result", CallKey::Append(*seq)));
-        }
-        if let Some(seq) = self.held.closes.keys().min() {
-            return Err(never("a result", CallKey::Close(*seq)));
-        }
-        if let Some(seq) = self.held.reads.keys().min() {
-            return Err(never("a result", CallKey::Read(*seq)));
+    /// Handles the event of a marker. Each entry of the markers of its task must already have its
+    /// call, and Workflow code must have its result.
+    pub(crate) fn marker_recorded(&mut self) -> Result<(), WFMachinesError> {
+        let appends = self.held.appends.keys().map(|seq| CallKey::Append(*seq));
+        let reads = self.held.reads.keys().map(|seq| CallKey::Read(*seq));
+        if let Some(call) = appends.chain(reads).min() {
+            return Err(WFMachinesError::Nondeterminism(format!(
+                "History has a result of Stream {call} that Workflow code never issued"
+            )));
         }
         if let Some((_, call)) = self.ready.keys().next() {
             return Err(WFMachinesError::Nondeterminism(format!(
                 "History has a result of Stream {call} that Workflow code never got"
             )));
         }
-        let mut sealed: Vec<u32> = (self.closes.iter())
-            .filter(|(_, close)| matches!(close.state, CloseState::Sealed(_)))
-            .map(|(seq, _)| *seq)
-            .collect();
-        sealed.sort_unstable();
-        for seq in sealed {
-            let close = self
-                .closes
-                .get_mut(&seq)
-                .expect("The close was just listed");
-            if let CloseState::Sealed(attempt) = close.state {
-                close.state = CloseState::Waiting(attempt);
-            }
-            let queue = key(&close.stream);
-            self.queues
-                .entry(queue.clone())
-                .or_default()
-                .push_back(CallKey::Close(seq));
-            self.start_head(&queue);
-        }
         Ok(())
     }
 
     /// Ends the replay. Each waiting call gets the attempt of the current task, and the head of
-    /// each queue starts.
+    /// each queue and each waiting read start.
     pub(crate) fn go_live(&mut self) -> Result<(), WFMachinesError> {
         if self.phase != Phase::Replaying {
             return Ok(());
         }
         let appends = (self.appends.iter()).map(|(seq, append)| (CallKey::Append(*seq), append));
         let unserved = (appends.map(|(call, append)| (call, &append.stream)))
-            .chain((self.closes.iter()).map(|(seq, close)| (CallKey::Close(*seq), &close.stream)))
             .chain((self.reads.iter()).map(|(seq, read)| (CallKey::Read(*seq), &read.stream)))
             .filter(|(_, stream)| self.runtimes.get(&stream.store).is_none())
             .min_by_key(|(call, _)| *call);
         if let Some((_, stream)) = unserved {
             return Err(no_runtime(stream));
-        }
-        if !self.keeps_ledgers && self.needs_next_task() {
-            return Err(no_ledger());
         }
         self.phase = Phase::Live;
         let attempt = self.task.attempt();
@@ -599,17 +557,12 @@ impl StreamCalls {
                 *waiting = attempt;
             }
         }
-        for close in self.closes.values_mut() {
-            if let CloseState::Sealed(waiting) | CloseState::Waiting(waiting) = &mut close.state {
-                *waiting = attempt;
-            }
-        }
         self.start_heads();
         Ok(())
     }
 
     /// Drops each call at a command that ends the Workflow, as Core drops a Local Activity there.
-    /// The ledger keeps the results that Workflow code already got in the task.
+    /// The markers keep the results that Workflow code already got in the task.
     pub(crate) fn stop_for_terminal(&mut self) {
         let mut unsent = HashSet::new();
         self.requests.retain(|request| match request {
@@ -623,44 +576,120 @@ impl StreamCalls {
             AppendState::Running(call_id) => Some(call_id),
             _ => None,
         });
-        let closes = (self.closes.values()).filter_map(|close| match close.state {
-            CloseState::Running(call_id) => Some(call_id),
-            _ => None,
-        });
         let reads = (self.reads.values()).filter_map(|read| match read.state {
-            ReadState::Running(call_id, _) => Some(call_id),
+            ReadState::Running(call_id, ..) => Some(call_id),
             _ => None,
         });
-        let running = appends.chain(closes).chain(reads);
+        let running = appends.chain(reads);
         let running = running.filter(|call_id| !unsent.contains(call_id));
         self.requests.extend(running.map(Request::Stop));
         self.phase = Phase::Stopped;
         self.appends.clear();
-        self.closes.clear();
         self.reads.clear();
         self.queues.clear();
         self.done.clear();
     }
 
-    /// Returns true while a call has no result in a ledger, so the run needs another task.
+    /// Returns true while the run needs another task at once: an append has no result in a
+    /// marker, or Core knows that the Stream of an open read has more Records for it.
     pub(crate) fn needs_next_task(&self) -> bool {
-        !self.appends.is_empty() || !self.closes.is_empty() || !self.reads.is_empty()
+        !self.appends.is_empty() || (self.reads.values()).any(|read| self.knows_more(read))
     }
 
-    /// Returns true if the ledger of the task has an entry.
-    pub(crate) fn has_ledger(&self) -> bool {
-        !self.ledger.is_empty()
+    /// Returns true if Core knows for certain that the Stream has Records for `read`. Core then
+    /// holds a page of it with Records, or the read starts where a page ended that the Store had
+    /// Records after.
+    fn knows_more(&self, read: &Read) -> bool {
+        match &read.state {
+            ReadState::Done(done) => !done.records.is_empty(),
+            ReadState::Waiting | ReadState::Running(..) => {
+                (self.more_after.get(&key(&read.stream)))
+                    .is_some_and(|after| *after == read.request.from_offset)
+            }
+            ReadState::Replayed => false,
+        }
     }
 
-    /// Returns true once the ledger of the task has no room for a result that waits, so the task
-    /// must complete with a new one forced.
-    pub(crate) fn must_complete(&self, activation: u64) -> bool {
-        self.next_result_fits(activation) == Some(false)
+    /// Stops each live read that Core doesn't know more Records for, before the task completes. It
+    /// starts again when the next task opens, so a read on an idle Stream makes no new task.
+    pub(crate) fn stop_idle_reads(&mut self) {
+        if self.phase != Phase::Live {
+            return;
+        }
+        let idle: Vec<u32> = (self.reads.iter())
+            .filter(|(_, read)| !self.knows_more(read))
+            .filter(|(_, read)| !matches!(read.state, ReadState::Replayed))
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in idle {
+            let read = self.reads.get_mut(&seq).expect("The read was just listed");
+            if let ReadState::Running(call_id, ..) = read.state {
+                stop_call(&mut self.requests, call_id);
+            }
+            read.state = ReadState::Waiting;
+            self.done.remove(&CallKey::Read(seq));
+        }
+    }
+
+    /// Notes that the task in hand completes with a command for the server if `hold`, so that the
+    /// Records of its checks wait for the next task and the command goes at once.
+    pub(crate) fn hold_check_pages(&mut self, hold: bool) {
+        self.hold_checks |= hold;
+    }
+
+    /// Readies the live reads for a completion of the task in hand. A read that had no answer in
+    /// this task gets a check first, so that the completion stops no read that the Store has
+    /// Records for, and forces no task for a Store in an outage. A read that waits to try again
+    /// after a failed try fails the task.
+    pub(crate) fn check_open_reads(&mut self) -> Result<(), WFMachinesError> {
+        if self.phase != Phase::Live || !self.task.is_open() {
+            return Ok(());
+        }
+        self.check_read_outage()?;
+        let mut stopped: Vec<u32> = (self.reads.iter())
+            .filter(|(_, read)| matches!(read.state, ReadState::Running(_, _, false)))
+            .filter(|(_, read)| !read.checked)
+            .map(|(seq, _)| *seq)
+            .collect();
+        stopped.sort_unstable();
+        for seq in stopped {
+            let read = self.reads.get_mut(&seq).expect("The read was just listed");
+            if let ReadState::Running(call_id, ..) = read.state {
+                stop_call(&mut self.requests, call_id);
+            }
+            read.state = ReadState::Waiting;
+            self.start_read(seq, true);
+        }
+        Ok(())
+    }
+
+    /// Fails the task if a live read waits to try again after a try that failed. A failure of the
+    /// Store is no answer, so Workflow code never gets it as a page or as a failure.
+    pub(crate) fn check_read_outage(&self) -> Result<(), WFMachinesError> {
+        if self.phase != Phase::Live {
+            return Ok(());
+        }
+        let mut reads: Vec<(&u32, &Read)> = self.reads.iter().collect();
+        reads.sort_unstable_by_key(|(seq, _)| **seq);
+        for (_, read) in reads {
+            if let ReadState::Running(_, last_try, _) = &read.state
+                && let Some(failure) = last_try.lock().as_ref()
+            {
+                return Err(read_outage(&read.stream, failure));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true if the task in hand recorded a Stream marker that History doesn't have yet.
+    pub(crate) fn has_marker(&self) -> bool {
+        self.marked
     }
 
     /// Returns the number of live calls that hold the task open, as a Local Activity does. A read
     /// holds it only before its read limit and while the task has no work for the server
-    /// (`has_work_for_server`), so a command never waits for a read.
+    /// (`has_work_for_server`), so a command waits for no more than one check. A check always holds
+    /// it. A page that the task holds back for its Record budget holds it no longer.
     pub(crate) fn outstanding(&self, has_work_for_server: bool) -> usize {
         if self.phase != Phase::Live {
             return 0;
@@ -673,16 +702,19 @@ impl StreamCalls {
                 )
             })
             .count();
-        let closes = (self.closes.values())
-            .filter(|close| matches!(close.state, CloseState::Waiting(_) | CloseState::Running(_)))
-            .count();
-        if has_work_for_server || self.read_limit_passed {
-            return appends + closes;
-        }
+        let reads_hold = !has_work_for_server && !self.read_limit_passed;
         let reads = (self.reads.values())
-            .filter(|read| matches!(read.state, ReadState::Waiting(_) | ReadState::Running(..)))
+            .filter(|read| match read.state {
+                ReadState::Running(_, _, check) => check || reads_hold,
+                _ => false,
+            })
             .count();
-        appends + closes + reads
+        appends + reads
+    }
+
+    /// Returns true once the replay is over and the run makes live calls.
+    pub(crate) fn is_live(&self) -> bool {
+        self.phase == Phase::Live
     }
 
     pub(crate) fn settings(&self) -> &StreamSettings {
@@ -696,16 +728,21 @@ impl StreamCalls {
             && (self.reads.values()).any(|read| matches!(read.state, ReadState::Running(..)))
     }
 
-    /// Ends the task's reads that have no answer, at its read limit, but a read that doesn't wait
-    /// and whose try waits for the answer. From the limit on no read holds the task, and each later
-    /// read of the task asks the Store not to wait.
-    pub(crate) fn read_limit(&mut self) {
+    /// Ends the task's reads that wait and have no answer, at its read limit. A read that waits to
+    /// try again after a failed try fails the task. From the limit on only a check holds the task,
+    /// and each later read of the task is a check.
+    pub(crate) fn read_limit(&mut self) -> Result<(), WFMachinesError> {
         if self.phase != Phase::Live || !self.task.is_open() {
-            return;
+            return Ok(());
         }
+        self.check_read_outage()?;
         self.read_limit_passed = true;
-        let reads: Vec<CallKey> = self.reads.keys().map(|seq| CallKey::Read(*seq)).collect();
-        self.end_reads(&reads);
+        let mut reads: Vec<u32> = self.reads.keys().copied().collect();
+        reads.sort_unstable();
+        for seq in reads {
+            self.end_read(seq);
+        }
+        Ok(())
     }
 
     /// Returns the activation of the first result from History whose call Workflow code issued.
@@ -733,34 +770,47 @@ impl StreamCalls {
             && marker.is_none_or(|marker| key.0 < marker)
     }
 
-    /// Returns the ledger of the task as it completes, with the intent of each close that fits. A
-    /// task that leaves a call with no result has a ledger with no entry, so that its completion
-    /// ends a task sequence as a command does.
-    pub(crate) fn take_ledger(&mut self) -> Option<WorkflowTaskStreamCalls> {
-        if matches!(self.phase, Phase::Replaying | Phase::ReplayOnly) {
+    /// Returns the append marker of the live results that the last [`Self::take_jobs`] gave, if it
+    /// gave any.
+    pub(crate) fn take_marker(&mut self) -> Option<StreamAppendMarkerData> {
+        (!self.marker.appends.is_empty()).then(|| mem::take(&mut self.marker))
+    }
+
+    /// Returns the read marker of the live results that the last [`Self::take_jobs`] gave, if it
+    /// gave any.
+    pub(crate) fn take_read_marker(&mut self) -> Option<StreamReadMarkerData> {
+        (!self.read_marker.reads.is_empty()).then(|| mem::take(&mut self.read_marker))
+    }
+
+    /// Returns a marker with no entry if the task completes with a new task `forced`, while a call
+    /// has no result in a marker and the task recorded none. A replay with chunking on would
+    /// otherwise take the task as a heartbeat and join it to the next one, whose activation
+    /// indexes would then not match. A task with another command event (`has_command_event`)
+    /// or with chunking off isn't joined, so it needs none. It's of the append kind if an append
+    /// is open.
+    pub(crate) fn take_completion_marker(
+        &mut self,
+        forced: bool,
+        has_command_event: bool,
+        chunking_disabled: bool,
+    ) -> Option<PeekedMarker> {
+        if self.phase != Phase::Live
+            || self.marked
+            || !forced
+            || has_command_event
+            || chunking_disabled
+        {
             return None;
         }
-        let attempt = self.task.attempt();
-        let mut asked: Vec<u32> = (self.closes.iter())
-            .filter(|(_, close)| matches!(close.state, CloseState::Asked))
-            .map(|(seq, _)| *seq)
-            .collect();
-        asked.sort_unstable();
-        for seq in asked {
-            let close = self
-                .closes
-                .get_mut(&seq)
-                .expect("The close was just listed");
-            if !self.ledger.close_intent(&close.stream, seq) {
-                break;
-            }
-            close.state = CloseState::Sealed(attempt);
-        }
-        let ledger = self.ledger.take();
-        if ledger.is_none() && self.needs_next_task() {
-            return Some(WorkflowTaskStreamCalls::default());
-        }
-        ledger
+        let marker = if !self.appends.is_empty() {
+            PeekedMarker::Append(StreamAppendMarkerData::default())
+        } else if !self.reads.is_empty() {
+            PeekedMarker::Read(StreamReadMarkerData::default())
+        } else {
+            return None;
+        };
+        self.marked = true;
+        Some(marker)
     }
 
     /// Makes each read that starts ask the Store to wait at most `max_wait`, and notes the reads
@@ -777,38 +827,39 @@ impl StreamCalls {
             };
             call.wait = call.wait.min(max_wait);
             if let Some(read) = self.reads.get_mut(seq) {
-                read.waits = !call.wait.is_zero();
+                read.sent_wait = call.wait;
             }
         }
     }
 
     /// Returns the calls that the Worker must start or stop.
     pub(crate) fn take_requests(&mut self) -> Vec<Request> {
-        std::mem::take(&mut self.requests)
+        mem::take(&mut self.requests)
     }
 
-    /// Drops every call, the ledger of the task and the entries of History, and leaves the run
-    /// with no task, as a failed task does. The run records no call after this.
+    /// Drops every call, the markers of the activation and the entries of History, and leaves the
+    /// run with no task, as a failed task does. The run records no call after this.
     pub(crate) fn stop(&mut self) {
         self.stop_for_terminal();
         self.task = TaskState::NoTask;
         self.held = Held::default();
         self.ready.clear();
         self.released = None;
-        self.ledger = LedgerBuilder::new(self.runtimes.settings);
+        self.marker = StreamAppendMarkerData::default();
+        self.read_marker = StreamReadMarkerData::default();
+        self.marked = false;
+        self.read_limit_passed = false;
+        self.task_record_bytes = 0;
+        self.task_read_results = 0;
+        self.hold_checks = false;
+        self.held_pages.clear();
+        self.more_after.clear();
         self.requests.clear();
     }
 
-    /// Checks that a live call can run on the Store of `stream`, and that History can keep its
-    /// result. A call whose result History can't keep must never run.
+    /// Checks that a live call can run on the Store of `stream`.
     fn check_runtime(&self, stream: &StreamRef) -> Result<(), WFMachinesError> {
-        if self.phase != Phase::Live {
-            return Ok(());
-        }
-        if !self.keeps_ledgers {
-            return Err(no_ledger());
-        }
-        if self.runtimes.get(&stream.store).is_none() {
+        if self.phase == Phase::Live && self.runtimes.get(&stream.store).is_none() {
             return Err(no_runtime(stream));
         }
         Ok(())
@@ -822,48 +873,13 @@ impl StreamCalls {
             return Ok(());
         };
         let call = CallKey::Append(seq);
-        check_stream(call, &append.stream, entry.r#ref.as_ref())?;
+        check_stream(call, &append.stream, &entry.stream_id, &entry.store)?;
         if !matches!(append.state, AppendState::Waiting { .. }) {
             return Err(second("result", call));
         }
         append.state = AppendState::Replayed;
-        let at = (activation_of(entry.activation_index), call);
-        self.ready.insert(at, append_job(seq, &entry).into());
-        Ok(())
-    }
-
-    fn match_intent(&mut self, seq: u32) -> Result<(), WFMachinesError> {
-        let Some(close) = self.closes.get_mut(&seq) else {
-            return Ok(());
-        };
-        let Some(intent) = self.held.intents.remove(&seq) else {
-            return Ok(());
-        };
-        let call = CallKey::Close(seq);
-        check_stream(call, &close.stream, intent.r#ref.as_ref())?;
-        if !matches!(close.state, CloseState::Asked) {
-            return Err(second("intent", call));
-        }
-        close.state = CloseState::Sealed(None);
-        Ok(())
-    }
-
-    fn match_result(&mut self, seq: u32) -> Result<(), WFMachinesError> {
-        let Some(close) = self.closes.get_mut(&seq) else {
-            return Ok(());
-        };
-        let Some(entry) = self.held.closes.remove(&seq) else {
-            return Ok(());
-        };
-        if !matches!(close.state, CloseState::Waiting(_)) {
-            return Err(WFMachinesError::Nondeterminism(format!(
-                "History has a result of Stream close {seq} with no intent before it, or a \
-                 second one"
-            )));
-        }
-        close.state = CloseState::Replayed;
-        let at = (activation_of(entry.activation_index), CallKey::Close(seq));
-        self.ready.insert(at, close_job(seq, &entry).into());
+        let at = (entry.activation_index, call);
+        self.ready.insert(at, append_job(&entry).into());
         Ok(())
     }
 
@@ -877,145 +893,161 @@ impl StreamCalls {
             return Ok(());
         };
         let (call, entry) = (CallKey::Read(seq), &held.entry);
-        check_stream(call, &read.stream, entry.r#ref.as_ref())?;
-        if entry.from_offset != read.from_offset {
+        check_stream(call, &read.stream, &entry.stream_id, &entry.store)?;
+        let from_offset = &read.request.from_offset;
+        if entry.from_offset != *from_offset {
             return Err(WFMachinesError::Nondeterminism(format!(
                 "Stream read {seq} gives the Records after {}, and History has them after {}",
-                offset_text(&read.from_offset),
+                offset_text(from_offset),
                 offset_text(&entry.from_offset)
             )));
         }
-        if !matches!(read.state, ReadState::Waiting(_)) {
+        if !matches!(read.state, ReadState::Waiting) {
             return Err(second("result", call));
         }
         let records = held.records?;
         read.state = ReadState::Replayed;
-        let at = (activation_of(entry.activation_index), call);
-        self.ready.insert(at, read_job(seq, entry, records).into());
+        let at = (entry.activation_index, call);
+        self.ready.insert(at, read_job(entry, records).into());
         Ok(())
     }
 
-    /// Starts read `seq` if it waits, the run is live and its task is open.
+    /// Starts read `seq` if it waits, the run is live, its task is open and has room for another
+    /// read result. After the read limit the read is a check.
     fn run_read(&mut self, seq: u32) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
         }
-        let Some(read) = self.reads.get_mut(&seq) else {
+        let Some(read) = self.reads.get(&seq) else {
             return;
         };
-        let ReadState::Waiting(waiting) = &read.state else {
+        let max_results = self.runtimes.settings.max_task_read_results;
+        if !matches!(read.state, ReadState::Waiting)
+            || read.checked
+            || self.task_read_results >= max_results
+        {
             return;
-        };
+        }
+        self.start_read(seq, self.read_limit_passed);
+    }
+
+    /// Starts read `seq`, which waits. A check is one Store call with no wait.
+    fn start_read(&mut self, seq: u32, check: bool) {
+        let read = self.reads.get_mut(&seq).expect("The caller found the read");
         let call_id = CALL_IDS.fetch_add(1, Ordering::Relaxed);
-        let running = ReadState::Running(call_id, waiting.last_try.clone());
-        let ReadState::Waiting(call) = mem::replace(&mut read.state, running) else {
-            return;
-        };
+        let last_try = LastTry::default();
+        read.state = ReadState::Running(call_id, last_try.clone(), check);
+        read.sent_wait = if check { Duration::ZERO } else { read.wait };
+        read.checked |= check;
         let call = Call {
             call_id,
             seq,
             store: read.stream.store.clone(),
-            op: Op::Read(call),
+            op: Op::Read(ReadCall {
+                request: read.request.clone(),
+                wait: read.sent_wait,
+                check,
+                last_try,
+            }),
         };
         self.requests.push(Request::Run(call));
     }
 
-    /// Ends each read of `calls` that has no answer. Its result is the failure of its last try if
-    /// that try failed, or else a page with no Record. A read that doesn't wait, and whose last try
-    /// didn't fail, goes on.
-    fn end_reads(&mut self, calls: &[CallKey]) {
-        for call in calls {
-            let CallKey::Read(seq) = *call else {
-                continue;
-            };
-            let Some(read) = self.reads.get_mut(&seq) else {
-                continue;
-            };
-            let failure = match &read.state {
-                ReadState::Running(_, last_try) => last_try.lock().clone(),
-                ReadState::Waiting(_) => None,
-                ReadState::Done(_) | ReadState::Replayed => continue,
-            };
-            // Only the Store can say that the Stream has no Record after the offset of such a read.
-            if failure.is_none() && !read.waits {
-                continue;
-            }
-            if let ReadState::Running(call_id, _) = read.state {
-                stop_call(&mut self.requests, call_id);
-            }
-            let from_offset = read.from_offset.clone();
-            read.state = ReadState::Done(ReadDone::cut(&read.stream, seq, from_offset, failure));
-            self.done.insert(*call);
+    /// Ends read `seq` if it waits for a Record and has no answer, with a page with no Record. A
+    /// read that doesn't wait goes on, since only the Store can say that the Stream has no Record
+    /// after its offset.
+    fn end_read(&mut self, seq: u32) {
+        let Some(read) = self.reads.get_mut(&seq) else {
+            return;
+        };
+        let ReadState::Running(call_id, _, false) = read.state else {
+            return;
+        };
+        if read.sent_wait.is_zero() {
+            return;
         }
+        stop_call(&mut self.requests, call_id);
+        let from_offset = read.request.from_offset.clone();
+        read.state = ReadState::Done(ReadDone::cut(&read.stream, seq, from_offset));
+        self.done.insert(CallKey::Read(seq));
     }
 
-    /// Returns whether the ledger has room for the first result that waits, if the task is open.
-    fn next_result_fits(&self, activation: u64) -> Option<bool> {
-        let call = *self.done.first()?;
-        if !self.task.is_open() {
-            return None;
+    /// Returns true if the task has room for the live result of `call`. A task with no Records yet
+    /// takes a page of any size, since a read asks for at most what such a task holds, and a
+    /// larger page has a single Record.
+    fn fits(&self, call: CallKey) -> bool {
+        let CallKey::Read(seq) = call else {
+            return true;
+        };
+        if self.held_pages.contains(&seq) {
+            return false;
         }
-        match call {
-            CallKey::Append(seq) => {
-                let AppendState::Done(result) = &self.appends[&seq].state else {
-                    return None;
-                };
-                Some(self.ledger.has_room_for(result, activation))
-            }
-            CallKey::Close(seq) => {
-                let CloseState::Done(result) = &self.closes[&seq].state else {
-                    return None;
-                };
-                Some(self.ledger.has_room_for(result, activation))
-            }
-            CallKey::Read(seq) => {
-                let ReadState::Done(result) = &self.reads[&seq].state else {
-                    return None;
-                };
-                Some(self.ledger.has_room_for_read(result, activation))
-            }
-        }
+        let Some(ReadState::Done(done)) = self.reads.get(&seq).map(|read| &read.state) else {
+            return true;
+        };
+        let (max, used) = (
+            self.settings().max_task_record_bytes(),
+            self.task_record_bytes,
+        );
+        done.bytes == 0 || used == 0 || (used <= max && done.bytes <= max - used)
     }
 
-    /// Records a live result in the ledger, and returns its job. Returns `None` if the ledger has
-    /// no room for it.
+    /// Records a live result in the marker of its kind for the activation at `activation`, and
+    /// returns its job. Returns `None` if the task has no room for it.
     fn record(
         &mut self,
         call: CallKey,
         activation: u64,
     ) -> Option<workflow_activation_job::Variant> {
-        match call {
+        let job = match call {
             CallKey::Append(seq) => {
                 let AppendState::Done(result) = &self.appends[&seq].state else {
                     return None;
                 };
-                if !self.ledger.append_result(result, activation) {
-                    return None;
-                }
-                Some(append_job(seq, &result.entry).into())
-            }
-            CallKey::Close(seq) => {
-                let CloseState::Done(result) = &self.closes[&seq].state else {
-                    return None;
+                let entry = StreamAppendResult {
+                    activation_index: activation,
+                    ..result.clone()
                 };
-                if !self.ledger.close_result(result, activation) {
-                    return None;
-                }
-                Some(close_job(seq, &result.entry).into())
+                let job = append_job(&entry).into();
+                self.marker.appends.push(entry);
+                job
             }
             CallKey::Read(seq) => {
-                let ReadState::Done(result) = &self.reads[&seq].state else {
-                    return None;
-                };
-                if !self.ledger.has_room_for_read(result, activation) {
+                if !self.fits(call) {
                     return None;
                 }
-                let ReadState::Done(result) = self.reads.remove(&seq)?.state else {
+                let read = self.reads.get_mut(&seq)?;
+                let ReadState::Done(done) = mem::replace(&mut read.state, ReadState::Replayed)
+                else {
                     return None;
                 };
-                Some(self.ledger.read_result(seq, result, activation).into())
+                let entry = StreamReadResult {
+                    activation_index: activation,
+                    ..done.entry
+                };
+                let page = match &entry.result {
+                    Some(stream_read_result::Result::Page(page)) => Some(&page.last_offset),
+                    _ => None,
+                };
+                let stream = key(&read.stream);
+                match (done.after, page) {
+                    (After::More, Some(last_offset)) => {
+                        self.more_after.insert(stream, last_offset.clone());
+                    }
+                    (After::AsBefore, _) => {}
+                    _ => {
+                        self.more_after.remove(&stream);
+                    }
+                }
+                self.task_record_bytes += done.bytes;
+                self.task_read_results += 1;
+                let job = read_job(&entry, done.records).into();
+                self.read_marker.reads.push(entry);
+                job
             }
-        }
+        };
+        self.marked = true;
+        Some(job)
     }
 
     /// Starts the call at the head of each queue, and each read that waits, once the run is live
@@ -1064,8 +1096,7 @@ impl StreamCalls {
                 };
                 let call_id = CALL_IDS.fetch_add(1, Ordering::Relaxed);
                 let running = AppendState::Running(call_id);
-                let AppendState::Waiting { bodies, .. } =
-                    std::mem::replace(&mut append.state, running)
+                let AppendState::Waiting { bodies, .. } = mem::replace(&mut append.state, running)
                 else {
                     return;
                 };
@@ -1085,21 +1116,6 @@ impl StreamCalls {
                     Op::Append(request, request_id),
                 )
             }
-            CallKey::Close(seq) => {
-                let Some(close) = self.closes.get_mut(&seq) else {
-                    return;
-                };
-                let CloseState::Waiting(Some(attempt)) = close.state else {
-                    return;
-                };
-                let call_id = CALL_IDS.fetch_add(1, Ordering::Relaxed);
-                close.state = CloseState::Running(call_id);
-                let request = CloseStreamRequest {
-                    r#ref: Some(close.stream.clone()),
-                    producer: Some(producer(&self.producer, attempt)),
-                };
-                (seq, call_id, &close.stream, Op::Close(request))
-            }
             // A read is in no queue.
             CallKey::Read(_) => return,
         };
@@ -1118,9 +1134,6 @@ impl StreamCalls {
             CallKey::Append(seq) => (self.appends.remove(&seq))
                 .filter(|append| !matches!(append.state, AppendState::Done(_)))
                 .map(|append| append.stream),
-            CallKey::Close(seq) => (self.closes.remove(&seq))
-                .filter(|close| !matches!(close.state, CloseState::Done(_)))
-                .map(|close| close.stream),
             CallKey::Read(seq) => {
                 self.reads.remove(&seq);
                 None
@@ -1161,11 +1174,6 @@ fn next_seq(kind: &str, seq: u32, last: &mut u32) -> Result<(), WFMachinesError>
     if seq <= *last {
         return Err(WFMachinesError::Fatal(format!(
             "Stream {kind} {seq} came after {kind} {last}"
-        )));
-    }
-    if seq > i32::MAX as u32 {
-        return Err(WFMachinesError::Fatal(format!(
-            "Stream {kind} has seq {seq}, and History keeps a seq as an `int32`"
         )));
     }
     *last = seq;
@@ -1233,12 +1241,18 @@ fn stop_call(requests: &mut Vec<Request>, call_id: u64) {
     }
 }
 
-fn no_ledger() -> WFMachinesError {
-    WFMachinesError::Stream(
-        "The server doesn't take the `sdk_metadata` of a Workflow Task completion, so History \
-         can't keep the results of Stream calls"
-            .to_string(),
-    )
+/// Returns true for the failure of a Store in an outage.
+fn is_outage(failure: &StreamFailure) -> bool {
+    failure.reason == StreamErrorReason::StoreUnavailable.as_str_name()
+}
+
+/// Returns the error that fails the task of a read in an outage, in the form of an append's.
+fn read_outage(stream: &StreamRef, failure: &StreamFailure) -> WFMachinesError {
+    let error = ReadError::store_unavailable(failure.message.clone());
+    WFMachinesError::Stream(format!(
+        "StreamStoreUnavailable: read of Stream \"{}\" on Store \"{}\": {error}",
+        stream.id, stream.store
+    ))
 }
 
 fn no_runtime(stream: &StreamRef) -> WFMachinesError {
@@ -1249,14 +1263,13 @@ fn no_runtime(stream: &StreamRef) -> WFMachinesError {
 }
 
 /// Checks that a call is for the Stream that History has, in the Store that History has. A call
-/// with no Store name matches any Store. An entry with no ref matches no call, since each call has
-/// a Stream id.
+/// with no Store name matches any Store.
 fn check_stream(
     call: CallKey,
     sent: &StreamRef,
-    recorded: Option<&StreamRef>,
+    id: &str,
+    store: &str,
 ) -> Result<(), WFMachinesError> {
-    let (id, store) = recorded.map_or(("", ""), |stream| (&stream.id[..], &stream.store[..]));
     if sent.id == id && (sent.store.is_empty() || sent.store == store) {
         return Ok(());
     }
@@ -1295,27 +1308,23 @@ fn key(stream: &StreamRef) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{StreamManager, StreamSettings, manager::recorded};
+    use super::super::{StreamManager, manager::recorded, read::record_bytes};
     use super::*;
     use crate::{
         telemetry::metrics::MetricsContext,
         test_help::stream_store::{MemoryStore, Request as StoreRequest},
     };
-    use prost::Message;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
-    use temporalio_common::protos::{
-        coresdk::workflow_activation::{
-            ResolveStreamAppend, ResolveStreamClose, ResolveStreamRead, resolve_stream_append,
-            resolve_stream_read,
-        },
-        temporal::api::sdk::v1::workflow_task_stream_calls::{
-            AppendOffsets, CallFailure, append_result,
+    use temporalio_common::protos::coresdk::{
+        external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
+        workflow_activation::{
+            ResolveStreamAppend, ResolveStreamRead, resolve_stream_append, resolve_stream_read,
         },
     };
     use temporalio_streams::{
-        AnyError, StreamRuntime,
-        proto::{ClientProducer, ReadRecordsResponse},
+        AnyError, ReadPage, StreamRuntime,
+        proto::{ReadRecordsResponse, StreamRecord},
         record::StoreLimits,
     };
     use tokio::runtime::Handle;
@@ -1332,17 +1341,15 @@ mod tests {
     }
 
     fn calls(phase: Phase, task: i64) -> StreamCalls {
-        let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), phase, true);
+        let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), phase);
         calls.set_task(TaskState::Open(task_attempt(task)));
         calls
     }
 
     /// Completes the current task, and opens the next one.
-    fn next_task(calls: &mut StreamCalls, task: i64) -> Option<WorkflowTaskStreamCalls> {
-        let ledger = calls.take_ledger();
+    fn next_task(calls: &mut StreamCalls, task: i64) {
         calls.set_task(TaskState::NoTask);
         calls.set_task(TaskState::Open(task_attempt(task)));
-        ledger
     }
 
     fn task_attempt(task: i64) -> WorkflowTaskAttempt {
@@ -1368,88 +1375,97 @@ mod tests {
         }
     }
 
-    fn close(seq: u32, id: &str) -> CloseStream {
-        CloseStream {
-            seq,
-            stream: Some(stream(id)),
-        }
-    }
-
-    /// Returns the read `seq` of the Stream `id`. It reads after an offset of its own, so that a
-    /// page that ends where it starts shows that the run ended the read.
-    fn read(seq: u32, id: &str) -> ReadStream {
+    fn read(seq: u32, id: &str, from_offset: &[u8]) -> ReadStream {
         ReadStream {
             seq,
             stream: Some(stream(id)),
-            from_offset: from_offset(seq),
+            from_offset: from_offset.to_vec(),
             ..Default::default()
         }
     }
 
-    fn from_offset(seq: u32) -> Vec<u8> {
-        seq.to_be_bytes().to_vec()
-    }
-
-    /// Returns the Store's page for read `seq`, with `count` Records. It ends past the start of
-    /// the read.
-    fn page(seq: u32, count: usize) -> ReadRecordsResponse {
-        let records = (0..count).map(|at| StreamRecord {
-            offset: [from_offset(seq), vec![at as u8]].concat(),
-            producer: Some(Producer {
-                kind: Some(Kind::Client(ClientProducer::default())),
-            }),
-            body: Some(Payload::default()),
-        });
-        ReadRecordsResponse {
-            records: records.collect(),
-            last_offset: [from_offset(seq), vec![0xff]].concat(),
-            done: false,
-        }
-    }
-
-    fn appended(seq: u32) -> append_result::Result {
-        append_result::Result::Appended(AppendOffsets {
+    fn appended(seq: u32) -> stream_append_result::Result {
+        stream_append_result::Result::Appended(StreamAppendOffsets {
             first_offset: vec![seq as u8],
             last_offset: vec![seq as u8],
         })
     }
 
-    /// Returns the result of append `seq` to the Stream `id`, as a run holds it before a ledger
-    /// records it.
-    fn append_done(seq: u32, id: &str) -> Waiting<AppendResult> {
-        Waiting::new(AppendResult {
-            seq: seq as i32,
-            r#ref: Some(stream(id)),
+    /// Returns `count` Records after `from_offset`, of `size` bytes of data each.
+    fn records(from_offset: &[u8], count: u8, size: usize) -> Vec<StreamRecord> {
+        let start = from_offset.first().copied().unwrap_or(0);
+        (1..=count)
+            .map(|at| StreamRecord {
+                offset: vec![start + at],
+                body: Some(Payload {
+                    data: vec![0; size],
+                    ..Default::default()
+                }),
+                producer: None,
+            })
+            .collect()
+    }
+
+    /// Returns the answer of the Store to read `seq` of `id` from `from_offset`, a page of
+    /// `records` with Records after it if `more`.
+    fn page(
+        seq: u32,
+        id: &str,
+        from_offset: &[u8],
+        records: Vec<StreamRecord>,
+        more: bool,
+    ) -> ReadDone {
+        let last_offset = (records.last()).map_or(from_offset.to_vec(), |r| r.offset.clone());
+        let response = ReadRecordsResponse {
+            records,
+            last_offset,
+        };
+        let answer = Ok(ReadPage { response, more });
+        ReadDone::new(&stream(id), seq, from_offset.to_vec(), answer)
+    }
+
+    /// Returns the marker of an activation at `activation` that has the result of append `seq` to
+    /// the Stream `id`.
+    fn marker(activation: u64, seq: u32, id: &str) -> PeekedMarker {
+        let entry = StreamAppendResult {
+            seq,
+            stream_id: id.to_string(),
+            store: "mem".to_string(),
+            activation_index: activation,
             result: Some(appended(seq)),
-            activation_index: 0,
+        };
+        PeekedMarker::Append(StreamAppendMarkerData {
+            appends: vec![entry],
         })
     }
 
-    fn refused(message: impl Into<String>) -> CallFailure {
+    /// Returns the seq and the activation index of each entry of `marker`.
+    fn entries(marker: Option<StreamAppendMarkerData>) -> Vec<(u32, u64)> {
+        (marker.into_iter().flat_map(|marker| marker.appends))
+            .map(|append| (append.seq, append.activation_index))
+            .collect()
+    }
+
+    fn refused(message: impl Into<String>) -> StreamFailure {
         recorded(&AnyError::invalid_argument(message))
     }
 
-    /// Returns a ledger that `write` fills.
-    fn history(write: impl FnOnce(&mut LedgerBuilder)) -> WorkflowTaskStreamCalls {
-        let mut ledger = LedgerBuilder::new(StreamSettings::default());
-        write(&mut ledger);
-        ledger.take().unwrap()
-    }
-
-    /// Returns the calls that started since the last look, as `append 1 of s at 3`, with the
-    /// started event id of their attempt.
+    /// Returns the calls that started since the last look, as `append 1 of s at 3` with the
+    /// started event id of their attempt, or as `read 1 of s`.
     fn started(calls: &mut StreamCalls) -> Vec<String> {
         let mut started: Vec<String> = (calls.take_requests().into_iter())
             .map(|request| {
                 let (call, stream, producer) = match request {
-                    Request::Run(Call { seq, op, .. }) => match op {
-                        Op::Append(r, _) => (CallKey::Append(seq), r.r#ref, r.producer),
-                        Op::Close(r) => (CallKey::Close(seq), r.r#ref, r.producer),
-                        // A read writes nothing, so it has no Producer.
-                        Op::Read(r) => {
-                            return format!("read {seq} of {}", r.request.r#ref.unwrap().id);
-                        }
-                    },
+                    Request::Run(Call {
+                        seq,
+                        op: Op::Append(r, _),
+                        ..
+                    }) => (CallKey::Append(seq), r.r#ref, r.producer),
+                    Request::Run(Call {
+                        seq,
+                        op: Op::Read(r),
+                        ..
+                    }) => return format!("read {seq} of {}", r.request.r#ref.unwrap().id),
                     Request::Stop(_) => return "stop".to_string(),
                 };
                 let Some(Kind::Workflow(workflow)) = producer.unwrap().kind else {
@@ -1463,46 +1479,41 @@ mod tests {
         started
     }
 
-    /// Gives a running call its result, a failure with `message` if there is one.
-    fn finish(calls: &mut StreamCalls, call: CallKey, message: Option<&str>) {
+    /// Gives a running append its result, a failure with `message` if there is one.
+    fn finish(calls: &mut StreamCalls, seq: u32, message: Option<&str>) {
         let failed = message.map(refused);
-        let (call_id, seq, outcome) = match call {
-            CallKey::Append(seq) => {
-                let AppendState::Running(call_id) = calls.appends[&seq].state else {
-                    panic!("{call} doesn't run");
-                };
-                let result = match failed {
-                    Some(failure) => append_result::Result::Failure(failure),
-                    None => appended(seq),
-                };
-                (call_id, seq, Outcome::Append(result))
-            }
-            CallKey::Close(seq) => {
-                let CloseState::Running(call_id) = calls.closes[&seq].state else {
-                    panic!("{call} doesn't run");
-                };
-                (call_id, seq, Outcome::Close(failed))
-            }
-            CallKey::Read(seq) => {
-                let ReadState::Running(call_id, _) = calls.reads[&seq].state else {
-                    panic!("{call} doesn't run");
-                };
-                let result = match failed {
-                    Some(failure) => Err(failure),
-                    None => Ok(page(seq, 1)),
-                };
-                let done = ReadDone::new(&stream("s"), seq, from_offset(seq), result);
-                (call_id, seq, Outcome::Read(done))
-            }
+        let AppendState::Running(call_id) = calls.appends[&seq].state else {
+            panic!("append {seq} doesn't run");
         };
-        calls.resolve(StreamResolution {
-            call_id,
-            seq,
-            outcome,
-        });
+        let result = match failed {
+            Some(failure) => stream_append_result::Result::Failure(failure),
+            None => appended(seq),
+        };
+        calls
+            .resolve(StreamResolution {
+                call_id,
+                seq,
+                outcome: Outcome::Append(result),
+            })
+            .unwrap();
     }
 
-    /// Returns the results of the activation at `activation`, as `append 1` or `close 2: <text>`.
+    /// Gives a running read the answer `done`.
+    fn answer_read(calls: &mut StreamCalls, seq: u32, done: ReadDone) {
+        let ReadState::Running(call_id, ..) = calls.reads[&seq].state else {
+            panic!("read {seq} doesn't run");
+        };
+        calls
+            .resolve(StreamResolution {
+                call_id,
+                seq,
+                outcome: Outcome::Read(done),
+            })
+            .unwrap();
+    }
+
+    /// Returns the results of the activation at `activation`, as `append 1`, `append 2: <text>` or
+    /// `read 3 of 2`, with the number of its Records.
     fn jobs(calls: &mut StreamCalls, activation: u64) -> Vec<String> {
         (calls.take_jobs(activation, None).into_iter())
             .map(|job| match job {
@@ -1511,16 +1522,11 @@ mod tests {
                     status: Some(resolve_stream_append::Status::Failed(failure)),
                 }) => format!("append {seq}: {}", failure.message),
                 Variant::ResolveStreamAppend(append) => format!("append {}", append.seq),
-                Variant::ResolveStreamClose(ResolveStreamClose {
-                    seq,
-                    failed: Some(failure),
-                }) => format!("close {seq}: {}", failure.message),
-                Variant::ResolveStreamClose(close) => format!("close {}", close.seq),
                 Variant::ResolveStreamRead(ResolveStreamRead {
                     seq,
-                    status: Some(resolve_stream_read::Status::Failed(failure)),
-                }) => format!("read {seq}: {}", failure.message),
-                Variant::ResolveStreamRead(read) => format!("read {}", read.seq),
+                    status: Some(resolve_stream_read::Status::Page(page)),
+                }) => format!("read {seq} of {}", page.records.len()),
+                Variant::ResolveStreamRead(read) => format!("read {}: failed", read.seq),
                 other => panic!("{other:?}"),
             })
             .collect()
@@ -1531,10 +1537,6 @@ mod tests {
         match &call.op {
             Op::Append(request, _) => (
                 CallKey::Append(call.seq),
-                &request.r#ref.as_ref().unwrap().id,
-            ),
-            Op::Close(request) => (
-                CallKey::Close(call.seq),
                 &request.r#ref.as_ref().unwrap().id,
             ),
             Op::Read(read) => (
@@ -1554,27 +1556,11 @@ mod tests {
         }
     }
 
-    /// Returns the Store's answer to `call`, which is `failure` if there is one.
-    fn answer(call: &Call, failure: Option<CallFailure>) -> StreamResolution {
-        let outcome = match (&call.op, failure) {
-            (Op::Append(..), None) => Outcome::Append(appended(call.seq)),
-            (Op::Append(..), Some(failure)) => {
-                Outcome::Append(append_result::Result::Failure(failure))
-            }
-            (Op::Close(_), failure) => Outcome::Close(failure),
-            (Op::Read(read), failure) => {
-                let stream = read.request.r#ref.as_ref().unwrap();
-                let result = match failure {
-                    Some(failure) => Err(failure),
-                    None => Ok(page(call.seq, 2)),
-                };
-                Outcome::Read(ReadDone::new(
-                    stream,
-                    call.seq,
-                    from_offset(call.seq),
-                    result,
-                ))
-            }
+    /// Returns the Store's answer to an append `call`, which is `failure` if there is one.
+    fn answer(call: &Call, failure: Option<StreamFailure>) -> StreamResolution {
+        let outcome = match failure {
+            None => Outcome::Append(appended(call.seq)),
+            Some(failure) => Outcome::Append(stream_append_result::Result::Failure(failure)),
         };
         StreamResolution {
             call_id: call.call_id,
@@ -1588,29 +1574,14 @@ mod tests {
         let mut calls = calls(Phase::Live, 3);
         calls.append(append(1, "s")).unwrap();
         calls.append(append(2, "s")).unwrap();
-        calls.close(close(1, "s")).unwrap();
         assert_eq!(started(&mut calls), ["append 1 of s at 3"]);
-        // Closes on Streams with long ids fill the ledger, so the last intent waits for task 7.
-        let long = |seq: u32| format!("{seq:02}{}", "s".repeat(4000));
-        for seq in 2..=70 {
-            calls.close(close(seq, &long(seq))).unwrap();
-        }
-        let first = next_task(&mut calls, 7).unwrap();
-        let sealed = first.close_intents.len() as u32;
-        assert!(sealed < 70, "{sealed}");
-        calls.ledger_recorded().unwrap();
-        finish(&mut calls, CallKey::Append(1), None);
-        let mut expected = vec!["append 2 of s at 3".to_string()];
-        expected.extend((2..=sealed).map(|seq| format!("close {seq} of {} at 3", long(seq))));
-        expected.sort();
-        assert_eq!(started(&mut calls), expected);
-        finish(&mut calls, CallKey::Append(2), None);
-        assert_eq!(started(&mut calls), ["close 1 of s at 3"]);
-        next_task(&mut calls, 11).unwrap();
-        calls.ledger_recorded().unwrap();
-        let rest = started(&mut calls);
-        assert_eq!(rest.len(), 70 - sealed as usize);
-        assert!(rest.iter().all(|call| call.ends_with(" at 7")), "{rest:?}");
+        // Append 2 waits in the queue of its Stream past the end of its task.
+        next_task(&mut calls, 7);
+        calls.append(append(3, "s")).unwrap();
+        finish(&mut calls, 1, None);
+        assert_eq!(started(&mut calls), ["append 2 of s at 3"]);
+        finish(&mut calls, 2, None);
+        assert_eq!(started(&mut calls), ["append 3 of s at 7"]);
     }
 
     #[test]
@@ -1619,47 +1590,131 @@ mod tests {
         live.append(append(1, "s")).unwrap();
         live.append(append(2, "t")).unwrap();
         started(&mut live);
-        finish(&mut live, CallKey::Append(2), None);
-        finish(&mut live, CallKey::Append(1), None);
+        finish(&mut live, 2, None);
+        finish(&mut live, 1, None);
         live.set_task(TaskState::Completing(task_attempt(3)));
         assert!(!live.has_jobs(4, None));
         assert_eq!(jobs(&mut live, 4), Vec::<String>::new());
-        // The ledger has no entry, and its completion ends a task sequence.
-        let ledger = next_task(&mut live, 7);
-        assert_eq!(ledger, Some(WorkflowTaskStreamCalls::default()));
+        assert_eq!(live.take_marker(), None);
+        next_task(&mut live, 7);
         assert!(live.has_jobs(0, None));
         assert_eq!(jobs(&mut live, 0), ["append 1", "append 2"]);
+        assert_eq!(entries(live.take_marker()), [(1, 0), (2, 0)]);
         live.append(append(3, "s")).unwrap();
         started(&mut live);
-        finish(&mut live, CallKey::Append(3), None);
+        finish(&mut live, 3, None);
         assert_eq!(jobs(&mut live, 2), ["append 3"]);
-        let ledger = next_task(&mut live, 11).unwrap();
-        let entries: Vec<_> = (ledger.append_results.iter())
-            .map(|append| (append.seq, append.activation_index))
-            .collect();
-        assert_eq!(entries, [(1, 0), (2, 0), (3, 2)]);
+        assert_eq!(entries(live.take_marker()), [(3, 2)]);
     }
 
     #[test]
     fn a_release_ends_with_its_activation() {
-        let ledger = history(|ledger| assert!(ledger.append_result(&append_done(1, "1"), 2)));
         let mut replay = calls(Phase::Replaying, 9);
         replay.append(append(1, "1")).unwrap();
-        replay.peeked(ledger, vec![]).unwrap();
+        replay.peeked(marker(2, 1, "1"), vec![]).unwrap();
         replay.release_ready();
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
         // A result of the next task waits for its own activation.
         replay.append(append(2, "2")).unwrap();
-        let next = history(|ledger| assert!(ledger.append_result(&append_done(2, "2"), 1)));
-        replay.peeked(next, vec![]).unwrap();
+        replay.peeked(marker(1, 2, "2"), vec![]).unwrap();
         assert!(!replay.has_jobs(0, None));
+    }
+
+    // Core asks for a new task for an open read only when it knows for certain that the Stream
+    // has Records for it. Otherwise the read stops at the completion and starts in the next task.
+    #[test]
+    fn a_read_needs_the_next_task_only_when_its_stream_has_more_for_it() {
+        let mut live = calls(Phase::Live, 3);
+        live.read(read(1, "s", b"")).unwrap();
+        assert_eq!(started(&mut live), ["read 1 of s"]);
+        // A full page with nothing after it says nothing of the Stream.
+        answer_read(&mut live, 1, page(1, "s", b"", records(b"", 2, 1), false));
+        assert_eq!(jobs(&mut live, 0), ["read 1 of 2"]);
+        live.read(read(2, "s", &[2])).unwrap();
+        assert_eq!(started(&mut live), ["read 2 of s"]);
+        assert!(!live.needs_next_task());
+        // The completion stops the read, and the next task starts it again.
+        live.stop_idle_reads();
+        assert_eq!(started(&mut live), ["stop"]);
+        assert_eq!(live.take_completion_marker(false, false, false), None);
+        next_task(&mut live, 7);
+        assert_eq!(started(&mut live), ["read 2 of s"]);
+        // A page that the runtime cut while the Store had more makes a read from its end need the
+        // next task, and a read from elsewhere not.
+        answer_read(&mut live, 2, page(2, "s", &[2], records(&[2], 1, 1), true));
+        assert_eq!(jobs(&mut live, 0), ["read 2 of 1"]);
+        live.read(read(3, "s", &[9])).unwrap();
+        assert!(!live.needs_next_task());
+        let mut waiting = read(4, "s", &[3]);
+        waiting.wait = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 0,
+        });
+        live.read(waiting).unwrap();
+        assert_eq!(started(&mut live), ["read 3 of s", "read 4 of s"]);
+        assert!(live.needs_next_task());
+        live.stop_idle_reads();
+        assert_eq!(started(&mut live), ["stop"]);
+        // A forced completion with no marker in its task leaves a marker of the read kind.
+        live.set_task(TaskState::NoTask);
+        assert_eq!(
+            live.take_completion_marker(true, false, false),
+            Some(PeekedMarker::Read(Default::default()))
+        );
+        live.set_task(TaskState::Open(task_attempt(11)));
+        started(&mut live);
+        // An empty page that Core made at the read limit keeps what the Stream had.
+        live.read_limit().unwrap();
+        live.reads.remove(&3);
+        let empty = jobs(&mut live, 0);
+        assert_eq!(empty, ["read 4 of 0"]);
+        live.read(read(5, "s", &[3])).unwrap();
+        assert!(live.needs_next_task());
+        // A failed read forgets it.
+        started(&mut live);
+        let ReadState::Running(call_id, ..) = live.reads[&5].state else {
+            panic!("read 5 doesn't run");
+        };
+        let failed = ReadDone::new(&stream("s"), 5, vec![3], Err(refused("down")));
+        live.resolve(StreamResolution {
+            call_id,
+            seq: 5,
+            outcome: Outcome::Read(failed),
+        })
+        .unwrap();
+        assert_eq!(jobs(&mut live, 1), ["read 5: failed"]);
+        live.read(read(6, "s", &[3])).unwrap();
+        assert!(!live.needs_next_task());
+    }
+
+    // A page that doesn't fit the Record budget of the task holds the task no longer, makes Core
+    // ask for the next task, and comes in its first activation.
+    #[test]
+    fn a_page_over_the_record_budget_comes_first_in_the_next_task() {
+        let mut live = calls(Phase::Live, 3);
+        live.runtimes.settings.max_task_record_bytes = 100;
+        live.read(read(1, "s", b"")).unwrap();
+        live.read(read(2, "t", b"")).unwrap();
+        started(&mut live);
+        let first = records(b"", 1, 60);
+        let bytes = record_bytes(&first);
+        answer_read(&mut live, 1, page(1, "s", b"", first, false));
+        answer_read(&mut live, 2, page(2, "t", b"", records(b"", 1, 60), false));
+        assert_eq!(jobs(&mut live, 0), ["read 1 of 1"]);
+        assert_eq!(live.task_record_bytes, bytes);
+        assert!(!live.has_jobs(1, None));
+        assert_eq!(live.outstanding(false), 0);
+        assert!(live.needs_next_task());
+        live.stop_idle_reads();
+        assert_eq!(started(&mut live), Vec::<String>::new());
+        next_task(&mut live, 7);
+        assert_eq!(jobs(&mut live, 0), ["read 2 of 1"]);
     }
 
     /// A command of Workflow code in a generated script.
     #[derive(Clone, Debug)]
     enum Command {
         Append(AppendToStream),
-        Close(CloseStream),
         Read(ReadStream),
         /// A command that ends the Workflow.
         Terminal,
@@ -1680,7 +1735,8 @@ mod tests {
         /// activation even with no Stream result.
         has_events: bool,
         activations: Vec<Activation>,
-        ledger: Option<WorkflowTaskStreamCalls>,
+        /// The marker of each activation that got a live result, in order.
+        markers: Vec<PeekedMarker>,
         /// True if this task sent the last command of the Workflow.
         ends_workflow: bool,
     }
@@ -1702,6 +1758,34 @@ mod tests {
         }
     }
 
+    /// The calls of the entries of `marker`.
+    fn calls_of(marker: &PeekedMarker) -> Vec<CallKey> {
+        match marker {
+            PeekedMarker::Append(data) => (data.appends.iter())
+                .map(|append| CallKey::Append(append.seq))
+                .collect(),
+            PeekedMarker::Read(data) => (data.reads.iter())
+                .map(|read| CallKey::Read(read.seq))
+                .collect(),
+        }
+    }
+
+    /// The Records that the first run gave each read, by its seq. A replay reads them again.
+    type Given = HashMap<u32, Vec<StreamRecord>>;
+
+    /// Returns what a replay reads for the entries of `marker`.
+    fn replay_reads(marker: &PeekedMarker, given: &Given) -> MarkerReads {
+        let PeekedMarker::Read(data) = marker else {
+            return vec![];
+        };
+        (data.reads.iter())
+            .map(|read| {
+                let records = given.get(&read.seq).cloned().unwrap_or_default();
+                needs_records(read).then_some(Ok(records))
+            })
+            .collect()
+    }
+
     /// A run that a generated test drives as the machines of Core do.
     struct Run {
         calls: StreamCalls,
@@ -1712,14 +1796,19 @@ mod tests {
     }
 
     impl Run {
-        /// Gives Workflow code an activation, and takes its commands.
-        fn activate(&mut self, commands: &[Command]) -> Result<Vec<Variant>, WFMachinesError> {
+        /// Gives Workflow code an activation, and takes its commands. Returns the jobs and the
+        /// markers of the activation.
+        fn activate(
+            &mut self,
+            commands: &[Command],
+        ) -> Result<(Vec<Variant>, Vec<PeekedMarker>), WFMachinesError> {
             let jobs = self.calls.take_jobs(self.activation, None);
+            let appends = self.calls.take_marker().map(PeekedMarker::Append);
+            let reads = self.calls.take_read_marker().map(PeekedMarker::Read);
             self.activation += 1;
             for command in commands {
                 match command {
                     Command::Append(append) => self.calls.append(append.clone())?,
-                    Command::Close(close) => self.calls.close(close.clone())?,
                     Command::Read(read) => self.calls.read(read.clone())?,
                     Command::Terminal => {
                         self.calls.stop_for_terminal();
@@ -1727,15 +1816,14 @@ mod tests {
                     }
                 }
             }
-            Ok(jobs)
+            Ok((jobs, appends.into_iter().chain(reads).collect()))
         }
 
         /// Returns the calls that the run still tracks.
         fn tracked(&self) -> BTreeSet<CallKey> {
-            (self.calls.appends.keys().map(|seq| CallKey::Append(*seq)))
-                .chain(self.calls.closes.keys().map(|seq| CallKey::Close(*seq)))
-                .chain(self.calls.reads.keys().map(|seq| CallKey::Read(*seq)))
-                .collect()
+            let appends = self.calls.appends.keys().map(|seq| CallKey::Append(*seq));
+            let reads = self.calls.reads.keys().map(|seq| CallKey::Read(*seq));
+            appends.chain(reads).collect()
         }
     }
 
@@ -1752,43 +1840,26 @@ mod tests {
     fn replay(
         seed: u64,
         history: &[Task],
+        given: &Given,
         live: WorkflowTaskAttempt,
     ) -> Result<Replayed, WFMachinesError> {
-        let calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Replaying, true);
+        let calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Replaying);
         let mut run = Run {
             calls,
             activation: 0,
             ended: false,
         };
         run.calls.set_task(TaskState::Open(live));
-        // The Store still has the Records of each page that the first run gave.
-        let pages: HashMap<u32, Vec<StreamRecord>> = (history.iter())
-            .flat_map(|task| &task.activations)
-            .flat_map(|activation| &activation.jobs)
-            .filter_map(|job| match job {
-                Variant::ResolveStreamRead(ResolveStreamRead {
-                    seq,
-                    status: Some(resolve_stream_read::Status::Page(page)),
-                }) => Some((*seq, page.records.clone())),
-                _ => None,
-            })
-            .collect();
         let mut replayed = vec![];
         let mut sent_in = None;
         for (index, task) in history.iter().enumerate() {
-            if index > 0 && history[index - 1].ledger.is_some() {
-                run.calls.ledger_recorded()?;
+            if index > 0 && !history[index - 1].markers.is_empty() {
+                run.calls.marker_recorded()?;
             }
-            // Core peeks the ledger that the task's completion recorded before it activates, with
-            // the Records of its read entries.
-            if let Some(ledger) = &task.ledger {
-                let records = (ledger.read_results.iter())
-                    .map(|entry| {
-                        let records = pages.get(&(entry.seq as u32)).cloned();
-                        needs_records(entry).then(|| records.ok_or_else(missing))
-                    })
-                    .collect();
-                run.calls.peeked(ledger.clone(), records)?;
+            // Core peeks the markers that the task's completion recorded before it activates.
+            for marker in &task.markers {
+                run.calls
+                    .peeked(marker.clone(), replay_reads(marker, given))?;
             }
             run.activation = 0;
             let mut activations = vec![];
@@ -1805,7 +1876,8 @@ mod tests {
                 }
                 first = false;
                 let at = run.activation;
-                let jobs = run.activate(&task.commands_at(at))?;
+                let (jobs, markers) = run.activate(&task.commands_at(at))?;
+                assert_eq!(markers, vec![], "seed {seed}: a replay records a result");
                 activations.push((at, jobs));
             }
             if run.ended && sent_in.is_none() {
@@ -1815,8 +1887,8 @@ mod tests {
             assert!(requests.is_empty(), "seed {seed}: {requests:?}");
             replayed.push(activations);
         }
-        if history.last().is_some_and(|task| task.ledger.is_some()) {
-            run.calls.ledger_recorded()?;
+        if history.last().is_some_and(|task| !task.markers.is_empty()) {
+            run.calls.marker_recorded()?;
         }
         run.activation = 0;
         run.calls.go_live()?;
@@ -1827,28 +1899,28 @@ mod tests {
         })
     }
 
-    /// Returns the error of a replay that has no Records for a read entry.
-    fn missing() -> ReplayError {
-        ReplayError::Unavailable("The replay has no Records".to_string())
-    }
-
     /// The cases that the generated scripts reached, over all seeds.
     #[derive(Default)]
     struct Seen {
-        full_ledgers: usize,
         heartbeats: usize,
         failed_tasks: usize,
-        /// The last commands that Workflow code sent while a call had no result in a ledger.
+        /// The last commands that Workflow code sent while a call had no result in a marker.
         dropped: usize,
         /// The commands with a Stream id or a Store name out of range.
         invalid: usize,
         bad_seqs: usize,
-        /// The reads that the read limit ended, and the tasks that completed with a command while
-        /// a read had no answer.
-        ended_reads: usize,
-        reads_left_running: usize,
-        /// The reads with no wait that went on at the read limit.
-        kept_reads: usize,
+        read_limits: usize,
+        /// Completions that stopped a read, and ones that asked for a new task for one.
+        stopped_reads: usize,
+        forced_by_reads: usize,
+        held_pages: usize,
+        /// Checks before a completion, the reads that a check parked, and tasks that a read in an
+        /// outage failed.
+        checks: usize,
+        parked: usize,
+        outages: usize,
+        /// Tasks that started no read since they gave all the read results that they can.
+        full_budgets: usize,
     }
 
     /// The first run of a generated script. It writes History, and checks a replay of it at each
@@ -1867,26 +1939,36 @@ mod tests {
         /// the next task.
         deferred: Vec<StreamResolution>,
         last_append: u32,
-        last_close: u32,
         last_read: u32,
-        /// True if the activation that the task completes with has work for the server.
-        has_work_for_server: bool,
-        /// The calls whose result no ledger has.
+        /// The offset of the last Record that the Store gave on each Stream.
+        offsets: HashMap<String, u8>,
+        given: Given,
+        /// The calls whose result no marker has.
         unresolved: BTreeSet<CallKey>,
         /// The state as of the last task in History, which a failed task goes back to.
-        committed: ((u32, u32, u32), BTreeSet<CallKey>),
+        committed: (u32, u32, BTreeSet<CallKey>),
+        /// True if the task in hand has a command for the server.
+        has_work: bool,
     }
 
     impl<'a> FirstRun<'a> {
         fn new(seed: u64, seen: &'a mut Seen) -> Self {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Live);
+            if rng.random_bool(0.3) {
+                calls.runtimes.settings.max_task_record_bytes = rng.random_range(1..400);
+            }
+            if rng.random_bool(0.3) {
+                calls.runtimes.settings.max_task_read_results = rng.random_range(1..4);
+            }
             let run = Run {
-                calls: StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Live, true),
+                calls,
                 activation: 0,
                 ended: false,
             };
             Self {
                 seed,
-                rng: StdRng::seed_from_u64(seed),
+                rng,
                 seen,
                 run,
                 history: vec![],
@@ -1895,11 +1977,12 @@ mod tests {
                 in_flight: vec![],
                 deferred: vec![],
                 last_append: 0,
-                last_close: 0,
                 last_read: 0,
-                has_work_for_server: false,
+                offsets: HashMap::new(),
+                given: Given::new(),
                 unresolved: BTreeSet::new(),
                 committed: Default::default(),
+                has_work: false,
             }
         }
 
@@ -1933,16 +2016,14 @@ mod tests {
 
         fn start_task(&mut self) {
             self.run.calls.set_task(TaskState::Open(self.task_attempt));
-            if self
-                .history
-                .last()
-                .is_some_and(|task| task.ledger.is_some())
-            {
-                self.run.calls.ledger_recorded().unwrap();
+            if (self.history.last()).is_some_and(|task| !task.markers.is_empty()) {
+                self.run.calls.marker_recorded().unwrap();
             }
             self.run.activation = 0;
             for resolution in std::mem::take(&mut self.deferred) {
-                self.run.calls.resolve(resolution);
+                let seed = self.seed;
+                (self.run.calls.resolve(resolution))
+                    .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
             }
             self.dispatch();
         }
@@ -1950,27 +2031,30 @@ mod tests {
         /// Runs the current task until it completes, and returns an error if it fails.
         fn run_task(&mut self) -> Result<(), ()> {
             self.task.has_events = self.history.is_empty() || self.rng.random_bool(0.6);
+            self.has_work = self.rng.random_bool(0.4);
             if self.task.has_events || self.run.calls.has_jobs(self.run.activation, None) {
                 self.activate()?;
             }
+            let mut checked = false;
             loop {
                 if self.run.ended {
-                    self.complete();
+                    self.complete(false);
                     return Ok(());
                 }
                 if self.run.calls.has_jobs(self.run.activation, None) {
                     self.activate()?;
                     continue;
                 }
-                if self.run.calls.must_complete(self.run.activation) {
-                    self.seen.full_ledgers += 1;
-                    self.complete();
-                    return Ok(());
-                }
-                let for_server = self.has_work_for_server;
-                if self.run.calls.outstanding(for_server) == 0 {
-                    self.seen.reads_left_running += usize::from(self.run.calls.read_runs());
-                    self.complete();
+                if self.run.calls.outstanding(self.has_work) == 0 {
+                    // Core checks the reads that the completion would stop once per completion.
+                    if !checked {
+                        checked = true;
+                        self.check_open_reads()?;
+                        if self.run.calls.outstanding(self.has_work) > 0 {
+                            continue;
+                        }
+                    }
+                    self.complete(false);
                     return Ok(());
                 }
                 let seed = self.seed;
@@ -1978,61 +2062,125 @@ mod tests {
                     !self.in_flight.is_empty(),
                     "seed {seed}: a call waits, and none runs"
                 );
-                match self.rng.random_range(0..40) {
+                match self.rng.random_range(0..48) {
                     // Core gives an activation for the first answer that arrives.
                     0..=35 => {
                         let resolution = self.answer();
-                        self.run.calls.resolve(resolution);
-                        self.dispatch();
-                    }
-                    // The read limit ends each read with no answer, but a read that doesn't wait
-                    // and whose last try didn't fail. Some tries in flight failed for an outage.
-                    36 if self.run.calls.read_runs() => {
-                        self.seen.ended_reads += 1;
-                        for at in 0..self.in_flight.len() {
-                            if let Op::Read(read) = &self.in_flight[at].op
-                                && self.rng.random_bool(0.3)
-                            {
-                                *read.last_try.lock() = Some(refused("The Store is down"));
-                            }
-                        }
-                        let running: Vec<(u32, bool)> = (self.run.calls.reads.iter())
-                            .filter_map(|(seq, read)| match &read.state {
-                                ReadState::Running(_, last_try) => {
-                                    Some((*seq, read.waits || last_try.lock().is_some()))
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        self.run.calls.read_limit();
-                        for (seq, ends) in running {
-                            let state = &self.run.calls.reads[&seq].state;
-                            let ended = matches!(state, ReadState::Done(_));
-                            assert_eq!(ended, ends, "seed {}: read {seq}", self.seed);
-                            self.seen.kept_reads += usize::from(!ended);
-                        }
-                        self.dispatch();
+                        self.resolve(resolution)?;
+                        checked = false;
                     }
                     36..=38 => {
-                        // The heartbeat completes the task. Results that arrive before the
-                        // completion wait for the next task.
+                        // The heartbeat completes the task, and fails it for a read in an outage.
+                        // Results that arrive before the completion wait for the next task.
                         self.seen.heartbeats += 1;
+                        self.check_outage(|calls| calls.check_read_outage())?;
                         self.run
                             .calls
                             .set_task(TaskState::Completing(self.task_attempt));
                         for _ in 0..self.rng.random_range(0..=2) {
                             if !self.in_flight.is_empty() {
                                 let resolution = self.answer();
-                                self.run.calls.resolve(resolution);
-                                self.dispatch();
+                                self.resolve(resolution)?;
                             }
                         }
-                        self.complete();
+                        self.complete(true);
                         return Ok(());
                     }
+                    39..=42 => {
+                        self.seen.read_limits += 1;
+                        self.check_outage(StreamCalls::read_limit)?;
+                        self.dispatch();
+                    }
+                    43..=46 => self.fail_a_try(),
                     _ => return Err(()),
                 }
             }
+        }
+
+        /// Readies the reads for a completion, as Core does when nothing else holds the task.
+        fn check_open_reads(&mut self) -> Result<(), ()> {
+            self.run.calls.hold_check_pages(self.has_work);
+            self.check_outage(StreamCalls::check_open_reads)?;
+            let checks = (self.run.calls.requests.iter())
+                .filter(
+                    |r| matches!(r, Request::Run(Call { op: Op::Read(read), .. }) if read.check),
+                )
+                .count();
+            self.seen.checks += checks;
+            self.dispatch();
+            Ok(())
+        }
+
+        /// Runs a step that fails the task for a read in an outage, and checks that it does so
+        /// only for such a read.
+        fn check_outage(
+            &mut self,
+            step: impl FnOnce(&mut StreamCalls) -> Result<(), WFMachinesError>,
+        ) -> Result<(), ()> {
+            let in_outage = (self.run.calls.reads.values()).any(|read| match &read.state {
+                ReadState::Running(_, last_try, _) => last_try.lock().is_some(),
+                _ => false,
+            });
+            let live = self.run.calls.phase == Phase::Live && self.run.calls.task.is_open();
+            let result = step(&mut self.run.calls);
+            let seed = self.seed;
+            match result {
+                Err(WFMachinesError::Stream(message)) => {
+                    assert!(in_outage && live, "seed {seed}: {message}");
+                    assert!(message.starts_with("StreamStoreUnavailable: read of Stream"));
+                    self.seen.outages += 1;
+                    Err(())
+                }
+                Err(error) => panic!("seed {seed}: {error:?}"),
+                Ok(()) => {
+                    assert!(!in_outage || !live, "seed {seed}");
+                    Ok(())
+                }
+            }
+        }
+
+        /// Fails the last try of a read that runs, as the Store in an outage does, while the read
+        /// waits to try again.
+        fn fail_a_try(&mut self) {
+            let running: Vec<&Read> = (self.run.calls.reads.values())
+                .filter(|read| matches!(read.state, ReadState::Running(_, _, false)))
+                .collect();
+            if running.is_empty() {
+                return;
+            }
+            let read = running[self.rng.random_range(0..running.len())];
+            if let ReadState::Running(_, last_try, _) = &read.state {
+                *last_try.lock() = Some(StreamFailure {
+                    reason: StreamErrorReason::StoreUnavailable
+                        .as_str_name()
+                        .to_string(),
+                    message: "Down".to_string(),
+                });
+            }
+        }
+
+        /// Handles an answer as Core does. A check that meets an outage fails the task.
+        fn resolve(&mut self, resolution: StreamResolution) -> Result<(), ()> {
+            let parks = (self.run.calls.reads.get(&resolution.seq)).is_some_and(|read| {
+                matches!(read.state, ReadState::Running(id, _, true) if id == resolution.call_id)
+            });
+            match self.run.calls.resolve(resolution) {
+                Ok(()) => {}
+                Err(WFMachinesError::Stream(message)) => {
+                    assert!(message.starts_with("StreamStoreUnavailable: read of Stream"));
+                    self.seen.outages += 1;
+                    return Err(());
+                }
+                Err(error) => panic!("seed {}: {error:?}", self.seed),
+            }
+            let seq_parked = |calls: &StreamCalls| {
+                (calls.reads.values())
+                    .filter(|read| matches!(read.state, ReadState::Waiting))
+                    .count()
+            };
+            self.seen.parked += usize::from(parks && seq_parked(&self.run.calls) > 0);
+            self.dispatch();
+            Ok(())
         }
 
         /// Gives Workflow code an activation with commands that the script makes up.
@@ -2048,18 +2196,25 @@ mod tests {
                 assert_eq!(result, Err(expected), "seed {}", self.seed);
                 return Err(());
             }
-            let jobs = result.unwrap_or_else(|error| panic!("seed {}: {error:?}", self.seed));
-            self.has_work_for_server = self.rng.random_bool(0.2);
+            let (jobs, markers) =
+                result.unwrap_or_else(|error| panic!("seed {}: {error:?}", self.seed));
+            self.task.markers.extend(markers);
+            for job in &jobs {
+                if let Variant::ResolveStreamRead(ResolveStreamRead {
+                    seq,
+                    status: Some(resolve_stream_read::Status::Page(page)),
+                }) = job
+                {
+                    self.given.insert(*seq, page.records.clone());
+                }
+            }
             for resolution in late {
-                self.run.calls.resolve(resolution);
+                self.resolve(resolution)?;
             }
             for command in &commands {
                 match command {
                     Command::Append(append) => {
                         self.unresolved.insert(CallKey::Append(append.seq));
-                    }
-                    Command::Close(close) => {
-                        self.unresolved.insert(CallKey::Close(close.seq));
                     }
                     Command::Read(read) => {
                         self.unresolved.insert(CallKey::Read(read.seq));
@@ -2091,15 +2246,13 @@ mod tests {
                         commands.push(Command::Append(append(self.last_append, &id)));
                     }
                     45..=69 => {
-                        self.last_close += 1;
-                        commands.push(Command::Close(close(self.last_close, &id)));
-                    }
-                    73..=79 | 90..=94 => {
                         self.last_read += 1;
-                        let mut command = read(self.last_read, &id);
-                        if self.rng.random_bool(0.5) {
-                            command.wait = Some(Duration::from_secs(60).try_into().unwrap());
-                        }
+                        let from_offset = match self.rng.random_bool(0.7) {
+                            true => self.offsets.get(&id).map_or(vec![], |at| vec![*at]),
+                            false => vec![self.rng.random_range(0..200)],
+                        };
+                        let mut command = read(self.last_read, &id, &from_offset);
+                        command.max_records = self.rng.random_range(0..4);
                         commands.push(Command::Read(command));
                     }
                     70..=72 => {
@@ -2116,23 +2269,22 @@ mod tests {
                                 (Command::Append(append(seq, &long)), error)
                             }
                             1 => {
-                                self.last_append += 1;
-                                let seq = self.last_append;
-                                let error = format!(
-                                    "Stream append {seq} is invalid: The Stream id is empty"
-                                );
-                                (Command::Append(append(seq, "")), error)
+                                self.last_read += 1;
+                                let seq = self.last_read;
+                                let error =
+                                    format!("Stream read {seq} is invalid: The Stream id is empty");
+                                (Command::Read(read(seq, "", b"")), error)
                             }
                             _ => {
-                                self.last_close += 1;
-                                let seq = self.last_close;
-                                let mut long_store = close(seq, &id);
+                                self.last_append += 1;
+                                let seq = self.last_append;
+                                let mut long_store = append(seq, &id);
                                 long_store.stream.as_mut().unwrap().store = long;
                                 let error = format!(
-                                    "Stream close {seq} is invalid: The Store name has 4097 \
+                                    "Stream append {seq} is invalid: The Store name has 4097 \
                                      bytes, more than 4096"
                                 );
-                                (Command::Close(long_store), error)
+                                (Command::Append(long_store), error)
                             }
                         };
                         commands.push(command);
@@ -2140,36 +2292,17 @@ mod tests {
                     }
                     80..=82 => {
                         self.seen.bad_seqs += 1;
-                        let (command, error) = if self.rng.random_bool(0.5) {
-                            let seq = self.last_append;
-                            let error = match seq {
-                                0 => "Stream append has seq 0, and a seq starts at 1".to_string(),
-                                _ => format!("Stream append {seq} came after append {seq}"),
-                            };
-                            (Command::Append(append(seq, &id)), error)
-                        } else {
-                            let seq = self.last_close;
-                            let error = match seq {
-                                0 => "Stream close has seq 0, and a seq starts at 1".to_string(),
-                                _ => format!("Stream close {seq} came after close {seq}"),
-                            };
-                            (Command::Close(close(seq, &id)), error)
+                        let seq = self.last_append;
+                        let error = match seq {
+                            0 => "Stream append has seq 0, and a seq starts at 1".to_string(),
+                            _ => format!("Stream append {seq} came after append {seq}"),
                         };
-                        commands.push(command);
+                        commands.push(Command::Append(append(seq, &id)));
                         return (commands, Some(WFMachinesError::Fatal(error)));
                     }
                     83..=86 => {
                         commands.push(Command::Terminal);
                         return (commands, None);
-                    }
-                    87..=89 => {
-                        // A burst of appends, each on a Stream of its own, can fill a ledger.
-                        for _ in 0..self.rng.random_range(40..=90) {
-                            self.last_append += 1;
-                            let long = "x".repeat(self.rng.random_range(0..3000));
-                            let id = format!("b{}{long}", self.last_append);
-                            commands.push(Command::Append(append(self.last_append, &id)));
-                        }
                     }
                     _ => {}
                 }
@@ -2180,50 +2313,91 @@ mod tests {
         /// Takes a random call in flight, and returns the Store's answer to it.
         fn answer(&mut self) -> StreamResolution {
             let call = (self.in_flight).swap_remove(self.rng.random_range(0..self.in_flight.len()));
-            let failure = match &call.op {
-                Op::Append(request, _) => {
-                    // A large failure fills the ledger in a few dozen results.
-                    let burst = request.r#ref.as_ref().unwrap().id.starts_with('b');
-                    let large = if burst { 8 } else { 1 };
-                    match self.rng.random_range(0..10) {
-                        at if at < large => Some(refused("x".repeat(4000))),
-                        at if at < large + 2 => Some(refused("refused")),
-                        _ => None,
-                    }
-                }
-                Op::Close(_) | Op::Read(_) => self.rng.random_bool(0.3).then(|| refused("refused")),
+            let mut failure = self.rng.random_bool(0.2).then(|| refused("refused"));
+            let Op::Read(read) = &call.op else {
+                return answer(&call, failure);
             };
-            answer(&call, failure)
+            // A check has one try, so it returns the outage of the Store.
+            if read.check && self.rng.random_bool(0.1) {
+                failure = Some(StreamFailure {
+                    reason: StreamErrorReason::StoreUnavailable
+                        .as_str_name()
+                        .to_string(),
+                    message: "Down".to_string(),
+                });
+            }
+            let request = &read.request;
+            let id = request.r#ref.as_ref().unwrap().id.clone();
+            let done = match failure {
+                Some(failure) => {
+                    let from_offset = request.from_offset.clone();
+                    ReadDone::new(&stream(&id), call.seq, from_offset, Err(failure))
+                }
+                None => {
+                    let count = self.rng.random_range(0..=request.max_records.min(3) as u8);
+                    let size = self.rng.random_range(0..100);
+                    let page_records = records(&request.from_offset, count, size);
+                    if let Some(last) = page_records.last() {
+                        self.offsets.insert(id.clone(), last.offset[0]);
+                    }
+                    let more = count > 0 && self.rng.random_bool(0.4);
+                    page(call.seq, &id, &request.from_offset, page_records, more)
+                }
+            };
+            StreamResolution {
+                call_id: call.call_id,
+                seq: call.seq,
+                outcome: Outcome::Read(done),
+            }
         }
 
         fn dispatch(&mut self) {
             dispatch(&mut self.run.calls, &mut self.in_flight);
         }
 
-        /// Completes the task in hand, and checks that the run tracks exactly the calls whose
-        /// result no ledger has.
-        fn complete(&mut self) {
-            let ledger = self.run.calls.take_ledger();
+        /// Completes the task in hand as Core does, with a new task if a heartbeat forces it or a
+        /// call needs it. Checks that the run tracks exactly the calls whose result no marker has.
+        fn complete(&mut self, heartbeat: bool) {
+            let needs_next_task = self.run.calls.needs_next_task();
+            let forced = heartbeat || needs_next_task;
+            let reads_open = !self.run.calls.reads.is_empty();
+            self.seen.forced_by_reads +=
+                usize::from(reads_open && needs_next_task && self.run.calls.appends.is_empty());
+            self.seen.held_pages += usize::from((self.run.calls.reads.values()).any(
+                |read| matches!(&read.state, ReadState::Done(done) if !done.records.is_empty()),
+            ));
+            if !forced {
+                self.seen.stopped_reads += usize::from(reads_open);
+                self.run.calls.stop_idle_reads();
+                self.dispatch();
+            }
+            let calls = &self.run.calls;
+            let budget = calls.runtimes.settings.max_task_read_results;
+            self.seen.full_budgets += usize::from(
+                calls.task_read_results >= budget
+                    && (calls.reads.values()).any(|read| matches!(read.state, ReadState::Waiting)),
+            );
+            let open = self.run.calls.take_completion_marker(forced, false, false);
+            self.task.markers.extend(open);
+            // Workflow code never gets the outage of a Store from a live read.
+            let outage = |marker: &PeekedMarker| match marker {
+                PeekedMarker::Read(data) => (data.reads.iter()).any(|read| {
+                    matches!(&read.result,
+                        Some(stream_read_result::Result::Failure(f)) if is_outage(f))
+                }),
+                PeekedMarker::Append(_) => false,
+            };
+            assert!(!self.task.markers.iter().any(outage), "seed {}", self.seed);
             self.run.calls.set_task(TaskState::NoTask);
-            for entry in ledger.iter() {
-                for append in &entry.append_results {
-                    self.unresolved.remove(&CallKey::Append(append.seq as u32));
-                }
-                for close in &entry.close_results {
-                    self.unresolved.remove(&CallKey::Close(close.seq as u32));
-                }
-                for read in &entry.read_results {
-                    self.unresolved.remove(&CallKey::Read(read.seq as u32));
+            for marker in &self.task.markers {
+                for call in calls_of(marker) {
+                    self.unresolved.remove(&call);
                 }
             }
             let mut task = std::mem::take(&mut self.task);
-            task.ledger = ledger;
             task.ends_workflow = self.run.ended;
             self.history.push(task);
-            self.committed = (
-                (self.last_append, self.last_close, self.last_read),
-                self.unresolved.clone(),
-            );
+            self.committed = (self.last_append, self.last_read, self.unresolved.clone());
             let seed = self.seed;
             assert_eq!(self.run.tracked(), self.unresolved, "seed {seed}");
             let in_flight = &self.in_flight;
@@ -2231,6 +2405,9 @@ mod tests {
                 !self.run.ended || in_flight.is_empty(),
                 "seed {seed}: {in_flight:?}"
             );
+            // A completion that asks for no new task leaves no read running.
+            let running = |call: &Call| matches!(call.op, Op::Read(_));
+            assert!(forced || !in_flight.iter().any(running), "seed {seed}");
             assert!(self.run.calls.ready.is_empty(), "seed {seed}");
             let queued = self.run.calls.queues.values().flatten();
             let waiting = self.run.calls.done.iter().chain(queued);
@@ -2259,13 +2436,12 @@ mod tests {
             self.run.calls.stop();
             self.in_flight.clear();
             self.deferred.clear();
-            (
-                (self.last_append, self.last_close, self.last_read),
-                self.unresolved,
-            ) = self.committed.clone();
+            (self.last_append, self.last_read, self.unresolved) = self.committed.clone();
             self.task = Task::default();
             self.task_attempt.attempt += 1;
+            let budget = self.run.calls.runtimes.settings.max_task_record_bytes;
             self.run = self.check_replay(self.task_attempt);
+            self.run.calls.runtimes.settings.max_task_record_bytes = budget;
             self.dispatch();
         }
 
@@ -2276,37 +2452,28 @@ mod tests {
                 jobs: replayed,
                 sent_in,
                 mut run,
-            } = replay(seed, &self.history, live)
+            } = replay(seed, &self.history, &self.given, live)
                 .unwrap_or_else(|error| panic!("seed {seed}: {error:?}"));
             let first: Vec<_> = self.history.iter().map(Task::jobs).collect();
             assert_eq!(replayed, first, "seed {seed}");
             let ended = self.history.iter().position(|task| task.ends_workflow);
             assert_eq!(sent_in, ended, "seed {seed}");
-            // The replay resumes each call whose result no ledger has, and only those.
+            // The replay resumes each call whose result no marker has, and only those.
             assert_eq!(run.tracked(), self.unresolved, "seed {seed}");
             let recorded: BTreeSet<CallKey> = (self.history.iter())
-                .filter_map(|task| task.ledger.as_ref())
-                .flat_map(|ledger| {
-                    let appends = ledger.append_results.iter();
-                    let closes = ledger.close_results.iter();
-                    (appends.map(|append| CallKey::Append(append.seq as u32)))
-                        .chain(closes.map(|close| CallKey::Close(close.seq as u32)))
-                })
+                .flat_map(|task| task.markers.iter())
+                .flat_map(calls_of)
                 .collect();
             for request in run.calls.take_requests() {
-                let Request::Run(Call { seq, op, .. }) = &request else {
+                let Request::Run(call) = &request else {
                     panic!("seed {seed}: {request:?}");
                 };
-                let (key, sent) = match op {
-                    Op::Append(append, _) => (CallKey::Append(*seq), &append.producer),
-                    Op::Close(close) => (CallKey::Close(*seq), &close.producer),
-                    // A read writes nothing, so it has no Producer.
-                    Op::Read(_) => (CallKey::Read(*seq), &None),
-                };
+                let (key, _) = target(call);
                 assert!(!recorded.contains(&key), "seed {seed}: {key} ran again");
-                let expected =
-                    (!matches!(key, CallKey::Read(_))).then(|| producer(&run.calls.producer, live));
-                assert_eq!(*sent, expected, "seed {seed}");
+                if let Op::Append(append, _) = &call.op {
+                    let expected = producer(&run.calls.producer, live);
+                    assert_eq!(append.producer, Some(expected), "seed {seed}");
+                }
                 run.calls.requests.push(request);
             }
             run
@@ -2327,26 +2494,34 @@ mod tests {
         }
         // The scripts reach each case that the test is for.
         let Seen {
-            full_ledgers,
             heartbeats,
             failed_tasks,
             dropped,
             invalid,
             bad_seqs,
-            ended_reads,
-            reads_left_running,
-            kept_reads,
+            read_limits,
+            stopped_reads,
+            forced_by_reads,
+            held_pages,
+            checks,
+            parked,
+            outages,
+            full_budgets,
         } = seen;
         let counts = [
-            full_ledgers,
             heartbeats,
             failed_tasks,
             dropped,
             invalid,
             bad_seqs,
-            ended_reads,
-            reads_left_running,
-            kept_reads,
+            read_limits,
+            stopped_reads,
+            forced_by_reads,
+            held_pages,
+            checks,
+            parked,
+            outages,
+            full_budgets,
         ];
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
     }
@@ -2357,26 +2532,21 @@ mod tests {
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
             let mut calls = calls(Phase::Live, 3);
-            // The calls of each Stream that have no result yet, in the order that they joined its
-            // queue. An append joins at its command, and a close once History has its intent.
+            // The calls of each Stream that have no result yet, in the order of their commands.
             let mut queues: BTreeMap<String, VecDeque<CallKey>> = BTreeMap::new();
             let mut in_flight: Vec<Call> = vec![];
-            let (mut appends, mut closes, mut task, mut ended) = (0, 0, 3, false);
+            let (mut appends, mut task, mut ended) = (0, 3, false);
             for _ in 0..60 {
                 let id = format!("s{}", rng.random_range(0..4));
                 match rng.random_range(0..20) {
                     _ if ended => {}
-                    0..=11 => {
+                    0..=15 => {
                         appends += 1;
                         calls.append(append(appends, &id)).unwrap();
                         queues
                             .entry(id)
                             .or_default()
                             .push_back(CallKey::Append(appends));
-                    }
-                    12..=15 => {
-                        closes += 1;
-                        calls.close(close(closes, &id)).unwrap();
                     }
                     16 => {
                         // The last command of the Workflow stops each call.
@@ -2388,15 +2558,7 @@ mod tests {
                 }
                 if rng.random_bool(0.15) {
                     task += 4;
-                    if let Some(ledger) = next_task(&mut calls, task) {
-                        calls.ledger_recorded().unwrap();
-                        for intent in &ledger.close_intents {
-                            queues
-                                .entry(intent.r#ref.as_ref().unwrap().id.clone())
-                                .or_default()
-                                .push_back(CallKey::Close(intent.seq as u32));
-                        }
-                    }
+                    next_task(&mut calls, task);
                 }
                 dispatch(&mut calls, &mut in_flight);
                 // The Store answers some of the calls in flight, in any order.
@@ -2409,7 +2571,7 @@ mod tests {
                     let oldest = queues.get_mut(id).and_then(VecDeque::pop_front);
                     assert_eq!(oldest, Some(key), "seed {seed}: Stream {id}");
                     let failure = rng.random_bool(0.3).then(|| refused("no"));
-                    calls.resolve(answer(&call, failure));
+                    calls.resolve(answer(&call, failure)).unwrap();
                     dispatch(&mut calls, &mut in_flight);
                 }
                 // Each Stream with calls that wait has its oldest one in flight, and only that
@@ -2427,188 +2589,6 @@ mod tests {
         assert!(together > 0);
     }
 
-    fn key_of(job: &Variant) -> CallKey {
-        match job {
-            Variant::ResolveStreamAppend(append) => CallKey::Append(append.seq),
-            Variant::ResolveStreamClose(close) => CallKey::Close(close.seq),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn each_result_and_intent_is_in_exactly_one_ledger_in_order() {
-        let (mut full, mut oversized, mut out_of_order) = (0, 0, 0);
-        for seed in 0..SEEDS {
-            let mut rng = StdRng::seed_from_u64(seed);
-            // A small bound fills a ledger after a few entries, and the default after many.
-            let mut runtimes = runtimes(&["mem"]);
-            if rng.random_bool(0.5) {
-                runtimes.settings.bounds.max_ledger_bytes = rng.random_range(1..=16 * 1024);
-            }
-            let max_entry = runtimes.settings.bounds.max_ledger_bytes;
-            let mut calls = StreamCalls::new("n", "w", "r", runtimes, Phase::Live, true);
-            calls.set_task(TaskState::Open(task_attempt(3)));
-            let budget = rng.random_range(1..=150);
-            let (mut appends, mut closes) = (0, 0);
-            let mut in_flight: Vec<Call> = vec![];
-            // The results that Core took in each task, in order, with their activation.
-            let mut taken: Vec<Vec<(u64, CallKey)>> = vec![vec![]];
-            let mut ledgers = vec![];
-            let (mut activation, mut task) = (0, 3);
-            // The highest seq of each kind that Core took so far.
-            let mut highest = (0, 0);
-            for round in 0.. {
-                assert!(round < 100_000, "seed {seed}: the run never ends");
-                // Most calls share a few Streams, so they wait in a queue. The others have a
-                // Stream of their own, whose long id fills a ledger sooner.
-                for _ in 0..rng.random_range(0..=4) {
-                    if appends + closes == budget {
-                        break;
-                    }
-                    let id = match rng.random_bool(0.6) {
-                        true => format!("s{}", rng.random_range(0..4)),
-                        false => {
-                            let long = "a".repeat(rng.random_range(0..3000));
-                            format!("own{}{long}", appends + closes)
-                        }
-                    };
-                    if rng.random_bool(0.7) {
-                        appends += 1;
-                        calls.append(append(appends, &id)).unwrap();
-                    } else {
-                        closes += 1;
-                        calls.close(close(closes, &id)).unwrap();
-                    }
-                }
-                dispatch(&mut calls, &mut in_flight);
-                // The Store answers some of the calls in flight, in any order. Most of them fail
-                // with a long message, which fills a ledger sooner.
-                for _ in 0..rng.random_range(0..=in_flight.len().min(6)) {
-                    let call = in_flight.swap_remove(rng.random_range(0..in_flight.len()));
-                    let bytes = rng.random_range(0..4200);
-                    let failure = rng.random_bool(0.7).then(|| refused("x".repeat(bytes)));
-                    calls.resolve(answer(&call, failure));
-                    dispatch(&mut calls, &mut in_flight);
-                }
-                // Core takes the results that wait in their order, up to the first that doesn't
-                // fit, and the ledger records them with the activation.
-                let waiting: Vec<CallKey> = calls.done.iter().copied().collect();
-                let took = if calls.has_jobs(activation, None) && rng.random_bool(0.8) {
-                    let jobs: Vec<CallKey> = calls
-                        .take_jobs(activation, None)
-                        .iter()
-                        .map(key_of)
-                        .collect();
-                    assert_eq!(jobs, waiting[..jobs.len()], "seed {seed}");
-                    jobs.len()
-                } else {
-                    0
-                };
-                assert!(
-                    waiting[took..].iter().all(|call| calls.done.contains(call)),
-                    "seed {seed}"
-                );
-                // A take stops only at a result that doesn't fit, so a result that still waits
-                // means that the ledger is full and the task must complete.
-                if took > 0 {
-                    let waits = !calls.done.is_empty();
-                    assert_eq!(calls.must_complete(activation), waits, "seed {seed}");
-                    full += usize::from(waits);
-                }
-                for call in &waiting[..took] {
-                    let (seq, high) = match call {
-                        CallKey::Append(seq) => (*seq, &mut highest.0),
-                        CallKey::Close(seq) => (*seq, &mut highest.1),
-                        CallKey::Read(_) => unreachable!("The test makes no read"),
-                    };
-                    out_of_order += usize::from(seq < *high);
-                    *high = seq.max(*high);
-                }
-                let entries = taken.last_mut().unwrap();
-                entries.extend(waiting[..took].iter().map(|call| (activation, *call)));
-                if took > 0 {
-                    activation += 1;
-                    continue;
-                }
-                // A full ledger completes the task, and so does a heartbeat at any time.
-                let finished = appends + closes == budget && !calls.needs_next_task();
-                if finished || calls.must_complete(activation) || rng.random_bool(0.03) {
-                    task += 4;
-                    let ledger = next_task(&mut calls, task);
-                    if ledger.is_some() {
-                        calls.ledger_recorded().unwrap();
-                    }
-                    ledgers.push(ledger.unwrap_or_default());
-                    taken.push(vec![]);
-                    activation = 0;
-                    if finished {
-                        break;
-                    }
-                }
-            }
-            // Each ledger records the results of its task in the order that Core took them, with
-            // their activations. The appends come first, then the closes.
-            for (index, ledger) in ledgers.iter().enumerate() {
-                let appends = ledger.append_results.iter();
-                let closes = ledger.close_results.iter();
-                let recorded: Vec<(u64, CallKey)> = (appends)
-                    .map(|a| {
-                        (
-                            activation_of(a.activation_index),
-                            CallKey::Append(a.seq as u32),
-                        )
-                    })
-                    .chain(closes.map(|c| {
-                        (
-                            activation_of(c.activation_index),
-                            CallKey::Close(c.seq as u32),
-                        )
-                    }))
-                    .collect();
-                let mut expected = taken[index].clone();
-                expected.sort_by_key(|(_, call)| matches!(call, CallKey::Close(_)));
-                assert_eq!(recorded, expected, "seed {seed}: task {index}");
-            }
-            let once = |seqs: Vec<u32>, count: u32| {
-                let mut sorted = seqs.clone();
-                sorted.sort_unstable();
-                assert_eq!(
-                    sorted,
-                    (1..=count).collect::<Vec<_>>(),
-                    "seed {seed}: {seqs:?}"
-                );
-            };
-            let all = |seqs: &dyn Fn(&WorkflowTaskStreamCalls) -> Vec<u32>| -> Vec<u32> {
-                ledgers.iter().flat_map(seqs).collect()
-            };
-            once(
-                all(&|m| m.append_results.iter().map(|a| a.seq as u32).collect()),
-                appends,
-            );
-            once(
-                all(&|m| m.close_results.iter().map(|c| c.seq as u32).collect()),
-                closes,
-            );
-            let intents = all(&|m| m.close_intents.iter().map(|i| i.seq as u32).collect());
-            assert_eq!(intents, (1..=closes).collect::<Vec<_>>(), "seed {seed}");
-            for ledger in &ledgers {
-                let entries = ledger.append_results.len()
-                    + ledger.close_intents.len()
-                    + ledger.close_results.len();
-                // The bound of the entries is on the encoded ledger.
-                let size = ledger.encoded_len();
-                assert!(size <= max_entry || entries == 1, "seed {seed}: {size}");
-                oversized += usize::from(size > max_entry);
-            }
-        }
-        // The scripts reach each case that the test is for.
-        let counts = [full, oversized, out_of_order];
-        assert!(
-            counts.iter().all(|count| *count > 0),
-            "full {full}, oversized {oversized}, out of order {out_of_order}"
-        );
-    }
-
     /// A change of History or of Workflow code that a replay must not take for the first run.
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Change {
@@ -2620,36 +2600,35 @@ mod tests {
         Twice,
         /// History has an entry for a seq that no command has.
         Seq,
-        /// History has an entry as the other kind of call.
-        Kind,
         /// History has an entry at another activation.
         Activation,
+        /// A read starts at another offset than History has.
+        FromOffset,
     }
 
     /// Makes a random change to `history`, if it has an entry to change.
     fn mutate(rng: &mut StdRng, history: &mut [Task]) -> Option<Change> {
-        let entries: Vec<(usize, CallKey)> = (history.iter().enumerate())
-            .filter_map(|(index, task)| Some((index, task.ledger.as_ref()?)))
-            .flat_map(|(index, ledger)| {
-                let appends = ledger.append_results.iter();
-                let closes = ledger.close_results.iter();
-                (appends.map(move |append| (index, CallKey::Append(append.seq as u32))))
-                    .chain(closes.map(move |close| (index, CallKey::Close(close.seq as u32))))
+        let entries: Vec<(usize, usize, CallKey)> = (history.iter().enumerate())
+            .flat_map(|(index, task)| task.markers.iter().enumerate().map(move |m| (index, m)))
+            .flat_map(|(index, (at, marker))| {
+                calls_of(marker)
+                    .into_iter()
+                    .map(move |call| (index, at, call))
             })
             .collect();
         if entries.is_empty() {
             return None;
         }
-        let (task, call) = entries[rng.random_range(0..entries.len())];
+        let (task, at_marker, call) = entries[rng.random_range(0..entries.len())];
         let change = [
             Change::Stream,
             Change::Missing,
             Change::Twice,
             Change::Seq,
-            Change::Kind,
             Change::Activation,
+            Change::FromOffset,
         ][rng.random_range(0..6)];
-        if let Change::Stream | Change::Missing = change {
+        if let Change::Stream | Change::Missing | Change::FromOffset = change {
             let commands = (history.iter_mut())
                 .flat_map(|task| task.activations.iter_mut())
                 .map(|activation| &mut activation.commands)
@@ -2661,57 +2640,34 @@ mod tests {
                 (Change::Missing, _) => {
                     commands.remove(at);
                 }
+                (Change::FromOffset, Command::Read(read)) => read.from_offset.push(0),
+                (Change::FromOffset, _) => return None,
                 (_, Command::Append(append)) => append.stream.as_mut().unwrap().id.push('!'),
-                (_, Command::Close(close)) => close.stream.as_mut().unwrap().id.push('!'),
                 (_, Command::Read(read)) => read.stream.as_mut().unwrap().id.push('!'),
                 (_, Command::Terminal) => return None,
             }
             return Some(change);
         }
-        let ledger = history[task].ledger.as_mut().unwrap();
-        match call {
-            CallKey::Append(seq) => {
-                let at = ledger
-                    .append_results
-                    .iter()
-                    .position(|append| append.seq == seq as i32)?;
+        match (&mut history[task].markers[at_marker], call) {
+            (PeekedMarker::Append(data), CallKey::Append(seq)) => {
+                let appends = &mut data.appends;
+                let at = appends.iter().position(|append| append.seq == seq)?;
                 match change {
-                    Change::Twice => ledger
-                        .append_results
-                        .push(ledger.append_results[at].clone()),
-                    Change::Seq => ledger.append_results[at].seq = 999,
-                    Change::Activation => ledger.append_results[at].activation_index += 1,
-                    _ => {
-                        let entry = ledger.append_results.remove(at);
-                        ledger.close_results.push(CloseResult {
-                            seq: seq as i32,
-                            failure: None,
-                            activation_index: entry.activation_index,
-                        });
-                    }
+                    Change::Twice => appends.push(appends[at].clone()),
+                    Change::Seq => appends[at].seq = 999,
+                    _ => appends[at].activation_index += 1,
                 }
             }
-            CallKey::Close(seq) => {
-                let at = ledger
-                    .close_results
-                    .iter()
-                    .position(|close| close.seq == seq as i32)?;
+            (PeekedMarker::Read(data), CallKey::Read(seq)) => {
+                let reads = &mut data.reads;
+                let at = reads.iter().position(|read| read.seq == seq)?;
                 match change {
-                    Change::Twice => ledger.close_results.push(ledger.close_results[at].clone()),
-                    Change::Seq => ledger.close_results[at].seq = 999,
-                    Change::Activation => ledger.close_results[at].activation_index += 1,
-                    _ => {
-                        let entry = ledger.close_results.remove(at);
-                        ledger.append_results.push(AppendResult {
-                            seq: seq as i32,
-                            r#ref: Some(stream("s0")),
-                            result: Some(append_result::Result::Appended(Default::default())),
-                            activation_index: entry.activation_index,
-                        });
-                    }
+                    Change::Twice => reads.push(reads[at].clone()),
+                    Change::Seq => reads[at].seq = 999,
+                    _ => reads[at].activation_index += 1,
                 }
             }
-            CallKey::Read(_) => unreachable!("No read is in the entries"),
+            _ => unreachable!("A marker has the calls of its kind"),
         }
         Some(change)
     }
@@ -2719,7 +2675,7 @@ mod tests {
     fn is_command_of(command: &Command, call: CallKey) -> bool {
         match (command, call) {
             (Command::Append(append), CallKey::Append(seq)) => append.seq == seq,
-            (Command::Close(close), CallKey::Close(seq)) => close.seq == seq,
+            (Command::Read(read), CallKey::Read(seq)) => read.seq == seq,
             _ => false,
         }
     }
@@ -2738,11 +2694,11 @@ mod tests {
             };
             mutated += 1;
             let first_jobs: Vec<_> = first.history.iter().map(Task::jobs).collect();
-            match replay(seed, &history, task_attempt(1000)) {
+            match replay(seed, &history, &first.given, task_attempt(1000)) {
                 Err(WFMachinesError::Nondeterminism(_)) => {}
-                // An entry at another activation, or of the other kind, can match a call. Then
-                // Workflow code gets other jobs, which is as wrong as an error.
-                Ok(replayed) if matches!(change, Change::Activation | Change::Kind) => {
+                // An entry at another activation can match a call. Then Workflow code gets other
+                // jobs, which is as wrong as an error.
+                Ok(replayed) if change == Change::Activation => {
                     assert_ne!(replayed.jobs, first_jobs, "seed {seed}: {change:?}");
                 }
                 other => panic!("seed {seed}: {change:?}: {:?}", other.map(|r| r.jobs)),
@@ -2755,15 +2711,14 @@ mod tests {
         let mut nameless = append(1, "s");
         nameless.stream.as_mut().unwrap().store.clear();
         replay.append(nameless).unwrap();
-        let ledger = history(|m| assert!(m.append_result(&append_done(1, "s"), 0)));
-        replay.peeked(ledger, vec![]).unwrap();
+        replay.peeked(marker(0, 1, "s"), vec![]).unwrap();
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_call_with_no_runtime_or_no_ledger_fails_the_task() {
+    async fn a_call_with_no_runtime_fails_the_task() {
         let stores = ["a", "b", "c"];
-        let (mut with_no_runtime, mut with_no_ledger) = (0, 0);
+        let mut with_no_runtime = 0;
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
             let served: Vec<(&str, Arc<MemoryStore>)> = (stores.into_iter())
@@ -2778,12 +2733,9 @@ mod tests {
                 let runtime = StreamRuntime::new(store.clone(), StoreLimits::default());
                 (name.to_string(), Arc::new(runtime))
             }));
-            // A server that doesn't take the `sdk_metadata` of a completion keeps no ledger.
-            let keeps_ledgers = rng.random_bool(0.7);
-            with_no_ledger += usize::from(!keeps_ledgers && phase != Phase::ReplayOnly);
-            let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), phase, keeps_ledgers);
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), phase);
             calls.set_task(TaskState::Open(task_attempt(3)));
-            let (mut appends, mut closes) = (0, 0);
+            let mut appends = 0;
             let (mut unserved, mut store_of) = (BTreeMap::new(), HashMap::new());
             for index in 0..rng.random_range(1..=6) {
                 let store = stores[rng.random_range(0..3)];
@@ -2792,91 +2744,64 @@ mod tests {
                     store: store.to_string(),
                 };
                 store_of.insert(stream.id.clone(), store);
-                let (call, result) = if rng.random_bool(0.5) {
-                    appends += 1;
-                    let command = AppendToStream {
-                        seq: appends,
-                        stream: Some(stream),
-                        bodies: vec![Payload::default()],
-                    };
-                    (CallKey::Append(appends), calls.append(command))
-                } else {
-                    closes += 1;
-                    let command = CloseStream {
-                        seq: closes,
-                        stream: Some(stream),
-                    };
-                    (CallKey::Close(closes), calls.close(command))
+                appends += 1;
+                let command = AppendToStream {
+                    seq: appends,
+                    stream: Some(stream),
+                    bodies: vec![Payload::default()],
                 };
+                let result = calls.append(command);
                 let error = WFMachinesError::Stream(format!(
                     "This Worker has no Stream runtime for the Store `{store}`"
                 ));
                 let is_served = served.iter().any(|(name, _)| *name == store);
-                if phase == Phase::Live && (!is_served || !keeps_ledgers) {
+                if phase == Phase::Live && !is_served {
                     // The command fails the task, so the run records nothing of the call.
-                    let error = if keeps_ledgers { error } else { no_ledger() };
                     assert_eq!(result, Err(error), "seed {seed}");
-                    let tracked = match call {
-                        CallKey::Append(seq) => calls.appends.contains_key(&seq),
-                        CallKey::Close(seq) => calls.closes.contains_key(&seq),
-                        CallKey::Read(seq) => calls.reads.contains_key(&seq),
-                    };
-                    assert!(!tracked, "seed {seed}");
+                    assert!(!calls.appends.contains_key(&appends), "seed {seed}");
                     break;
                 }
                 assert_eq!(result, Ok(()), "seed {seed}");
                 if !is_served {
-                    unserved.insert(call, error);
+                    unserved.insert(appends, error);
                 }
             }
-            let ledger = calls.take_ledger().unwrap_or_default();
-            calls.ledger_recorded().unwrap();
+            calls.marker_recorded().unwrap();
             let mut sent = calls.take_requests();
             let at_go_live = calls.go_live();
             sent.extend(calls.take_requests());
-            // No call on a Store with no runtime records an intent or reaches a Store.
-            let streams: Vec<&str> = (ledger.close_intents.iter())
-                .map(|intent| intent.r#ref.as_ref().unwrap().store.as_str())
-                .chain(sent.iter().map(|request| match request {
+            // No call on a Store with no runtime reaches a Store.
+            let streams: Vec<&str> = (sent.iter())
+                .map(|request| match request {
                     Request::Run(call) => call.store.as_str(),
                     Request::Stop(_) => panic!("seed {seed}"),
-                }))
+                })
                 .collect();
             assert!(
                 (streams.iter()).all(|store| served.iter().any(|(name, _)| name == store)),
                 "seed {seed}"
             );
-            // A replay fails the task when it goes live with an unserved call, or with any call
-            // whose result History can't keep, which a replay Worker never does.
+            // A replay fails the task when it goes live with an unserved call, which a replay
+            // Worker never does.
             let expected = match (phase, unserved.into_values().next()) {
                 (Phase::Replaying, Some(error)) => Err(error),
-                (Phase::Replaying, None) if !keeps_ledgers && appends + closes > 0 => {
-                    Err(no_ledger())
-                }
                 _ => Ok(()),
             };
             assert_eq!(at_go_live, expected, "seed {seed}");
-            // No call runs if History can't keep its result.
-            assert!(keeps_ledgers || sent.is_empty(), "seed {seed}");
             // Each Store gets only the calls whose ref has its name.
             let manager = StreamManager::new(runtimes, Handle::current(), |_, _| {});
             manager.dispatch("r", sent, |_| MetricsContext::no_op());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             for (name, store) in &served {
                 for request in store.requests() {
-                    let id = match request {
-                        StoreRequest::Append(append, _) => append.r#ref.unwrap().id,
-                        StoreRequest::Close(close) => close.r#ref.unwrap().id,
-                        StoreRequest::Read(read) => read.r#ref.unwrap().id,
+                    let StoreRequest::Append(append, _) = request else {
+                        panic!("seed {seed}: {request:?}");
                     };
+                    let id = append.stream_id;
                     assert_eq!(store_of[&id], *name, "seed {seed}: Stream {id}");
                 }
             }
         }
         assert!(with_no_runtime > 0, "No seed had a Worker with no runtime");
-        assert!(
-            with_no_ledger > 0,
-            "No seed had a server that keeps no ledger"
-        );
     }
 }

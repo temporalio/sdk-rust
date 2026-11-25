@@ -5,8 +5,8 @@
 use super::{
     StreamRuntimes,
     digest::digest,
-    ledger::{has_ledger, peeked_ledger},
     manager::{cut, is_outage, next_wait, retry_waits},
+    marker::{is_read_marker, peeked_read_marker},
 };
 use crate::{
     telemetry::metrics::{MetricsContext, stream_store},
@@ -31,16 +31,20 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use temporalio_common::protos::temporal::api::{
-    history::v1::HistoryEvent,
-    sdk::v1::workflow_task_stream_calls::{ReadPage, ReadResult, read_result},
+use temporalio_common::protos::{
+    coresdk::external_data::{StreamReadPage, StreamReadResult, stream_read_result},
+    temporal::api::history::v1::HistoryEvent,
 };
 use temporalio_streams::{
     AnyReason, ReadReason,
-    proto::{ReadRecordsRequest, StreamRecord, StreamRef},
+    proto::{
+        StreamRecord,
+        sdk::{ReadRecordsRequest, StreamRef},
+    },
     record::field_len,
 };
 use tokio::{sync::watch, time::Instant};
+use tracing::debug;
 
 /// Why a replay can't give Workflow code the Records of a read entry.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,56 +54,58 @@ pub(crate) enum ReplayError {
     /// The Store gave no answer, or this Worker can't read from it, so another attempt may still
     /// read the Records.
     Unavailable(String),
+    /// This Worker has no Stream runtime for the Store of the entry, so it can't replay History.
+    NoRuntime(String),
 }
 
-/// The Records that a replay read for the read entries of one ledger, by the index of each entry.
+/// The Records that a replay read for the read entries of one marker, by the index of each entry.
 /// An entry with no Records has no result.
-pub(crate) type LedgerReads = Vec<Option<Result<Vec<StreamRecord>, ReplayError>>>;
+pub(crate) type MarkerReads = Vec<Option<Result<Vec<StreamRecord>, ReplayError>>>;
 
-/// The Records that a replay read for the ledgers of a History, by the event id of each ledger.
+/// The Records that a replay read for the markers of a History, by the event id of each marker.
 #[derive(Debug, Default)]
 pub(crate) struct ReplayReads {
-    pub(crate) reads: HashMap<i64, LedgerReads>,
+    pub(crate) reads: HashMap<i64, MarkerReads>,
     pub(crate) unread: Option<i64>,
 }
 
 impl ReplayReads {
-    /// Returns true if a run new to the cache must read the Records of the ledgers in the
+    /// Returns true if a run new to the cache must read the Records of the markers in the
     /// events of `update` before it replays them.
     pub(crate) fn needed_by(update: &HistoryUpdate) -> bool {
-        update.stream_reads.is_none() && update.get_events().iter().any(has_ledger)
+        update.stream_reads.is_none() && update.get_events().iter().any(is_read_marker)
     }
 
-    /// Takes the Records that were read for the ledger event `event_id` of `update`.
-    pub(crate) fn take_from(update: &mut HistoryUpdate, event_id: i64) -> LedgerReads {
+    /// Takes the Records that were read for the marker event `event_id` of `update`.
+    pub(crate) fn take_from(update: &mut HistoryUpdate, event_id: i64) -> MarkerReads {
         (update.stream_reads.as_mut()).map_or_else(Vec::new, |reads| reads.take(event_id))
     }
 
-    /// Adds the Records of the next ledgers to `update`, which a completion waited for.
+    /// Adds the Records of the next markers to `update`, which a completion waited for.
     pub(crate) fn add_to(self, update: &mut HistoryUpdate) {
         if let Some(reads) = &mut update.stream_reads {
             reads.extend(self);
         }
     }
 
-    /// Takes the results of the read entries of the ledger event `event_id`.
-    pub(crate) fn take(&mut self, event_id: i64) -> LedgerReads {
+    /// Takes the results of the read entries of the marker event `event_id`.
+    pub(crate) fn take(&mut self, event_id: i64) -> MarkerReads {
         self.reads.remove(&event_id).unwrap_or_default()
     }
 
-    /// Returns the event id of the first ledger whose Records the replay hasn't read yet.
+    /// Returns the event id of the first marker whose Records the replay hasn't read yet.
     pub(crate) fn unread(&self) -> Option<i64> {
         self.unread
     }
 
-    /// Adds the Records of the next part, and takes its first ledger that is still unread.
+    /// Adds the Records of the next part, and takes its first marker that is still unread.
     pub(crate) fn extend(&mut self, part: ReplayReads) {
         self.reads.extend(part.reads);
         self.unread = part.unread;
     }
 }
 
-/// A read of the Records that a replay needs for the ledgers of its History. The task
+/// A read of the Records that a replay needs for the markers of its History. The task
 /// slots of the Worker bound these reads, since each one is for a task that holds a slot.
 #[derive(Debug)]
 pub(in crate::worker::workflow) enum StreamRecordsReq {
@@ -134,29 +140,29 @@ impl StreamRecordsReq {
 }
 
 /// Returns true if the replay of `entry` needs its Records from the Store.
-pub(crate) fn needs_records(entry: &ReadResult) -> bool {
+pub(crate) fn needs_records(entry: &StreamReadResult) -> bool {
     unread_page(entry).is_some()
 }
 
 /// Returns the page of `entry` if it has Records.
-fn unread_page(entry: &ReadResult) -> Option<&ReadPage> {
+fn unread_page(entry: &StreamReadResult) -> Option<&StreamReadPage> {
     match &entry.result {
-        Some(read_result::Result::Page(page)) if page.record_count > 0 => Some(page),
+        Some(stream_read_result::Result::Page(page)) if page.record_count > 0 => Some(page),
         _ => None,
     }
 }
 
-/// A ledger of History whose Records a replay hasn't read yet.
+/// A marker of History whose Records a replay hasn't read yet.
 #[derive(Debug)]
-struct UnreadLedger {
+struct UnreadMarker {
     event_id: i64,
-    /// The number of read entries of the ledger.
+    /// The number of read entries of the marker.
     len: usize,
     /// The read entries that need Records from the Store.
     entries: Vec<UnreadEntry>,
 }
 
-impl UnreadLedger {
+impl UnreadMarker {
     /// Returns the bytes of Records that the entries recorded. History sets them, so they can be
     /// any size.
     fn recorded_bytes(&self) -> usize {
@@ -169,7 +175,7 @@ impl UnreadLedger {
 /// What a replay needs of a read entry to read its Records again.
 #[derive(Debug)]
 struct UnreadEntry {
-    /// The index of the entry among the read entries of its ledger.
+    /// The index of the entry among the read entries of its marker.
     index: usize,
     stream: StreamRef,
     after_offset: Vec<u8>,
@@ -178,12 +184,12 @@ struct UnreadEntry {
     record_bytes: u64,
 }
 
-/// A reader of the Records of read entries, for the replay of one run. It keeps the ledgers of
+/// A reader of the Records of read entries, for the replay of one run. It keeps the markers of
 /// History that it hasn't read yet, and reads them a part at a time.
 #[derive(derive_more::Debug)]
 pub(crate) struct ReplayReader {
     runtimes: StreamRuntimes,
-    unread: VecDeque<UnreadLedger>,
+    unread: VecDeque<UnreadMarker>,
     #[debug(skip)]
     metrics: MetricsContext,
     /// The metrics of each Store that the reader read, by its name.
@@ -202,60 +208,66 @@ impl ReplayReader {
         }
     }
 
-    /// Queues each ledger in `events` that has a read entry with Records.
-    pub(crate) fn queue<'a>(&mut self, events: impl Iterator<Item = &'a HistoryEvent>) {
+    /// Queues each marker in `events` that has a read entry with Records, and returns the bytes of
+    /// Records that they record.
+    pub(crate) fn queue<'a>(&mut self, events: impl Iterator<Item = &'a HistoryEvent>) -> u64 {
+        let mut recorded = 0_u64;
         for event in events {
-            let Some(Ok(data)) = peeked_ledger(event) else {
+            let Some(Ok(data)) = peeked_read_marker(event) else {
                 continue;
             };
-            // The check of a ledger refuses a negative count or size.
-            let unread = |(index, entry): (usize, &ReadResult)| {
+            let unread = |(index, entry): (usize, &StreamReadResult)| {
                 let page = unread_page(entry)?;
                 Some(UnreadEntry {
                     index,
-                    stream: entry.r#ref.clone().unwrap_or_default(),
+                    stream: StreamRef {
+                        id: entry.stream_id.clone(),
+                        store: entry.store.clone(),
+                    },
                     after_offset: entry.from_offset.clone(),
-                    count: u64::try_from(page.record_count).unwrap_or_default(),
+                    count: u64::from(page.record_count),
                     digest: page.digest.clone(),
-                    record_bytes: u64::try_from(page.record_bytes).unwrap_or_default(),
+                    record_bytes: page.record_bytes,
                 })
             };
-            let reads = &data.read_results;
+            let reads = &data.reads;
             let entries: Vec<UnreadEntry> = (reads.iter().enumerate()).filter_map(unread).collect();
+            recorded = (entries.iter()).fold(recorded, |sum, e| sum.saturating_add(e.record_bytes));
             if !entries.is_empty() {
-                self.unread.push_back(UnreadLedger {
+                self.unread.push_back(UnreadMarker {
                     event_id: event.event_id,
                     len: reads.len(),
                     entries,
                 });
             }
         }
+        recorded
     }
 
-    /// Returns true while a queued ledger has no Records yet.
+    /// Returns true while a queued marker has no Records yet.
     pub(crate) fn has_unread(&self) -> bool {
         !self.unread.is_empty()
     }
 
-    /// Reads the Records of the next part of the queue. A part is the next ledgers while their
-    /// recorded bytes stay within `MAX_TASK_RECORD_BYTES`, and at least one ledger.
+    /// Reads the Records of the next part of the queue. A part is the next markers while their
+    /// recorded bytes stay within `MAX_REPLAY_PART_BYTES`, and at least one marker.
     pub(crate) async fn read_next(&mut self) -> ReplayReads {
-        let max_bytes = self.runtimes.settings.max_task_record_bytes();
+        let max_bytes = self.runtimes.settings.max_replay_part_bytes();
         let mut reads = ReplayReads::default();
-        // The read takes ledgers by their recorded bytes before any Store call, so that the
-        // entries of all the ledgers that it takes can read at the same time.
+        // The read takes markers by their recorded bytes before any Store call, so that the
+        // entries of all the markers that it takes can read at the same time.
         let (mut entries, mut taken_bytes) = (vec![], 0_usize);
-        while let Some(ledger) = self.unread.pop_front() {
-            let ledger_bytes = ledger.recorded_bytes();
-            if !reads.reads.is_empty() && taken_bytes.saturating_add(ledger_bytes) > max_bytes {
-                self.unread.push_front(ledger);
+        while let Some(marker) = self.unread.pop_front() {
+            let marker_bytes = marker.recorded_bytes();
+            if !reads.reads.is_empty() && taken_bytes.saturating_add(marker_bytes) > max_bytes {
+                self.unread.push_front(marker);
                 break;
             }
-            taken_bytes = taken_bytes.saturating_add(ledger_bytes);
-            (reads.reads).insert(ledger.event_id, vec![None; ledger.len]);
-            entries.extend((ledger.entries.into_iter()).map(|entry| (ledger.event_id, entry)));
+            taken_bytes = taken_bytes.saturating_add(marker_bytes);
+            (reads.reads).insert(marker.event_id, vec![None; marker.len]);
+            entries.extend((marker.entries.into_iter()).map(|entry| (marker.event_id, entry)));
         }
-        reads.unread = self.unread.front().map(|ledger| ledger.event_id);
+        reads.unread = self.unread.front().map(|marker| marker.event_id);
         // Each Store has its own deadline, so the outage of one Store ends no read of another.
         let deadlines: HashMap<String, Deadline> = (entries.iter())
             .map(|(_, entry)| (entry.stream.store.clone(), Deadline::default()))
@@ -279,13 +291,13 @@ impl ReplayReader {
             })
             .buffer_unordered(self.runtimes.settings.replay_concurrency);
         while let Some((event_id, index, result)) = read.next().await {
-            let ledger = (reads.reads.get_mut(&event_id)).expect("Each entry has its ledger");
-            ledger[index] = Some(result);
+            let marker = (reads.reads.get_mut(&event_id)).expect("Each entry has its marker");
+            marker[index] = Some(result);
         }
         reads
     }
 
-    /// Makes `paginator` read the Records of the ledgers of its History, for a run new to
+    /// Makes `paginator` read the Records of the markers of its History, for a run new to
     /// the cache.
     pub(crate) fn add_to(
         paginator: &mut HistoryPaginator,
@@ -296,11 +308,18 @@ impl ReplayReader {
         paginator.stream_reader = Some(ReplayReader::new(runtimes, metrics.clone()));
     }
 
-    /// Reads the first part of the Records of the ledgers of `update`, which has the whole
-    /// History, and keeps the ledgers after it for [`Self::read_next_part`].
+    /// Reads the first part of the Records of the markers of `update`, which has the whole
+    /// History, and keeps the markers after it for [`Self::read_next_part`].
     async fn read_first_part(paginator: &mut HistoryPaginator, update: &mut HistoryUpdate) {
         if let Some(reader) = &mut paginator.stream_reader {
-            reader.queue(update.get_events().iter());
+            let recorded = reader.queue(update.get_events().iter());
+            if recorded > 0 {
+                debug!(
+                    run_id = %paginator.run_id,
+                    recorded_bytes = recorded,
+                    "The replay reads the Records of the read markers of its History again"
+                );
+            }
             update.stream_reads = Some(reader.read_next().await);
         }
     }
@@ -312,13 +331,13 @@ impl ReplayReader {
         reader.read_next().await
     }
 
-    /// Returns true while a ledger of the History of `paginator` has no Records yet.
+    /// Returns true while a marker of the History of `paginator` has no Records yet.
     pub(crate) fn has_unread_in(paginator: &HistoryPaginator) -> bool {
         (paginator.stream_reader.as_ref()).is_some_and(ReplayReader::has_unread)
     }
 
     /// Drops the reader of `paginator` and the Records of `update`. A cached run needs neither,
-    /// since it gave Workflow code each Record of its ledgers.
+    /// since it gave Workflow code each Record of its markers.
     pub(crate) fn forget(paginator: &mut HistoryPaginator, update: &mut HistoryUpdate) {
         paginator.stream_reader = None;
         update.stream_reads = None;
@@ -340,7 +359,7 @@ impl ReplayReader {
             )
         };
         let Some(runtime) = self.runtimes.get(&stream.store) else {
-            return Err(ReplayError::Unavailable(cut(format!(
+            return Err(ReplayError::NoRuntime(cut(format!(
                 "This Worker has no Stream runtime for the Store `{}`, so it can't read {}",
                 stream.store,
                 range()
@@ -388,7 +407,7 @@ impl ReplayReader {
                     waits = retry_waits(&settings);
                     // An answer with no Records that moves the cursor passed entries that aren't
                     // Records, so it doesn't mean that Records are missing.
-                    if page.records.is_empty() && (page.done || page.last_offset == cursor) {
+                    if page.records.is_empty() && page.last_offset == cursor {
                         return Err(gone(format!("it has only {} of them", records.len())));
                     }
                     let page_bytes = page
@@ -397,9 +416,6 @@ impl ReplayReader {
                         .map(|record| field_len(record.encoded_len()));
                     bytes += page_bytes.sum::<usize>();
                     records.extend(page.records);
-                    if page.done && (records.len() as u64) < count {
-                        return Err(gone(format!("it has only {} of them", records.len())));
-                    }
                     cursor = page.last_offset;
                     continue;
                 }
@@ -484,20 +500,24 @@ pub(crate) fn offset_text(offset: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        StreamSettings,
+        StreamSettings, marker_details,
         test_store::{Entry, Fault, Model, ModelStore, client},
     };
     use super::*;
     use parking_lot::Mutex;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::{Arc, atomic::Ordering};
-    use temporalio_common::protos::temporal::api::{
-        common::v1::Payload,
-        history::v1::{WorkflowTaskCompletedEventAttributes, history_event},
-        sdk::v1::{WorkflowTaskCompletedMetadata, WorkflowTaskStreamCalls},
+    use temporalio_common::protos::{
+        constants::STREAM_READ_MARKER_NAME,
+        coresdk::external_data::StreamReadMarkerData,
+        temporal::api::{
+            common::v1::Payload,
+            history::v1::{MarkerRecordedEventAttributes, history_event},
+        },
     };
     use temporalio_streams::{
-        ReadError, ReadReason, StreamError, StreamRuntime, record::StoreLimits,
+        ReadError, ReadReason, StreamError, StreamRuntime, proto::ReadRecordsRequest as StoreRead,
+        record::StoreLimits,
     };
 
     /// How the Store of a replay differs from the Store of the first run.
@@ -521,23 +541,26 @@ mod tests {
         NoRuntime,
     }
 
-    /// Returns the completion `event_id` of a Workflow Task with `ledger`.
-    fn completed(event_id: i64, ledger: WorkflowTaskStreamCalls) -> HistoryEvent {
-        let sdk_metadata = WorkflowTaskCompletedMetadata {
-            stream_calls: Some(Box::new(ledger)),
-            ..Default::default()
-        };
-        let completed = WorkflowTaskCompletedEventAttributes {
-            sdk_metadata: Some(sdk_metadata),
+    /// Returns the read marker `event_id` with `data`.
+    fn marker_event(event_id: i64, data: &StreamReadMarkerData) -> HistoryEvent {
+        let marker = MarkerRecordedEventAttributes {
+            marker_name: STREAM_READ_MARKER_NAME.to_string(),
+            details: marker_details(data),
             ..Default::default()
         };
         HistoryEvent {
             event_id,
-            attributes: Some(
-                history_event::Attributes::WorkflowTaskCompletedEventAttributes(completed),
-            ),
+            attributes: Some(history_event::Attributes::MarkerRecordedEventAttributes(
+                marker,
+            )),
             ..Default::default()
         }
+    }
+
+    fn with_stream(mut entry: StreamReadResult, stream: &StreamRef) -> StreamReadResult {
+        entry.stream_id.clone_from(&stream.id);
+        entry.store.clone_from(&stream.store);
+        entry
     }
 
     fn record(offset: &[u8], data: u8, size: usize) -> StreamRecord {
@@ -553,27 +576,27 @@ mod tests {
 
     /// Returns the entry of a read that gave the page `given` after `from_offset`. It has the
     /// digest of the Records.
-    fn page_entry(seq: i32, from_offset: &[u8], given: &[StreamRecord]) -> ReadResult {
-        let mut page = ReadPage {
-            record_count: given.len() as i32,
+    fn page_entry(seq: u32, from_offset: &[u8], given: &[StreamRecord]) -> StreamReadResult {
+        let mut page = StreamReadPage {
+            record_count: given.len() as u32,
             ..Default::default()
         };
         if !given.is_empty() {
             page.digest = digest(given);
             let size = |record: &StreamRecord| field_len(record.encoded_len());
-            page.record_bytes = given.iter().map(size).sum::<usize>() as i64;
+            page.record_bytes = given.iter().map(size).sum::<usize>() as u64;
         }
-        ReadResult {
+        StreamReadResult {
             seq,
             from_offset: from_offset.to_vec(),
-            result: Some(read_result::Result::Page(page)),
+            result: Some(stream_read_result::Result::Page(page)),
             ..Default::default()
         }
     }
 
-    fn page(entry: &ReadResult) -> &ReadPage {
+    fn page(entry: &StreamReadResult) -> &StreamReadPage {
         match &entry.result {
-            Some(read_result::Result::Page(page)) => page,
+            Some(stream_read_result::Result::Page(page)) => page,
             other => panic!("{other:?}"),
         }
     }
@@ -688,7 +711,7 @@ mod tests {
         }
         let tries = Tries::default();
         let kept = tries.clone();
-        let fault = move |rng: &mut StdRng, _: &ReadRecordsRequest| {
+        let fault = move |rng: &mut StdRng, _: &StoreRead| {
             let now = Instant::now();
             let fails = |error| Some(Fault::Fails(error));
             let (fault, failed) = match kind {
@@ -708,7 +731,7 @@ mod tests {
             kept.lock().push((now, failed));
             fault
         };
-        let model = Model::new(seed, entries, rng.random_bool(0.5), fault);
+        let model = Model::new(seed, entries, fault);
         Replayed {
             kind,
             stream,
@@ -724,7 +747,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_replay_read_gives_the_records_or_its_cause() {
         let (mut together, mut stopped, mut cut_off, mut timed_out) = (0, 0, 0, 0);
-        let (mut ledgers_together, mut many_together, mut beside_an_outage) = (0, 0, 0);
+        let (mut markers_together, mut many_together, mut beside_an_outage) = (0, 0, 0);
         for seed in 0..300 {
             let mut rng = StdRng::seed_from_u64(seed);
             let settings = StreamSettings {
@@ -736,13 +759,13 @@ mod tests {
                 ..Default::default()
             };
             let stores = ["mem", "disk"].map(|name| replayed(&mut rng, seed, name, settings));
-            // The ledgers of the first run, each with read entries over the two Streams. An entry
-            // of few Records lets a part take several ledgers.
+            // The markers of the first run, each with read entries over the two Streams. An entry
+            // of few Records lets a part take several markers.
             let (mut events, mut datas) = (vec![], vec![]);
             let mut expected = vec![];
-            let ledgers = rng.random_range(1..=4);
-            for event_id in 1..=ledgers {
-                let mut ledger = WorkflowTaskStreamCalls::default();
+            let markers = rng.random_range(1..=4);
+            for event_id in 1..=markers {
+                let mut marker = StreamReadMarkerData::default();
                 for seq in 1..=rng.random_range(1..=4) {
                     let of = rng.random_range(0..2);
                     let records = &stores[of].records;
@@ -756,14 +779,13 @@ mod tests {
                         at => records[at - 1].offset.clone(),
                     };
                     let given = records[from..from + count].to_vec();
-                    let mut entry = page_entry(seq, &after_offset, &given);
-                    entry.r#ref = Some(stores[of].stream.clone());
-                    ledger.read_results.push(entry);
+                    let entry = page_entry(seq, &after_offset, &given);
+                    marker.reads.push(with_stream(entry, &stores[of].stream));
                     let read = (count > 0).then_some(given);
                     expected.push((event_id, seq as usize - 1, of, after_offset, read));
                 }
-                events.push(completed(event_id, ledger.clone()));
-                datas.push(ledger);
+                events.push(marker_event(event_id, &marker));
+                datas.push(marker);
             }
             let served = (stores.iter())
                 .filter(|store| store.kind != Store::NoRuntime)
@@ -773,22 +795,22 @@ mod tests {
                 });
             let mut runtimes = StreamRuntimes::new(served);
             runtimes.settings = settings;
-            // The ledgers with an entry that needs Records, each with its recorded bytes.
-            let needing: Vec<(i64, usize)> = (1..=ledgers)
+            // The markers with an entry that needs Records, each with its recorded bytes.
+            let needing: Vec<(i64, usize)> = (1..=markers)
                 .zip(&datas)
-                .filter(|(_, data)| data.read_results.iter().any(needs_records))
+                .filter(|(_, data)| data.reads.iter().any(needs_records))
                 .map(|(event_id, data)| {
-                    let bytes = data.read_results.iter().map(|read| page(read).record_bytes);
-                    (event_id, bytes.sum::<i64>() as usize)
+                    let bytes = data.reads.iter().map(|read| page(read).record_bytes);
+                    (event_id, bytes.sum::<u64>() as usize)
                 })
                 .collect();
             let recorded: usize = needing.iter().map(|(_, bytes)| bytes).sum();
-            runtimes.settings.bounds.max_task_record_bytes = rng.random_range(1..=2 * recorded + 1);
-            let max_bytes = runtimes.settings.bounds.max_task_record_bytes;
+            runtimes.settings.max_task_record_bytes = rng.random_range(1..=2 * recorded + 1);
+            let max_bytes = runtimes.settings.max_task_record_bytes;
             let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
             reader.queue(events.iter());
-            // The reader gives each ledger in one part, in the order of History.
-            let mut results = HashMap::<i64, LedgerReads>::new();
+            // The reader gives each marker in one part, in the order of History.
+            let mut results = HashMap::<i64, MarkerReads>::new();
             let mut next = 0;
             while reader.has_unread() {
                 let seen = stores.each_ref().map(|store| store.tries.lock().len());
@@ -811,13 +833,13 @@ mod tests {
                 if let Some(last) = deadlines.iter().max() {
                     assert!(end <= *last, "seed {seed}: {:?} late", end - *last);
                 }
-                // A part takes at least one ledger, and those that it takes fit the bound unless
+                // A part takes at least one marker, and those that it takes fit the bound unless
                 // it takes only one. The next one would pass the bound.
                 let taken: Vec<&(i64, usize)> = (needing[next..].iter())
                     .take_while(|(event_id, _)| {
-                        let ledger = part.take(*event_id);
-                        let read = !ledger.is_empty();
-                        results.insert(*event_id, ledger);
+                        let marker = part.take(*event_id);
+                        let read = !marker.is_empty();
+                        results.insert(*event_id, marker);
                         read
                     })
                     .collect();
@@ -833,46 +855,43 @@ mod tests {
                 );
                 let passes = |(_, bytes): &(i64, usize)| taken_bytes + bytes > max_bytes;
                 assert!(unread.is_none_or(passes), "seed {seed}");
-                for event_id in 1..=ledgers {
+                for event_id in 1..=markers {
                     assert!(part.take(event_id).is_empty(), "seed {seed}: {event_id}");
                 }
                 stopped += usize::from(unread.is_some());
-                ledgers_together += usize::from(taken.len() > 1);
-                // Ledgers of more than 10 small Records each fit the bound together.
+                markers_together += usize::from(taken.len() > 1);
+                // Markers of more than 10 small Records each fit the bound together.
                 let many = |(event_id, _): &&(i64, usize)| {
-                    let entries = datas[*event_id as usize - 1].read_results.iter();
-                    entries.map(|entry| page(entry).record_count).sum::<i32>() > 10
+                    let entries = datas[*event_id as usize - 1].reads.iter();
+                    entries.map(|entry| page(entry).record_count).sum::<u32>() > 10
                 };
                 many_together += usize::from(taken.len() > 1 && taken.iter().all(many));
             }
             assert_eq!(next, needing.len(), "seed {seed}");
-            // A ledger holds no more than its recorded bytes.
+            // A marker holds no more than its recorded bytes.
             for (event_id, max) in &needing {
                 let records = (results[event_id].iter().flatten()).filter_map(|r| r.as_ref().ok());
                 let held: usize = records.flatten().map(|r| field_len(r.encoded_len())).sum();
                 assert!(held <= *max, "seed {seed}: {held} of {max}");
             }
             for store in &stores {
-                let read: Vec<&ReadPage> = (datas.iter())
-                    .flat_map(|data| &data.read_results)
-                    .filter(|entry| entry.r#ref.as_ref() == Some(&store.stream))
+                let read: Vec<&StreamReadPage> = (datas.iter())
+                    .flat_map(|data| &data.reads)
+                    .filter(|entry| {
+                        entry.stream_id == store.stream.id && entry.store == store.stream.store
+                    })
                     .filter_map(unread_page)
                     .collect();
                 let largest = (store.model.records_after(&[]).iter())
                     .map(|record| field_len(record.encoded_len()))
                     .max()
                     .unwrap_or(0);
-                // Each entry gets its recorded bytes and one Record more, or, if its Records
-                // grew, at most its count of them.
+                // A try gets at most the Records that its entry has left and one more, which the
+                // runtime asks for.
                 let answered = store.model.answered.load(Ordering::Relaxed);
-                let recorded = read.iter().map(|page| page.record_bytes).sum::<i64>() as usize;
-                let bound = match store.kind {
-                    Store::Larger => {
-                        read.iter().map(|page| page.record_count).sum::<i32>() as usize
-                    }
-                    _ => read.len(),
-                } * largest
-                    + recorded;
+                let most = read.iter().map(|page| page.record_count).max().unwrap_or(0) as usize;
+                let tries = store.tries.lock().len();
+                let bound = tries * (most + 1) * largest;
                 assert!(answered <= bound, "seed {seed}: {answered} of {bound}");
                 let (_, peak) = store.model.model.lock().reading;
                 assert!(peak <= settings.replay_concurrency, "seed {seed}: {peak}");
@@ -882,7 +901,7 @@ mod tests {
                 let store = &stores[of];
                 let kind = store.kind;
                 let result = (results.get_mut(&event_id))
-                    .and_then(|ledger| ledger.get_mut(index))
+                    .and_then(|marker| marker.get_mut(index))
                     .and_then(Option::take);
                 // The Records that the Store of the replay has where the entry read.
                 let unchanged = given.as_ref().is_some_and(|given| {
@@ -907,9 +926,13 @@ mod tests {
                     }
                     (Some(_), Some(Err(ReplayError::Unavailable(message)))) => {
                         let unknown = matches!(kind, Store::Outage | Store::Refuses);
-                        assert!(unknown || kind == Store::NoRuntime, "seed {seed}: {kind:?}");
+                        assert!(unknown, "seed {seed}: {kind:?}");
                         cut_off += usize::from(fits(&message, seed));
                         timed_out += usize::from(kind == Store::Outage);
+                    }
+                    (Some(_), Some(Err(ReplayError::NoRuntime(message)))) => {
+                        assert_eq!(kind, Store::NoRuntime, "seed {seed}");
+                        cut_off += usize::from(fits(&message, seed));
                     }
                     other => panic!("seed {seed}: {kind:?}: {other:?}"),
                 }
@@ -920,43 +943,41 @@ mod tests {
             stopped,
             cut_off,
             timed_out,
-            ledgers_together,
+            markers_together,
             many_together,
             beside_an_outage,
         ];
         assert!(reached.iter().all(|count| *count > 0), "{reached:?}");
     }
 
-    /// Replays a ledger with one read entry, of one Record with `size` bytes of data that the
+    /// Replays a marker with one read entry, of one Record with `size` bytes of data that the
     /// entry recorded `less` bytes short of, from a Store whose reads get `fault`. Returns the
     /// Record and the entry's result.
     async fn replay_one_record(
         less: u64,
         size: usize,
         settings: StreamSettings,
-        fault: impl FnMut(&mut StdRng, &ReadRecordsRequest) -> Option<Fault> + Send + 'static,
-    ) -> (StreamRecord, LedgerReads) {
+        fault: impl FnMut(&mut StdRng, &StoreRead) -> Option<Fault> + Send + 'static,
+    ) -> (StreamRecord, MarkerReads) {
         let given = record(&[1], 0, size);
         let stream = StreamRef {
             id: "s".to_string(),
             store: "mem".to_string(),
         };
         let mut entry = page_entry(1, &[], std::slice::from_ref(&given));
-        if let Some(read_result::Result::Page(page)) = &mut entry.result {
-            page.record_bytes -= less as i64;
+        if let Some(stream_read_result::Result::Page(page)) = &mut entry.result {
+            page.record_bytes -= less;
         }
-        entry.r#ref = Some(stream.clone());
-        let data = WorkflowTaskStreamCalls {
-            read_results: vec![entry],
-            ..Default::default()
+        let data = StreamReadMarkerData {
+            reads: vec![with_stream(entry, &stream)],
         };
-        let event = completed(1, data);
+        let event = marker_event(1, &data);
         let entry = Entry {
             offset: vec![1],
             at: Duration::ZERO,
             record: Some(given.clone()),
         };
-        let model = ModelStore::new(Model::new(0, vec![entry], false, fault));
+        let model = ModelStore::new(Model::new(0, vec![entry], fault));
         let runtime = StreamRuntime::new(Arc::new(model), StoreLimits::default());
         let mut runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
         runtimes.settings = settings;
@@ -991,7 +1012,7 @@ mod tests {
             ..Default::default()
         };
         let mut failed = false;
-        let fault = move |_: &mut StdRng, _: &ReadRecordsRequest| {
+        let fault = move |_: &mut StdRng, _: &StoreRead| {
             let down = StreamError::store_unavailable("Down");
             (!std::mem::replace(&mut failed, true)).then_some(Fault::Fails(down))
         };

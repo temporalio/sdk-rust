@@ -9816,7 +9816,7 @@ components:
           format: date-time
         lastStartedTime:
           type: string
-          description: Time the current attempt started, or the final attempt if the activity has closed; unset while waiting for a retry.
+          description: Time the last attempt was started.
           format: date-time
         attempt:
           type: integer
@@ -14524,7 +14524,6 @@ components:
           format: date-time
         lastStartedTime:
           type: string
-          description: Time the current attempt started, or the final attempt if the activity has closed; unset while waiting for a retry.
           format: date-time
         attempt:
           type: integer
@@ -17949,23 +17948,6 @@ components:
              Time-skipping state propagated by the execution that started this workflow.
              This field is intended for use by the Temporal server, for example when a schedule
              starts a workflow, and is not intended to be set by external clients.
-        eagerWorkerControlTaskQueue:
-          type: string
-          description: |-
-            Experimental. A dedicated per-worker Nexus task queue for control tasks sent to
-             the worker processing the eager Workflow Task. Used only when eager execution is accepted.
-        eagerWorkerCapabilities:
-          allOf:
-            - $ref: '#/components/schemas/StartWorkflowExecutionRequest_Capabilities'
-          description: |-
-            Experimental. SDK capabilities of the worker processing the eager Workflow Task.
-             Used only when eager execution is accepted.
-    StartWorkflowExecutionRequest_Capabilities:
-      type: object
-      properties:
-        supportsWorkflowHeartbeatNotification:
-          type: boolean
-          description: Experimental. Whether this worker supports Workflow heartbeat notifications.
     StartWorkflowExecutionResponse:
       type: object
       properties:
@@ -18045,25 +18027,6 @@ components:
         type:
           type: string
           description: The type of the driver, required.
-    StreamRef:
-      type: object
-      properties:
-        id:
-          type: string
-        store:
-          type: string
-          description: |-
-            The name under which the client and Worker config registered the Store of this Stream. An
-             SDK uses it to send a call on this ref to the right Store. When it's empty, the SDK picks
-             the Store from its config. Only an SDK sets and reads this field. The server and a Store
-             ignore it.
-      description: |-
-        Experimental. Might change in the future.
-         A reference to one Stream, which code passes to other code as data. Callers treat the `id` as
-         opaque. An id is never used for a second Stream while the Store remembers the first one, so a
-         create for a closed or expired Stream fails. A Store can forget an expired Stream after a time
-         of its choice, and a create for its id succeeds after that. Every SDK encodes a ref in a
-         Payload with this message, so a ref that one SDK writes decodes in another.
     StructuredCalendarSpec:
       type: object
       properties:
@@ -20095,7 +20058,7 @@ components:
           type: integer
           description: |-
             Number of pollers this poller pool is currently targeting, which may differ from current_pollers.
-             0 if the SDK does not report a target. See is_autoscaling for whether the target can change.
+             0 if unknown, such as a poller pool of fixed size.
           format: int32
     WorkerSelector:
       type: object
@@ -21583,14 +21546,6 @@ components:
             Version of the SDK that processed the task. This is usually something like "1.20.0" and is
              usually the same as client-version gRPC header. This should only be set if its value changed
              since the last time recorded on the workflow (or be set on the first task).
-        streamCalls:
-          allOf:
-            - $ref: '#/components/schemas/WorkflowTaskStreamCalls'
-          description: |-
-            Experimental. Might change in the future.
-             The Stream calls of this Workflow Task. An SDK sets it if Workflow code got the result of a
-             Stream call in the task, asked for a close, or has a call with no result yet. So it can have
-             no entry.
     WorkflowTaskFailedEventAttributes:
       type: object
       properties:
@@ -21755,170 +21710,6 @@ components:
             Used by server internally to properly reapply build ID redirects to an execution
              when rebuilding it from events.
              Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
-    WorkflowTaskStreamCalls:
-      type: object
-      properties:
-        closeIntents:
-          type: array
-          items:
-            $ref: '#/components/schemas/WorkflowTaskStreamCalls_CloseIntent'
-          description: |-
-            The closes that Workflow code asked for in this task. The SDK closes a Stream only when
-             History has the intent, so the result of a close is in a later task.
-        appendResults:
-          type: array
-          items:
-            $ref: '#/components/schemas/WorkflowTaskStreamCalls_AppendResult'
-          description: The results of the appends that Workflow code got in this task.
-        closeResults:
-          type: array
-          items:
-            $ref: '#/components/schemas/WorkflowTaskStreamCalls_CloseResult'
-          description: The results of the closes that Workflow code got in this task.
-        readResults:
-          type: array
-          items:
-            $ref: '#/components/schemas/WorkflowTaskStreamCalls_ReadResult'
-          description: The results of the reads that Workflow code got in this task.
-      description: |-
-        Experimental. Might change in the future.
-         The Stream calls of one Workflow Task. An SDK records them on the completion of the task, so
-         that a replay gives Workflow code the same result for each call. A replay doesn't append or
-         close again for a result that is here. For a page, it reads the Records from the Store again.
-    WorkflowTaskStreamCalls_AppendOffsets:
-      type: object
-      properties:
-        firstOffset:
-          type: string
-          format: bytes
-        lastOffset:
-          type: string
-          format: bytes
-      description: The offsets of the first and the last Record of a batch, as the Store returned them.
-    WorkflowTaskStreamCalls_AppendResult:
-      type: object
-      properties:
-        seq:
-          type: integer
-          description: The sequence number that the SDK gave the append.
-          format: int32
-        ref:
-          $ref: '#/components/schemas/StreamRef'
-        appended:
-          $ref: '#/components/schemas/WorkflowTaskStreamCalls_AppendOffsets'
-        failure:
-          $ref: '#/components/schemas/WorkflowTaskStreamCalls_CallFailure'
-        activationIndex:
-          type: integer
-          description: |-
-            The index of the activation of this Workflow Task in which Workflow code got the result,
-             from 0. A replay gives the result in the activation with this index. A Local Activity marker
-             has the same index for a result in the same activation.
-          format: int32
-      description: The result of an append.
-    WorkflowTaskStreamCalls_CallFailure:
-      type: object
-      properties:
-        reason:
-          enum:
-            - STREAM_ERROR_REASON_UNSPECIFIED
-            - STREAM_ERROR_REASON_NOT_FOUND
-            - STREAM_ERROR_REASON_EXPIRED
-            - STREAM_ERROR_REASON_CLOSED
-            - STREAM_ERROR_REASON_FENCED
-            - STREAM_ERROR_REASON_FORMAT_TOO_NEW
-            - STREAM_ERROR_REASON_OFFSET_TOO_HIGH
-            - STREAM_ERROR_REASON_TOO_LARGE
-            - STREAM_ERROR_REASON_INVALID_ARGUMENT
-            - STREAM_ERROR_REASON_STORE_UNAVAILABLE
-            - STREAM_ERROR_REASON_UNSUPPORTED
-            - STREAM_ERROR_REASON_ALREADY_EXISTS
-            - STREAM_ERROR_REASON_STORE_CORRUPT
-          type: string
-          format: enum
-        message:
-          type: string
-      description: Why a call failed. The SDK builds the error that Workflow code gets from it.
-    WorkflowTaskStreamCalls_CloseIntent:
-      type: object
-      properties:
-        seq:
-          type: integer
-          description: The sequence number that the SDK gave the close.
-          format: int32
-        ref:
-          $ref: '#/components/schemas/StreamRef'
-      description: The intent of Workflow code to close a Stream.
-    WorkflowTaskStreamCalls_CloseResult:
-      type: object
-      properties:
-        seq:
-          type: integer
-          format: int32
-        failure:
-          allOf:
-            - $ref: '#/components/schemas/WorkflowTaskStreamCalls_CallFailure'
-          description: Unset if the Stream is closed.
-        activationIndex:
-          type: integer
-          description: The activation that gave the result, as `activation_index` of `AppendResult`.
-          format: int32
-      description: The result of a close. The intent with the same `seq` has the ref of the Stream.
-    WorkflowTaskStreamCalls_ReadPage:
-      type: object
-      properties:
-        recordCount:
-          type: integer
-          description: The number of Records in the page.
-          format: int32
-        done:
-          type: boolean
-          description: True if the Stream was closed and had no Record after this page.
-        digest:
-          type: string
-          description: |-
-            The first 16 bytes of a SHA-256 over the Records, in an encoding that the SDK owns. It's
-             empty if the page has no Record.
-          format: bytes
-        recordBytes:
-          type: string
-          description: |-
-            The size of the Records in bytes, as the `max_bytes` of a read measures it. It's set when
-             `digest` is, so a replay knows how much to read.
-        lastOffset:
-          type: string
-          description: |-
-            The `last_offset` that Workflow code got with the page. A replay gives the same value,
-             since another read of the Store can end at another offset.
-          format: bytes
-      description: |-
-        A page that a read gave Workflow code. It doesn't have the Records. A replay reads them from
-         the Store again and checks them against `digest`.
-    WorkflowTaskStreamCalls_ReadResult:
-      type: object
-      properties:
-        seq:
-          type: integer
-          description: The sequence number that the SDK gave the read.
-          format: int32
-        ref:
-          $ref: '#/components/schemas/StreamRef'
-        fromOffset:
-          type: string
-          description: |-
-            The `from_offset` of the read. A replay reads the Records of the page after it.
-             (-- api-linter: core::0140::prepositions=disabled
-                 aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
-          format: bytes
-        page:
-          $ref: '#/components/schemas/WorkflowTaskStreamCalls_ReadPage'
-        failure:
-          $ref: '#/components/schemas/WorkflowTaskStreamCalls_CallFailure'
-        activationIndex:
-          type: integer
-          description: The activation that gave the result, as `activation_index` of `AppendResult`.
-          format: int32
-      description: The result of a read.
     WorkflowTaskTimedOutEventAttributes:
       type: object
       properties:

@@ -305,8 +305,8 @@ impl WFStream {
                 self.history_fetch_refcounter.clone(),
             ));
         }
-        // A run new to the cache replays its History, so it first reads the Records of its
-        // ledgers.
+        // A run new to the cache replays its History, so it first reads the Records of its read
+        // markers.
         if !self.runs.has_run(&run_id) && ReplayReads::needed_by(&pwft.work.update) {
             let (config, metrics) = (&self.worker_config, &self.metrics);
             ReplayReader::add_to(&mut pwft.paginator, config, metrics);

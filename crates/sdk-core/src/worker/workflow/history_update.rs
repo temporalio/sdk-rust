@@ -4,7 +4,7 @@ use crate::{
     protosext::ValidPollWFTQResponse,
     worker::{
         client::WorkerClient,
-        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT, streams::has_ledger},
+        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
     },
 };
 use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
@@ -51,7 +51,7 @@ pub(crate) struct HistoryUpdate {
     has_last_wft: bool,
     wft_count: usize,
     pub(super) chunking_disabled: bool,
-    /// The Records that a run new to the cache read for the ledgers of these events, and
+    /// The Records that a run new to the cache read for the read markers of these events, and
     /// that the machines haven't peeked yet. It's `None` for a cached run, which reads none.
     pub(super) stream_reads: Option<ReplayReads>,
 }
@@ -80,8 +80,8 @@ impl HistoryUpdate {
     }
 
     /// Returns true if the WFT sequence after the one that ends at the index `end` of the events
-    /// ends at or after the first ledger with no Records yet. The machines peek that sequence when
-    /// they take the one before it, and give its ledgers their Records.
+    /// ends at or after the first read marker with no Records yet. The machines peek that sequence
+    /// when they take the one before it, and give its read markers their Records.
     fn peeks_unread_stream_records(&self, end: usize) -> bool {
         let unread = self.stream_reads.as_ref().and_then(ReplayReads::unread);
         let (Some(unread), Some(taken)) = (unread, self.get_events().get(end)) else {
@@ -122,7 +122,7 @@ pub(crate) struct HistoryPaginator {
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
     chunking_disabled: bool,
-    /// Set for a run new to the cache, which reads the Records of the ledgers of its
+    /// Set for a run new to the cache, which reads the Records of the read markers of its
     /// History a part at a time.
     pub(super) stream_reader: Option<ReplayReader>,
 }
@@ -820,9 +820,7 @@ fn find_end_index_of_next_wft_seq_chunked(
             continue;
         }
 
-        // A Local Activity marker is a command event, so its task is never taken as a heartbeat.
-        // A ledger has no event, so its completion counts as a command here.
-        if e.is_command_event() || has_ledger(e) {
+        if e.is_command_event() {
             saw_command = true;
             saw_command_or_started = true;
         }
@@ -854,12 +852,11 @@ fn find_end_index_of_next_wft_seq_chunked(
                 } else if next_event_type == EventType::WorkflowTaskCompleted {
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
-                            && !has_ledger(next_event)
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
                         {
                             // If we've never seen an interesting event and the next two events are
-                            // a completion with no ledger followed immediately again by scheduled,
-                            // then this is a WFT heartbeat and also doesn't conclude the sequence.
+                            // a completion followed immediately again by scheduled, then this is a
+                            // WFT heartbeat and also doesn't conclude the sequence.
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
@@ -925,6 +922,7 @@ fn disables_chunking(event: &HistoryEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::workflow::streams::marker_details;
     use crate::{
         replay::{HistoryInfo, TestHistoryBuilder, canned_histories},
         test_help::{ResponseType, hist_to_poll_resp},
@@ -932,15 +930,16 @@ mod tests {
     };
     use futures_util::TryStreamExt;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
-    use temporalio_common::protos::temporal::api::{
-        common::v1::WorkflowExecution,
-        enums::v1::WorkflowTaskFailedCause,
-        sdk::v1::{
-            WorkflowTaskStreamCalls,
-            workflow_task_stream_calls::{ReadPage, ReadResult, read_result},
+    use temporalio_common::protos::{
+        constants::STREAM_READ_MARKER_NAME,
+        coresdk::external_data::{
+            StreamReadMarkerData, StreamReadPage, StreamReadResult, stream_read_result,
         },
-        stream::v1::StreamRef,
-        workflowservice::v1::GetWorkflowExecutionHistoryResponse,
+        temporal::api::{
+            common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
+            history::v1::MarkerRecordedEventAttributes,
+            workflowservice::v1::GetWorkflowExecutionHistoryResponse,
+        },
     };
 
     impl From<HistoryInfo> for HistoryUpdate {
@@ -1227,70 +1226,6 @@ mod tests {
         assert_eq!(seq.len(), 4);
         let seq = next_check_peek(&mut update, 27);
         assert_eq!(seq.len(), 2);
-    }
-
-    #[test]
-    fn a_ledger_ends_sequences_as_a_command_after_its_completion_does() {
-        let mut forced_ledgers = 0;
-        for seed in 0..300 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let chunking = rng.random_bool(0.5);
-            let (mut with_ledger, mut with_command) =
-                (TestHistoryBuilder::default(), TestHistoryBuilder::default());
-            for t in [&mut with_ledger, &mut with_command] {
-                t.add_by_type(EventType::WorkflowExecutionStarted);
-                t.add_workflow_task_scheduled_and_started();
-            }
-            // Maps each started event of `with_ledger` to the same event of `with_command`.
-            let mut ids = vec![];
-            for task in 0..rng.random_range(1..8) {
-                let (ledger, command) = (rng.random_bool(0.5), rng.random_bool(0.3));
-                let forced = rng.random_bool(0.6);
-                forced_ledgers += usize::from(ledger && !command && forced);
-                for t in [&mut with_ledger, &mut with_command] {
-                    t.add_workflow_task_completed();
-                    if task == 0 && !chunking {
-                        let unchunked = [CoreInternalFlags::DisableWorkflowTaskChunking];
-                        t.set_flags_last_wft(&unchunked, &[]);
-                    }
-                    if command {
-                        t.add_by_type(EventType::TimerStarted);
-                    }
-                }
-                if ledger {
-                    with_ledger.set_stream_calls_last_wft(Default::default());
-                    with_command.add_by_type(EventType::TimerStarted);
-                }
-                if !forced {
-                    for t in [&mut with_ledger, &mut with_command] {
-                        t.add_we_signaled("s", vec![]);
-                    }
-                }
-                for t in [&mut with_ledger, &mut with_command] {
-                    t.add_workflow_task_scheduled_and_started();
-                }
-                let started = with_ledger.current_event_id();
-                ids.push((started, with_command.current_event_id()));
-            }
-            let ends = |t: &TestHistoryBuilder| {
-                let mut update = t.as_history_update();
-                let (mut from_id, mut ends) = (0, vec![]);
-                while let NextWFT::WFT(events, _) = update.take_next_wft_sequence(from_id) {
-                    from_id = events.last().unwrap().event_id;
-                    ends.push(from_id);
-                }
-                ends
-            };
-            let to_command_ids = |ends: Vec<i64>| -> Vec<i64> {
-                let started = |end: i64| ids.iter().find(|(id, _)| *id == end).map(|ids| ids.1);
-                ends.into_iter()
-                    .map(|end| started(end).unwrap_or(end))
-                    .collect()
-            };
-            let expected = ends(&with_command);
-            assert_eq!(to_command_ids(ends(&with_ledger)), expected, "seed {seed}");
-        }
-        assert!(forced_ledgers > 0);
     }
 
     #[test]
@@ -2023,41 +1958,43 @@ mod tests {
         assert_eq!(seq.len(), 3);
     }
 
-    /// Returns a ledger with a read whose Records aren't in History.
-    fn ledger() -> WorkflowTaskStreamCalls {
-        let page = ReadPage {
+    /// Returns a read marker of the completion `completed`, with a read whose Records aren't in
+    /// History.
+    fn read_marker(completed: i64) -> MarkerRecordedEventAttributes {
+        let page = StreamReadPage {
             record_count: 1,
             digest: vec![0; 16],
             record_bytes: 1,
             ..Default::default()
         };
-        let read = ReadResult {
+        let read = StreamReadResult {
             seq: 1,
-            r#ref: Some(StreamRef {
-                id: "s".to_string(),
-                store: "mem".to_string(),
-            }),
-            result: Some(read_result::Result::Page(page)),
+            stream_id: "s".to_string(),
+            store: "mem".to_string(),
+            result: Some(stream_read_result::Result::Page(page)),
             ..Default::default()
         };
-        WorkflowTaskStreamCalls {
-            read_results: vec![read],
+        let data = StreamReadMarkerData { reads: vec![read] };
+        MarkerRecordedEventAttributes {
+            marker_name: STREAM_READ_MARKER_NAME.to_string(),
+            details: marker_details(&data),
+            workflow_task_completed_event_id: completed,
             ..Default::default()
         }
     }
 
-    // The machines take a WFT sequence and peek the one after it, whose ledgers then get their
-    // Records. So an update gives a sequence only once it has the Records of the next one.
+    // The machines take a WFT sequence and peek the one after it, whose read markers then get
+    // their Records. So an update gives a sequence only once it has the Records of the next one.
     #[test]
     fn an_update_waits_for_the_records_of_the_sequence_that_the_machines_peek() {
-        let (mut waited, mut went_on_before_an_unread_ledger) = (0, 0);
+        let (mut waited, mut went_on_before_an_unread_marker) = (0, 0);
         for seed in 0..500 {
             let mut rng = StdRng::seed_from_u64(seed);
             let chunking_disabled = rng.random_bool(0.5);
             let mut t = TestHistoryBuilder::default();
             t.add_by_type(EventType::WorkflowExecutionStarted);
             t.add_workflow_task_scheduled_and_started();
-            let mut ledgers = vec![];
+            let mut markers = vec![];
             for task in 0..rng.random_range(3..12) {
                 match rng.random_range(0..8) {
                     0 => t.add_workflow_task_failed_with_failure(
@@ -2076,9 +2013,7 @@ mod tests {
                                 t.add_update_accepted(format!("u{task}"), "update");
                             }
                             _ => {
-                                t.set_stream_calls_last_wft(ledger());
-                                ledgers.push(completed);
-                                t.add_timer_started(task.to_string());
+                                markers.push(t.add(read_marker(completed)));
                             }
                         }
                     }
@@ -2089,8 +2024,8 @@ mod tests {
             let last = events.last().unwrap().event_id;
             let update =
                 || HistoryUpdate::from_events(events.clone(), 0, last, true, chunking_disabled).0;
-            // The replay read the Records of the ledgers before a random one.
-            let unread = ledgers.get(rng.random_range(0..=ledgers.len())).copied();
+            // The replay read the Records of the markers before a random one.
+            let unread = markers.get(rng.random_range(0..=markers.len())).copied();
             let is_unread = |event: &&HistoryEvent| unread.is_some_and(|id| event.event_id >= id);
             let mut gated = update();
             gated.stream_reads = Some(ReplayReads {
@@ -2108,10 +2043,10 @@ mod tests {
                 let peeks_unread = peeked.iter().any(|event| is_unread(&event));
                 assert_eq!(can_take, !peeks_unread, "seed {seed}: from {from}");
                 waited += usize::from(peeks_unread);
-                went_on_before_an_unread_ledger += usize::from(can_take && unread.is_some());
+                went_on_before_an_unread_marker += usize::from(can_take && unread.is_some());
                 from = taken.last().unwrap().event_id;
             }
         }
-        assert!(waited > 0 && went_on_before_an_unread_ledger > 0);
+        assert!(waited > 0 && went_on_before_an_unread_marker > 0);
     }
 }

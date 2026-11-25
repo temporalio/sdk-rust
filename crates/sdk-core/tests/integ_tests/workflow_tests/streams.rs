@@ -1,319 +1,540 @@
-use crate::common::{CoreWfStarter, integ_worker_config};
-use futures_util::stream;
+//! The Stream reads of Workflow code against a dev server, which writes and pages the History.
+
+use crate::common::CoreWfStarter;
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use temporalio_client::{NamespacedClient, grpc::WorkflowService};
 use temporalio_common::protos::{
+    constants::STREAM_READ_MARKER_NAME,
     coresdk::{
-        workflow_activation::{WorkflowActivation, workflow_activation_job::Variant as Job},
+        FromJsonPayloadExt,
+        external_data::{StreamReadMarkerData, stream_read_result},
+        workflow_activation::{
+            WorkflowActivation, resolve_stream_read, workflow_activation_job::Variant as Job,
+        },
         workflow_commands::{
-            AppendToStream, CloseStream, CompleteWorkflowExecution, ReadStream, StartTimer,
+            CompleteWorkflowExecution, ModifyWorkflowProperties, ReadStream, StartTimer,
             workflow_command::Variant as Command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
-        common::v1::Payload,
-        failure::v1::Failure,
-        history::v1::history_event::Attributes,
-        sdk::v1::{WorkflowTaskStreamCalls, workflow_task_stream_calls::read_result},
+        common::v1::{Memo, Payload, WorkflowExecution},
+        enums::v1::EventType,
+        history::v1::{History, history_event::Attributes},
+        workflowservice::v1::GetWorkflowExecutionHistoryRequest,
     },
 };
 use temporalio_sdk_core::{
-    StreamRuntimes, init_replay_worker, prost_dur,
-    replay::{HistoryForReplay, ReplayWorkerInput},
-    test_help::{
-        WorkerTestHelpers,
-        stream_store::{MemoryStore, Request},
-    },
+    StreamRuntimes, prost_dur,
+    test_help::stream_store::{MemoryStore, Op},
 };
 use temporalio_streams::{
     StreamRuntime, StreamStore,
     proto::{
         AppendRecord, AppendRecordsRequest, ClientProducer, CreateStreamRequest, Producer,
-        StreamRef, producer::Kind,
+        producer::Kind, sdk::StreamRef,
     },
     record::StoreLimits,
 };
 
 pub(crate) const STORE: &str = "mem";
 
-pub(crate) fn stream(id: &str) -> StreamRef {
+pub(crate) fn stream() -> StreamRef {
     StreamRef {
-        id: id.to_string(),
+        id: "s".to_string(),
         store: STORE.to_string(),
     }
 }
 
-/// The Workflow of the test. It reads `quiet` and starts a timer. The timer is a command for the
-/// server, so the task completes at once and the read gives its page in the next task. The read
-/// waits for a Record that never comes, so its page has none. At that page the Workflow reads `in`
-/// twice and appends to `out`, at the result of the append it closes `out`, and it completes at the
-/// result of the close.
-fn workflow(activation: &WorkflowActivation) -> Vec<Command> {
-    let mut commands: Vec<Command> = vec![];
-    for job in &activation.jobs {
-        match &job.variant {
-            Some(Job::InitializeWorkflow(_)) => {
-                let waits = ReadStream {
-                    wait: Some(prost_dur!(from_secs(60))),
-                    ..read(1, "quiet")
-                };
-                commands.push(waits.into());
-                // The Workflow completes long before the timer fires.
-                let timer = StartTimer {
-                    seq: 1,
-                    start_to_fire_timeout: Some(prost_dur!(from_secs(60))),
-                };
-                commands.push(timer.into());
-            }
-            Some(Job::ResolveStreamRead(page)) if page.seq == 1 => {
-                commands.push(read(2, "in").into());
-                commands.push(read(3, "in").into());
-                let body = Payload::from(b"hello".to_vec());
-                let append = AppendToStream {
-                    seq: 1,
-                    stream: Some(stream("out")),
-                    bodies: vec![body],
-                };
-                commands.push(append.into());
-            }
-            Some(Job::ResolveStreamAppend(_)) => {
-                let close = CloseStream {
-                    seq: 1,
-                    stream: Some(stream("out")),
-                };
-                commands.push(close.into());
-            }
-            Some(Job::ResolveStreamClose(_)) => {
-                commands.push(CompleteWorkflowExecution { result: None }.into());
-            }
+/// Returns a Store with the Stream `s` of `count` Records, and its runtime for a Worker.
+pub(crate) async fn store(count: usize) -> (Arc<MemoryStore>, StreamRuntimes) {
+    let store = Arc::new(MemoryStore::default());
+    let create = CreateStreamRequest {
+        stream_id: "s".to_string(),
+        ..Default::default()
+    };
+    store.create_stream(create, "s".to_string()).await.unwrap();
+    let producer = Producer {
+        kind: Some(Kind::Client(ClientProducer {
+            namespace: "default".to_string(),
+            id: "test".to_string(),
+        })),
+    };
+    // A batch has at most 1000 Records.
+    for start in (0..count).step_by(1000) {
+        let records = (start..count.min(start + 1000))
+            .map(|at| AppendRecord {
+                body: Some(Payload::from(at.to_be_bytes().to_vec())),
+            })
+            .collect();
+        let fill = AppendRecordsRequest {
+            stream_id: "s".to_string(),
+            producer: Some(producer.clone()),
+            records,
+        };
+        store.append_records(fill, String::new()).await.unwrap();
+    }
+    let runtime = Arc::new(StreamRuntime::new(store.clone(), StoreLimits::default()));
+    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime)]);
+    (store, runtimes)
+}
+
+/// Returns the read of one Record of `s` after `from_offset`, with no wait.
+fn read(seq: u32, from_offset: &[u8]) -> Command {
+    ReadStream {
+        seq,
+        stream: Some(stream()),
+        from_offset: from_offset.to_vec(),
+        max_records: 1,
+        ..Default::default()
+    }
+    .into()
+}
+
+fn complete() -> Command {
+    CompleteWorkflowExecution { result: None }.into()
+}
+
+/// Returns each job of `activation` as text, with the number of Records of a page.
+fn jobs_of(activation: &WorkflowActivation) -> Vec<String> {
+    (activation.jobs.iter())
+        .filter_map(|job| job.variant.as_ref())
+        .map(|job| match job {
+            Job::ResolveStreamRead(read) => match &read.status {
+                Some(resolve_stream_read::Status::Page(page)) => {
+                    format!("read {} of {}", read.seq, page.records.len())
+                }
+                _ => format!("read {} failed", read.seq),
+            },
+            other => format!("{other:?}")
+                .split(['(', ' '])
+                .next()
+                .unwrap()
+                .to_string(),
+        })
+        .collect()
+}
+
+/// Returns the next commands of a Workflow that drains `s` one Record at a time. It starts timer 1
+/// once a read gives no Record or fails, and completes once the timer fires.
+fn drain(activation: &WorkflowActivation) -> Vec<Command> {
+    let mut commands = vec![];
+    for job in activation
+        .jobs
+        .iter()
+        .filter_map(|job| job.variant.as_ref())
+    {
+        match job {
+            Job::InitializeWorkflow(_) => commands.push(read(1, &[])),
+            Job::ResolveStreamRead(result) => match &result.status {
+                Some(resolve_stream_read::Status::Page(page)) if !page.records.is_empty() => {
+                    commands.push(read(result.seq + 1, &page.last_offset));
+                }
+                _ => commands.push(
+                    StartTimer {
+                        seq: 1,
+                        start_to_fire_timeout: Some(prost_dur!(from_secs(1))),
+                    }
+                    .into(),
+                ),
+            },
+            Job::FireTimer(_) => commands.push(complete()),
             _ => {}
         }
     }
     commands
 }
 
-fn read(seq: u32, id: &str) -> ReadStream {
-    ReadStream {
-        seq,
-        stream: Some(stream(id)),
-        max_records: 2,
-        ..Default::default()
-    }
-}
+/// The Records of the Stream that a replay of a paged History reads.
+const PAGED_RECORDS: usize = 400;
 
-/// Returns the results of Stream calls in `activation`, as text.
-fn stream_jobs(activation: &WorkflowActivation) -> Vec<String> {
-    let jobs = activation
+/// Returns the next commands of a Workflow that reads `s` one Record at a time, with a timer at
+/// each page that never fires in the test. The timer is a command, so each page has a Workflow
+/// Task and a batch of History of its own. At the last Record of the Stream, which the data of
+/// the Record tells, it starts timer 1, and it completes once timer 1 fires.
+fn drain_a_page_in_each_task(activation: &WorkflowActivation) -> Vec<Command> {
+    let last = (PAGED_RECORDS - 1).to_be_bytes().to_vec();
+    let mut commands = vec![];
+    for job in activation
         .jobs
         .iter()
-        .filter_map(|job| job.variant.as_ref());
-    jobs.filter(|job| {
-        matches!(
-            job,
-            Job::ResolveStreamAppend(_) | Job::ResolveStreamRead(_) | Job::ResolveStreamClose(_)
-        )
-    })
-    .map(|job| format!("{job:?}"))
-    .collect()
-}
-
-/// Returns the entries of the Stream calls of a task, as text, sorted. The order of the results of
-/// one task depends on when the Store answers.
-fn entries(calls: &WorkflowTaskStreamCalls) -> Vec<String> {
-    let appends = (calls.append_results.iter()).map(|a| format!("append {}", a.seq));
-    let intents = (calls.close_intents.iter()).map(|i| format!("close intent {}", i.seq));
-    let closes = (calls.close_results.iter()).map(|c| format!("close {}", c.seq));
-    let reads = calls.read_results.iter().map(|read| match &read.result {
-        Some(read_result::Result::Page(page)) => {
-            format!("read {} with {} Records", read.seq, page.record_count)
+        .filter_map(|job| job.variant.as_ref())
+    {
+        match job {
+            Job::InitializeWorkflow(_) => commands.push(read(1, &[])),
+            Job::ResolveStreamRead(result) => {
+                let Some(resolve_stream_read::Status::Page(page)) = &result.status else {
+                    continue;
+                };
+                let ends = (page.records.iter())
+                    .any(|record| record.body.as_ref().is_some_and(|body| body.data == last));
+                let (seq, wait) = match ends {
+                    true => (1, 1),
+                    false => (1000 + result.seq, 3600),
+                };
+                let timer = StartTimer {
+                    seq,
+                    start_to_fire_timeout: Some(prost_dur!(from_secs(wait))),
+                };
+                commands.push(timer.into());
+                if !ends {
+                    commands.push(read(result.seq + 1, &page.last_offset));
+                }
+            }
+            Job::FireTimer(fired) if fired.seq == 1 => commands.push(complete()),
+            _ => {}
         }
-        other => format!("read {}: {other:?}", read.seq),
-    });
-    let mut entries: Vec<String> = appends.chain(intents).chain(closes).chain(reads).collect();
-    entries.sort();
-    entries
-}
-
-/// Returns a Store with the Streams `out`, `in` and `quiet`, and its runtime for a Worker. The
-/// Stream `in` has three Records.
-pub(crate) async fn store() -> (Arc<MemoryStore>, StreamRuntimes) {
-    let store = Arc::new(MemoryStore::default());
-    for id in ["out", "in", "quiet"] {
-        let create = CreateStreamRequest {
-            stream_ref: Some(stream(id)),
-            ..Default::default()
-        };
-        store.create_stream(create, id.to_string()).await.unwrap();
     }
-    let client = Kind::Client(ClientProducer {
-        namespace: "default".to_string(),
-        id: "test".to_string(),
-    });
-    let bodies: Vec<Payload> = (0..3u8).map(|at| Payload::from(vec![at])).collect();
-    let fill = AppendRecordsRequest {
-        r#ref: Some(stream("in")),
-        producer: Some(Producer { kind: Some(client) }),
-        records: (bodies.iter().cloned())
-            .map(|body| AppendRecord { body: Some(body) })
-            .collect(),
-    };
-    store.append_records(fill, String::new()).await.unwrap();
-    let runtime = Arc::new(StreamRuntime::new(store.clone(), StoreLimits::default()));
-    let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime)]);
-    (store, runtimes)
+    commands
 }
 
-// The attempt of a Stream call and the Stream calls of a Workflow Task in History depend on what
-// the server does with a failed task, with a task that Core forces, and with a completion whose
-// Stream calls have no entry, which a mock server can't show.
+/// Returns the entries of each read marker of `history`, and the event id of the marker.
+fn read_markers(history: &History) -> Vec<(i64, StreamReadMarkerData)> {
+    (history.events.iter())
+        .filter_map(|event| match event.attributes.as_ref()? {
+            Attributes::MarkerRecordedEventAttributes(marker)
+                if marker.marker_name == STREAM_READ_MARKER_NAME =>
+            {
+                let data = &marker.details["data"].payloads[0];
+                Some((
+                    event.event_id,
+                    StreamReadMarkerData::from_json_payload(data).unwrap(),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// A run that leaves the cache replays a long History, which the server pages, and reads the
+// Records of each read marker from the Store again.
 #[tokio::test]
-async fn stream_calls_write_as_the_servers_task_and_replay_from_its_ledgers() {
-    let (store, mut runtimes) = store().await;
-    // The read of `quiet` ends by its read limit, so this keeps the test short.
-    runtimes.settings.read_time = Some(Duration::from_secs(2));
-    let mut starter = CoreWfStarter::new("stream_calls_write_as_the_servers_task");
-    // A task must not reach its heartbeat, which would split its results over two ledgers.
-    starter.workflow_options.task_timeout = Some(Duration::from_secs(60));
+async fn a_replay_of_a_paged_history_gives_each_page_of_the_first_run() {
+    let (store, runtimes) = store(PAGED_RECORDS).await;
+    let mut starter = CoreWfStarter::new("a_replay_of_a_paged_history");
+    starter.workflow_options.task_timeout = Some(Duration::from_secs(30));
+    let of_worker = runtimes.clone();
+    starter.set_core_cfg_mutator(move |config| config.stream_runtimes = of_worker.clone());
+    let core = starter.get_core_worker().await;
+    let run_id = starter.start_wf().await;
+    // The first run drains the Stream, and the run leaves the cache once timer 1 is out.
+    let (mut lives, mut evictions) = (vec![vec![]], vec![]);
+    let drive = async {
+        loop {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            let run_id = activation.run_id.clone();
+            if let Some(Job::RemoveFromCache(evict)) =
+                activation.jobs.first().and_then(|job| job.variant.as_ref())
+            {
+                evictions.push(evict.message.clone());
+                lives.push(vec![]);
+                let evicted = WorkflowActivationCompletion::empty(run_id);
+                core.complete_workflow_activation(evicted).await.unwrap();
+                continue;
+            }
+            lives.last_mut().unwrap().push(jobs_of(&activation));
+            let commands = drain_a_page_in_each_task(&activation);
+            let starts_timer = commands
+                .iter()
+                .any(|command| matches!(command, Command::StartTimer(timer) if timer.seq == 1));
+            let ends = commands
+                .iter()
+                .any(|command| matches!(command, Command::CompleteWorkflowExecution(_)));
+            let completion = WorkflowActivationCompletion::from_cmds(run_id.clone(), commands);
+            core.complete_workflow_activation(completion).await.unwrap();
+            if ends {
+                return;
+            }
+            if starts_timer && evictions.is_empty() {
+                core.request_workflow_eviction(&run_id);
+            }
+        }
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(120), drive)
+        .await
+        .is_ok();
+    let history = starter.get_history().await;
+    // The server gives the History in pages.
+    let mut client = starter.get_core_client().await;
+    let request = GetWorkflowExecutionHistoryRequest {
+        namespace: client.namespace(),
+        execution: Some(WorkflowExecution {
+            workflow_id: starter.get_wf_id().to_string(),
+            run_id,
+        }),
+        ..Default::default()
+    };
+    let first_page =
+        WorkflowService::get_workflow_execution_history(&mut client, tonic::Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+    let first_page_events = first_page.history.map_or(0, |history| history.events.len());
+    assert!(
+        !first_page.next_page_token.is_empty(),
+        "The server gave all {} events in one page",
+        history.events.len()
+    );
+    let markers = read_markers(&history).len();
+    let first = lives[0].clone();
+    let replayed = lives.get(1).cloned().unwrap_or_default();
+    let fired = vec!["FireTimer".to_string()];
+    let label = format!(
+        "History has {} events in pages of {first_page_events}, and {markers} read markers. \
+         Evictions {evictions:?}. The first run had {} activations, and the replay {}. The Store \
+         got {} reads",
+        history.events.len(),
+        first.len(),
+        replayed.len(),
+        store.reads().len()
+    );
+    assert!(finished, "The Workflow didn't complete. {label}");
+    assert_eq!(replayed, [first, vec![fired]].concat(), "{label}");
+}
+
+// A read in the same completion as a command doesn't hold the task. With no later event for the
+// Workflow, the Records of the Stream must still reach the read.
+#[tokio::test]
+async fn a_read_with_a_memo_upsert_in_the_first_task_gets_its_page() {
+    let (store, runtimes) = store(3).await;
+    let mut starter = CoreWfStarter::new("a_read_with_a_memo_upsert");
     let of_worker = runtimes.clone();
     starter.set_core_cfg_mutator(move |config| config.stream_runtimes = of_worker.clone());
     let core = starter.get_core_worker().await;
     starter.start_wf().await;
-
-    // The first attempt of task 2 fails once its append has a result, and the server sends a second
-    // attempt of the task. The failure evicts the run, so that attempt replays it from the start.
-    let mut failed = false;
-    let mut live = vec![];
-    loop {
-        let activation = core.poll_workflow_activation().await.unwrap();
-        let run_id = activation.run_id.clone();
-        if activation.is_only_eviction() {
-            let evicted = WorkflowActivationCompletion::empty(run_id);
-            core.complete_workflow_activation(evicted).await.unwrap();
-            continue;
-        }
-        let variants = || (activation.jobs.iter()).filter_map(|job| job.variant.as_ref());
-        if variants().any(|job| matches!(job, Job::InitializeWorkflow(_))) {
-            live.clear();
-        }
-        if !failed && variants().any(|job| matches!(job, Job::ResolveStreamAppend(_))) {
-            failed = true;
-            let failure = Failure::application_failure("The test fails this task".into(), false);
-            let fails = WorkflowActivationCompletion::fail(run_id, failure, None);
-            core.complete_workflow_activation(fails).await.unwrap();
-            continue;
-        }
-        live.extend(stream_jobs(&activation));
-        let commands = workflow(&activation);
-        let ends = matches!(commands[..], [Command::CompleteWorkflowExecution(_)]);
-        let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
-        core.complete_workflow_activation(completion).await.unwrap();
-        if ends {
-            break;
-        }
-    }
-    core.handle_eviction().await;
-    assert_eq!(live.len(), 5, "{live:?}");
-
-    // History has the Stream calls on the completion of each Workflow Task with a result or an
-    // intent, and on the completion of task 1, which has no entry but leaves a read with no result.
-    // So the server kept the field, also with no entry. Task 1 completed for its timer while the
-    // read ran, so its result is in the Stream calls of the next task.
-    let history = starter.get_history().await;
-    let mut ledgers = vec![];
-    // The attempt of each Workflow Task, by the id of its started event.
-    let mut attempts = HashMap::new();
-    let mut scheduled_attempt = 0;
-    for event in &history.events {
-        match event.attributes.as_ref() {
-            Some(Attributes::WorkflowTaskScheduledEventAttributes(scheduled)) => {
-                scheduled_attempt = scheduled.attempt;
-            }
-            Some(Attributes::WorkflowTaskStartedEventAttributes(_)) => {
-                attempts.insert(event.event_id, scheduled_attempt);
-            }
-            Some(Attributes::WorkflowTaskCompletedEventAttributes(completed)) => {
-                let metadata = completed.sdk_metadata.as_ref();
-                if let Some(calls) = metadata.and_then(|metadata| metadata.stream_calls.as_ref()) {
-                    ledgers.push((event.event_id, entries(calls)));
+    let mut seen = vec![];
+    let drive = async {
+        loop {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            let run_id = activation.run_id.clone();
+            seen.push(jobs_of(&activation));
+            let commands: Vec<Command> = match activation.jobs[0].variant.as_ref() {
+                Some(Job::InitializeWorkflow(_)) => {
+                    let fields = HashMap::from([("k".to_string(), Payload::from(vec![1]))]);
+                    let memo = ModifyWorkflowProperties {
+                        upserted_memo: Some(Memo { fields }),
+                    };
+                    vec![memo.into(), read(1, &[])]
                 }
+                _ if seen
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|job| job.starts_with("read 1")) =>
+                {
+                    vec![complete()]
+                }
+                _ => vec![],
+            };
+            let ends = matches!(commands[..], [Command::CompleteWorkflowExecution(_)]);
+            let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
+            core.complete_workflow_activation(completion).await.unwrap();
+            if ends {
+                return;
             }
-            // The Workflow has no Local Activity and no patch, and a Stream call adds no event to
-            // History, so History has no marker.
-            Some(Attributes::MarkerRecordedEventAttributes(marker)) => {
-                panic!("History has a marker: {marker:?}");
-            }
-            _ => {}
         }
-    }
-    let tasks: Vec<i64> = ledgers.iter().map(|(completed, _)| *completed).collect();
-    assert!(tasks.windows(2).all(|pair| pair[0] < pair[1]), "{tasks:?}");
-    let recorded: Vec<Vec<String>> = ledgers.into_iter().map(|(_, entries)| entries).collect();
-    let expected = [
-        vec![],
-        vec![
-            "append 1",
-            "close intent 1",
-            "read 1 with 0 Records",
-            "read 2 with 2 Records",
-            "read 3 with 2 Records",
-        ],
-        vec!["close 1"],
-    ];
-    assert_eq!(recorded, expected);
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(20), drive)
+        .await
+        .is_ok();
+    let history = starter.get_history().await;
+    let events: Vec<EventType> = history.events.iter().map(|e| e.event_type()).collect();
+    assert!(
+        finished,
+        "The read got no page in 20 s: activations {seen:?}, History {events:?}, {} reads of the \
+         Store",
+        store.reads().len()
+    );
+}
 
-    // Each write has the attempt that the server gave its Workflow Task. The append ran in both
-    // attempts of task 2. The close ran in task 3 with the attempt that recorded its intent, the
-    // second one of task 2. The server doesn't count a failure of a task on a sticky queue, so
-    // both attempts of task 2 can have the same number, and their started events tell them apart.
-    let writes: Vec<(i64, i32)> = (store.requests().iter())
-        .filter_map(|request| match request {
-            Request::Append(append, _) if append.r#ref == Some(stream("out")) => {
-                append.producer.as_ref()
+// Workflow code drains a Stream one Record at a time. The runtime cut the first page while the
+// Store had more, and then the Store gives no answer. A read outage fails the task as an append
+// outage does, so Core must not make a new task with an empty marker at each read limit, and
+// History must keep no failure of the read.
+#[tokio::test]
+async fn a_read_outage_after_a_cut_page_fails_the_task_on_the_server() {
+    let (store, mut runtimes) = store(4).await;
+    runtimes.settings.read_time = Some(Duration::from_millis(250));
+    runtimes.settings.try_deadline = Duration::from_secs(2);
+    // The Store answers the first read only.
+    store.hold(Op::Read);
+    store.pass(Op::Read, 1);
+    let mut starter = CoreWfStarter::new("a_read_outage_after_a_cut_page");
+    let of_worker = runtimes.clone();
+    starter.set_core_cfg_mutator(move |config| config.stream_runtimes = of_worker.clone());
+    let core = starter.get_core_worker().await;
+    starter.start_wf().await;
+    let mut seen = vec![];
+    let drive = async {
+        loop {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            let run_id = activation.run_id.clone();
+            if activation.is_only_eviction() {
+                seen.push(vec!["eviction".to_string()]);
+                let evicted = WorkflowActivationCompletion::empty(run_id);
+                core.complete_workflow_activation(evicted).await.unwrap();
+                continue;
             }
-            Request::Close(close) => close.producer.as_ref(),
-            _ => None,
-        })
-        .map(|producer| match &producer.kind {
-            Some(Kind::Workflow(workflow)) => {
-                let attempt = workflow.attempt.expect("A Workflow call has its attempt");
-                (attempt.started_event_id, attempt.attempt)
+            seen.push(jobs_of(&activation));
+            // The Workflow completes at a failed read in place of the timer.
+            let commands: Vec<Command> = (drain(&activation).into_iter())
+                .map(|command| match command {
+                    Command::StartTimer(_) => complete(),
+                    other => other,
+                })
+                .collect();
+            let ends = matches!(commands[..], [Command::CompleteWorkflowExecution(_)]);
+            let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
+            core.complete_workflow_activation(completion).await.unwrap();
+            if ends {
+                return;
             }
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(writes.len(), 3, "{writes:?}");
-    for (started, attempt) in &writes {
-        assert_eq!(
-            attempts.get(started),
-            Some(attempt),
-            "{writes:?} {attempts:?}"
-        );
-    }
-    let (first, second, close) = (writes[0].0, writes[1].0, writes[2].0);
-    assert!(first < second && second == close, "{writes:?}");
-
-    // A second Worker, which doesn't have the run, replays the History of the server. It reads
-    // the Records of the digest from the Store, and gives Workflow code the jobs of the first run.
-    let mut config = integ_worker_config(starter.get_task_queue());
-    config.stream_runtimes = runtimes;
-    let history = HistoryForReplay::new(history, starter.get_wf_id());
-    let replayer = init_replay_worker(ReplayWorkerInput::new(config, stream::iter([history])));
-    let replayer = replayer.expect("The replay Worker starts");
-    let mut replayed = vec![];
-    loop {
-        let activation = replayer.poll_workflow_activation().await.unwrap();
-        let run_id = activation.run_id.clone();
-        if activation.is_only_eviction() {
-            let evicted = WorkflowActivationCompletion::empty(run_id);
-            replayer
-                .complete_workflow_activation(evicted)
-                .await
-                .unwrap();
-            break;
         }
-        replayed.extend(stream_jobs(&activation));
-        let completion = WorkflowActivationCompletion::from_cmds(run_id, workflow(&activation));
-        (replayer.complete_workflow_activation(completion).await).unwrap();
-    }
-    assert_eq!(replayed, live);
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), drive).await;
+    let history = starter.get_history().await;
+    let markers = read_markers(&history);
+    let empty = markers
+        .iter()
+        .filter(|(_, data)| data.reads.is_empty())
+        .count();
+    let recorded_failure = (markers.iter().flat_map(|(_, data)| &data.reads))
+        .any(|entry| matches!(entry.result, Some(stream_read_result::Result::Failure(_))));
+    let failed_tasks = (history.events.iter())
+        .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+        .count();
+    let events: Vec<EventType> = history.events.iter().map(|e| e.event_type()).collect();
+    assert!(
+        empty == 0 && !recorded_failure && failed_tasks > 0,
+        "{empty} read markers with no entry, a read marker with a failure: {recorded_failure}, \
+         {failed_tasks} failed tasks. Activations {seen:?}, History {events:?}"
+    );
+}
+
+/// Returns the number of each type of event in `history`.
+fn count_of(history: &History, event_type: EventType) -> usize {
+    (history.events.iter())
+        .filter(|event| event.event_type() == event_type)
+        .count()
+}
+
+// A read with a wait on a Stream with no Record gets a check before each completion with a timer.
+// The check gets no Record, so the read starts again in the task that the timer makes, and the
+// Worker asks the server for no other task.
+#[tokio::test]
+async fn a_read_of_an_idle_stream_makes_no_task_on_the_server() {
+    let (store, runtimes) = store(0).await;
+    let mut starter = CoreWfStarter::new("a_read_of_an_idle_stream");
+    let of_worker = runtimes.clone();
+    starter.set_core_cfg_mutator(move |config| config.stream_runtimes = of_worker.clone());
+    let core = starter.get_core_worker().await;
+    starter.start_wf().await;
+    let timer = |seq| -> Command {
+        StartTimer {
+            seq,
+            start_to_fire_timeout: Some(prost_dur!(from_millis(500))),
+        }
+        .into()
+    };
+    let mut seen = vec![];
+    let drive = async {
+        loop {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            let run_id = activation.run_id.clone();
+            seen.push(jobs_of(&activation));
+            let commands: Vec<Command> = match activation.jobs[0].variant.as_ref() {
+                Some(Job::InitializeWorkflow(_)) => {
+                    let read = ReadStream {
+                        seq: 1,
+                        stream: Some(stream()),
+                        wait: Some(prost_dur!(from_secs(60))),
+                        ..Default::default()
+                    };
+                    vec![read.into(), timer(1)]
+                }
+                Some(Job::FireTimer(fired)) if fired.seq < 3 => vec![timer(fired.seq + 1)],
+                _ => vec![complete()],
+            };
+            let ends = matches!(commands[..], [Command::CompleteWorkflowExecution(_)]);
+            let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
+            core.complete_workflow_activation(completion).await.unwrap();
+            if ends {
+                return;
+            }
+        }
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(20), drive)
+        .await
+        .is_ok();
+    let history = starter.get_history().await;
+    let events: Vec<EventType> = history.events.iter().map(|e| e.event_type()).collect();
+    let label = format!(
+        "activations {seen:?}, History {events:?}, {} reads of the Store",
+        store.reads().len()
+    );
+    assert!(finished, "{label}");
+    // The first task and the task of each timer.
+    assert_eq!(
+        count_of(&history, EventType::WorkflowTaskCompleted),
+        4,
+        "{label}"
+    );
+    assert_eq!(read_markers(&history), [], "{label}");
+}
+
+// Workflow code drains a Stream with no wait, and answers its last page after the read limit of
+// the task. The next read is a check, and its page with no Record ends the drain in the same task.
+#[tokio::test]
+async fn a_drain_that_crosses_the_read_limit_ends_in_its_task_on_the_server() {
+    let (store, mut runtimes) = store(2).await;
+    runtimes.settings.read_time = Some(Duration::from_millis(250));
+    let mut starter = CoreWfStarter::new("a_drain_that_crosses_the_read_limit");
+    let of_worker = runtimes.clone();
+    starter.set_core_cfg_mutator(move |config| config.stream_runtimes = of_worker.clone());
+    let core = starter.get_core_worker().await;
+    starter.start_wf().await;
+    let mut seen = vec![];
+    let drive = async {
+        loop {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            let run_id = activation.run_id.clone();
+            let jobs = jobs_of(&activation);
+            if jobs.iter().any(|job| job.starts_with("read 2 of")) {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+            seen.push(jobs);
+            // The Workflow completes at the page with no Record in place of the timer.
+            let commands: Vec<Command> = (drain(&activation).into_iter())
+                .map(|command| match command {
+                    Command::StartTimer(_) => complete(),
+                    other => other,
+                })
+                .collect();
+            let ends = matches!(commands[..], [Command::CompleteWorkflowExecution(_)]);
+            let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
+            core.complete_workflow_activation(completion).await.unwrap();
+            if ends {
+                return;
+            }
+        }
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(20), drive)
+        .await
+        .is_ok();
+    let history = starter.get_history().await;
+    let events: Vec<EventType> = history.events.iter().map(|e| e.event_type()).collect();
+    let label = format!(
+        "activations {seen:?}, History {events:?}, {} reads of the Store",
+        store.reads().len()
+    );
+    assert!(finished, "{label}");
+    assert_eq!(
+        count_of(&history, EventType::WorkflowTaskCompleted),
+        1,
+        "{label}"
+    );
+    let entries: usize = (read_markers(&history).iter())
+        .map(|(_, data)| data.reads.len())
+        .sum();
+    assert_eq!(entries, 3, "{label}");
 }

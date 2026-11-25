@@ -1143,8 +1143,7 @@ where
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
                 Some(
                     ActivationVariant::ResolveStreamRead(_)
-                    | ActivationVariant::ResolveStreamAppend(_)
-                    | ActivationVariant::ResolveStreamClose(_),
+                    | ActivationVariant::ResolveStreamAppend(_),
                 ) => {
                     return Err(Box::new(Failure {
                         message: "This SDK doesn't send any Stream command".to_string(),
