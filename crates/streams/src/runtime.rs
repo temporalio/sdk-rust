@@ -43,8 +43,8 @@ impl StreamRuntime {
     /// Creates a Stream. If a Stream already has the id, the create fails, or it returns
     /// `created` false with the `UseExisting` policy. Every try of one create passes the same
     /// `request_id`, so a retry after a lost response returns `created` true. The response has the
-    /// ref of the request, since the Store gets only its id. A caller that picked the Store for a
-    /// ref with no Store name sets that name in the response, so later calls on the ref use it.
+    /// ref of the request, since the Store gets only its id. The runtime doesn't know the name of
+    /// its Store, so a ref with no Store name has none in the response either.
     pub async fn create_stream(
         &self,
         request: sdk::CreateStreamRequest,
