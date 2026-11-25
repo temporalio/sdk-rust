@@ -24,6 +24,7 @@ use parking_lot::Mutex;
 use rstest::{fixture, rstest};
 use siphasher::sip::SipHasher13;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     sync::{
@@ -1704,6 +1705,122 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its
         [vec![timer, fail]],
         "Expected exactly one completion, containing the live task's StartTimer followed by a \
          FailWorkflowExecution with lang's error"
+    );
+}
+
+/// When the first run's workflow code scheduled local activity 2 of task 1.
+#[derive(Clone, Copy, Debug)]
+enum SecondLocalActivity {
+    AtTheFirstResult,
+    WithTheFirst,
+}
+
+/// What lang answers if Core activates it again after its failure.
+#[derive(Clone, Copy, Debug)]
+enum ReplyAfterTheFailure {
+    FailsAgain,
+    StartsTheTimer,
+    SendsNoCommands,
+}
+
+// History records the two results for activations 1 and 2 of task 1, so replay holds the second
+// one while lang fails the first. The held result must not keep the failure from going out, give
+// lang another activation, or let lang's next reply replace the cause.
+#[rstest]
+#[case::at_the_first_result(
+    SecondLocalActivity::AtTheFirstResult,
+    ReplyAfterTheFailure::FailsAgain
+)]
+#[case::with_the_first_then_a_failure(
+    SecondLocalActivity::WithTheFirst,
+    ReplyAfterTheFailure::FailsAgain
+)]
+#[case::with_the_first_then_a_timer(
+    SecondLocalActivity::WithTheFirst,
+    ReplyAfterTheFailure::StartsTheTimer
+)]
+#[case::with_the_first_then_no_commands(
+    SecondLocalActivity::WithTheFirst,
+    ReplyAfterTheFailure::SendsNoCommands
+)]
+#[tokio::test]
+async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_command(
+    #[case] second: SecondLocalActivity,
+    #[case] reply: ReplyAfterTheFailure,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    for seq in 1..=2 {
+        let result = Some("done".into());
+        t.add_local_activity_marker(seq, &seq.to_string(), result, None, |marker| {
+            marker.activation_index = Some(u64::from(seq));
+        });
+    }
+    let started = t.add_timer_started("1".to_string());
+    t.add_timer_fired(started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    let local_activity = |seq| {
+        schedule_local_activity_cmd(
+            seq,
+            &seq.to_string(),
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )
+    };
+    let activations = RefCell::new(vec![]);
+    let lang = |act: &WorkflowActivation| {
+        activations.borrow_mut().push(act.jobs.clone());
+        let count = activations.borrow().len();
+        match &act.jobs[0].variant {
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+                let commands = match second {
+                    SecondLocalActivity::AtTheFirstResult => vec![local_activity(1)],
+                    SecondLocalActivity::WithTheFirst => vec![local_activity(1), local_activity(2)],
+                };
+                WorkflowActivationCompletion::from_cmds(act.run_id.clone(), commands)
+            }
+            _ if count == 2 => langs_nondeterminism_failure(act),
+            _ => match reply {
+                ReplyAfterTheFailure::FailsAgain => langs_nondeterminism_failure(act),
+                ReplyAfterTheFailure::StartsTheTimer => WorkflowActivationCompletion::from_cmds(
+                    act.run_id.clone(),
+                    vec![start_timer_cmd(1, Duration::from_secs(1))],
+                ),
+                ReplyAfterTheFailure::SendsNoCommands => {
+                    WorkflowActivationCompletion::empty(act.run_id.clone())
+                }
+            },
+        }
+    };
+    let run = run_failing_workflow_on_nondeterminism(mh, lang);
+    let sent = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("Expected the failure to go out within 10 seconds");
+    assert_eq!(
+        sent,
+        fails_with_langs_error(),
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
+    );
+    let activations = activations.into_inner();
+    assert_eq!(
+        activations.len(),
+        2,
+        "Expected lang to get no activation after the one it failed: {activations:?}"
+    );
+    assert_matches!(
+        &activations[1][..],
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity { seq: 1, .. }
+            )),
+        }]
     );
 }
 
