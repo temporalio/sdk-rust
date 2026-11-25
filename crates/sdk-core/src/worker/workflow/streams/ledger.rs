@@ -1,26 +1,21 @@
-//! The ledger of a Workflow Task, which has the results and the close intents of the task's Stream
-//! calls. Core puts it on the completion of the task, as the `stream_calls` of its `sdk_metadata`,
-//! and History keeps it in the `WorkflowTaskCompleted` event.
+//! The ledger of a Workflow Task, which has the results of the task's Stream calls. Core puts it
+//! on the completion of the task, as the `stream_calls` of its `sdk_metadata`, and History keeps it
+//! in the `WorkflowTaskCompleted` event.
 
 use super::{StreamSettings, manager::failure_of};
 use crate::worker::workflow::WFMachinesError;
 use prost::{Message, encoding::encoded_len_varint};
 use temporalio_common::protos::{
-    coresdk::workflow_activation::{
-        ResolveStreamAppend, ResolveStreamClose, StreamAppended, resolve_stream_append,
-    },
+    coresdk::workflow_activation::{ResolveStreamAppend, StreamAppended, resolve_stream_append},
     temporal::api::{
         history::v1::{HistoryEvent, history_event},
         sdk::v1::{
             WorkflowTaskStreamCalls,
-            workflow_task_stream_calls::{AppendResult, CloseIntent, CloseResult, append_result},
+            workflow_task_stream_calls::{AppendResult, append_result},
         },
     },
 };
-use temporalio_streams::{
-    proto::{StreamErrorReason, StreamRef},
-    record::field_len,
-};
+use temporalio_streams::{proto::StreamErrorReason, record::field_len};
 
 /// The entry of a result that waits for an activation, as a ledger records it, with its encoded
 /// size.
@@ -69,13 +64,6 @@ pub(crate) fn append_job(seq: u32, entry: &AppendResult) -> ResolveStreamAppend 
     ResolveStreamAppend { seq, status }
 }
 
-pub(crate) fn close_job(seq: u32, entry: &CloseResult) -> ResolveStreamClose {
-    ResolveStreamClose {
-        seq,
-        failed: entry.failure.as_ref().map(failure_of),
-    }
-}
-
 /// Returns the seq of an entry in History. Workflow code numbers its calls from 1, so an entry
 /// with a negative seq is malformed.
 pub(crate) fn seq_of(seq: i32) -> Result<u32, WFMachinesError> {
@@ -116,35 +104,6 @@ impl LedgerBuilder {
             return false;
         }
         self.data.append_results.push(AppendResult {
-            activation_index: index,
-            ..done.entry.clone()
-        });
-        true
-    }
-
-    /// Records the intent of close `seq` on `stream`. Returns false if the ledger has no room.
-    pub(crate) fn close_intent(&mut self, stream: &StreamRef, seq: u32) -> bool {
-        let entry = CloseIntent {
-            seq: seq as i32,
-            r#ref: Some(stream.clone()),
-        };
-        if !self.fits(field_len(entry.encoded_len())) {
-            return false;
-        }
-        self.data.close_intents.push(entry);
-        true
-    }
-
-    /// Records the result of a close, given at `activation`. Returns false if the ledger has no
-    /// room for it.
-    pub(crate) fn close_result(&mut self, done: &Waiting<CloseResult>, activation: u64) -> bool {
-        let Some((index, len)) = done.at(activation) else {
-            return false;
-        };
-        if !self.fits(len) {
-            return false;
-        }
-        self.data.close_results.push(CloseResult {
             activation_index: index,
             ..done.entry.clone()
         });
@@ -214,12 +173,10 @@ fn check(ledger: &WorkflowTaskStreamCalls) -> Result<(), WFMachinesError> {
     }
     // Core builds the failure of a call from its reason, and a later version can have a reason
     // that this one doesn't know.
-    let failed_appends = (ledger.append_results.iter()).filter_map(|append| match &append.result {
+    let mut failures = (ledger.append_results.iter()).filter_map(|append| match &append.result {
         Some(append_result::Result::Failure(failure)) => Some(failure),
         _ => None,
     });
-    let failed_closes = (ledger.close_results.iter()).filter_map(|close| close.failure.as_ref());
-    let mut failures = failed_appends.chain(failed_closes);
     if let Some(failure) =
         failures.find(|failure| StreamErrorReason::try_from(failure.reason).is_err())
     {
@@ -228,17 +185,8 @@ fn check(ledger: &WorkflowTaskStreamCalls) -> Result<(), WFMachinesError> {
             failure.reason
         )));
     }
-    let indexes = (ledger
-        .append_results
-        .iter()
-        .map(|append| append.activation_index))
-    .chain(
-        ledger
-            .close_results
-            .iter()
-            .map(|close| close.activation_index),
-    );
-    if let Some(index) = indexes.into_iter().find(|index| *index < 0) {
+    let mut indexes = (ledger.append_results.iter()).map(|append| append.activation_index);
+    if let Some(index) = indexes.find(|index| *index < 0) {
         return Err(malformed(format!(
             "has the negative activation index {index}"
         )));
@@ -294,26 +242,16 @@ mod tests {
             }],
             ..Default::default()
         };
-        let close = |failure, activation_index| WorkflowTaskStreamCalls {
-            close_results: vec![CloseResult {
-                seq: 9,
-                failure,
-                activation_index,
-            }],
-            ..Default::default()
-        };
         let cases = [
             (append(None, 0), "has no result of append 9"),
             (
                 append(appended(), -1),
                 "has the negative activation index -1",
             ),
-            (close(None, -2), "has the negative activation index -2"),
             (
                 append(Some(append_result::Result::Failure(later())), 0),
                 unknown,
             ),
-            (close(Some(later()), 0), unknown),
         ];
         for (ledger, why) in cases {
             let Some(Err(WFMachinesError::Fatal(error))) = peeked_ledger(&event(ledger)) else {
@@ -327,19 +265,19 @@ mod tests {
 
     #[test]
     fn a_ledger_counts_the_bytes_of_an_activation_index() {
-        let done = Waiting::new(CloseResult {
+        let done = Waiting::new(AppendResult {
             seq: 1,
             ..Default::default()
         });
         for activation in [0, 1, 127, 128, i32::MAX as u64] {
             let mut builder = LedgerBuilder::new(StreamSettings::default());
-            assert!(builder.close_result(&done, activation));
+            assert!(builder.append_result(&done, activation));
             // `take` asserts that the counted bytes are the encoded size.
             let ledger = builder.take().unwrap();
-            assert_eq!(ledger.close_results[0].activation_index as u64, activation);
+            assert_eq!(ledger.append_results[0].activation_index as u64, activation);
         }
         // History keeps the index as an `int32`, so a higher one has no room.
         let mut builder = LedgerBuilder::new(StreamSettings::default());
-        assert!(!builder.close_result(&done, i32::MAX as u64 + 1));
+        assert!(!builder.append_result(&done, i32::MAX as u64 + 1));
     }
 }

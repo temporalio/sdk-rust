@@ -57,7 +57,6 @@ message WorkflowCommand {
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
         AppendToStream append_to_stream = 25;
-        CloseStream close_stream = 26;
     }
 }
 
@@ -435,8 +434,7 @@ message RequestCancelNexusOperation {
 // No command cancels an append, so lang must accept the job of an append that nothing awaits.
 // Core drops an append that has no result when lang sends the Workflow's last command.
 //
-// Core sends the appends and the closes of one Stream to the Store one at a time, in the order of
-// their commands.
+// Core sends the appends of one Stream to the Store one at a time, in the order of their commands.
 //
 // A bad `seq` or `stream`, or a Store that the Worker has no runtime for, fails the Workflow Task.
 // So does a Store that is still unavailable at the task's heartbeat. The failure message then
@@ -449,19 +447,4 @@ message AppendToStream {
     uint32 seq = 1;
     temporal.api.stream.v1.StreamRef stream = 2;
     repeated temporal.api.common.v1.Payload bodies = 3;
-}
-
-// Closes a Stream. The Workflow Task of the command records only the intent to close. Core closes
-// the Stream once History has that task, so a task that fails closes nothing, and its retry can
-// still append. The result comes in a `ResolveStreamClose` job of a later task.
-//
-// An append that lang sends in the same task is written before the close.
-//
-// The rules of `AppendToStream` about cancellation, the Workflow's last command, task failures and
-// replay apply to a close too. So Workflow code that needs its close must await the result before
-// its last command.
-message CloseStream {
-    // Lang's incremental sequence number for closes, starting at 1.
-    uint32 seq = 1;
-    temporal.api.stream.v1.StreamRef stream = 2;
 }

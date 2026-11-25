@@ -11,7 +11,7 @@ use temporalio_common::protos::temporal::api::{
 };
 use temporalio_streams::{
     AnyReason, StreamError, StreamRuntime,
-    proto::{AppendRecordsRequest, CloseStreamRequest, StreamErrorReason},
+    proto::{AppendRecordsRequest, StreamErrorReason},
 };
 use tokio::{runtime::Handle, task::AbortHandle};
 
@@ -46,7 +46,6 @@ pub(crate) struct Call {
 pub(crate) enum Op {
     /// An append, with the request id that each of its tries passes.
     Append(AppendRecordsRequest, String),
-    Close(CloseStreamRequest),
 }
 
 /// The result of a call, for its run.
@@ -60,8 +59,6 @@ pub(crate) struct StreamResolution {
 #[derive(Debug)]
 pub(crate) enum Outcome {
     Append(append_result::Result),
-    /// `None` if the Stream is closed.
-    Close(Option<CallFailure>),
 }
 
 type Sink = Arc<dyn Fn(String, StreamResolution) + Send + Sync>;
@@ -160,11 +157,8 @@ impl StreamManager {
             store,
             op,
         } = call;
-        let stream = match &op {
-            Op::Append(request, _) => &request.r#ref,
-            Op::Close(request) => &request.r#ref,
-        };
-        let stream_id = stream.as_ref().map_or("", |stream| &stream.id);
+        let Op::Append(request, _) = &op;
+        let stream_id = request.r#ref.as_ref().map_or("", |stream| &stream.id);
         let runtime = (self.runtimes.get(&store).cloned())
             .expect("The run starts no call on a Store with no runtime");
         let settings = self.runtimes.settings;
@@ -172,15 +166,7 @@ impl StreamManager {
             tasks: self.tasks.clone(),
             run_id: run_id.to_string(),
             call_id,
-            what: format!(
-                "{} of Stream \"{}\" on Store \"{}\"",
-                match op {
-                    Op::Append(..) => "append",
-                    Op::Close(_) => "close",
-                },
-                stream_id,
-                store
-            ),
+            what: format!("append of Stream \"{stream_id}\" on Store \"{store}\""),
         };
         let sink = self.sink.clone();
         let task = self.handle.spawn(async move {
@@ -223,16 +209,11 @@ async fn run(runtime: &StreamRuntime, op: Op, settings: StreamSettings, note: &N
                 Err(error) => append_result::Result::Failure(recorded(&error)),
             })
         }
-        Op::Close(request) => {
-            let answer = tries(settings, note, || runtime.close_stream(request.clone())).await;
-            Outcome::Close(answer.err().map(|error| recorded(&error)))
-        }
     }
 }
 
 /// Sends the request again while the Store is in an outage, with no time limit. A resend is safe,
-/// because a Store doesn't write a batch whose request id it still remembers, and a second close
-/// succeeds.
+/// because a Store doesn't write a batch whose request id it still remembers.
 async fn tries<T, R, F>(
     settings: StreamSettings,
     note: &Note,
@@ -460,18 +441,6 @@ mod tests {
         })
     }
 
-    fn close(call_id: u64) -> Request {
-        Request::Run(Call {
-            call_id,
-            seq: 2,
-            store: "mem".to_string(),
-            op: Op::Close(CloseStreamRequest {
-                r#ref: Some(stream()),
-                producer: producer(),
-            }),
-        })
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_try_with_no_answer_is_an_outage() {
         let (store, manager, mut results) = manager().await;
@@ -499,19 +468,21 @@ mod tests {
         let (store, manager, mut results) = manager().await;
         let down = || AnyError::store_unavailable("The Store is down");
         store.fail(StoreOp::Append, down(), usize::MAX);
-        store.fail(StoreOp::Close, down(), usize::MAX);
-        manager.dispatch("a", vec![append(1), close(2), append(3)]);
-        manager.dispatch("b", vec![close(4)]);
+        manager.dispatch("a", vec![append(1), append(2), append(3)]);
+        manager.dispatch("b", vec![append(4)]);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(manager.outage("a").is_some());
         manager.dispatch("a", vec![Request::Stop(3)]);
         manager.cancel_run("a");
         assert_eq!(manager.outage("a"), None);
         assert!(manager.outage("b").is_some());
-        store.fail(StoreOp::Close, down(), 0);
+        store.fail(StoreOp::Append, down(), 0);
         let (run_id, resolution) = results.recv().await.unwrap();
         assert_eq!((run_id.as_str(), resolution.call_id), ("b", 4));
-        assert!(matches!(resolution.outcome, Outcome::Close(None)));
+        assert!(matches!(
+            resolution.outcome,
+            Outcome::Append(append_result::Result::Appended(_))
+        ));
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert!(results.try_recv().is_err());
         let after = store.requests().len();

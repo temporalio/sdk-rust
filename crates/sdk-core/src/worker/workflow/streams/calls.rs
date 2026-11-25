@@ -3,7 +3,7 @@
 
 use super::{
     StreamRuntimes, TaskState,
-    ledger::{LedgerBuilder, Waiting, activation_of, append_job, close_job, seq_of},
+    ledger::{LedgerBuilder, Waiting, activation_of, append_job, seq_of},
     manager::{Call, Op, Outcome, Request, StreamResolution},
 };
 use crate::worker::workflow::WFMachinesError;
@@ -13,16 +13,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use temporalio_common::protos::{
-    coresdk::{
-        workflow_activation::workflow_activation_job,
-        workflow_commands::{AppendToStream, CloseStream},
-    },
+    coresdk::{workflow_activation::workflow_activation_job, workflow_commands::AppendToStream},
     temporal::api::{
         common::v1::Payload,
-        sdk::v1::{
-            WorkflowTaskStreamCalls,
-            workflow_task_stream_calls::{AppendResult, CloseIntent, CloseResult},
-        },
+        sdk::v1::{WorkflowTaskStreamCalls, workflow_task_stream_calls::AppendResult},
     },
 };
 use temporalio_streams::{
@@ -30,8 +24,8 @@ use temporalio_streams::{
     attempt::attempt_key,
     ids::validate_stream_id,
     proto::{
-        AppendRecord, AppendRecordsRequest, CloseStreamRequest, Producer, StreamRef,
-        WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+        AppendRecord, AppendRecordsRequest, Producer, StreamRef, WorkflowProducer,
+        WorkflowTaskAttempt, producer::Kind,
     },
 };
 
@@ -60,14 +54,12 @@ pub(crate) enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CallKey {
     Append(u32),
-    Close(u32),
 }
 
 impl fmt::Display for CallKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CallKey::Append(seq) => write!(f, "append {seq}"),
-            CallKey::Close(seq) => write!(f, "close {seq}"),
         }
     }
 }
@@ -90,41 +82,18 @@ enum AppendState {
     Replayed,
 }
 
-struct Close {
-    stream: StreamRef,
-    state: CloseState,
-}
-
-enum CloseState {
-    /// No ledger has the intent yet.
-    Asked,
-    /// The ledger of the task has the intent. A replayed close gets its attempt at go-live.
-    Sealed(Option<WorkflowTaskAttempt>),
-    /// History has the intent, so the close is in its queue.
-    Waiting(Option<WorkflowTaskAttempt>),
-    Running(u64),
-    /// The result waits for an activation, in the form that the ledger records it.
-    Done(Waiting<CloseResult>),
-    /// History has the result, which waits for its activation.
-    Replayed,
-}
-
 /// The entries of History's ledgers whose calls Workflow code hasn't issued yet, by seq.
 #[derive(Default)]
 struct Held {
     appends: HashMap<u32, AppendResult>,
-    intents: HashMap<u32, CloseIntent>,
-    closes: HashMap<u32, CloseResult>,
 }
 
 impl Held {
     /// Returns the activation and the call of the first result, in the order of the first run.
     fn first_result(&self) -> Option<(u64, CallKey)> {
-        let appends = (self.appends.iter())
-            .map(|(seq, a)| (activation_of(a.activation_index), CallKey::Append(*seq)));
-        let closes = (self.closes.iter())
-            .map(|(seq, c)| (activation_of(c.activation_index), CallKey::Close(*seq)));
-        appends.chain(closes).min()
+        (self.appends.iter())
+            .map(|(seq, a)| (activation_of(a.activation_index), CallKey::Append(*seq)))
+            .min()
     }
 }
 
@@ -139,12 +108,9 @@ pub(crate) struct StreamCalls {
     keeps_ledgers: bool,
     task: TaskState,
     appends: HashMap<u32, Append>,
-    closes: HashMap<u32, Close>,
-    /// The appends and closes of each Stream, in the order that they were queued. Only the head
-    /// runs.
+    /// The appends of each Stream, in the order that they were queued. Only the head runs.
     queues: HashMap<(String, String), VecDeque<CallKey>>,
     last_append: u32,
-    last_close: u32,
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
@@ -180,10 +146,8 @@ impl StreamCalls {
             keeps_ledgers,
             task: TaskState::NoTask,
             appends: HashMap::new(),
-            closes: HashMap::new(),
             queues: HashMap::new(),
             last_append: 0,
-            last_close: 0,
             done: BTreeSet::new(),
             held: Held::default(),
             ready: BTreeMap::new(),
@@ -227,21 +191,6 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Records only the intent. The close runs once History has it, so a task that fails closes
-    /// nothing.
-    pub(crate) fn close(&mut self, command: CloseStream) -> Result<(), WFMachinesError> {
-        if self.phase == Phase::Stopped {
-            return Ok(());
-        }
-        let CloseStream { seq, stream } = command;
-        next_seq("close", seq, &mut self.last_close)?;
-        let stream = valid_stream(CallKey::Close(seq), stream)?;
-        self.check_runtime(&stream)?;
-        let state = CloseState::Asked;
-        self.closes.insert(seq, Close { stream, state });
-        self.match_intent(seq)
-    }
-
     /// Handles the result of a running call, and starts the next call of its Stream. It ignores the
     /// result of a call that was stopped.
     pub(crate) fn resolve(&mut self, resolution: StreamResolution) {
@@ -265,20 +214,6 @@ impl StreamCalls {
                     activation_index: 0,
                 }));
                 (CallKey::Append(seq), key(&append.stream))
-            }
-            Outcome::Close(failure) => {
-                let Some(close) = self.closes.get_mut(&seq) else {
-                    return;
-                };
-                if !matches!(close.state, CloseState::Running(id) if id == call_id) {
-                    return;
-                }
-                close.state = CloseState::Done(Waiting::new(CloseResult {
-                    seq: seq as i32,
-                    failure,
-                    activation_index: 0,
-                }));
-                (CallKey::Close(seq), key(&close.stream))
             }
         };
         self.done.insert(call);
@@ -327,19 +262,7 @@ impl StreamCalls {
 
     /// Holds the entries of a ledger from History, each for its call.
     pub(crate) fn peeked(&mut self, data: WorkflowTaskStreamCalls) -> Result<(), WFMachinesError> {
-        let WorkflowTaskStreamCalls {
-            close_intents,
-            append_results,
-            close_results,
-            ..
-        } = data;
-        for intent in close_intents {
-            let seq = seq_of(intent.seq)?;
-            if self.held.intents.insert(seq, intent).is_some() {
-                return Err(second("intent", CallKey::Close(seq)));
-            }
-            self.match_intent(seq)?;
-        }
+        let WorkflowTaskStreamCalls { append_results, .. } = data;
         for append in append_results {
             let seq = seq_of(append.seq)?;
             if self.held.appends.insert(seq, append).is_some() {
@@ -347,57 +270,22 @@ impl StreamCalls {
             }
             self.match_append(seq)?;
         }
-        for close in close_results {
-            let seq = seq_of(close.seq)?;
-            if self.held.closes.insert(seq, close).is_some() {
-                return Err(second("result", CallKey::Close(seq)));
-            }
-            self.match_result(seq)?;
-        }
         Ok(())
     }
 
     /// Handles the completion in History that has a ledger. Each entry of the ledger must already
-    /// have its call, and each close whose intent the ledger has joins its queue.
+    /// have its call.
     pub(crate) fn ledger_recorded(&mut self) -> Result<(), WFMachinesError> {
-        let never = |what: &str, call: CallKey| {
-            WFMachinesError::Nondeterminism(format!(
-                "History has {what} of Stream {call} that Workflow code never issued"
-            ))
-        };
-        if let Some(seq) = self.held.intents.keys().min() {
-            return Err(never("an intent", CallKey::Close(*seq)));
-        }
         if let Some(seq) = self.held.appends.keys().min() {
-            return Err(never("a result", CallKey::Append(*seq)));
-        }
-        if let Some(seq) = self.held.closes.keys().min() {
-            return Err(never("a result", CallKey::Close(*seq)));
+            return Err(WFMachinesError::Nondeterminism(format!(
+                "History has a result of Stream {} that Workflow code never issued",
+                CallKey::Append(*seq)
+            )));
         }
         if let Some((_, call)) = self.ready.keys().next() {
             return Err(WFMachinesError::Nondeterminism(format!(
                 "History has a result of Stream {call} that Workflow code never got"
             )));
-        }
-        let mut sealed: Vec<u32> = (self.closes.iter())
-            .filter(|(_, close)| matches!(close.state, CloseState::Sealed(_)))
-            .map(|(seq, _)| *seq)
-            .collect();
-        sealed.sort_unstable();
-        for seq in sealed {
-            let close = self
-                .closes
-                .get_mut(&seq)
-                .expect("The close was just listed");
-            if let CloseState::Sealed(attempt) = close.state {
-                close.state = CloseState::Waiting(attempt);
-            }
-            let queue = key(&close.stream);
-            self.queues
-                .entry(queue.clone())
-                .or_default()
-                .push_back(CallKey::Close(seq));
-            self.start_head(&queue);
         }
         Ok(())
     }
@@ -408,13 +296,11 @@ impl StreamCalls {
         if self.phase != Phase::Replaying {
             return Ok(());
         }
-        let appends = (self.appends.iter()).map(|(seq, append)| (CallKey::Append(*seq), append));
-        let unserved = (appends.map(|(call, append)| (call, &append.stream)))
-            .chain((self.closes.iter()).map(|(seq, close)| (CallKey::Close(*seq), &close.stream)))
-            .filter(|(_, stream)| self.runtimes.get(&stream.store).is_none())
-            .min_by_key(|(call, _)| *call);
-        if let Some((_, stream)) = unserved {
-            return Err(no_runtime(stream));
+        let unserved = (self.appends.iter())
+            .filter(|(_, append)| self.runtimes.get(&append.stream.store).is_none())
+            .min_by_key(|(seq, _)| **seq);
+        if let Some((_, append)) = unserved {
+            return Err(no_runtime(&append.stream));
         }
         if !self.keeps_ledgers && self.needs_next_task() {
             return Err(no_ledger());
@@ -426,11 +312,6 @@ impl StreamCalls {
                 attempt: waiting, ..
             } = &mut append.state
             {
-                *waiting = attempt;
-            }
-        }
-        for close in self.closes.values_mut() {
-            if let CloseState::Sealed(waiting) | CloseState::Waiting(waiting) = &mut close.state {
                 *waiting = attempt;
             }
         }
@@ -449,28 +330,22 @@ impl StreamCalls {
             }
             Request::Stop(_) => true,
         });
-        let appends = (self.appends.values()).filter_map(|append| match append.state {
-            AppendState::Running(call_id) => Some(call_id),
-            _ => None,
-        });
-        let closes = (self.closes.values()).filter_map(|close| match close.state {
-            CloseState::Running(call_id) => Some(call_id),
-            _ => None,
-        });
-        let running = appends
-            .chain(closes)
+        let running = (self.appends.values())
+            .filter_map(|append| match append.state {
+                AppendState::Running(call_id) => Some(call_id),
+                _ => None,
+            })
             .filter(|call_id| !unsent.contains(call_id));
         self.requests.extend(running.map(Request::Stop));
         self.phase = Phase::Stopped;
         self.appends.clear();
-        self.closes.clear();
         self.queues.clear();
         self.done.clear();
     }
 
     /// Returns true while a call has no result in a ledger, so the run needs another task.
     pub(crate) fn needs_next_task(&self) -> bool {
-        !self.appends.is_empty() || !self.closes.is_empty()
+        !self.appends.is_empty()
     }
 
     /// Returns true if the ledger of the task has an entry.
@@ -489,18 +364,14 @@ impl StreamCalls {
         if self.phase != Phase::Live {
             return 0;
         }
-        let appends = (self.appends.values())
+        (self.appends.values())
             .filter(|append| {
                 matches!(
                     append.state,
                     AppendState::Waiting { .. } | AppendState::Running(_)
                 )
             })
-            .count();
-        let closes = (self.closes.values())
-            .filter(|close| matches!(close.state, CloseState::Waiting(_) | CloseState::Running(_)))
-            .count();
-        appends + closes
+            .count()
     }
 
     /// Returns the activation of the first result from History whose call Workflow code issued.
@@ -528,28 +399,11 @@ impl StreamCalls {
             && marker.is_none_or(|marker| key.0 < marker)
     }
 
-    /// Returns the ledger of the task as it completes, with the intent of each close that fits. A
-    /// task that leaves a call with no result has a ledger with no entry, so that its completion
-    /// ends a task sequence as a command does.
+    /// Returns the ledger of the task as it completes. A task that leaves a call with no result has
+    /// a ledger with no entry, so that its completion ends a task sequence as a command does.
     pub(crate) fn take_ledger(&mut self) -> Option<WorkflowTaskStreamCalls> {
         if matches!(self.phase, Phase::Replaying | Phase::ReplayOnly) {
             return None;
-        }
-        let attempt = self.task.attempt();
-        let mut asked: Vec<u32> = (self.closes.iter())
-            .filter(|(_, close)| matches!(close.state, CloseState::Asked))
-            .map(|(seq, _)| *seq)
-            .collect();
-        asked.sort_unstable();
-        for seq in asked {
-            let close = self
-                .closes
-                .get_mut(&seq)
-                .expect("The close was just listed");
-            if !self.ledger.close_intent(&close.stream, seq) {
-                break;
-            }
-            close.state = CloseState::Sealed(attempt);
         }
         let ledger = self.ledger.take();
         if ledger.is_none() && self.needs_next_task() {
@@ -608,61 +462,16 @@ impl StreamCalls {
         Ok(())
     }
 
-    fn match_intent(&mut self, seq: u32) -> Result<(), WFMachinesError> {
-        let Some(close) = self.closes.get_mut(&seq) else {
-            return Ok(());
-        };
-        let Some(intent) = self.held.intents.remove(&seq) else {
-            return Ok(());
-        };
-        let call = CallKey::Close(seq);
-        check_stream(call, &close.stream, intent.r#ref.as_ref())?;
-        if !matches!(close.state, CloseState::Asked) {
-            return Err(second("intent", call));
-        }
-        close.state = CloseState::Sealed(None);
-        Ok(())
-    }
-
-    fn match_result(&mut self, seq: u32) -> Result<(), WFMachinesError> {
-        let Some(close) = self.closes.get_mut(&seq) else {
-            return Ok(());
-        };
-        let Some(entry) = self.held.closes.remove(&seq) else {
-            return Ok(());
-        };
-        if !matches!(close.state, CloseState::Waiting(_)) {
-            return Err(WFMachinesError::Nondeterminism(format!(
-                "History has a result of Stream close {seq} with no intent before it, or a \
-                 second one"
-            )));
-        }
-        close.state = CloseState::Replayed;
-        let at = (activation_of(entry.activation_index), CallKey::Close(seq));
-        self.ready.insert(at, close_job(seq, &entry).into());
-        Ok(())
-    }
-
     /// Returns whether the ledger has room for the first result that waits, if the task is open.
     fn next_result_fits(&self, activation: u64) -> Option<bool> {
-        let call = *self.done.first()?;
+        let CallKey::Append(seq) = *self.done.first()?;
         if !self.task.is_open() {
             return None;
         }
-        match call {
-            CallKey::Append(seq) => {
-                let AppendState::Done(result) = &self.appends[&seq].state else {
-                    return None;
-                };
-                Some(self.ledger.has_room_for(result, activation))
-            }
-            CallKey::Close(seq) => {
-                let CloseState::Done(result) = &self.closes[&seq].state else {
-                    return None;
-                };
-                Some(self.ledger.has_room_for(result, activation))
-            }
-        }
+        let AppendState::Done(result) = &self.appends[&seq].state else {
+            return None;
+        };
+        Some(self.ledger.has_room_for(result, activation))
     }
 
     /// Records a live result in the ledger, and returns its job. Returns `None` if the ledger has
@@ -672,26 +481,14 @@ impl StreamCalls {
         call: CallKey,
         activation: u64,
     ) -> Option<workflow_activation_job::Variant> {
-        match call {
-            CallKey::Append(seq) => {
-                let AppendState::Done(result) = &self.appends[&seq].state else {
-                    return None;
-                };
-                if !self.ledger.append_result(result, activation) {
-                    return None;
-                }
-                Some(append_job(seq, &result.entry).into())
-            }
-            CallKey::Close(seq) => {
-                let CloseState::Done(result) = &self.closes[&seq].state else {
-                    return None;
-                };
-                if !self.ledger.close_result(result, activation) {
-                    return None;
-                }
-                Some(close_job(seq, &result.entry).into())
-            }
+        let CallKey::Append(seq) = call;
+        let AppendState::Done(result) = &self.appends[&seq].state else {
+            return None;
+        };
+        if !self.ledger.append_result(result, activation) {
+            return None;
         }
+        Some(append_job(seq, &result.entry).into())
     }
 
     /// Starts the call at the head of each queue, once the run is live and its task is open. It
@@ -755,21 +552,6 @@ impl StreamCalls {
                     Op::Append(request, request_id),
                 )
             }
-            CallKey::Close(seq) => {
-                let Some(close) = self.closes.get_mut(&seq) else {
-                    return;
-                };
-                let CloseState::Waiting(Some(attempt)) = close.state else {
-                    return;
-                };
-                let call_id = CALL_IDS.fetch_add(1, Ordering::Relaxed);
-                close.state = CloseState::Running(call_id);
-                let request = CloseStreamRequest {
-                    r#ref: Some(close.stream.clone()),
-                    producer: Some(producer(&self.producer, attempt)),
-                };
-                (seq, call_id, &close.stream, Op::Close(request))
-            }
         };
         let call = Call {
             call_id,
@@ -786,9 +568,6 @@ impl StreamCalls {
             CallKey::Append(seq) => (self.appends.remove(&seq))
                 .filter(|append| !matches!(append.state, AppendState::Done(_)))
                 .map(|append| append.stream),
-            CallKey::Close(seq) => (self.closes.remove(&seq))
-                .filter(|close| !matches!(close.state, CloseState::Done(_)))
-                .map(|close| close.stream),
         };
         if let Some(stream) = stream {
             self.leave_queue(&key(&stream), call);
@@ -927,9 +706,7 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
     use temporalio_common::protos::{
-        coresdk::workflow_activation::{
-            ResolveStreamAppend, ResolveStreamClose, resolve_stream_append,
-        },
+        coresdk::workflow_activation::{ResolveStreamAppend, resolve_stream_append},
         temporal::api::sdk::v1::workflow_task_stream_calls::{
             AppendOffsets, CallFailure, append_result,
         },
@@ -985,13 +762,6 @@ mod tests {
         }
     }
 
-    fn close(seq: u32, id: &str) -> CloseStream {
-        CloseStream {
-            seq,
-            stream: Some(stream(id)),
-        }
-    }
-
     fn appended(seq: u32) -> append_result::Result {
         append_result::Result::Appended(AppendOffsets {
             first_offset: vec![seq as u8],
@@ -1027,10 +797,11 @@ mod tests {
         let mut started: Vec<String> = (calls.take_requests().into_iter())
             .map(|request| {
                 let (call, stream, producer) = match request {
-                    Request::Run(Call { seq, op, .. }) => match op {
-                        Op::Append(r, _) => (CallKey::Append(seq), r.r#ref, r.producer),
-                        Op::Close(r) => (CallKey::Close(seq), r.r#ref, r.producer),
-                    },
+                    Request::Run(Call {
+                        seq,
+                        op: Op::Append(r, _),
+                        ..
+                    }) => (CallKey::Append(seq), r.r#ref, r.producer),
                     Request::Stop(_) => return "stop".to_string(),
                 };
                 let Some(Kind::Workflow(workflow)) = producer.unwrap().kind else {
@@ -1047,32 +818,22 @@ mod tests {
     /// Gives a running call its result, a failure with `message` if there is one.
     fn finish(calls: &mut StreamCalls, call: CallKey, message: Option<&str>) {
         let failed = message.map(refused);
-        let (call_id, seq, outcome) = match call {
-            CallKey::Append(seq) => {
-                let AppendState::Running(call_id) = calls.appends[&seq].state else {
-                    panic!("{call} doesn't run");
-                };
-                let result = match failed {
-                    Some(failure) => append_result::Result::Failure(failure),
-                    None => appended(seq),
-                };
-                (call_id, seq, Outcome::Append(result))
-            }
-            CallKey::Close(seq) => {
-                let CloseState::Running(call_id) = calls.closes[&seq].state else {
-                    panic!("{call} doesn't run");
-                };
-                (call_id, seq, Outcome::Close(failed))
-            }
+        let CallKey::Append(seq) = call;
+        let AppendState::Running(call_id) = calls.appends[&seq].state else {
+            panic!("{call} doesn't run");
+        };
+        let result = match failed {
+            Some(failure) => append_result::Result::Failure(failure),
+            None => appended(seq),
         };
         calls.resolve(StreamResolution {
             call_id,
             seq,
-            outcome,
+            outcome: Outcome::Append(result),
         });
     }
 
-    /// Returns the results of the activation at `activation`, as `append 1` or `close 2: <text>`.
+    /// Returns the results of the activation at `activation`, as `append 1` or `append 2: <text>`.
     fn jobs(calls: &mut StreamCalls, activation: u64) -> Vec<String> {
         (calls.take_jobs(activation, None).into_iter())
             .map(|job| match job {
@@ -1081,11 +842,6 @@ mod tests {
                     status: Some(resolve_stream_append::Status::Failed(failure)),
                 }) => format!("append {seq}: {}", failure.message),
                 Variant::ResolveStreamAppend(append) => format!("append {}", append.seq),
-                Variant::ResolveStreamClose(ResolveStreamClose {
-                    seq,
-                    failed: Some(failure),
-                }) => format!("close {seq}: {}", failure.message),
-                Variant::ResolveStreamClose(close) => format!("close {}", close.seq),
                 other => panic!("{other:?}"),
             })
             .collect()
@@ -1093,16 +849,11 @@ mod tests {
 
     /// Returns the key of a call that runs, and the id of its Stream.
     fn target(call: &Call) -> (CallKey, &str) {
-        match &call.op {
-            Op::Append(request, _) => (
-                CallKey::Append(call.seq),
-                &request.r#ref.as_ref().unwrap().id,
-            ),
-            Op::Close(request) => (
-                CallKey::Close(call.seq),
-                &request.r#ref.as_ref().unwrap().id,
-            ),
-        }
+        let Op::Append(request, _) = &call.op;
+        (
+            CallKey::Append(call.seq),
+            &request.r#ref.as_ref().unwrap().id,
+        )
     }
 
     /// Moves the calls that the run starts into `in_flight`, and drops the ones that it stops.
@@ -1117,12 +868,9 @@ mod tests {
 
     /// Returns the Store's answer to `call`, which is `failure` if there is one.
     fn answer(call: &Call, failure: Option<CallFailure>) -> StreamResolution {
-        let outcome = match (&call.op, failure) {
-            (Op::Append(..), None) => Outcome::Append(appended(call.seq)),
-            (Op::Append(..), Some(failure)) => {
-                Outcome::Append(append_result::Result::Failure(failure))
-            }
-            (Op::Close(_), failure) => Outcome::Close(failure),
+        let outcome = match failure {
+            None => Outcome::Append(appended(call.seq)),
+            Some(failure) => Outcome::Append(append_result::Result::Failure(failure)),
         };
         StreamResolution {
             call_id: call.call_id,
@@ -1136,29 +884,15 @@ mod tests {
         let mut calls = calls(Phase::Live, 3);
         calls.append(append(1, "s")).unwrap();
         calls.append(append(2, "s")).unwrap();
-        calls.close(close(1, "s")).unwrap();
         assert_eq!(started(&mut calls), ["append 1 of s at 3"]);
-        // Closes on Streams with long ids fill the ledger, so the last intent waits for task 7.
-        let long = |seq: u32| format!("{seq:02}{}", "s".repeat(4000));
-        for seq in 2..=70 {
-            calls.close(close(seq, &long(seq))).unwrap();
-        }
-        let first = next_task(&mut calls, 7).unwrap();
-        let sealed = first.close_intents.len() as u32;
-        assert!(sealed < 70, "{sealed}");
+        // Append 2 waits in the queue of its Stream past the end of its task.
+        next_task(&mut calls, 7);
         calls.ledger_recorded().unwrap();
+        calls.append(append(3, "s")).unwrap();
         finish(&mut calls, CallKey::Append(1), None);
-        let mut expected = vec!["append 2 of s at 3".to_string()];
-        expected.extend((2..=sealed).map(|seq| format!("close {seq} of {} at 3", long(seq))));
-        expected.sort();
-        assert_eq!(started(&mut calls), expected);
+        assert_eq!(started(&mut calls), ["append 2 of s at 3"]);
         finish(&mut calls, CallKey::Append(2), None);
-        assert_eq!(started(&mut calls), ["close 1 of s at 3"]);
-        next_task(&mut calls, 11).unwrap();
-        calls.ledger_recorded().unwrap();
-        let rest = started(&mut calls);
-        assert_eq!(rest.len(), 70 - sealed as usize);
-        assert!(rest.iter().all(|call| call.ends_with(" at 7")), "{rest:?}");
+        assert_eq!(started(&mut calls), ["append 3 of s at 7"]);
     }
 
     #[test]
@@ -1207,7 +941,6 @@ mod tests {
     #[derive(Clone, Debug)]
     enum Command {
         Append(AppendToStream),
-        Close(CloseStream),
         /// A command that ends the Workflow.
         Terminal,
     }
@@ -1266,7 +999,6 @@ mod tests {
             for command in commands {
                 match command {
                     Command::Append(append) => self.calls.append(append.clone())?,
-                    Command::Close(close) => self.calls.close(close.clone())?,
                     Command::Terminal => {
                         self.calls.stop_for_terminal();
                         self.ended = true;
@@ -1276,11 +1008,9 @@ mod tests {
             Ok(jobs)
         }
 
-        /// Returns the appends and closes that the run still tracks.
+        /// Returns the appends that the run still tracks.
         fn tracked(&self) -> BTreeSet<CallKey> {
-            (self.calls.appends.keys().map(|seq| CallKey::Append(*seq)))
-                .chain(self.calls.closes.keys().map(|seq| CallKey::Close(*seq)))
-                .collect()
+            (self.calls.appends.keys().map(|seq| CallKey::Append(*seq))).collect()
         }
     }
 
@@ -1382,11 +1112,10 @@ mod tests {
         /// the next task.
         deferred: Vec<StreamResolution>,
         last_append: u32,
-        last_close: u32,
         /// The calls whose result no ledger has.
         unresolved: BTreeSet<CallKey>,
         /// The state as of the last task in History, which a failed task goes back to.
-        committed: (u32, u32, BTreeSet<CallKey>),
+        committed: (u32, BTreeSet<CallKey>),
     }
 
     impl<'a> FirstRun<'a> {
@@ -1407,7 +1136,6 @@ mod tests {
                 in_flight: vec![],
                 deferred: vec![],
                 last_append: 0,
-                last_close: 0,
                 unresolved: BTreeSet::new(),
                 committed: Default::default(),
             }
@@ -1537,9 +1265,6 @@ mod tests {
                     Command::Append(append) => {
                         self.unresolved.insert(CallKey::Append(append.seq));
                     }
-                    Command::Close(close) => {
-                        self.unresolved.insert(CallKey::Close(close.seq));
-                    }
                     Command::Terminal => {
                         self.seen.dropped += usize::from(!self.unresolved.is_empty());
                         self.unresolved.clear();
@@ -1562,13 +1287,9 @@ mod tests {
             for _ in 0..self.rng.random_range(0..=3) {
                 let id = format!("s{}", self.rng.random_range(0..3));
                 match self.rng.random_range(0..100) {
-                    0..=44 => {
+                    0..=69 => {
                         self.last_append += 1;
                         commands.push(Command::Append(append(self.last_append, &id)));
-                    }
-                    45..=69 => {
-                        self.last_close += 1;
-                        commands.push(Command::Close(close(self.last_close, &id)));
                     }
                     70..=72 => {
                         self.seen.invalid += 1;
@@ -1592,15 +1313,15 @@ mod tests {
                                 (Command::Append(append(seq, "")), error)
                             }
                             _ => {
-                                self.last_close += 1;
-                                let seq = self.last_close;
-                                let mut long_store = close(seq, &id);
+                                self.last_append += 1;
+                                let seq = self.last_append;
+                                let mut long_store = append(seq, &id);
                                 long_store.stream.as_mut().unwrap().store = long;
                                 let error = format!(
-                                    "Stream close {seq} is invalid: The Store name has 4097 \
+                                    "Stream append {seq} is invalid: The Store name has 4097 \
                                      bytes, more than 4096"
                                 );
-                                (Command::Close(long_store), error)
+                                (Command::Append(long_store), error)
                             }
                         };
                         commands.push(command);
@@ -1608,22 +1329,12 @@ mod tests {
                     }
                     80..=82 => {
                         self.seen.bad_seqs += 1;
-                        let (command, error) = if self.rng.random_bool(0.5) {
-                            let seq = self.last_append;
-                            let error = match seq {
-                                0 => "Stream append has seq 0, and a seq starts at 1".to_string(),
-                                _ => format!("Stream append {seq} came after append {seq}"),
-                            };
-                            (Command::Append(append(seq, &id)), error)
-                        } else {
-                            let seq = self.last_close;
-                            let error = match seq {
-                                0 => "Stream close has seq 0, and a seq starts at 1".to_string(),
-                                _ => format!("Stream close {seq} came after close {seq}"),
-                            };
-                            (Command::Close(close(seq, &id)), error)
+                        let seq = self.last_append;
+                        let error = match seq {
+                            0 => "Stream append has seq 0, and a seq starts at 1".to_string(),
+                            _ => format!("Stream append {seq} came after append {seq}"),
                         };
-                        commands.push(command);
+                        commands.push(Command::Append(append(seq, &id)));
                         return (commands, Some(WFMachinesError::Fatal(error)));
                     }
                     83..=86 => {
@@ -1648,18 +1359,14 @@ mod tests {
         /// Takes a random call in flight, and returns the Store's answer to it.
         fn answer(&mut self) -> StreamResolution {
             let call = (self.in_flight).swap_remove(self.rng.random_range(0..self.in_flight.len()));
-            let failure = match &call.op {
-                Op::Append(request, _) => {
-                    // A large failure fills the ledger in a few dozen results.
-                    let burst = request.r#ref.as_ref().unwrap().id.starts_with('b');
-                    let large = if burst { 8 } else { 1 };
-                    match self.rng.random_range(0..10) {
-                        at if at < large => Some(refused("x".repeat(4000))),
-                        at if at < large + 2 => Some(refused("refused")),
-                        _ => None,
-                    }
-                }
-                Op::Close(_) => self.rng.random_bool(0.3).then(|| refused("refused")),
+            let Op::Append(request, _) = &call.op;
+            // A large failure fills the ledger in a few dozen results.
+            let burst = request.r#ref.as_ref().unwrap().id.starts_with('b');
+            let large = if burst { 8 } else { 1 };
+            let failure = match self.rng.random_range(0..10) {
+                at if at < large => Some(refused("x".repeat(4000))),
+                at if at < large + 2 => Some(refused("refused")),
+                _ => None,
             };
             answer(&call, failure)
         }
@@ -1677,15 +1384,12 @@ mod tests {
                 for append in &entry.append_results {
                     self.unresolved.remove(&CallKey::Append(append.seq as u32));
                 }
-                for close in &entry.close_results {
-                    self.unresolved.remove(&CallKey::Close(close.seq as u32));
-                }
             }
             let mut task = std::mem::take(&mut self.task);
             task.ledger = ledger;
             task.ends_workflow = self.run.ended;
             self.history.push(task);
-            self.committed = (self.last_append, self.last_close, self.unresolved.clone());
+            self.committed = (self.last_append, self.unresolved.clone());
             let seed = self.seed;
             assert_eq!(self.run.tracked(), self.unresolved, "seed {seed}");
             let in_flight = &self.in_flight;
@@ -1721,7 +1425,7 @@ mod tests {
             self.run.calls.stop();
             self.in_flight.clear();
             self.deferred.clear();
-            (self.last_append, self.last_close, self.unresolved) = self.committed.clone();
+            (self.last_append, self.unresolved) = self.committed.clone();
             self.task = Task::default();
             self.task_attempt.attempt += 1;
             self.run = self.check_replay(self.task_attempt);
@@ -1745,21 +1449,19 @@ mod tests {
             assert_eq!(run.tracked(), self.unresolved, "seed {seed}");
             let recorded: BTreeSet<CallKey> = (self.history.iter())
                 .filter_map(|task| task.ledger.as_ref())
-                .flat_map(|ledger| {
-                    let appends = ledger.append_results.iter();
-                    let closes = ledger.close_results.iter();
-                    (appends.map(|append| CallKey::Append(append.seq as u32)))
-                        .chain(closes.map(|close| CallKey::Close(close.seq as u32)))
-                })
+                .flat_map(|ledger| ledger.append_results.iter())
+                .map(|append| CallKey::Append(append.seq as u32))
                 .collect();
             for request in run.calls.take_requests() {
-                let Request::Run(Call { seq, op, .. }) = &request else {
+                let Request::Run(Call {
+                    seq,
+                    op: Op::Append(append, _),
+                    ..
+                }) = &request
+                else {
                     panic!("seed {seed}: {request:?}");
                 };
-                let (key, sent) = match op {
-                    Op::Append(append, _) => (CallKey::Append(*seq), &append.producer),
-                    Op::Close(close) => (CallKey::Close(*seq), &close.producer),
-                };
+                let (key, sent) = (CallKey::Append(*seq), &append.producer);
                 assert!(!recorded.contains(&key), "seed {seed}: {key} ran again");
                 let expected = producer(&run.calls.producer, live);
                 assert_eq!(*sent, Some(expected), "seed {seed}");
@@ -1807,26 +1509,21 @@ mod tests {
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
             let mut calls = calls(Phase::Live, 3);
-            // The calls of each Stream that have no result yet, in the order that they joined its
-            // queue. An append joins at its command, and a close once History has its intent.
+            // The calls of each Stream that have no result yet, in the order of their commands.
             let mut queues: BTreeMap<String, VecDeque<CallKey>> = BTreeMap::new();
             let mut in_flight: Vec<Call> = vec![];
-            let (mut appends, mut closes, mut task, mut ended) = (0, 0, 3, false);
+            let (mut appends, mut task, mut ended) = (0, 3, false);
             for _ in 0..60 {
                 let id = format!("s{}", rng.random_range(0..4));
                 match rng.random_range(0..20) {
                     _ if ended => {}
-                    0..=11 => {
+                    0..=15 => {
                         appends += 1;
                         calls.append(append(appends, &id)).unwrap();
                         queues
                             .entry(id)
                             .or_default()
                             .push_back(CallKey::Append(appends));
-                    }
-                    12..=15 => {
-                        closes += 1;
-                        calls.close(close(closes, &id)).unwrap();
                     }
                     16 => {
                         // The last command of the Workflow stops each call.
@@ -1838,14 +1535,8 @@ mod tests {
                 }
                 if rng.random_bool(0.15) {
                     task += 4;
-                    if let Some(ledger) = next_task(&mut calls, task) {
+                    if next_task(&mut calls, task).is_some() {
                         calls.ledger_recorded().unwrap();
-                        for intent in &ledger.close_intents {
-                            queues
-                                .entry(intent.r#ref.as_ref().unwrap().id.clone())
-                                .or_default()
-                                .push_back(CallKey::Close(intent.seq as u32));
-                        }
                     }
                 }
                 dispatch(&mut calls, &mut in_flight);
@@ -1880,13 +1571,12 @@ mod tests {
     fn key_of(job: &Variant) -> CallKey {
         match job {
             Variant::ResolveStreamAppend(append) => CallKey::Append(append.seq),
-            Variant::ResolveStreamClose(close) => CallKey::Close(close.seq),
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn each_result_and_intent_is_in_exactly_one_ledger_in_order() {
+    fn each_result_is_in_exactly_one_ledger_in_order() {
         let (mut full, mut oversized, mut out_of_order) = (0, 0, 0);
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
@@ -1899,36 +1589,31 @@ mod tests {
             let mut calls = StreamCalls::new("n", "w", "r", runtimes, Phase::Live, true);
             calls.set_task(TaskState::Open(task_attempt(3)));
             let budget = rng.random_range(1..=150);
-            let (mut appends, mut closes) = (0, 0);
+            let mut appends = 0;
             let mut in_flight: Vec<Call> = vec![];
             // The results that Core took in each task, in order, with their activation.
             let mut taken: Vec<Vec<(u64, CallKey)>> = vec![vec![]];
             let mut ledgers = vec![];
             let (mut activation, mut task) = (0, 3);
-            // The highest seq of each kind that Core took so far.
-            let mut highest = (0, 0);
+            // The highest seq that Core took so far.
+            let mut highest = 0;
             for round in 0.. {
                 assert!(round < 100_000, "seed {seed}: the run never ends");
                 // Most calls share a few Streams, so they wait in a queue. The others have a
                 // Stream of their own, whose long id fills a ledger sooner.
                 for _ in 0..rng.random_range(0..=4) {
-                    if appends + closes == budget {
+                    if appends == budget {
                         break;
                     }
                     let id = match rng.random_bool(0.6) {
                         true => format!("s{}", rng.random_range(0..4)),
                         false => {
                             let long = "a".repeat(rng.random_range(0..3000));
-                            format!("own{}{long}", appends + closes)
+                            format!("own{appends}{long}")
                         }
                     };
-                    if rng.random_bool(0.7) {
-                        appends += 1;
-                        calls.append(append(appends, &id)).unwrap();
-                    } else {
-                        closes += 1;
-                        calls.close(close(closes, &id)).unwrap();
-                    }
+                    appends += 1;
+                    calls.append(append(appends, &id)).unwrap();
                 }
                 dispatch(&mut calls, &mut in_flight);
                 // The Store answers some of the calls in flight, in any order. Most of them fail
@@ -1965,13 +1650,9 @@ mod tests {
                     assert_eq!(calls.must_complete(activation), waits, "seed {seed}");
                     full += usize::from(waits);
                 }
-                for call in &waiting[..took] {
-                    let (seq, high) = match call {
-                        CallKey::Append(seq) => (*seq, &mut highest.0),
-                        CallKey::Close(seq) => (*seq, &mut highest.1),
-                    };
-                    out_of_order += usize::from(seq < *high);
-                    *high = seq.max(*high);
+                for CallKey::Append(seq) in &waiting[..took] {
+                    out_of_order += usize::from(*seq < highest);
+                    highest = highest.max(*seq);
                 }
                 let entries = taken.last_mut().unwrap();
                 entries.extend(waiting[..took].iter().map(|call| (activation, *call)));
@@ -1980,7 +1661,7 @@ mod tests {
                     continue;
                 }
                 // A full ledger completes the task, and so does a heartbeat at any time.
-                let finished = appends + closes == budget && !calls.needs_next_task();
+                let finished = appends == budget && !calls.needs_next_task();
                 if finished || calls.must_complete(activation) || rng.random_bool(0.03) {
                     task += 4;
                     let ledger = next_task(&mut calls, task);
@@ -1996,54 +1677,25 @@ mod tests {
                 }
             }
             // Each ledger records the results of its task in the order that Core took them, with
-            // their activations. The appends come first, then the closes.
+            // their activations.
             for (index, ledger) in ledgers.iter().enumerate() {
-                let appends = ledger.append_results.iter();
-                let closes = ledger.close_results.iter();
-                let recorded: Vec<(u64, CallKey)> = (appends)
+                let recorded: Vec<(u64, CallKey)> = (ledger.append_results.iter())
                     .map(|a| {
                         (
                             activation_of(a.activation_index),
                             CallKey::Append(a.seq as u32),
                         )
                     })
-                    .chain(closes.map(|c| {
-                        (
-                            activation_of(c.activation_index),
-                            CallKey::Close(c.seq as u32),
-                        )
-                    }))
                     .collect();
-                let mut expected = taken[index].clone();
-                expected.sort_by_key(|(_, call)| matches!(call, CallKey::Close(_)));
-                assert_eq!(recorded, expected, "seed {seed}: task {index}");
+                assert_eq!(recorded, taken[index], "seed {seed}: task {index}");
             }
-            let once = |seqs: Vec<u32>, count: u32| {
-                let mut sorted = seqs.clone();
-                sorted.sort_unstable();
-                assert_eq!(
-                    sorted,
-                    (1..=count).collect::<Vec<_>>(),
-                    "seed {seed}: {seqs:?}"
-                );
-            };
-            let all = |seqs: &dyn Fn(&WorkflowTaskStreamCalls) -> Vec<u32>| -> Vec<u32> {
-                ledgers.iter().flat_map(seqs).collect()
-            };
-            once(
-                all(&|m| m.append_results.iter().map(|a| a.seq as u32).collect()),
-                appends,
-            );
-            once(
-                all(&|m| m.close_results.iter().map(|c| c.seq as u32).collect()),
-                closes,
-            );
-            let intents = all(&|m| m.close_intents.iter().map(|i| i.seq as u32).collect());
-            assert_eq!(intents, (1..=closes).collect::<Vec<_>>(), "seed {seed}");
+            let mut seqs: Vec<u32> = (ledgers.iter())
+                .flat_map(|ledger| ledger.append_results.iter().map(|a| a.seq as u32))
+                .collect();
+            seqs.sort_unstable();
+            assert_eq!(seqs, (1..=appends).collect::<Vec<_>>(), "seed {seed}");
             for ledger in &ledgers {
-                let entries = ledger.append_results.len()
-                    + ledger.close_intents.len()
-                    + ledger.close_results.len();
+                let entries = ledger.append_results.len();
                 // The bound of the entries is on the encoded ledger.
                 let size = ledger.encoded_len();
                 assert!(size <= max_entry || entries == 1, "seed {seed}: {size}");
@@ -2069,8 +1721,6 @@ mod tests {
         Twice,
         /// History has an entry for a seq that no command has.
         Seq,
-        /// History has an entry as the other kind of call.
-        Kind,
         /// History has an entry at another activation.
         Activation,
     }
@@ -2080,10 +1730,8 @@ mod tests {
         let entries: Vec<(usize, CallKey)> = (history.iter().enumerate())
             .filter_map(|(index, task)| Some((index, task.ledger.as_ref()?)))
             .flat_map(|(index, ledger)| {
-                let appends = ledger.append_results.iter();
-                let closes = ledger.close_results.iter();
-                (appends.map(move |append| (index, CallKey::Append(append.seq as u32))))
-                    .chain(closes.map(move |close| (index, CallKey::Close(close.seq as u32))))
+                (ledger.append_results.iter())
+                    .map(move |append| (index, CallKey::Append(append.seq as u32)))
             })
             .collect();
         if entries.is_empty() {
@@ -2095,9 +1743,8 @@ mod tests {
             Change::Missing,
             Change::Twice,
             Change::Seq,
-            Change::Kind,
             Change::Activation,
-        ][rng.random_range(0..6)];
+        ][rng.random_range(0..5)];
         if let Change::Stream | Change::Missing = change {
             let commands = (history.iter_mut())
                 .flat_map(|task| task.activations.iter_mut())
@@ -2111,54 +1758,23 @@ mod tests {
                     commands.remove(at);
                 }
                 (_, Command::Append(append)) => append.stream.as_mut().unwrap().id.push('!'),
-                (_, Command::Close(close)) => close.stream.as_mut().unwrap().id.push('!'),
                 (_, Command::Terminal) => return None,
             }
             return Some(change);
         }
         let ledger = history[task].ledger.as_mut().unwrap();
-        match call {
-            CallKey::Append(seq) => {
-                let at = ledger
-                    .append_results
-                    .iter()
-                    .position(|append| append.seq == seq as i32)?;
-                match change {
-                    Change::Twice => ledger
-                        .append_results
-                        .push(ledger.append_results[at].clone()),
-                    Change::Seq => ledger.append_results[at].seq = 999,
-                    Change::Activation => ledger.append_results[at].activation_index += 1,
-                    _ => {
-                        let entry = ledger.append_results.remove(at);
-                        ledger.close_results.push(CloseResult {
-                            seq: seq as i32,
-                            failure: None,
-                            activation_index: entry.activation_index,
-                        });
-                    }
-                }
-            }
-            CallKey::Close(seq) => {
-                let at = ledger
-                    .close_results
-                    .iter()
-                    .position(|close| close.seq == seq as i32)?;
-                match change {
-                    Change::Twice => ledger.close_results.push(ledger.close_results[at].clone()),
-                    Change::Seq => ledger.close_results[at].seq = 999,
-                    Change::Activation => ledger.close_results[at].activation_index += 1,
-                    _ => {
-                        let entry = ledger.close_results.remove(at);
-                        ledger.append_results.push(AppendResult {
-                            seq: seq as i32,
-                            r#ref: Some(stream("s0")),
-                            result: Some(append_result::Result::Appended(Default::default())),
-                            activation_index: entry.activation_index,
-                        });
-                    }
-                }
-            }
+        let CallKey::Append(seq) = call;
+        let at = ledger
+            .append_results
+            .iter()
+            .position(|append| append.seq == seq as i32)?;
+        match change {
+            Change::Twice => ledger
+                .append_results
+                .push(ledger.append_results[at].clone()),
+            Change::Seq => ledger.append_results[at].seq = 999,
+            Change::Activation => ledger.append_results[at].activation_index += 1,
+            Change::Stream | Change::Missing => unreachable!("Handled above"),
         }
         Some(change)
     }
@@ -2166,8 +1782,7 @@ mod tests {
     fn is_command_of(command: &Command, call: CallKey) -> bool {
         match (command, call) {
             (Command::Append(append), CallKey::Append(seq)) => append.seq == seq,
-            (Command::Close(close), CallKey::Close(seq)) => close.seq == seq,
-            _ => false,
+            (Command::Terminal, _) => false,
         }
     }
 
@@ -2187,9 +1802,9 @@ mod tests {
             let first_jobs: Vec<_> = first.history.iter().map(Task::jobs).collect();
             match replay(seed, &history, task_attempt(1000)) {
                 Err(WFMachinesError::Nondeterminism(_)) => {}
-                // An entry at another activation, or of the other kind, can match a call. Then
-                // Workflow code gets other jobs, which is as wrong as an error.
-                Ok(replayed) if matches!(change, Change::Activation | Change::Kind) => {
+                // An entry at another activation can match a call. Then Workflow code gets other
+                // jobs, which is as wrong as an error.
+                Ok(replayed) if change == Change::Activation => {
                     assert_ne!(replayed.jobs, first_jobs, "seed {seed}: {change:?}");
                 }
                 other => panic!("seed {seed}: {change:?}: {:?}", other.map(|r| r.jobs)),
@@ -2230,7 +1845,7 @@ mod tests {
             with_no_ledger += usize::from(!keeps_ledgers && phase != Phase::ReplayOnly);
             let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), phase, keeps_ledgers);
             calls.set_task(TaskState::Open(task_attempt(3)));
-            let (mut appends, mut closes) = (0, 0);
+            let mut appends = 0;
             let (mut unserved, mut store_of) = (BTreeMap::new(), HashMap::new());
             for index in 0..rng.random_range(1..=6) {
                 let store = stores[rng.random_range(0..3)];
@@ -2239,22 +1854,13 @@ mod tests {
                     store: store.to_string(),
                 };
                 store_of.insert(stream.id.clone(), store);
-                let (call, result) = if rng.random_bool(0.5) {
-                    appends += 1;
-                    let command = AppendToStream {
-                        seq: appends,
-                        stream: Some(stream),
-                        bodies: vec![Payload::default()],
-                    };
-                    (CallKey::Append(appends), calls.append(command))
-                } else {
-                    closes += 1;
-                    let command = CloseStream {
-                        seq: closes,
-                        stream: Some(stream),
-                    };
-                    (CallKey::Close(closes), calls.close(command))
+                appends += 1;
+                let command = AppendToStream {
+                    seq: appends,
+                    stream: Some(stream),
+                    bodies: vec![Payload::default()],
                 };
+                let result = calls.append(command);
                 let error = WFMachinesError::Stream(format!(
                     "This Worker has no Stream runtime for the Store `{store}`"
                 ));
@@ -2263,30 +1869,25 @@ mod tests {
                     // The command fails the task, so the run records nothing of the call.
                     let error = if keeps_ledgers { error } else { no_ledger() };
                     assert_eq!(result, Err(error), "seed {seed}");
-                    let tracked = match call {
-                        CallKey::Append(seq) => calls.appends.contains_key(&seq),
-                        CallKey::Close(seq) => calls.closes.contains_key(&seq),
-                    };
-                    assert!(!tracked, "seed {seed}");
+                    assert!(!calls.appends.contains_key(&appends), "seed {seed}");
                     break;
                 }
                 assert_eq!(result, Ok(()), "seed {seed}");
                 if !is_served {
-                    unserved.insert(call, error);
+                    unserved.insert(appends, error);
                 }
             }
-            let ledger = calls.take_ledger().unwrap_or_default();
+            calls.take_ledger();
             calls.ledger_recorded().unwrap();
             let mut sent = calls.take_requests();
             let at_go_live = calls.go_live();
             sent.extend(calls.take_requests());
-            // No call on a Store with no runtime records an intent or reaches a Store.
-            let streams: Vec<&str> = (ledger.close_intents.iter())
-                .map(|intent| intent.r#ref.as_ref().unwrap().store.as_str())
-                .chain(sent.iter().map(|request| match request {
+            // No call on a Store with no runtime reaches a Store.
+            let streams: Vec<&str> = (sent.iter())
+                .map(|request| match request {
                     Request::Run(call) => call.store.as_str(),
                     Request::Stop(_) => panic!("seed {seed}"),
-                }))
+                })
                 .collect();
             assert!(
                 (streams.iter()).all(|store| served.iter().any(|(name, _)| name == store)),
@@ -2296,9 +1897,7 @@ mod tests {
             // whose result History can't keep, which a replay Worker never does.
             let expected = match (phase, unserved.into_values().next()) {
                 (Phase::Replaying, Some(error)) => Err(error),
-                (Phase::Replaying, None) if !keeps_ledgers && appends + closes > 0 => {
-                    Err(no_ledger())
-                }
+                (Phase::Replaying, None) if !keeps_ledgers && appends > 0 => Err(no_ledger()),
                 _ => Ok(()),
             };
             assert_eq!(at_go_live, expected, "seed {seed}");
@@ -2310,10 +1909,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             for (name, store) in &served {
                 for request in store.requests() {
-                    let id = match request {
-                        StoreRequest::Append(append, _) => append.r#ref.unwrap().id,
-                        StoreRequest::Close(close) => close.r#ref.unwrap().id,
+                    let StoreRequest::Append(append, _) = request else {
+                        panic!("seed {seed}: {request:?}");
                     };
+                    let id = append.r#ref.unwrap().id;
                     assert_eq!(store_of[&id], *name, "seed {seed}: Stream {id}");
                 }
             }

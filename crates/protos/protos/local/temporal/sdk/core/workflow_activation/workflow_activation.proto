@@ -50,8 +50,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * Stream results go after the local activity resolutions, because a replay scans ahead for them
-//  too. Appends go before closes, each in `seq` order. If a replay gives several activations in
-//  one, the Stream results keep the order of those activations.
+//  too. They are in `seq` order. If a replay gives several activations in one, the Stream results
+//  keep the order of those activations.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -153,8 +153,6 @@ message WorkflowActivationJob {
         ResolveNexusOperation resolve_nexus_operation = 16;
         // An append to a Stream finished.
         ResolveStreamAppend resolve_stream_append = 18;
-        // A close of a Stream finished.
-        ResolveStreamClose resolve_stream_close = 19;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -464,13 +462,4 @@ message ResolveStreamAppend {
 message StreamAppended {
     bytes first_offset = 1;
     bytes last_offset = 2;
-}
-
-// The result of a `CloseStream`. The activation rules of `ResolveStreamAppend` apply to it too.
-message ResolveStreamClose {
-    // The `seq` of the `CloseStream`.
-    uint32 seq = 1;
-    // Unset if the Stream is closed, also when it was already closed. When set, it has the same
-    // parts as the `failed` of a `ResolveStreamAppend`.
-    temporal.api.failure.v1.Failure failed = 2;
 }

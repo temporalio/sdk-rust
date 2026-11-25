@@ -28,12 +28,12 @@ use temporalio_common::protos::{
         activity_result::ActivityExecutionResult,
         activity_task::activity_task,
         workflow_activation::{
-            ResolveStreamAppend, ResolveStreamClose, StreamAppended, WorkflowActivation,
+            ResolveStreamAppend, StreamAppended, WorkflowActivation,
             remove_from_cache::EvictionReason, resolve_stream_append,
             workflow_activation_job::Variant as Job,
         },
         workflow_commands::{
-            AppendToStream, CancelWorkflowExecution, CloseStream, CompleteWorkflowExecution,
+            AppendToStream, CancelWorkflowExecution, CompleteWorkflowExecution,
             ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
             ScheduleLocalActivity, StartTimer, UpdateResponse, query_result, update_response,
             workflow_command::Variant as Command,
@@ -49,9 +49,7 @@ use temporalio_common::protos::{
         query::v1::WorkflowQuery,
         sdk::v1::{
             WorkflowTaskStreamCalls,
-            workflow_task_stream_calls::{
-                AppendOffsets, AppendResult, CloseIntent, CloseResult, append_result,
-            },
+            workflow_task_stream_calls::{AppendOffsets, AppendResult, append_result},
         },
         workflowservice::v1::{
             PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
@@ -351,17 +349,6 @@ fn complete_with_ledger(t: &mut TestHistoryBuilder, data: &WorkflowTaskStreamCal
     t.set_stream_calls_last_wft(data.clone());
 }
 
-/// Returns the ledger of a task that asked for close 1 of the Stream `stream_id`.
-fn close_intent(stream_id: &str) -> WorkflowTaskStreamCalls {
-    WorkflowTaskStreamCalls {
-        close_intents: vec![CloseIntent {
-            seq: 1,
-            r#ref: Some(stream(stream_id)),
-        }],
-        ..Default::default()
-    }
-}
-
 /// Adds the events of a completion that the server took to `history`.
 fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) {
     history.add_workflow_task_completed();
@@ -493,14 +480,6 @@ fn append(seq: u32, id: &str) -> Command {
     .into()
 }
 
-fn close(seq: u32, id: &str) -> Command {
-    CloseStream {
-        seq,
-        stream: Some(stream(id)),
-    }
-    .into()
-}
-
 fn complete() -> Command {
     CompleteWorkflowExecution { result: None }.into()
 }
@@ -588,62 +567,6 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_ledger() {
     changed.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-#[rstest::rstest]
-#[case::the_server_takes_it(None)]
-#[case::a_failed_task(Some(1))]
-#[case::a_refused_completion(Some(2))]
-#[tokio::test]
-async fn a_close_takes_effect_only_after_the_server_took_its_task(#[case] failure: Option<u8>) {
-    let store = store(&["c", "s"]).await;
-    let closes = |store: &MemoryStore| {
-        let closes = (store.requests().into_iter()).filter(|r| matches!(r, Request::Close(_)));
-        closes.count()
-    };
-    let mut opts = StartOpts::new(&store);
-    let watched = store.clone();
-    opts.served = Some(Box::new(move |_, t| {
-        let ran = closes(&watched);
-        assert_eq!(ran, 0, "The close ran before the server took its task");
-        Some(next_task(t))
-    }));
-    opts.fails = usize::from(failure == Some(1));
-    opts.refuse = (failure == Some(2)).then_some(1);
-    let run = start(history(Duration::from_secs(60)), opts);
-    let first = run.worker.poll_workflow_activation().await.unwrap();
-    // The result of the append gives a second activation of the task.
-    let commands = vec![close(1, "c"), append(1, "s")];
-    let completion = WorkflowActivationCompletion::from_cmds(first.run_id.clone(), commands);
-    run.worker
-        .complete_workflow_activation(completion)
-        .await
-        .unwrap();
-    let appended = run.worker.poll_workflow_activation().await.unwrap();
-    assert!(resolves_append(&appended, 1), "{appended:?}");
-    let completion = match failure {
-        Some(1) => WorkflowActivationCompletion::fail(appended.run_id, "boom".into(), None),
-        _ => WorkflowActivationCompletion::empty(appended.run_id),
-    };
-    run.worker
-        .complete_workflow_activation(completion)
-        .await
-        .unwrap();
-    let rest = run.drive(|_| vec![complete()]).await;
-    if failure.is_none() {
-        let closed = ResolveStreamClose {
-            seq: 1,
-            failed: None,
-        };
-        assert_eq!(rest, [[Job::ResolveStreamClose(closed)]]);
-        let ledger = ledger(&run.sent()[0]).unwrap();
-        assert_eq!(ledger.close_intents, close_intent("c").close_intents);
-    } else {
-        assert_eq!(rest, Vec::<Vec<Job>>::new());
-        assert_eq!(closes(&store), 0);
-    }
-    run.worker.drain_pollers_and_shutdown_ref().await;
-    assert_eq!(store.is_closed("c"), failure.is_none());
-}
-
 /// The state of a call when Workflow code sends its last command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AtTheEnd {
@@ -654,10 +577,8 @@ enum AtTheEnd {
     Answered,
     /// The Store has the request, and gave no answer.
     Runs,
-    /// The close waits behind a close of its Stream that runs.
+    /// The append waits behind an append of its Stream that runs.
     Waits,
-    /// Workflow code asked for the close in the last task, so History has no intent of it.
-    Asked,
     /// The call is in the completion that has the last command.
     WithTheCommand,
 }
@@ -674,7 +595,6 @@ enum End {
 
 #[derive(Clone, Debug)]
 struct EndingCall {
-    op: Op,
     seq: u32,
     stream: String,
     state: AtTheEnd,
@@ -682,10 +602,7 @@ struct EndingCall {
 
 impl EndingCall {
     fn command(&self) -> Command {
-        match self.op {
-            Op::Append => append(self.seq, &self.stream),
-            Op::Close => close(self.seq, &self.stream),
-        }
+        append(self.seq, &self.stream)
     }
 
     fn reaches_the_store(&self) -> bool {
@@ -694,13 +611,13 @@ impl EndingCall {
     }
 }
 
-/// A Workflow that ends in task 2 while it has Stream calls. Task 1 asked for the closes whose
-/// intents History has, and a Signal starts task 2.
+/// A Workflow that ends in task 2 while it has Stream calls, and a Signal starts task 2. Task 1
+/// appended with no result in History, so its appends run again in task 2.
 #[derive(Debug)]
 struct Ending {
     end: End,
     calls: Vec<EndingCall>,
-    /// The number of the closes that task 1 asked for. They're the first closes.
+    /// The number of the appends of task 1. They're the first appends.
     in_history: usize,
     /// The indexes of the calls whose results Workflow code takes, in the order of their results.
     taken: Vec<usize>,
@@ -719,32 +636,28 @@ impl Ending {
             End::CoreFails,
         ][rng.random_range(0..5)];
         let mut calls: Vec<EndingCall> = vec![];
-        // Adds a call with the next seq of its kind, on a Stream that no other call has.
-        let add = |calls: &mut Vec<EndingCall>, op: Op, state| {
-            let seq = calls.iter().filter(|call| call.op == op).count() as u32 + 1;
+        // Adds a call with the next seq, on a Stream that no other call has.
+        let add = |calls: &mut Vec<EndingCall>, state| {
+            let seq = calls.len() as u32 + 1;
             calls.push(EndingCall {
-                op,
                 seq,
-                stream: format!("{op:?}{seq}"),
+                stream: format!("s{seq}"),
                 state,
             });
         };
         for _ in 0..rng.random_range(0..=3) {
             let state = [Taken, Answered, Runs][rng.random_range(0..3)];
-            add(&mut calls, Op::Close, state);
+            add(&mut calls, state);
             if state == Runs && rng.random_bool(0.5) {
                 let ahead = calls.last().unwrap().stream.clone();
-                add(&mut calls, Op::Close, Waits);
+                add(&mut calls, Waits);
                 calls.last_mut().unwrap().stream = ahead;
             }
         }
         let in_history = calls.len();
-        for _ in 0..rng.random_range(0..=2) {
-            add(&mut calls, Op::Close, Asked);
-        }
         for _ in 0..rng.random_range(0..=3) {
             let state = [Taken, Answered, Runs][rng.random_range(0..3)];
-            add(&mut calls, Op::Append, state);
+            add(&mut calls, state);
         }
         // With no result to take, the Signal's activation is the last one.
         if calls.iter().all(|call| call.state != Taken) {
@@ -753,8 +666,7 @@ impl Ending {
             }
         }
         for _ in 0..rng.random_range(0..=2) {
-            let op = [Op::Append, Op::Close][rng.random_range(0..2)];
-            add(&mut calls, op, WithTheCommand);
+            add(&mut calls, WithTheCommand);
         }
         // A failed completion has no command.
         if end == End::CoreFails {
@@ -784,19 +696,7 @@ impl Ending {
     /// Returns the History up to task 2.
     fn history(&self, task_timeout: Duration) -> TestHistoryBuilder {
         let mut t = history(task_timeout);
-        let closes = &self.calls[..self.in_history];
-        let mut intents = WorkflowTaskStreamCalls::default();
-        for close in closes {
-            intents.close_intents.push(CloseIntent {
-                seq: close.seq as i32,
-                r#ref: Some(stream(&close.stream)),
-            });
-        }
-        if closes.is_empty() {
-            t.add_workflow_task_completed();
-        } else {
-            complete_with_ledger(&mut t, &intents);
-        }
+        t.add_workflow_task_completed();
         t.add_we_signaled("go", vec![]);
         if self.end == End::Cancel {
             t.add_cancel_requested();
@@ -811,8 +711,8 @@ impl Ending {
         use AtTheEnd::*;
         let mut commands = vec![];
         if number == 0 {
-            let closes = &self.calls[..self.in_history];
-            return closes.iter().map(EndingCall::command).collect();
+            let first = &self.calls[..self.in_history];
+            return first.iter().map(EndingCall::command).collect();
         }
         if number == 1 {
             let sent =
@@ -848,24 +748,26 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
     for seed in 0..40 {
         let _seed = SeedOnPanic(seed);
         let ending = Ending::generate(&mut StdRng::seed_from_u64(seed));
-        seen.extend(ending.calls.iter().map(|call| (call.op, call.state as u8)));
+        seen.extend(ending.calls.iter().map(|call| call.state as u8));
         let ids: Vec<&str> = (ending.calls.iter())
             .map(|call| call.stream.as_str())
             .collect();
         let store = store(&ids).await;
-        // In the first seed whose closes of History all run, their Store is down, and the heartbeat
-        // of the task fires while its last activation is outstanding.
-        let closes = &ending.calls[..ending.in_history];
-        let run_only = closes.iter().all(|call| matches!(call.state, Runs | Waits));
-        let down = !had_outage && !closes.is_empty() && run_only;
+        // In the first seed whose calls that reach the Store are all appends of task 1 that run,
+        // the Store is down, and the heartbeat of the task fires while its last activation is
+        // outstanding.
+        let (first, rest) = ending.calls.split_at(ending.in_history);
+        let run_only = first.iter().all(|call| matches!(call.state, Runs | Waits))
+            && rest.iter().all(|call| call.state == WithTheCommand);
+        let down = !had_outage && !first.is_empty() && run_only;
         had_outage |= down;
-        let in_outage = |id: &&&str| down && closes.iter().any(|close| close.stream == **id);
-        for id in ids.iter().filter(|id| !in_outage(id)) {
-            store.hold_stream(id);
-        }
         if down {
             let error = StreamError::store_unavailable("The Store is down");
-            store.fail(Op::Close, error, usize::MAX);
+            store.fail(Op::Append, error, usize::MAX);
+        } else {
+            for id in &ids {
+                store.hold_stream(id);
+            }
         }
         let mut opts = StartOpts::new(&store);
         opts.served = None;
@@ -927,18 +829,10 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
         worker.drain_pollers_and_shutdown_ref().await;
 
         // The completion has the results that Workflow code took, and then the last command. It
-        // has no intent of a close, and forces no task.
+        // forces no task.
         let mut expected = WorkflowTaskStreamCalls::default();
         for (activation, at) in (1..).zip(&ending.taken) {
             let call = &ending.calls[*at];
-            if call.op == Op::Close {
-                expected.close_results.push(CloseResult {
-                    seq: call.seq as i32,
-                    failure: None,
-                    activation_index: activation,
-                });
-                continue;
-            }
             let offset = store.records(&call.stream)[0].offset.clone();
             let offsets = AppendOffsets {
                 first_offset: offset.clone(),
@@ -966,10 +860,10 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
         assert!(!sent[0].force_create_new_workflow_task, "seed {seed}");
 
         // No Store call starts after the last command, and a call with no answer writes nothing.
-        // A call reaches the Store once, but for a close in an outage, which tries again.
-        let mut reached: Vec<(Op, String)> = (ending.calls.iter())
+        // A call reaches the Store once, but for an append in an outage, which tries again.
+        let mut reached: Vec<String> = (ending.calls.iter())
             .filter(|call| call.reaches_the_store())
-            .map(|call| (call.op, call.stream.clone()))
+            .map(|call| call.stream.clone())
             .collect();
         reached.sort();
         assert_eq!(calls_at(&store), reached, "seed {seed}: {ending:?}");
@@ -992,21 +886,17 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
         assert_eq!(replayed, live, "seed {seed}: {ending:?}");
     }
     assert!(had_outage);
-    // The seeds reach each state of a call, for an append and for a close.
-    let states = [Taken, Answered, Runs, WithTheCommand];
-    let mut expected: HashSet<(Op, u8)> = (states.iter())
-        .flat_map(|state| [(Op::Append, *state as u8), (Op::Close, *state as u8)])
-        .collect();
-    expected.extend([(Op::Close, Waits as u8), (Op::Close, Asked as u8)]);
-    assert_eq!(seen, expected);
+    // The seeds reach each state of a call.
+    let states = [Taken, Answered, Runs, Waits, WithTheCommand];
+    assert_eq!(seen, states.iter().map(|state| *state as u8).collect());
 }
 
-/// Returns the kind and the Stream of each call that reached the Store, once for each call.
-fn calls_at(store: &MemoryStore) -> Vec<(Op, String)> {
-    let mut calls: Vec<(Op, String)> = (store.requests().into_iter())
+/// Returns the Stream of each call that reached the Store, once for each call.
+fn calls_at(store: &MemoryStore) -> Vec<String> {
+    let mut calls: Vec<String> = (store.requests().into_iter())
         .map(|request| match request {
-            Request::Append(append, _) => (Op::Append, append.r#ref.unwrap().id),
-            Request::Close(close) => (Op::Close, close.r#ref.unwrap().id),
+            Request::Append(append, _) => append.r#ref.unwrap().id,
+            Request::Close(close) => panic!("{close:?}"),
         })
         .collect();
     calls.sort();
@@ -1015,10 +905,7 @@ fn calls_at(store: &MemoryStore) -> Vec<(Op, String)> {
 }
 
 fn written(store: &MemoryStore, call: &EndingCall) -> bool {
-    match call.op {
-        Op::Append => !store.records(&call.stream).is_empty(),
-        Op::Close => store.is_closed(&call.stream),
-    }
+    !store.records(&call.stream).is_empty()
 }
 
 fn fast_tries(wc: &mut WorkerConfig) {
@@ -1032,34 +919,31 @@ fn fast_tries(wc: &mut WorkerConfig) {
 
 #[derive(Clone, Copy, Debug)]
 enum Outage {
-    AppendFails,
-    AppendGetsNoAnswer,
-    CloseFails,
-    AppendFailsWithNoLocalActivityManager,
+    Fails,
+    GetsNoAnswer,
+    FailsWithNoLocalActivityManager,
     /// The task fails on two attempts. Core reports the failure of a task only on its first
     /// attempt, so the server learns of the second one by the task timeout.
-    AppendFailsOnALaterAttempt,
+    FailsOnALaterAttempt,
 }
 
 #[rstest::rstest]
-#[case(Outage::AppendFails)]
-#[case(Outage::AppendGetsNoAnswer)]
-#[case(Outage::CloseFails)]
-#[case(Outage::AppendFailsWithNoLocalActivityManager)]
-#[case(Outage::AppendFailsOnALaterAttempt)]
+#[case(Outage::Fails)]
+#[case(Outage::GetsNoAnswer)]
+#[case(Outage::FailsWithNoLocalActivityManager)]
+#[case(Outage::FailsOnALaterAttempt)]
 #[tokio::test]
 async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Outage) {
     let store = store(&["s"]).await;
     let down = StreamError::store_unavailable("The Store is down");
     match outage {
-        Outage::AppendGetsNoAnswer => store.hold(Op::Append),
-        Outage::CloseFails => store.fail(Op::Close, down, usize::MAX),
+        Outage::GetsNoAnswer => store.hold(Op::Append),
         _ => store.fail(Op::Append, down, usize::MAX),
     }
     let mut opts = StartOpts::new(&store);
     opts.fails = 1;
     opts.configure = match outage {
-        Outage::AppendFailsWithNoLocalActivityManager => |wc| {
+        Outage::FailsWithNoLocalActivityManager => |wc| {
             fast_tries(wc);
             wc.task_types = WorkerTaskTypes::workflow_only();
         },
@@ -1067,29 +951,25 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     };
     let t = history(Duration::from_secs(1));
     let mut attempts = 1;
-    if let Outage::AppendFailsOnALaterAttempt = outage {
+    if let Outage::FailsOnALaterAttempt = outage {
         // The mock poller numbers the attempts of a task from 1.
         attempts = 2;
         let task = task_of(&t);
         opts.responses = vec![ResponseType::Raw(task.clone()), ResponseType::Raw(task)];
     }
     let run = start(t, opts);
-    let workflow: Workflow = match outage {
-        Outage::CloseFails => |_| vec![close(1, "s")],
-        _ => |_| vec![append(1, "s")],
-    };
+    let workflow: Workflow = |_| vec![append(1, "s")];
     for _ in 0..attempts {
         let driven = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow)).await;
         assert_eq!(driven.expect("The call never failed its task").len(), 1);
     }
     // The try with no answer ends at the deadline of the Worker's settings.
-    let (call, error) = match outage {
-        Outage::CloseFails => ("close", "The Store is down"),
-        Outage::AppendGetsNoAnswer => ("append", "The Store gave no answer in 50ms"),
-        _ => ("append", "The Store is down"),
+    let error = match outage {
+        Outage::GetsNoAnswer => "The Store gave no answer in 50ms",
+        _ => "The Store is down",
     };
     let message = format!(
-        "StreamStoreUnavailable: {call} of Stream \"s\" on Store \"{STORE}\": \
+        "StreamStoreUnavailable: append of Stream \"s\" on Store \"{STORE}\": \
          stream_store_unavailable: {error}"
     );
     let failed = run.failed.lock().clone();
@@ -1101,8 +981,7 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
         )]
     );
     // The task that the outage failed sent no completion, so it forced no task.
-    let closes = usize::from(matches!(outage, Outage::CloseFails));
-    assert_eq!(run.sent().len(), closes);
+    assert!(run.sent().is_empty());
     assert!(store.requests().len() > 1, "{:?}", store.requests());
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
@@ -1157,104 +1036,6 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-#[tokio::test]
-async fn a_call_in_an_outage_goes_on_when_a_full_ledger_completes_its_task() {
-    let store = store(&["c", "f"]).await;
-    // The close is in an outage once it runs, and each append fails with a large message.
-    store.fail(
-        Op::Close,
-        StreamError::store_unavailable("down"),
-        usize::MAX,
-    );
-    store.fail(
-        Op::Append,
-        StreamError::invalid_argument("x".repeat(4000)),
-        usize::MAX,
-    );
-    store.hold(Op::Append);
-    let mut opts = StartOpts::new(&store);
-    // An append that waits at the hold must not count as a try with no answer.
-    opts.configure = |wc| {
-        fast_tries(wc);
-        wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
-    };
-    // Task 2 has a Signal, so that Workflow code gets an activation in it.
-    opts.served = Some(Box::new(|number, t| {
-        if number == 1 {
-            t.add_we_signaled("go", vec![]);
-        }
-        Some(next_task(t))
-    }));
-    let run = start(history(Duration::from_secs(60)), opts);
-    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
-        Some(Job::InitializeWorkflow(_)) => vec![close(1, "c")],
-        Some(Job::SignalWorkflow(_)) => (1..=70).map(|seq| append(seq, "f")).collect(),
-        Some(Job::ResolveStreamClose(_)) => vec![complete()],
-        _ => vec![],
-    };
-    let init = run.worker.poll_workflow_activation().await.unwrap();
-    respond(&run.worker, &init, workflow).await;
-    let signal = run.worker.poll_workflow_activation().await.unwrap();
-    respond(&run.worker, &signal, workflow).await;
-    // The close is in its outage once the Store saw it a second time.
-    let is_close = |request: &Request| matches!(request, Request::Close(_));
-    wait_until(|| {
-        store
-            .requests()
-            .iter()
-            .filter(|request| is_close(request))
-            .count()
-            >= 2
-    })
-    .await;
-    // The appends of one Stream run one at a time. Each result arrives while no activation is
-    // outstanding, so the one that doesn't fit in the ledger completes the task with a new one
-    // forced.
-    let mut results = vec![];
-    let is_append = |request: &Request| matches!(request, Request::Append(..));
-    while results.len() < 70 {
-        // A release frees only an append that the Store already holds.
-        wait_until(|| store.requests().into_iter().filter(is_append).count() > results.len()).await;
-        store.release();
-        store.hold(Op::Append);
-        let activation = run.worker.poll_workflow_activation().await.unwrap();
-        for job in &activation.jobs {
-            let Some(Job::ResolveStreamAppend(result)) = &job.variant else {
-                panic!("{activation:?}");
-            };
-            results.push(result.seq);
-        }
-        respond(&run.worker, &activation, workflow).await;
-    }
-    assert_eq!(results, (1..=70).collect::<Vec<_>>());
-    assert_eq!(run.failed.lock().clone(), []);
-    // The close continues in the next task, and ends when the Store is available again.
-    store.fail(Op::Close, StreamError::store_unavailable("down"), 0);
-    let closed = run.worker.poll_workflow_activation().await.unwrap();
-    assert!(matches!(
-        closed.jobs[0].variant,
-        Some(Job::ResolveStreamClose(_))
-    ));
-    respond(&run.worker, &closed, workflow).await;
-    run.worker.drain_pollers_and_shutdown_ref().await;
-    // Task 2 completed with a new task forced when its ledger was full, and the results that
-    // didn't fit went into the ledger of task 3.
-    let sent = run.sent();
-    let appends = |sent: &WorkflowTaskCompletion| -> Vec<u32> {
-        let ledger = ledger(sent).unwrap_or_default();
-        (ledger.append_results.iter())
-            .map(|append| append.seq as u32)
-            .collect()
-    };
-    let (second, third) = (appends(&sent[1]), appends(&sent[2]));
-    assert!(sent[1].force_create_new_workflow_task && !third.is_empty());
-    assert_eq!([second, third].concat(), results);
-    assert_eq!(
-        command_types(sent.last().unwrap()).last(),
-        Some(&CommandType::CompleteWorkflowExecution)
-    );
-}
-
 #[rstest::rstest]
 #[case::with_a_ledger_to_send(true, 1)]
 #[case::with_nothing_else(false, 1)]
@@ -1306,14 +1087,14 @@ async fn an_eviction_completes_a_task_that_a_call_holds(
 
 #[tokio::test]
 async fn a_replay_worker_makes_no_live_call() {
-    let store = store(&["s", "c"]).await;
+    let store = store(&["s"]).await;
     let mut t = history(Duration::from_secs(60));
-    complete_with_ledger(&mut t, &close_intent("c"));
+    t.add_workflow_task_completed();
     t.add_workflow_task_scheduled_and_started();
     let mut opts = StartOpts::new(&store);
     opts.replay = true;
     let run = start(t, opts);
-    let jobs = run.drive(|_| vec![append(1, "s"), close(1, "c")]).await;
+    let jobs = run.drive(|_| vec![append(1, "s")]).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(store.requests(), []);
     run.worker.drain_pollers_and_shutdown_ref().await;
@@ -1370,10 +1151,11 @@ fn writers(store: &MemoryStore, id: &str) -> Vec<(Vec<u8>, i64, i32)> {
 async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     #[case] earlier: EarlierAttempt,
 ) {
-    let store = store(&["s", "c"]).await;
-    // Task 1 recorded the intent of close 1.
+    let store = store(&["s"]).await;
+    // A timer of task 1 keeps it apart from task 2 in a replay with chunking on.
     let mut t = history(Duration::from_secs(60));
-    complete_with_ledger(&mut t, &close_intent("c"));
+    t.add_workflow_task_completed();
+    t.add_timer_started("1".to_string());
     let second = next_task(&mut t);
     let run_id = t.get_orig_run_id().to_string();
     match earlier {
@@ -1388,7 +1170,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     }
     let mut task = next_task(&mut t);
     if let EarlierAttempt::UpdateAccepted | EarlierAttempt::UpdateRejected = earlier {
-        task.add_update_request("u", 8);
+        task.add_update_request("u", 9);
     }
     let runs_the_earlier_attempt = matches!(
         earlier,
@@ -1396,7 +1178,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     );
     if !runs_the_earlier_attempt {
         let attempt = WorkflowTaskAttempt {
-            started_event_id: 6,
+            started_event_id: 7,
             attempt: 1,
             started_time: None,
         };
@@ -1422,22 +1204,17 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     }
     opts.fails = usize::from(matches!(earlier, EarlierAttempt::LaterRetryOfAFailedTask));
     let run = start(t, opts);
-    // The Workflow ends once its last append and its close have their results.
+    // The Workflow ends once its last append has its result.
     let last_append = if let EarlierAttempt::UpdateAccepted = earlier {
         2
     } else {
         1
     };
-    let left = Cell::new(2usize);
+    let done = Cell::new(false);
     let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
-        let results = (activation.jobs.iter()).filter(|job| match &job.variant {
-            Some(Job::ResolveStreamAppend(append)) => append.seq == last_append,
-            Some(Job::ResolveStreamClose(_)) => true,
-            _ => false,
-        });
-        left.set(left.get() - results.count());
+        done.set(done.get() || resolves_append(activation, last_append));
         match &activation.jobs[0].variant {
-            Some(Job::InitializeWorkflow(_)) => vec![append(1, "s"), close(1, "c")],
+            Some(Job::InitializeWorkflow(_)) => vec![timer(1), append(1, "s")],
             Some(Job::DoUpdate(_)) if last_append == 2 => {
                 let accepted = update_response::Response::Accepted(());
                 vec![update_response(activation, accepted), append(2, "s")]
@@ -1446,13 +1223,11 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
                 let rejected = update_response::Response::Rejected(Default::default());
                 vec![update_response(activation, rejected)]
             }
-            _ if left.get() == 0 => vec![complete()],
+            _ if done.get() => vec![complete()],
             _ => vec![],
         }
     };
     if runs_the_earlier_attempt {
-        // The close of the earlier attempt never reaches the Store.
-        store.hold(Op::Close);
         if let EarlierAttempt::Eviction = earlier {
             store.lose_answers(Op::Append, usize::MAX);
         }
@@ -1477,7 +1252,6 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
         }
         assert_eq!(run.drive(workflow).await.len(), 0);
         store.lose_answers(Op::Append, 0);
-        store.release();
     }
     let jobs = run.drive(workflow).await;
     let appended = jobs.iter().flatten().any(|job| {
@@ -1492,9 +1266,9 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     assert!(appended, "{jobs:?}");
     let id = producer_key(&producer(&run_id, Default::default())).unwrap();
     let (earlier_task, go_live) = match earlier {
-        EarlierAttempt::LaterRetryOfAFailedTask => ((9, 1), (9, 2)),
-        EarlierAttempt::UpdateRejected => ((6, 1), (12, 1)),
-        _ => ((6, 1), (9, 1)),
+        EarlierAttempt::LaterRetryOfAFailedTask => ((10, 1), (10, 2)),
+        EarlierAttempt::UpdateRejected => ((7, 1), (13, 1)),
+        _ => ((7, 1), (10, 1)),
     };
     let mut expected = vec![
         (id.clone(), earlier_task.0, earlier_task.1),
@@ -1513,7 +1287,6 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
             assert_eq!(first, (task, attempt), "{earlier:?}");
         }
     }
-    assert!(store.is_closed("c"));
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
@@ -2086,7 +1859,7 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
 /// Returns Workflow code that a generated test runs: the commands of each activation that has a
 /// job other than a query or an Update, in order. The last of them ends the Workflow.
 fn script(rng: &mut StdRng) -> Vec<Vec<Command>> {
-    let (mut appends, mut closes, mut locals, mut timers) = (0, 0, 0, 0);
+    let (mut appends, mut locals, mut timers) = (0, 0, 0);
     let steps = rng.random_range(3..=10);
     (1..=steps)
         .map(|step| {
@@ -2094,13 +1867,9 @@ fn script(rng: &mut StdRng) -> Vec<Vec<Command>> {
             for _ in 0..rng.random_range(0..=3) {
                 let id = format!("s{}", rng.random_range(0..3));
                 match rng.random_range(0..10) {
-                    0..=4 => {
+                    0..=5 => {
                         appends += 1;
                         commands.push(append(appends, &id));
-                    }
-                    5 => {
-                        closes += 1;
-                        commands.push(close(closes, &id));
                     }
                     6..=8 => {
                         locals += 1;
@@ -2252,7 +2021,7 @@ fn replayed(
         .collect()
 }
 
-/// Returns a job as `append 3`, `append 3 failed`, `close 1`, `local 2` or the name of its kind.
+/// Returns a job as `append 3`, `append 3 failed`, `local 2` or the name of its kind.
 fn summary(job: &Job) -> String {
     match job {
         Job::ResolveStreamAppend(ResolveStreamAppend {
@@ -2260,10 +2029,6 @@ fn summary(job: &Job) -> String {
             status: Some(resolve_stream_append::Status::Failed(_)),
         }) => format!("append {seq} failed"),
         Job::ResolveStreamAppend(append) => format!("append {}", append.seq),
-        Job::ResolveStreamClose(close) if close.failed.is_some() => {
-            format!("close {} failed", close.seq)
-        }
-        Job::ResolveStreamClose(close) => format!("close {}", close.seq),
         Job::ResolveActivity(local) => format!("local {}", local.seq),
         other => format!("{other:?}")
             .split(['(', ' '])
@@ -2405,15 +2170,10 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
                 }
                 let commands = scripted(&script, &mut progress, earlier.as_mut(), activation);
                 for command in &commands {
-                    let (call, stream) = match command {
-                        Command::AppendToStream(append) => {
-                            (format!("append {}", append.seq), &append.stream)
-                        }
-                        Command::CloseStream(close) => {
-                            (format!("close {}", close.seq), &close.stream)
-                        }
-                        _ => continue,
+                    let Command::AppendToStream(append) = command else {
+                        continue;
                     };
+                    let (call, stream) = (format!("append {}", append.seq), &append.stream);
                     made.insert(call, number);
                     if rng.random_bool(0.3) {
                         store.hold_stream(&stream.as_ref().unwrap().id);

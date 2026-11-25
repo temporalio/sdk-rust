@@ -1829,7 +1829,6 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
-                WFCommandVariant::CloseStream(attrs) => self.stream_calls.close(attrs)?,
             }
         }
         Ok(())
