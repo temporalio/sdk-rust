@@ -594,6 +594,15 @@ fn def_build_id() -> WorkerDeploymentOptions {
 }
 
 impl WorkerOptions {
+    /// Append a worker plugin. Plugins run in registration order, after client plugins.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
+    pub fn worker_plugin<P: WorkerPlugin>(&mut self, plugin: P) -> &mut Self {
+        self.worker_plugins.push(Arc::new(plugin));
+        self
+    }
+
     /// Register an experimental typed Nexus service handler.
     #[cfg(feature = "experimental")]
     pub fn register_nexus_service(
