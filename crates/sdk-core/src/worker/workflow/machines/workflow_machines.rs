@@ -369,6 +369,25 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
+        let unread = self.last_history_from_server.get_events();
+        if let Some(first) = unread
+            .iter()
+            .find(|event| event.event_id > self.last_processed_event)
+        {
+            let last = unread.last().unwrap().event_id;
+            let incoming = update.get_events();
+            if !incoming
+                .first()
+                .is_some_and(|event| event.event_id <= first.event_id)
+                || !incoming.last().is_some_and(|event| event.event_id >= last)
+            {
+                return Err(fatal!(
+                    "Refusing to replace unprocessed history events {} through {}",
+                    first.event_id,
+                    last
+                ));
+            }
+        }
         self.note_wft_events(update.get_events());
         update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
