@@ -266,7 +266,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyError, AppendReason,
-        proto::{AppendRecord, StreamRecord},
+        proto::{AppendRecord, CreateStreamResponse, StreamRecord},
         record::DEFAULT_MAX_RECORD_BYTES,
         test_store::{Scripted, client, runtime, task, workflow},
     };
@@ -437,6 +437,21 @@ mod tests {
         ];
         for (result, error) in cases {
             assert_eq!(result, Err(error));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_answers_with_the_ref_of_its_request() {
+        // The Store gets only the id, so the `store` of the ref comes from the request.
+        let (store, runtime) = runtime();
+        for created in [true, false] {
+            store.answers.lock().created = CreateStreamResponse { created };
+            let answer = sdk::CreateStreamResponse {
+                r#ref: stream_ref("s", "x"),
+                created,
+            };
+            let response = runtime.create_stream(valid_create(), "r".to_string());
+            assert_eq!(response.await, Ok(answer));
         }
     }
 
