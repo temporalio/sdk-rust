@@ -88,11 +88,8 @@ impl StreamSettings {
                     .to_string(),
             );
         }
-        let zeros = [("try_deadline", self.try_deadline.is_zero())];
-        if let Some((setting, _)) = zeros.iter().find(|(_, zero)| *zero) {
-            return Err(format!(
-                "The Stream setting `{setting}` must be more than 0"
-            ));
+        if self.try_deadline.is_zero() {
+            return Err("The Stream setting `try_deadline` must be more than 0".to_string());
         }
         Ok(())
     }
