@@ -47,10 +47,11 @@ use futures_util::future::BoxFuture;
 ///
 /// When the Store fails or doesn't respond in time, it returns
 /// [`AnyReason::StoreUnavailable`](crate::AnyReason::StoreUnavailable), which tells the caller
-/// that a retry may succeed. Core tries an append of Workflow code again after that reason, with
-/// no time limit, and Workflow code never gets that error for it. A read of Workflow code has a
-/// time limit, so it can end with that error. So a Store returns it only for a failure that can be
-/// resolved at a later try.
+/// that a retry may succeed. Core tries an append of Workflow code again after that reason. If the
+/// Store is still unavailable at the heartbeat of the Workflow Task, the task fails, so Workflow
+/// code never gets that error for an append. A read of Workflow code has a time limit, so it can
+/// end with that error. So a Store returns it only for a failure that can be resolved at a later
+/// try.
 ///
 /// # How callers call a Store
 ///

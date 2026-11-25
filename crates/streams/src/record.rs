@@ -53,8 +53,7 @@ impl StoreLimits {
 
     /// Sets the maximum size of one stored Record, in bytes. It must be 1 or more, and the default
     /// is 1.5 MiB. The size of a Record counts its Producer, so a Producer with longer ids leaves
-    /// less room for the body. Core holds no Record over the default in a marker, so a read of
-    /// Workflow code that keeps its Records in History fails for a larger one.
+    /// less room for the body.
     pub fn with_max_record_bytes(self, bytes: usize) -> Result<Self, AnyError> {
         Ok(Self {
             max_record_bytes: at_least_one("max_record_bytes", bytes)?,
