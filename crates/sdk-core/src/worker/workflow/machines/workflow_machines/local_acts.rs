@@ -140,13 +140,11 @@ impl LocalActivityData {
         self.activation_index += 1;
     }
 
-    /// Advances to the next held result of History, which is the next peeked resolution or the
-    /// Stream result at index `stream`, whichever is lower.
+    /// Advances to the next peeked resolution, or to the Stream result at index `stream` if that
+    /// one is lower. It does nothing when the next peeked resolution has no index.
     ///
-    /// Stream results share this counter. No event starts the activation of a Stream result, so
-    /// History keeps its index, and a replay must give both kinds in the order of the first run.
-    /// A separate counter for Streams would need the same reset and the same step, and each jump
-    /// here would have to set both. So it would be a copy that must stay equal to this one.
+    /// Stream results share this counter, because a replay must give both kinds of result in the
+    /// order of the first run.
     pub(super) fn advance_to_next_resolution_activation(&mut self, stream: Option<u64>) {
         if let Some(activation_index) = self
             .preresolutions

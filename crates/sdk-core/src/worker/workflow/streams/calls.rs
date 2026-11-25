@@ -92,7 +92,7 @@ pub(crate) enum Phase {
     Stopped,
 }
 
-/// A call by its kind and seq. Core gives the results of one activation in this order.
+/// The kind and seq of a call. Core gives the results of one activation in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CallKey {
     Append(u32),
@@ -159,7 +159,7 @@ struct HeldRead {
     records: Result<Vec<StreamRecord>, ReplayError>,
 }
 
-/// The entries of History's markers whose calls Workflow code hasn't issued yet, by seq.
+/// Marker entries from History whose calls Workflow code hasn't issued yet, by seq.
 #[derive(Default)]
 struct Held {
     appends: HashMap<u32, StreamAppendResult>,
@@ -207,7 +207,7 @@ pub(crate) struct StreamCalls {
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
-    /// History's results whose calls Workflow code issued, by the activation that gets them.
+    /// Results from History whose calls Workflow code has issued, by the activation that gets them.
     ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
@@ -434,9 +434,9 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Returns true if the activation at index `activation` of the task gets a result. A result
-    /// from History waits for the Local Activity result of the next marker, at index `marker`, if
-    /// the first run gave that one before it or with it.
+    /// Returns true if activation `activation` of the task has a Stream result to give. A result
+    /// from History is held back while the index of the next Local Activity marker, `marker`, is at
+    /// or below the result's own index, so that the Local Activity result goes first.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -591,17 +591,19 @@ impl StreamCalls {
     }
 
     /// Returns true while the run needs another task at once: an append has no result in a
-    /// marker, or Core knows that the Stream of an open read has more Records for it.
+    /// marker, Core knows that the Stream of an open read has more Records for it, or the read
+    /// result budget of the task holds back a read.
     pub(crate) fn needs_next_task(&self) -> bool {
         !self.appends.is_empty() || (self.reads.values()).any(|read| self.knows_more(read))
     }
 
-    /// Returns true if Core knows for certain that the Stream has Records for `read`. Core then
-    /// holds a page of it with Records, or the read starts where a page ended that the Store had
-    /// Records after.
+    /// Returns true if Core knows for certain that `read` has a result for the next task. Core then
+    /// holds a page of it with Records, the read starts where a page ended that the Store had
+    /// Records after, or the read result budget of the task holds the read back.
     fn knows_more(&self, read: &Read) -> bool {
         match &read.state {
             ReadState::Done(done) => !done.records.is_empty(),
+            ReadState::Waiting if self.budget_holds(read) => true,
             ReadState::Waiting | ReadState::Running(..) => {
                 (self.more_after.get(&key(&read.stream)))
                     .is_some_and(|after| *after == read.request.from_offset)
@@ -610,8 +612,18 @@ impl StreamCalls {
         }
     }
 
-    /// Stops each live read that Core doesn't know more Records for, before the task completes. It
-    /// starts again when the next task opens, so a read on an idle Stream makes no new task.
+    /// Returns true if `read` waits only because the task in hand gave all the read results that
+    /// it can. A read that its check parked in the task got no Record, so it waits for another
+    /// reason. The next task counts from zero, so a held read forces at most one task per budget.
+    fn budget_holds(&self, read: &Read) -> bool {
+        matches!(read.state, ReadState::Waiting)
+            && !read.checked
+            && self.task_read_results >= self.runtimes.settings.max_task_read_results
+    }
+
+    /// Stops each live read that Core knows no result for in the next task, before the task
+    /// completes. It starts again when the next task opens, so a read on an idle Stream makes no
+    /// new task.
     pub(crate) fn stop_idle_reads(&mut self) {
         if self.phase != Phase::Live {
             return;
@@ -756,9 +768,10 @@ impl StreamCalls {
         self.next_ready_activation().into_iter().chain(held).min()
     }
 
-    /// Releases the results from History for the next activation, whatever their index, in the
-    /// order of the first run, up to the first one whose call Workflow code hasn't issued. A replay
-    /// with chunking on and no job to give does the same for Local Activity results.
+    /// Releases the results from History to the next activation in the order of the first run,
+    /// regardless of their index. It stops at the first result whose call Workflow code hasn't
+    /// issued. A replay with chunking on does the same for Local Activity results when it has no
+    /// other job to give.
     pub(crate) fn release_ready(&mut self) {
         let held = self.held.first_result();
         let comes = |key: &&(u64, CallKey)| held.is_none_or(|held| **key < held);
@@ -921,11 +934,7 @@ impl StreamCalls {
         let Some(read) = self.reads.get(&seq) else {
             return;
         };
-        let max_results = self.runtimes.settings.max_task_read_results;
-        if !matches!(read.state, ReadState::Waiting)
-            || read.checked
-            || self.task_read_results >= max_results
-        {
+        if !matches!(read.state, ReadState::Waiting) || read.checked || self.budget_holds(read) {
             return;
         }
         self.start_read(seq, self.read_limit_passed);
@@ -1711,6 +1720,35 @@ mod tests {
         assert_eq!(jobs(&mut live, 0), ["read 2 of 1"]);
     }
 
+    // A read that the read result budget of the task holds back gets no check, makes Core ask for
+    // the next task, and starts when that task opens. The command that ends the Workflow drops it,
+    // so that task then needs no next task.
+    #[test]
+    fn a_read_that_the_result_budget_holds_back_needs_the_next_task() {
+        let mut live = calls(Phase::Live, 3);
+        live.runtimes.settings.max_task_read_results = 1;
+        live.read(read(1, "s", b"")).unwrap();
+        assert_eq!(started(&mut live), ["read 1 of s"]);
+        answer_read(&mut live, 1, page(1, "s", b"", vec![], false));
+        assert_eq!(jobs(&mut live, 0), ["read 1 of 0"]);
+        assert!(!live.needs_next_task());
+        live.read(read(2, "s", b"")).unwrap();
+        assert_eq!(started(&mut live), Vec::<String>::new());
+        assert_eq!(live.outstanding(false), 0);
+        live.check_open_reads().unwrap();
+        assert_eq!(started(&mut live), Vec::<String>::new());
+        assert!(live.needs_next_task());
+        next_task(&mut live, 7);
+        assert_eq!(started(&mut live), ["read 2 of s"]);
+        assert!(!live.needs_next_task());
+        answer_read(&mut live, 2, page(2, "s", b"", vec![], false));
+        assert_eq!(jobs(&mut live, 0), ["read 2 of 0"]);
+        live.read(read(3, "s", b"")).unwrap();
+        assert!(live.needs_next_task());
+        live.stop_for_terminal();
+        assert!(!live.needs_next_task());
+    }
+
     /// A command of Workflow code in a generated script.
     #[derive(Clone, Debug)]
     enum Command {
@@ -1919,7 +1957,7 @@ mod tests {
         checks: usize,
         parked: usize,
         outages: usize,
-        /// Tasks that started no read since they gave all the read results that they can.
+        /// Tasks that held back a read since they gave all the read results that they can.
         full_budgets: usize,
     }
 
@@ -1949,6 +1987,8 @@ mod tests {
         committed: (u32, u32, BTreeSet<CallKey>),
         /// True if the task in hand has a command for the server.
         has_work: bool,
+        /// The reads that the read result budget of the last task held back.
+        held_back: Vec<u32>,
     }
 
     impl<'a> FirstRun<'a> {
@@ -1983,6 +2023,7 @@ mod tests {
                 unresolved: BTreeSet::new(),
                 committed: Default::default(),
                 has_work: false,
+                held_back: vec![],
             }
         }
 
@@ -2016,6 +2057,12 @@ mod tests {
 
         fn start_task(&mut self) {
             self.run.calls.set_task(TaskState::Open(self.task_attempt));
+            // A read that the budget held back starts as soon as the task that it forced opens.
+            for seq in std::mem::take(&mut self.held_back) {
+                let state = self.run.calls.reads.get(&seq).map(|read| &read.state);
+                let runs = matches!(state, Some(ReadState::Running(..)));
+                assert!(runs, "seed {}: read {seq} doesn't run", self.seed);
+            }
             if (self.history.last()).is_some_and(|task| !task.markers.is_empty()) {
                 self.run.calls.marker_recorded().unwrap();
             }
@@ -2100,13 +2147,28 @@ mod tests {
         /// Readies the reads for a completion, as Core does when nothing else holds the task.
         fn check_open_reads(&mut self) -> Result<(), ()> {
             self.run.calls.hold_check_pages(self.has_work);
+            // Only a read that runs gets a check, so a read that the budget holds back gets none.
+            let waiting: BTreeSet<u32> = (self.run.calls.reads.iter())
+                .filter(|(_, read)| matches!(read.state, ReadState::Waiting))
+                .map(|(seq, _)| *seq)
+                .collect();
             self.check_outage(StreamCalls::check_open_reads)?;
-            let checks = (self.run.calls.requests.iter())
-                .filter(
-                    |r| matches!(r, Request::Run(Call { op: Op::Read(read), .. }) if read.check),
-                )
-                .count();
-            self.seen.checks += checks;
+            let checks: Vec<u32> = (self.run.calls.requests.iter())
+                .filter_map(|r| match r {
+                    Request::Run(Call {
+                        seq,
+                        op: Op::Read(read),
+                        ..
+                    }) if read.check => Some(*seq),
+                    _ => None,
+                })
+                .collect();
+            let seed = self.seed;
+            assert!(
+                checks.iter().all(|seq| !waiting.contains(seq)),
+                "seed {seed}"
+            );
+            self.seen.checks += checks.len();
             self.dispatch();
             Ok(())
         }
@@ -2253,6 +2315,12 @@ mod tests {
                         };
                         let mut command = read(self.last_read, &id, &from_offset);
                         command.max_records = self.rng.random_range(0..4);
+                        // A check with no Record parks a read with a wait, so the completion
+                        // stops it and forces no task.
+                        command.wait = self.rng.random_bool(0.3).then_some(prost_types::Duration {
+                            seconds: 1,
+                            nanos: 0,
+                        });
                         commands.push(Command::Read(command));
                     }
                     70..=72 => {
@@ -2360,6 +2428,17 @@ mod tests {
         fn complete(&mut self, heartbeat: bool) {
             let needs_next_task = self.run.calls.needs_next_task();
             let forced = heartbeat || needs_next_task;
+            // A read that the budget holds back forces the next task, and gets no check first.
+            let calls = &self.run.calls;
+            let budget = calls.runtimes.settings.max_task_read_results;
+            let held_back: Vec<u32> = (calls.reads.iter())
+                .filter(|(_, read)| matches!(read.state, ReadState::Waiting) && !read.checked)
+                .filter(|_| calls.task_read_results >= budget)
+                .map(|(seq, _)| *seq)
+                .collect();
+            assert!(held_back.is_empty() || forced, "seed {}", self.seed);
+            self.seen.full_budgets += usize::from(!held_back.is_empty());
+            self.held_back = held_back;
             let reads_open = !self.run.calls.reads.is_empty();
             self.seen.forced_by_reads +=
                 usize::from(reads_open && needs_next_task && self.run.calls.appends.is_empty());
@@ -2371,12 +2450,6 @@ mod tests {
                 self.run.calls.stop_idle_reads();
                 self.dispatch();
             }
-            let calls = &self.run.calls;
-            let budget = calls.runtimes.settings.max_task_read_results;
-            self.seen.full_budgets += usize::from(
-                calls.task_read_results >= budget
-                    && (calls.reads.values()).any(|read| matches!(read.state, ReadState::Waiting)),
-            );
             let open = self.run.calls.take_completion_marker(forced, false, false);
             self.task.markers.extend(open);
             // Workflow code never gets the outage of a Store from a live read.
@@ -2430,7 +2503,7 @@ mod tests {
             }
         }
 
-        /// Fails the task in hand. A new run replays History and goes live in the next attempt.
+        /// Fails the current task. A new run replays History and goes live in the next attempt.
         fn retry(&mut self) {
             self.seen.failed_tasks += 1;
             self.run.calls.stop();
@@ -2438,6 +2511,7 @@ mod tests {
             self.deferred.clear();
             (self.last_append, self.last_read, self.unresolved) = self.committed.clone();
             self.task = Task::default();
+            self.held_back.clear();
             self.task_attempt.attempt += 1;
             let budget = self.run.calls.runtimes.settings.max_task_record_bytes;
             self.run = self.check_replay(self.task_attempt);

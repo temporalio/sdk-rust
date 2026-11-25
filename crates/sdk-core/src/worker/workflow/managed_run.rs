@@ -1171,9 +1171,9 @@ impl ManagedRun {
     pub(super) fn stream_work_is_stale_for(&self, work: &PreparedWFT) -> bool {
         let machines = &self.wfm.machines;
         let update = &work.update;
-        // The server gives out a task only after the one before it is over. So a task that arrives
-        // while the run holds an unreported task replaces it, at any started event id. While lang
-        // answers attached queries, the flag is set before the task is reported. A replacing task
+        // The server hands out a task only after the previous one is over. So a task that arrives
+        // while the run still holds an unreported one replaces it, whatever its started event id.
+        // `awaiting_next_wft` is already set while lang answers attached queries. A replacing task
         // then waits, and the held task's completion gets `NotFound`, which also replays the run.
         let replaces_held_task = self.wft.is_some()
             && !self.wfm.awaiting_next_wft
@@ -1481,7 +1481,7 @@ impl ManagedRun {
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         // An evicted run with an open Stream call completes its task, and doesn't let it time out.
         // Other runs ask for a new task for an open append, and for a read only if its Stream has
-        // more Records for it.
+        // more Records for it or the read result budget of the task holds it back.
         let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction

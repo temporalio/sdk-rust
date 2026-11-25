@@ -2470,36 +2470,22 @@ async fn a_read_outage_during_a_wait_fails_the_task() {
 
 // A Local Activity holds the task, and Workflow code reads an empty Stream in a loop with no wait.
 // Each read gets a page with no Record at once, so a budget bounds the read results of the task,
-// as the Record budget bounds its bytes. The read that the budget keeps back starts when the next
-// task opens, and only a page that Core knows of would ask for that task.
+// as the Record budget bounds its bytes. The read that the budget keeps back makes the completion
+// with the timer ask for the next task, and starts when that task opens.
 #[tokio::test]
 async fn the_read_results_of_one_task_have_a_bound() {
     const BOUND: usize = 256;
     let store = store(&["s"]).await;
-    let mut opts = StartOpts::new(&store);
-    opts.eager = Some(Box::new(|completion, t| {
-        if completion.force_create_new_workflow_task {
-            return Some(next_task(t));
-        }
-        command_types(completion)
-            .contains(&CommandType::StartTimer)
-            .then(|| {
-                fire_last_timer(t);
-                next_task(t)
-            })
-    }));
-    let run = start(history(Duration::from_secs(60)), opts);
-    let mut fired = false;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
     let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
         let resolved = (activation.jobs.iter())
             .any(|job| matches!(job.variant, Some(Job::ResolveActivity(_))));
-        fired |= fires_a_last_timer(activation);
         match &activation.jobs[0].variant {
             Some(Job::InitializeWorkflow(_)) => {
                 vec![local_activity(1), read(1, "s", &[], Duration::ZERO).into()]
             }
             _ if resolved => vec![timer(1)],
-            _ if fired && results(activation).next().is_some() => vec![complete()],
+            _ if results(activation).any(|result| result.seq > BOUND as u32) => vec![complete()],
             _ => (results(activation))
                 .map(|result| read(result.seq + 1, "s", &[], Duration::ZERO).into())
                 .collect(),
@@ -2526,11 +2512,54 @@ async fn the_read_results_of_one_task_have_a_bound() {
             .flat_map(|marker| marker.reads.iter().map(|entry| entry.seq))
             .collect()
     };
-    let first = seqs(&sent[0]);
-    assert_eq!(first.len(), BOUND, "{sequence}");
+    let first: Vec<u32> = (1..=BOUND as u32).collect();
+    assert_eq!(seqs(&sent[0]), first, "{sequence}");
     assert!(command_types(&sent[0]).contains(&CommandType::StartTimer));
-    assert!(!sent[0].force_create_new_workflow_task, "{sequence}");
+    assert!(sent[0].force_create_new_workflow_task, "{sequence}");
     assert_eq!(seqs(&sent[1]), [BOUND as u32 + 1], "{sequence}");
+    assert_eq!(sent.len(), 2, "{sequence}");
+}
+
+// A Workflow reads an empty Stream in a loop with no wait, and has no other work. After the read
+// results of its first task, only the read that the budget keeps back is open. It still gets the
+// next task with no other event, and a replay gives the same jobs.
+#[tokio::test]
+async fn a_read_that_the_result_budget_holds_back_forces_the_next_task() {
+    const BOUND: u32 = 256;
+    let store = store(&["s"]).await;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => vec![read(1, "s", &[], Duration::ZERO).into()],
+            _ if results(activation).any(|result| result.seq > BOUND) => vec![complete()],
+            _ => (results(activation))
+                .map(|result| read(result.seq + 1, "s", &[], Duration::ZERO).into())
+                .collect(),
+        }
+    };
+    let live = tokio::time::timeout(Duration::from_secs(10), run.drive(workflow)).await;
+    let sent = run.sent();
+    let completions: Vec<String> = (sent.iter())
+        .map(|sent| {
+            let forced = sent.force_create_new_workflow_task;
+            format!("{:?} forced {forced}", command_types(sent))
+        })
+        .collect();
+    let live = live.unwrap_or_else(|_| panic!("The Workflow didn't complete: {completions:?}"));
+    let seqs = |completion: &WorkflowTaskCompletion| -> Vec<u32> {
+        (read_markers(completion).iter())
+            .flat_map(|marker| marker.reads.iter().map(|entry| entry.seq))
+            .collect()
+    };
+    let [first, second] = &sent[..] else {
+        panic!("{completions:?}");
+    };
+    assert_eq!(seqs(first), (1..=BOUND).collect::<Vec<u32>>());
+    assert!(first.force_create_new_workflow_task, "{completions:?}");
+    assert_eq!(seqs(second), [BOUND + 1]);
+    assert!(!second.force_create_new_workflow_task, "{completions:?}");
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(run.replay(workflow).await, live);
 }
 
 /// Returns Workflow code that reads Stream `s` with `read` in its first task. At a page with
