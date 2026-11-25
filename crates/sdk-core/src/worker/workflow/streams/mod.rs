@@ -150,7 +150,8 @@ impl Default for StreamSettings {
 }
 
 impl StreamSettings {
-    /// Checks the lower bounds of the settings. Nothing bounds a setting from above.
+    /// Checks the settings. Each has a lower bound, and `retry_initial_interval` can't be more than
+    /// `retry_max_interval`.
     pub(crate) fn check(&self) -> Result<(), String> {
         let first = self.retry_initial_interval;
         if first.is_zero() || first > self.retry_max_interval {
@@ -384,5 +385,88 @@ pub(super) fn task_attempt(info: &WorkflowTaskInfo) -> WorkflowTaskAttempt {
         started_event_id: info.started_event_id,
         attempt: i32::try_from(info.attempt).unwrap_or(i32::MAX),
         started_time: info.started_time.map(Into::into),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_settings_check_refuses_each_value_out_of_its_bounds() {
+        let settings = StreamSettings::default();
+        assert_eq!(settings.check(), Ok(()));
+        let first_at_max = StreamSettings {
+            retry_initial_interval: settings.retry_max_interval,
+            ..settings
+        };
+        assert_eq!(first_at_max.check(), Ok(()));
+        let retry = Err(
+            "The Stream setting `retry_initial_interval` must be more than 0 and at most \
+             `retry_max_interval`"
+                .to_string(),
+        );
+        let zero_first = StreamSettings {
+            retry_initial_interval: Duration::ZERO,
+            ..settings
+        };
+        assert_eq!(zero_first.check(), retry);
+        let first_above_max = StreamSettings {
+            retry_initial_interval: settings.retry_max_interval + Duration::from_millis(1),
+            ..settings
+        };
+        assert_eq!(first_above_max.check(), retry);
+        let zeros = [
+            (
+                "try_deadline",
+                StreamSettings {
+                    try_deadline: Duration::ZERO,
+                    ..settings
+                },
+            ),
+            (
+                "read_time",
+                StreamSettings {
+                    read_time: Some(Duration::ZERO),
+                    ..settings
+                },
+            ),
+            (
+                "read_check_deadline",
+                StreamSettings {
+                    read_check_deadline: Duration::ZERO,
+                    ..settings
+                },
+            ),
+            (
+                "max_task_read_results",
+                StreamSettings {
+                    max_task_read_results: 0,
+                    ..settings
+                },
+            ),
+            (
+                "replay_concurrency",
+                StreamSettings {
+                    replay_concurrency: 0,
+                    ..settings
+                },
+            ),
+            (
+                "replay_read_runs",
+                StreamSettings {
+                    replay_read_runs: 0,
+                    ..settings
+                },
+            ),
+        ];
+        for (setting, zero) in zeros {
+            assert_eq!(
+                zero.check(),
+                Err(format!(
+                    "The Stream setting `{setting}` must be more than 0"
+                ))
+            );
+        }
     }
 }

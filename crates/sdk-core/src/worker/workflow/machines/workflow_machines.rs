@@ -632,8 +632,8 @@ impl WorkflowMachines {
             let (activation, marker) = self.result_activations();
             let results = self.stream_calls.take_jobs(activation, marker);
             jobs.extend(results.into_iter().map(OutgoingJob::from));
-            // A replay places these results by the marker, so it must be where Workflow code gets
-            // them, before its commands of this activation.
+            // A replay places these results by their markers, so the markers must go where Workflow
+            // code gets them, before the commands of this activation.
             let appends = self.stream_calls.take_marker().map(PeekedMarker::Append);
             let reads = self.stream_calls.take_read_marker().map(PeekedMarker::Read);
             for data in appends.into_iter().chain(reads) {

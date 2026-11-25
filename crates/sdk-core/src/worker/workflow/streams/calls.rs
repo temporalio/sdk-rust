@@ -92,7 +92,7 @@ pub(crate) enum Phase {
     Stopped,
 }
 
-/// A call by its kind and seq. Core gives the results of one activation in this order.
+/// The kind and seq of a call. Core gives the results of one activation in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CallKey {
     Append(u32),
@@ -159,7 +159,7 @@ struct HeldRead {
     records: Result<Vec<StreamRecord>, ReplayError>,
 }
 
-/// The entries of History's markers whose calls Workflow code hasn't issued yet, by seq.
+/// Marker entries from History whose calls Workflow code hasn't issued yet, by seq.
 #[derive(Default)]
 struct Held {
     appends: HashMap<u32, StreamAppendResult>,
@@ -207,7 +207,7 @@ pub(crate) struct StreamCalls {
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
-    /// History's results whose calls Workflow code issued, by the activation that gets them.
+    /// Results from History whose calls Workflow code has issued, by the activation that gets them.
     ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
@@ -434,9 +434,9 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Returns true if the activation at index `activation` of the task gets a result. A result
-    /// from History waits for the Local Activity result of the next marker, at index `marker`, if
-    /// the first run gave that one before it or with it.
+    /// Returns true if activation `activation` of the task has a Stream result to give. A result
+    /// from History is held back while the index of the next Local Activity marker, `marker`, is at
+    /// or below the result's own index, so that the Local Activity result goes first.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -768,9 +768,10 @@ impl StreamCalls {
         self.next_ready_activation().into_iter().chain(held).min()
     }
 
-    /// Releases the results from History for the next activation, whatever their index, in the
-    /// order of the first run, up to the first one whose call Workflow code hasn't issued. A replay
-    /// with chunking on and no job to give does the same for Local Activity results.
+    /// Releases the results from History to the next activation in the order of the first run,
+    /// regardless of their index. It stops at the first result whose call Workflow code hasn't
+    /// issued. A replay with chunking on does the same for Local Activity results when it has no
+    /// other job to give.
     pub(crate) fn release_ready(&mut self) {
         let held = self.held.first_result();
         let comes = |key: &&(u64, CallKey)| held.is_none_or(|held| **key < held);
@@ -2499,7 +2500,7 @@ mod tests {
             }
         }
 
-        /// Fails the task in hand. A new run replays History and goes live in the next attempt.
+        /// Fails the current task. A new run replays History and goes live in the next attempt.
         fn retry(&mut self) {
             self.seen.failed_tasks += 1;
             self.run.calls.stop();

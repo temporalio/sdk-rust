@@ -1171,9 +1171,9 @@ impl ManagedRun {
     pub(super) fn stream_work_is_stale_for(&self, work: &PreparedWFT) -> bool {
         let machines = &self.wfm.machines;
         let update = &work.update;
-        // The server gives out a task only after the one before it is over. So a task that arrives
-        // while the run holds an unreported task replaces it, at any started event id. While lang
-        // answers attached queries, the flag is set before the task is reported. A replacing task
+        // The server hands out a task only after the previous one is over. So a task that arrives
+        // while the run still holds an unreported one replaces it, whatever its started event id.
+        // `awaiting_next_wft` is already set while lang answers attached queries. A replacing task
         // then waits, and the held task's completion gets `NotFound`, which also replays the run.
         let replaces_held_task = self.wft.is_some()
             && !self.wfm.awaiting_next_wft

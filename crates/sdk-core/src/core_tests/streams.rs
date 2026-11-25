@@ -22,6 +22,7 @@ use crate::{
 };
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex;
+use prost::Message;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::{
     cell::Cell,
@@ -60,9 +61,12 @@ use temporalio_common::protos::{
         failure::v1::Failure,
         history::v1::{
             History, HistoryEvent, MarkerRecordedEventAttributes, TimerCanceledEventAttributes,
-            UpsertWorkflowSearchAttributesEventAttributes, history_event,
+            UpsertWorkflowSearchAttributesEventAttributes,
+            WorkflowExecutionUpdateAcceptedEventAttributes,
+            WorkflowExecutionUpdateCompletedEventAttributes, history_event,
         },
         query::v1::WorkflowQuery,
+        update::v1::{Acceptance, Response as UpdateOutcome},
         workflowservice::v1::{
             GetWorkflowExecutionHistoryResponse, PollWorkflowTaskQueueResponse,
             RespondWorkflowTaskCompletedResponse,
@@ -543,23 +547,8 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(_)) => {
                 history.add_continued_as_new();
             }
-            // A rejected Update leaves no event.
-            Some(Attributes::ProtocolMessageCommandAttributes(command)) => {
-                let message = (completion.messages.iter())
-                    .find(|message| message.id == command.message_id)
-                    .expect("A protocol command has its message");
-                let id = &message.protocol_instance_id;
-                match message.body.as_ref().map(|body| body.type_url.as_str()) {
-                    Some("type.googleapis.com/temporal.api.update.v1.Acceptance") => {
-                        accepted.insert(id, history.add_update_accepted(id, "update_fn"));
-                    }
-                    Some("type.googleapis.com/temporal.api.update.v1.Response") => {
-                        let accepted_id = (accepted.get(id).copied())
-                            .unwrap_or_else(|| accepted_event_id(history, id));
-                        history.add_update_completed(accepted_id);
-                    }
-                    _ => {}
-                }
+            Some(Attributes::ProtocolMessageCommandAttributes(message)) => {
+                write_update(history, completion, &message.message_id, &mut accepted);
             }
             other => panic!("The mock server can't write {other:?}"),
         }
@@ -579,6 +568,47 @@ fn accepted_event_id(history: &TestHistoryBuilder, id: &str) -> i64 {
             _ => None,
         })
         .expect("A completed Update was accepted")
+}
+
+/// Adds the event of the Update message `id` of `completion`, at the place of its command, as the
+/// server does. `accepted` has the event id of each Update that the completion accepted. An Update
+/// that an earlier completion accepted has its event in `history`.
+fn write_update(
+    history: &mut TestHistoryBuilder,
+    completion: &WorkflowTaskCompletion,
+    id: &str,
+    accepted: &mut HashMap<String, i64>,
+) {
+    let message = (completion.messages.iter())
+        .find(|message| message.id == id)
+        .expect("A protocol message command has its message");
+    let instance = message.protocol_instance_id.clone();
+    let body = message.body.as_ref().unwrap();
+    let kind = body.type_url.rsplit('.').next().unwrap();
+    match kind {
+        "Acceptance" => {
+            let acceptance = Acceptance::decode(&body.value[..]).unwrap();
+            let event = history.add(WorkflowExecutionUpdateAcceptedEventAttributes {
+                protocol_instance_id: instance.clone(),
+                accepted_request_message_id: acceptance.accepted_request_message_id,
+                accepted_request_sequencing_event_id: acceptance
+                    .accepted_request_sequencing_event_id,
+                accepted_request: acceptance.accepted_request,
+            });
+            accepted.insert(instance, event);
+        }
+        "Response" => {
+            let response = UpdateOutcome::decode(&body.value[..]).unwrap();
+            let accepted_id = (accepted.get(&instance).copied())
+                .unwrap_or_else(|| accepted_event_id(history, &instance));
+            history.add(WorkflowExecutionUpdateCompletedEventAttributes {
+                meta: response.meta,
+                accepted_event_id: accepted_id,
+                outcome: response.outcome,
+            });
+        }
+        other => panic!("The mock server can't write the Update message {other}"),
+    }
 }
 
 type Workflow = fn(&WorkflowActivation) -> Vec<Command>;
@@ -766,6 +796,50 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(evicted, Some(EvictionReason::Nondeterminism));
     changed.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+#[tokio::test]
+async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
+    let store = store(&["s"]).await;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append(1, "s")],
+        _ => vec![complete()],
+    };
+    run.drive(workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(markers(&run.sent()[0])[0].appends[0].store, STORE);
+
+    let mut opts = StartOpts::new(&store);
+    opts.replay = true;
+    let replay = start(run.history.lock().clone(), opts);
+    let worker = &replay.worker;
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let Command::AppendToStream(mut command) = append(1, "s") else {
+        unreachable!()
+    };
+    command.stream.as_mut().unwrap().store = "other".to_string();
+    let completion = WorkflowActivationCompletion::from_cmd(init.run_id.clone(), command.into());
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    let evicted = worker.poll_workflow_activation().await.unwrap();
+    let [job] = &evicted.jobs[..] else {
+        panic!("{evicted:?}");
+    };
+    let Some(Job::RemoveFromCache(eviction)) = &job.variant else {
+        panic!("{evicted:?}");
+    };
+    assert_eq!(eviction.reason(), EvictionReason::Nondeterminism);
+    let message = format!(
+        "Stream append 1 is for Stream `s` in Store `other`, and History has it for Stream `s` in \
+         Store `{STORE}`"
+    );
+    assert!(eviction.message.contains(&message), "{}", eviction.message);
+    let done = WorkflowActivationCompletion::empty(evicted.run_id);
+    worker.complete_workflow_activation(done).await.unwrap();
+    worker.drain_pollers_and_shutdown_ref().await;
 }
 
 /// The state of a call when Workflow code sends its last command.
@@ -1235,6 +1309,58 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     assert_eq!(recorded, [1]);
     assert_eq!(store.requests().len(), 1);
     run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+#[tokio::test]
+async fn a_forced_completion_with_an_open_append_keeps_its_task_apart_on_replay() {
+    let store = store(&["s1", "s2"]).await;
+    store.hold_stream("s1");
+    store.hold_stream("s2");
+    let mut opts = StartOpts::new(&store);
+    // An append that waits at the hold must not count as a try with no answer.
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600));
+    let held = store.clone();
+    // Append 1 answers once the heartbeat completed task 1, and append 2 once Workflow code has the
+    // result of append 1. So task 2 gives them in two activations.
+    opts.served = Some(Box::new(move |_, t| {
+        held.release_stream("s1");
+        Some(next_task(t))
+    }));
+    // The heartbeat of task 2 must not come before append 2 has its result.
+    let run = start(history(Duration::from_secs(1)), opts);
+    let workflow = |activation: &WorkflowActivation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append(1, "s1"), append(2, "s2")],
+        _ if resolves_append(activation, 2) => vec![complete()],
+        _ => {
+            store.release_stream("s2");
+            vec![]
+        }
+    };
+    let live = run.drive(workflow).await;
+    let results: Vec<Vec<String>> = (live.iter())
+        .map(|jobs| jobs.iter().map(summary).collect())
+        .collect();
+    assert_eq!(
+        results,
+        [["InitializeWorkflow"], ["append 1"], ["append 2"]]
+    );
+    let sent = run.sent();
+    assert!(sent[0].force_create_new_workflow_task);
+    let recorded: Vec<Vec<(u32, u64)>> = (markers(&sent[1]).iter())
+        .map(|marker| {
+            let entries = marker.appends.iter();
+            entries
+                .map(|entry| (entry.seq, entry.activation_index))
+                .collect()
+        })
+        .collect();
+    assert_eq!(recorded, [[(1, 0)], [(2, 1)]]);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    // The marker with no entry is the only command event of task 1. Without it, a replay with
+    // chunking on takes task 1 for a heartbeat and joins it to task 2. The indexes of task 2 then
+    // count from the activation of task 1, so append 2 at index 1 comes with append 1.
+    assert_eq!(run.replay(workflow).await, live);
 }
 
 #[rstest::rstest]
@@ -1742,6 +1868,102 @@ async fn a_call_of_an_update_handler_runs_after_the_update_is_accepted(#[case] c
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+#[rstest::rstest]
+#[case::with_chunking(true)]
+#[case::with_no_chunking(false)]
+#[tokio::test]
+async fn an_update_whose_append_has_its_result_in_its_task_replays_as_its_first_run(
+    #[case] chunking: bool,
+) {
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    // The server answers task 1 with the task of an Update. Task 1 has no command, so with chunking
+    // on only the rule for an accepted Update keeps it apart from task 2.
+    opts.eager = Some(Box::new(|completion, t| {
+        if !completion.commands.is_empty() {
+            return None;
+        }
+        let mut task = next_task(t);
+        task.add_update_request("u", t.current_event_id() - 1);
+        Some(task)
+    }));
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![],
+        Some(Job::DoUpdate(_)) => {
+            let accepted = update_response::Response::Accepted(());
+            vec![update_response(activation, accepted), append(1, "s")]
+        }
+        _ => {
+            let completed = UpdateResponse {
+                protocol_instance_id: "u".to_string(),
+                response: Some(update_response::Response::Completed(Payload::default())),
+            };
+            vec![completed.into(), complete()]
+        }
+    };
+    let live = run.drive(workflow).await;
+    let offset = store.records("s")[0].offset.clone();
+    let appended = ResolveStreamAppend {
+        seq: 1,
+        status: Some(resolve_stream_append::Status::Appended(StreamAppended {
+            first_offset: offset.clone(),
+            last_offset: offset.clone(),
+        })),
+    };
+    assert!(matches!(live[1][..], [Job::DoUpdate(_)]), "{live:?}");
+    assert_eq!(live[2], [Job::ResolveStreamAppend(appended)]);
+    // Task 2 accepts the Update, records the result of its append and completes it.
+    let sent = run.sent();
+    assert_eq!(sent.len(), 2);
+    let expected = StreamAppendMarkerData {
+        appends: vec![self::appended(1, "s", offset, 1)],
+    };
+    assert_eq!(markers(&sent[1]), [expected]);
+    let types = [
+        CommandType::ProtocolMessage,
+        CommandType::RecordMarker,
+        CommandType::ProtocolMessage,
+        CommandType::CompleteWorkflowExecution,
+    ];
+    assert_eq!(command_types(&sent[1]), types);
+    let events: Vec<EventType> = (run.history.lock().get_full_history_info().unwrap().events())
+        .iter()
+        .map(|event| event.event_type())
+        .collect();
+    let task = [
+        EventType::WorkflowTaskScheduled,
+        EventType::WorkflowTaskStarted,
+        EventType::WorkflowTaskCompleted,
+    ];
+    let expected = [
+        &[EventType::WorkflowExecutionStarted][..],
+        &task,
+        &task,
+        &[
+            EventType::WorkflowExecutionUpdateAccepted,
+            EventType::MarkerRecorded,
+            EventType::WorkflowExecutionUpdateCompleted,
+            EventType::WorkflowExecutionCompleted,
+        ],
+    ]
+    .concat();
+    assert_eq!(events, expected);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+
+    let writes = store.requests().len();
+    let mut replayed = run.replay_with(chunking, workflow).await;
+    // Only a live run asks lang to validate an Update.
+    for job in replayed.iter_mut().flatten() {
+        if let Job::DoUpdate(update) = job {
+            assert!(!update.run_validator);
+            update.run_validator = true;
+        }
+    }
+    assert_eq!(replayed, live);
+    assert_eq!(store.requests().len(), writes);
+}
+
 /// The kind of a call of a first run that [`replay_calls`] replays. In one activation the first
 /// run gave the results of Local Activities before those of appends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2228,7 +2450,8 @@ fn with_events(jobs: &[Vec<Job>]) -> Vec<Vec<String>> {
     kept.filter(|jobs| !jobs.is_empty()).collect()
 }
 
-/// Completes each Local Activity of `worker` after a random wait, and each cancel of one at once.
+/// Completes each Local Activity of `worker` after a random wait, and each cancel of one
+/// immediately.
 async fn complete_local_activities(worker: &Worker, rng: &mut StdRng) {
     while let Ok(task) = worker.poll_activity_task().await {
         let result = match task.variant {
