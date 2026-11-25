@@ -41,16 +41,16 @@ use futures_util::future::BoxFuture;
 ///   gives the same bytes for both, and the byte order of their keys determines the order of the
 ///   attempts.
 /// - Fencing is optional. A Store that fences keeps the newest attempt of each Producer that
-///   appended to a Stream, and refuses an append or a close of that Producer from an earlier
-///   attempt. Only an append changes the newest attempt, and a close doesn't. Every Record has its
-///   Producer and attempt either way, so a reader can tell the attempts apart without it.
+///   appended to a Stream, and refuses an append of that Producer from an earlier attempt. Every
+///   Record has its Producer and attempt either way, so a reader can tell the attempts apart
+///   without it.
 ///
 /// When the Store fails or doesn't respond in time, it returns
 /// [`AnyReason::StoreUnavailable`](crate::AnyReason::StoreUnavailable), which tells the caller
-/// that a retry may succeed. Core tries an append or a close of Workflow code again after that
-/// reason, with no time limit, and Workflow code never gets that error for them. A read of
-/// Workflow code has a time limit, so it can end with that error. So a Store returns it only for
-/// a failure that can be resolved at a later try.
+/// that a retry may succeed. Core tries an append of Workflow code again after that reason, with
+/// no time limit, and Workflow code never gets that error for it. A read of Workflow code has a
+/// time limit, so it can end with that error. So a Store returns it only for a failure that can be
+/// resolved at a later try.
 ///
 /// # How callers call a Store
 ///
