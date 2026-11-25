@@ -44,7 +44,10 @@ the durable operation. Persist both `operation_id()` and `run_id()`, then reconn
 run, including when a start's conflict policy returns an existing execution.
 
 Start options accept timeouts, ID reuse/conflict policies, search attributes, UI metadata, and
-`RpcOptions`. Handle methods have `*_with_options` variants for per-call RPC controls. Nexus headers
+`RpcOptions`. By default, closed IDs can be reused and a running operation with the same ID
+causes `NexusClientError::AlreadyStarted`. An operation that completes unsuccessfully returns
+`NexusClientError::Operation` with its IDs and decoded cause; RPC and conversion errors are
+separate. Handle methods have `*_with_options` variants for per-call RPC controls. Nexus headers
 are available only through `ClientInterceptor::start_nexus_operation`'s request, and are transmitted
 as plaintext; typed start options deliberately do not expose them.
 
@@ -52,7 +55,7 @@ Input, result, and failure payloads use the configured data converter and codecs
 serialization context. Search attributes and fixed UI metadata follow Temporal's standard encoding
 rather than custom codecs. The current experimental Nexus serialization context carries no target
 fields, so target-aware codecs cannot yet consume the server's propagated serialization context.
-This API and its pinned experimental `nexus-rpc` dependency may change.
+This API may change.
 
 ## Quick Start
 

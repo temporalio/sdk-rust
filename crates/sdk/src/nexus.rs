@@ -241,15 +241,29 @@ impl TemporalNexusClient {
             WorkflowOperationToken::new(self.client.namespace(), options.workflow_id.clone())
                 .encode_token();
         let workflow_event_type = link::WorkflowEvent::full_name();
+        let nexus_operation_type = link::NexusOperation::full_name();
         let links = self
             .request
             .links
             .iter()
-            .filter(|link| link.r#type == workflow_event_type)
-            .map(proto::workflow_event_link_from_nexus)
+            .filter_map(|link| {
+                if link.r#type == workflow_event_type {
+                    Some(proto::workflow_event_link_from_nexus(link))
+                } else if link.r#type == nexus_operation_type {
+                    Some(proto::nexus_operation_link_from_nexus(link))
+                } else {
+                    None
+                }
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| TemporalOperationError::handler("BAD_REQUEST", error, false))?;
-        options.links.extend(links.clone());
+        // Older servers accept only workflow-event links at the top level of a start request.
+        options.links.extend(
+            links
+                .iter()
+                .filter(|link| matches!(link.variant, Some(link::Variant::WorkflowEvent(_))))
+                .cloned(),
+        );
         if !self.request.callback.is_empty() {
             let mut header = self.request.callback_header.clone();
             // Completion can reach the caller before AsyncSuccess supplies the operation identity.

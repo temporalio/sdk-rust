@@ -2692,7 +2692,9 @@ pub mod temporal {
                         temporal::api::{
                             common::{
                                 self,
-                                v1::link::{WorkflowEvent, workflow_event},
+                                v1::link::{
+                                    NexusOperation, Variant, WorkflowEvent, workflow_event,
+                                },
                             },
                             enums::v1::EventType,
                             failure,
@@ -2746,6 +2748,55 @@ pub mod temporal {
 
                     static SCHEME_PREFIX: &str = "temporal://";
 
+                    fn decode_link_segment(segment: &str) -> Result<String, anyhow::Error> {
+                        percent_decode_str(segment)
+                            .decode_utf8()
+                            .map(|decoded| decoded.into_owned())
+                            .map_err(|err| anyhow!("Invalid UTF-8 in nexus link path: {err}"))
+                    }
+
+                    /// Attempt to parse a Nexus link into a standalone Nexus operation link.
+                    pub fn nexus_operation_link_from_nexus(
+                        link: &Link,
+                    ) -> Result<common::v1::Link, anyhow::Error> {
+                        let path = link.url.strip_prefix(SCHEME_PREFIX).ok_or_else(|| {
+                            anyhow!("Invalid scheme for nexus link: {:?}", link.url)
+                        })?;
+                        let uri = Uri::try_from(path)?;
+                        let segments = uri.path().split('/').collect::<Vec<_>>();
+                        let [
+                            "",
+                            "namespaces",
+                            namespace,
+                            "nexus-operations",
+                            operation_id,
+                            run_id,
+                            "details",
+                        ] = segments.as_slice()
+                        else {
+                            bail!(
+                                "Invalid path for standalone Nexus operation link: {:?}",
+                                link
+                            );
+                        };
+                        if [namespace, operation_id, run_id]
+                            .iter()
+                            .any(|s| s.is_empty())
+                        {
+                            bail!(
+                                "Missing execution identity in standalone Nexus operation link: {:?}",
+                                link
+                            );
+                        }
+                        Ok(common::v1::Link {
+                            variant: Some(Variant::NexusOperation(NexusOperation {
+                                namespace: decode_link_segment(namespace)?,
+                                operation_id: decode_link_segment(operation_id)?,
+                                run_id: decode_link_segment(run_id)?,
+                            })),
+                        })
+                    }
+
                     /// Attempt to parse a Nexus link into a workflow event link.
                     pub fn workflow_event_link_from_nexus(
                         l: &Link,
@@ -2780,13 +2831,6 @@ pub mod temporal {
                         if path_parts.get(6) != Some(&"history") {
                             bail!("Invalid path for nexus link, no history segment: {:?}", l);
                         }
-                        // Decode after splitting so an encoded slash remains part of its ID.
-                        let decode_segment = |segment| {
-                            percent_decode_str(segment)
-                                .decode_utf8()
-                                .map(|decoded| decoded.into_owned())
-                                .map_err(|err| anyhow!("Invalid UTF-8 in nexus link path: {err}"))
-                        };
                         let reference = if let Some(query) = path.query() {
                             let mut eventref = workflow_event::EventReference::default();
                             let query_parts = query.split('&').collect::<Vec<_>>();
@@ -2824,14 +2868,12 @@ pub mod temporal {
                         };
 
                         Ok(common::v1::Link {
-                            variant: Some(common::v1::link::Variant::WorkflowEvent(
-                                WorkflowEvent {
-                                    namespace: decode_segment(namespace)?,
-                                    workflow_id: decode_segment(workflow_id)?,
-                                    run_id: decode_segment(run_id)?,
-                                    reference,
-                                },
-                            )),
+                            variant: Some(Variant::WorkflowEvent(WorkflowEvent {
+                                namespace: decode_link_segment(namespace)?,
+                                workflow_id: decode_link_segment(workflow_id)?,
+                                run_id: decode_link_segment(run_id)?,
+                                reference,
+                            })),
                         })
                     }
 

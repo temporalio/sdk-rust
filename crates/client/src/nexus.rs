@@ -37,22 +37,28 @@ use futures_util::FutureExt;
 use std::{marker::PhantomData, time::Duration};
 use temporalio_common::{
     data_converters::{
-        GenericPayloadConverter, NexusSerializationContext, NoopDecodeHint, PayloadConversionError,
-        SerializationContext, SerializationContextData, TemporalDeserializable,
-        TemporalSerializable,
+        GenericPayloadConverter, NexusOperationDecodeHint, NexusSerializationContext,
+        PayloadConversionError, SerializationContext, SerializationContextData,
+        TemporalDeserializable, TemporalSerializable,
     },
+    external_storage::{retrieve_external_payloads, store_external_payloads},
     payload_visitor::decode_payloads,
-    protos::temporal::api::{
-        enums::v1::{
-            NexusOperationIdConflictPolicy, NexusOperationIdReusePolicy, NexusOperationWaitStage,
+    protos::{
+        temporal::api::{
+            enums::v1::{
+                NexusOperationIdConflictPolicy, NexusOperationIdReusePolicy,
+                NexusOperationWaitStage,
+            },
+            errordetails::v1::NexusOperationExecutionAlreadyStartedFailure,
+            sdk::v1::UserMetadata,
+            workflowservice::v1::{
+                DescribeNexusOperationExecutionRequest, DescribeNexusOperationExecutionResponse,
+                PollNexusOperationExecutionRequest, PollNexusOperationExecutionResponse,
+                RequestCancelNexusOperationExecutionRequest, StartNexusOperationExecutionRequest,
+                poll_nexus_operation_execution_response::Outcome,
+            },
         },
-        sdk::v1::UserMetadata,
-        workflowservice::v1::{
-            DescribeNexusOperationExecutionRequest, DescribeNexusOperationExecutionResponse,
-            PollNexusOperationExecutionRequest, PollNexusOperationExecutionResponse,
-            RequestCancelNexusOperationExecutionRequest, StartNexusOperationExecutionRequest,
-            poll_nexus_operation_execution_response::Outcome,
-        },
+        utilities::decode_status_detail,
     },
     search_attributes::SearchAttributes,
 };
@@ -68,12 +74,31 @@ pub enum NexusClientError {
     /// A Temporal RPC failed.
     #[error("Nexus RPC failed: {0}")]
     Rpc(#[from] tonic::Status),
+    /// An existing execution has the same ID and the reuse or conflict policy prevents starting.
+    #[error("Nexus operation {operation_id:?} already started with run ID: {run_id:?}")]
+    AlreadyStarted {
+        /// Caller-assigned operation ID.
+        operation_id: String,
+        /// Run ID of the conflicting execution, if reported by the server.
+        run_id: Option<String>,
+        /// The original gRPC status.
+        #[source]
+        source: tonic::Status,
+    },
     /// Input, output, or failure payload conversion failed.
     #[error("Nexus payload conversion failed: {0}")]
     Serialization(#[from] PayloadConversionError),
     /// The operation completed unsuccessfully.
-    #[error(transparent)]
-    Operation(#[from] NexusOperationError),
+    #[error("{source} (operation ID: {operation_id}, run ID: {run_id})")]
+    Operation {
+        /// Caller-assigned operation ID.
+        operation_id: String,
+        /// Run ID of the failed execution.
+        run_id: String,
+        /// The operation failure and its decoded cause.
+        #[source]
+        source: NexusOperationError,
+    },
     /// The server returned an inconsistent or incomplete response.
     #[error("Malformed Nexus response: {0}")]
     MalformedResponse(&'static str),
@@ -99,10 +124,12 @@ pub struct NexusOperationStartOptions {
     pub schedule_to_start_timeout: Option<Duration>,
     /// Maximum time after an asynchronous handler starts.
     pub start_to_close_timeout: Option<Duration>,
-    /// Policy for a previously closed operation with the same ID.
-    pub id_reuse_policy: Option<NexusOperationIdReusePolicy>,
-    /// Policy for an already running operation with the same ID.
-    pub id_conflict_policy: Option<NexusOperationIdConflictPolicy>,
+    /// Policy for a previously closed operation with the same ID. Defaults to allowing duplicates.
+    #[builder(default = NexusOperationIdReusePolicy::AllowDuplicate)]
+    pub id_reuse_policy: NexusOperationIdReusePolicy,
+    /// Policy for an already running operation with the same ID. Defaults to failing the start.
+    #[builder(default = NexusOperationIdConflictPolicy::Fail)]
+    pub id_conflict_policy: NexusOperationIdConflictPolicy,
     /// Indexed attributes. These are not passed through payload codecs.
     pub search_attributes: Option<SearchAttributes>,
     /// Fixed UI summary, encoded with the default payload converter.
@@ -195,6 +222,10 @@ impl<S: NexusService> NexusClient<S> {
         O::Input: TemporalSerializable,
         O::Output: TemporalDeserializable + 'static,
     {
+        let operation_id = options.operation_id;
+        if operation_id.is_empty() {
+            return Err(NexusClientError::InvalidExecutionId);
+        }
         let converter = self.client.data_converter();
         let context = context();
         let payload = converter.payload_converter().to_payload(
@@ -207,10 +238,6 @@ impl<S: NexusService> NexusClient<S> {
         }
         let metadata_converter = temporalio_common::data_converters::PayloadConverter::default();
         let metadata_context = SerializationContext::new(&context, &metadata_converter);
-        let operation_id = options.operation_id;
-        if operation_id.is_empty() {
-            return Err(NexusClientError::InvalidExecutionId);
-        }
         let request = StartNexusOperationExecutionRequest {
             namespace: self.client.namespace(),
             identity: self.client.identity(),
@@ -235,8 +262,8 @@ impl<S: NexusService> NexusClient<S> {
                 .map(TryInto::try_into)
                 .transpose()
                 .map_err(|_| NexusClientError::InvalidTimeout("start-to-close"))?,
-            id_reuse_policy: options.id_reuse_policy.unwrap_or_default() as i32,
-            id_conflict_policy: options.id_conflict_policy.unwrap_or_default() as i32,
+            id_reuse_policy: options.id_reuse_policy as i32,
+            id_conflict_policy: options.id_conflict_policy as i32,
             search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
             user_metadata: Some(UserMetadata {
                 summary: options
@@ -258,7 +285,17 @@ impl<S: NexusService> NexusClient<S> {
             },
             Next::new(|input: interceptors::StartNexusOperationInput| {
                 async move {
-                    let mut request = tonic::Request::new(input.request);
+                    let mut request = input.request;
+                    let user_metadata = request.user_metadata.take();
+                    store_external_payloads(
+                        &mut request,
+                        self.client.data_converter(),
+                        &self.client.namespace(),
+                        None,
+                    )
+                    .await?;
+                    request.user_metadata = user_metadata;
+                    let mut request = tonic::Request::new(request);
                     input.rpc_options.apply_to(&mut request);
                     Ok(self
                         .client
@@ -270,7 +307,22 @@ impl<S: NexusService> NexusClient<S> {
                 .boxed()
             }),
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            NexusClientError::Rpc(source) if source.code() == tonic::Code::AlreadyExists => {
+                match decode_status_detail::<NexusOperationExecutionAlreadyStartedFailure>(
+                    source.details(),
+                ) {
+                    Some(detail) => NexusClientError::AlreadyStarted {
+                        operation_id: operation_id.clone(),
+                        run_id: (!detail.run_id.is_empty()).then_some(detail.run_id),
+                        source,
+                    },
+                    None => NexusClientError::Rpc(source),
+                }
+            }
+            other => other,
+        })?;
         if response.run_id.is_empty() {
             return Err(NexusClientError::MalformedResponse(
                 "start returned an empty run ID",
@@ -415,14 +467,18 @@ impl<Output> NexusOperationHandle<Output> {
     ) -> Result<(), NexusClientError> {
         if matches!(response.outcome, Some(Outcome::Failure(_))) {
             let converter = self.client.data_converter();
+            retrieve_external_payloads(response, converter).await?;
             decode_payloads(response, converter.codec(), &context()).await?;
             if let Some(Outcome::Failure(failure)) = response.outcome.take() {
-                return Err(NexusOperationError::from(converter.to_error(
-                    &context(),
-                    failure,
-                    NoopDecodeHint,
-                )?)
-                .into());
+                return Err(NexusClientError::Operation {
+                    operation_id: self.operation_id.clone(),
+                    run_id: self.run_id.clone(),
+                    source: converter.to_error(
+                        &context(),
+                        failure,
+                        NexusOperationDecodeHint::Failed,
+                    )?,
+                });
             }
         }
         Ok(())
@@ -520,6 +576,7 @@ impl<Output> NexusOperationHandle<Output> {
             .info
             .as_mut()
             .and_then(|info| info.user_metadata.take());
+        retrieve_external_payloads(&mut response, self.client.data_converter()).await?;
         decode_payloads(
             &mut response,
             self.client.data_converter().codec(),
@@ -547,6 +604,7 @@ impl<Output: TemporalDeserializable + 'static> NexusOperationHandle<Output> {
         let mut response = self.poll(NexusOperationWaitStage::Closed, options).await?;
         self.decode_failure(&mut response).await?;
         let converter = self.client.data_converter();
+        retrieve_external_payloads(&mut response, converter).await?;
         decode_payloads(&mut response, converter.codec(), &context()).await?;
         match response.outcome {
             Some(Outcome::Result(payload)) => Ok(converter.payload_converter().from_payload(

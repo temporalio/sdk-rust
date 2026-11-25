@@ -11,9 +11,13 @@ use prost::Message;
 use std::sync::Arc;
 use temporalio_common::{
     data_converters::{DataConverter, DefaultFailureConverter, PayloadCodec, PayloadConverter},
+    error::IncomingError,
     protos::temporal::api::{
         common::v1::Payload,
-        failure::v1::{CanceledFailureInfo, Failure, failure::FailureInfo},
+        failure::v1::{
+            ApplicationFailureInfo, CanceledFailureInfo, Failure, NexusHandlerFailureInfo,
+            failure::FailureInfo,
+        },
         nexus::v1::NexusOperationExecutionInfo,
         workflowservice::v1::{
             RequestCancelNexusOperationExecutionResponse, StartNexusOperationExecutionResponse,
@@ -338,12 +342,73 @@ async fn cancellation_retains_failure_and_targets_exact_run() {
         .cancel_with_options("stop", RpcOptions::default())
         .await
         .unwrap();
-    let NexusClientError::Operation(error @ NexusOperationError::Cancelled(_)) =
-        handle.result().await.unwrap_err()
+    let NexusClientError::Operation {
+        operation_id,
+        run_id,
+        source,
+    } = handle.result().await.unwrap_err()
     else {
-        panic!("expected cancelled operation")
+        panic!("expected operation failure")
     };
-    assert_eq!(error.failure(), Some(&failure));
+    assert_eq!(
+        (operation_id.as_str(), run_id.as_str()),
+        ("operation", "run")
+    );
+    assert!(source.as_cancelled().is_some());
+    assert_eq!(source.operation_failure().unwrap().failure(), &failure);
+}
+
+#[tokio::test]
+async fn failure_retains_handler_and_application_causes() {
+    let client = client(
+        |request| {
+            assert_eq!(request.rpc, "PollNexusOperationExecution");
+            PollNexusOperationExecutionResponse {
+                run_id: "run".into(),
+                wait_stage: NexusOperationWaitStage::Closed as i32,
+                outcome: Some(Outcome::Failure(Failure {
+                    message: "handler rejected the input".into(),
+                    failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
+                        NexusHandlerFailureInfo {
+                            r#type: "BAD_REQUEST".into(),
+                            ..Default::default()
+                        },
+                    )),
+                    cause: Some(Box::new(Failure {
+                        message: "amount must be positive".into(),
+                        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                            ApplicationFailureInfo::default(),
+                        )),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec()
+        },
+        DataConverter::default(),
+        vec![],
+    )
+    .await;
+    let handle = client
+        .nexus_client(Payments, "endpoint")
+        .get_handle(Payments::charge, "operation", "run")
+        .unwrap();
+    let NexusClientError::Operation { source, .. } = handle.result().await.unwrap_err() else {
+        panic!("expected operation failure");
+    };
+    let Some(IncomingError::NexusHandler(handler)) = source.operation_failure().unwrap().cause()
+    else {
+        panic!("expected a Nexus handler error");
+    };
+    let Some(IncomingError::Application(application)) = handler.cause() else {
+        panic!("expected an application error");
+    };
+    assert_eq!(
+        application.failure().unwrap().message,
+        "amount must be positive"
+    );
 }
 
 #[tokio::test]
