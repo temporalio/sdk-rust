@@ -36,6 +36,11 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Consume buffered events through a known Workflow Task boundary before fetching another history
+  page, preventing out-of-order history failures when a cache-miss reload outlives its polled task.
+* Reject history updates that omit unread buffered events before replacing buffered history.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

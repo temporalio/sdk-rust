@@ -1,8 +1,38 @@
-use std::{sync::Arc, time::Duration};
-use temporalio_common::protos::{
-    coresdk::{AsJsonPayloadExt, workflow_activation::WorkflowActivation},
-    temporal::api::history::v1::{
-        History, TimerStartedEventAttributes, WorkflowExecutionCompletedEventAttributes,
+use crate::common::{get_integ_client, integ_namespace};
+use futures_util::{StreamExt, stream};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use temporalio_client::{
+    NamespacedClient, UntypedSignal, UntypedWorkflow, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowTerminateOptions, grpc::WorkflowService,
+};
+use temporalio_common::{
+    data_converters::RawValue,
+    protos::{
+        coresdk::{
+            AsJsonPayloadExt,
+            workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
+            workflow_completion::WorkflowActivationCompletion,
+        },
+        temporal::api::{
+            common::v1::WorkflowExecution,
+            enums::v1::{EventType, TaskQueueKind, TaskQueueType},
+            history::v1::{
+                History, TimerStartedEventAttributes, WorkflowExecutionCompletedEventAttributes,
+            },
+            sdk::v1::WorkflowTaskCompletedMetadata,
+            taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
+            workflowservice::v1::{
+                DescribeTaskQueueRequest, GetWorkflowExecutionHistoryRequest,
+                PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
+            },
+        },
     },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
@@ -14,8 +44,9 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
-    test_help::CoreInternalFlags,
+    test_help::{CoreInternalFlags, MocksHolder, WorkerExt, mock_worker, mock_worker_client},
 };
+use tonic::IntoRequest;
 
 struct HeartbeatActivity;
 
@@ -143,4 +174,275 @@ async fn workflow_task_chunking_replays_compatible_histories(#[case] unchunked: 
         .replay_workflow(heartbeat_history(unchunked).into())
         .await
         .unwrap();
+}
+
+#[rstest::rstest]
+#[case::chunked(false)]
+#[case::unchunked(true)]
+#[tokio::test]
+async fn stale_cache_miss_replays_server_history_newer_than_polled_task(#[case] unchunked: bool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut client = get_integ_client(integ_namespace(), None).await;
+        let namespace = client.namespace().to_owned();
+        let workflow_id = format!("stale-cache-miss-{}", uuid::Uuid::new_v4());
+        let normal_queue = TaskQueue {
+            name: workflow_id.clone(),
+            kind: TaskQueueKind::Normal.into(),
+            ..Default::default()
+        };
+        let sticky_queue = TaskQueue {
+            name: format!("{workflow_id}-sticky"),
+            normal_name: normal_queue.name.clone(),
+            kind: TaskQueueKind::Sticky.into(),
+        };
+        let handle = client
+            .start_workflow(
+                UntypedWorkflow::new(DEFAULT_WORKFLOW_TYPE),
+                RawValue::empty(),
+                WorkflowStartOptions::new(normal_queue.name.clone(), workflow_id.clone())
+                    .task_timeout(Duration::from_secs(2))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let execution = WorkflowExecution {
+            workflow_id,
+            run_id: handle.run_id().unwrap().to_owned(),
+        };
+        let poll = |queue: TaskQueue| {
+            let mut client = client.clone();
+            let namespace = namespace.clone();
+            async move {
+                client
+                    .poll_workflow_task_queue(
+                        PollWorkflowTaskQueueRequest {
+                            namespace,
+                            task_queue: Some(queue),
+                            identity: "stale-cache-miss".to_owned(),
+                            ..Default::default()
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner()
+            }
+        };
+        let signal = |name: &str| {
+            handle.signal(
+                UntypedSignal::new(name.to_owned()),
+                RawValue::empty(),
+                WorkflowSignalOptions::default(),
+            )
+        };
+        let complete =
+            |token: Vec<u8>,
+             sticky_attributes: Option<StickyExecutionAttributes>,
+             sdk_metadata: Option<WorkflowTaskCompletedMetadata>| {
+                let mut client = client.clone();
+                let namespace = namespace.clone();
+                async move {
+                    client
+                        .respond_workflow_task_completed(
+                            RespondWorkflowTaskCompletedRequest {
+                                namespace,
+                                task_token: token,
+                                identity: "stale-cache-miss".to_owned(),
+                                sticky_attributes,
+                                force_create_new_workflow_task: true,
+                                sdk_metadata,
+                                ..Default::default()
+                            }
+                            .into_request(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            };
+        let sticky_poll = tokio::spawn(poll(sticky_queue.clone()));
+        loop {
+            let description = client
+                .clone()
+                .describe_task_queue(
+                    DescribeTaskQueueRequest {
+                        namespace: namespace.clone(),
+                        task_queue: Some(sticky_queue.clone()),
+                        task_queue_type: TaskQueueType::Workflow.into(),
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            if !description.pollers.is_empty() {
+                break;
+            }
+        }
+        let first = poll(normal_queue.clone()).await;
+        signal("polled").await.unwrap();
+        complete(
+            first.task_token,
+            Some(StickyExecutionAttributes {
+                worker_task_queue: Some(sticky_queue.clone()),
+                schedule_to_start_timeout: Some(Duration::from_secs(30).try_into().unwrap()),
+            }),
+            unchunked.then_some(WorkflowTaskCompletedMetadata {
+                core_used_flags: vec![CoreInternalFlags::DisableWorkflowTaskChunking as u32],
+                ..Default::default()
+            }),
+        )
+        .await;
+        let stale = sticky_poll.await.unwrap();
+        assert_eq!(stale.previous_started_event_id, first.started_event_id);
+        assert!(stale.history.as_ref().unwrap().events[0].event_id > 1);
+        assert!(stale.next_page_token.is_empty());
+
+        // A buffered signal makes the timeout and retry visible in persisted history.
+        signal("after-timeout").await.unwrap();
+        let retry = poll(normal_queue.clone()).await;
+        signal("later").await.unwrap();
+        complete(retry.task_token, None, None).await;
+        let next = poll(normal_queue.clone()).await;
+        signal("last").await.unwrap();
+        complete(next.task_token, None, None).await;
+        // Signals persist individually while the next task is scheduled, without a running
+        // task buffering them into one batch. Exceed the default history page size.
+        const PAGE_FILLER_SIGNALS: usize = 1100;
+        for _ in 0..PAGE_FILLER_SIGNALS {
+            signal("padding").await.unwrap();
+        }
+        let current = poll(normal_queue.clone()).await;
+        assert!(current.started_event_id > stale.started_event_id);
+
+        let mut pages = VecDeque::new();
+        let mut token = vec![];
+        loop {
+            let response = client
+                .get_workflow_execution_history(
+                    GetWorkflowExecutionHistoryRequest {
+                        namespace: namespace.clone(),
+                        execution: Some(execution.clone()),
+                        next_page_token: token.clone(),
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            let next = response.next_page_token.clone();
+            pages.push_back((token, response));
+            if next.is_empty() {
+                break;
+            }
+            token = next;
+        }
+        assert!(
+            pages.len() > 1,
+            "fresh history must span default-sized server pages"
+        );
+        assert!(
+            pages
+                .iter()
+                .flat_map(|(_, response)| &response.history.as_ref().unwrap().events)
+                .any(|event| event.event_type() == EventType::WorkflowTaskTimedOut)
+        );
+        assert_eq!(
+            pages
+                .back()
+                .unwrap()
+                .1
+                .history
+                .as_ref()
+                .unwrap()
+                .events
+                .last()
+                .unwrap()
+                .event_id,
+            current.started_event_id
+        );
+        let expired = client
+            .respond_workflow_task_completed(
+                RespondWorkflowTaskCompletedRequest {
+                    namespace: namespace.clone(),
+                    task_token: stale.task_token.clone(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(expired.code(), tonic::Code::NotFound);
+        let total_pages = pages.len();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let count = fetches.clone();
+        // Preserve the server's poll IDs and page cuts while controlling when Core sees them.
+        let mut mock = mock_worker_client();
+        mock.expect_get_workflow_execution_history()
+            .returning(move |_, _, token| {
+                let (expected_token, response) =
+                    pages.pop_front().expect("unexpected extra page fetch");
+                assert_eq!(token, expected_token);
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok(response)
+            });
+        let (reported, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        mock.expect_complete_workflow_task()
+            .times(1)
+            .returning(move |request, _| {
+                reported.send(request).unwrap();
+                Err(expired.clone())
+            });
+        mock.expect_fail_workflow_task()
+            .returning(|_, _, failure| panic!("server history failed replay: {failure:?}"));
+        let stale_token = stale.task_token.clone();
+        let mocks =
+            MocksHolder::from_wft_stream(mock, stream::iter([stale]).chain(stream::pending()));
+        let core = mock_worker(mocks);
+        let initial = core.poll_workflow_activation().await.unwrap();
+        assert!(initial.is_replaying);
+        assert!(
+            fetches.load(Ordering::Relaxed) < total_pages,
+            "server history must be adopted before all pages are fetched"
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(initial.run_id))
+            .await
+            .unwrap();
+        let mut signals = 0;
+        loop {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            let eviction = activation.eviction_reason().is_some();
+            for job in &activation.jobs {
+                if matches!(job.variant, Some(Variant::SignalWorkflow(_))) {
+                    signals += 1;
+                }
+            }
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(
+                activation.run_id,
+            ))
+            .await
+            .unwrap();
+            if eviction {
+                break;
+            }
+        }
+        assert_eq!(signals, PAGE_FILLER_SIGNALS + 4);
+        assert_eq!(fetches.load(Ordering::Relaxed), total_pages);
+        let report = reports
+            .try_recv()
+            .expect("history must finish before stale-task reporting");
+        assert_eq!(report.task_token.into_inner(), stale_token);
+        core.drain_pollers_and_shutdown().await;
+        handle
+            .terminate(
+                WorkflowTerminateOptions::builder()
+                    .reason("stale cache miss verification completed".to_owned())
+                    .build(),
+            )
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
 }

@@ -2263,6 +2263,70 @@ mod tests {
             })
         }
 
+        #[derive(Clone, Copy, PartialEq)]
+        enum HistoryReplacement {
+            Covered,
+            SkipsPrefix,
+            TruncatesTail,
+            Empty,
+        }
+
+        #[rstest]
+        #[case::covered(HistoryReplacement::Covered)]
+        #[case::skips_unread_prefix(HistoryReplacement::SkipsPrefix)]
+        #[case::truncates_unread_tail(HistoryReplacement::TruncatesTail)]
+        #[case::empty(HistoryReplacement::Empty)]
+        fn history_replacement_preserves_unread_events(
+            #[case] replacement: HistoryReplacement,
+            #[values(false, true)] unchunked: bool,
+        ) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_full_wf_task();
+            if unchunked {
+                history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+            }
+            history.add_we_signaled("first", vec![]);
+            history.add_full_wf_task();
+            history.add_we_signaled("second", vec![]);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            live.get_next_activation().unwrap();
+            live.push_commands_and_iterate(vec![]).unwrap();
+            let update = match replacement {
+                HistoryReplacement::Covered => history.get_full_history_info().unwrap().into(),
+                HistoryReplacement::SkipsPrefix => history.get_one_wft(3).unwrap().into(),
+                HistoryReplacement::TruncatesTail => history.get_history_info(2).unwrap().into(),
+                HistoryReplacement::Empty => crate::worker::workflow::HistoryUpdate::dummy(),
+            };
+            let result = live.feed_history_from_new_page(update);
+            if replacement == HistoryReplacement::Covered {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unprocessed history")
+                );
+            }
+            let mut signals = vec![];
+            loop {
+                let activation = live.get_next_activation().unwrap();
+                if activation.jobs.is_empty() {
+                    break;
+                }
+                for job in activation.jobs {
+                    let Some(Variant::SignalWorkflow(signal)) = job.variant else {
+                        panic!("unexpected job: {job:?}");
+                    };
+                    signals.push(signal.signal_name);
+                }
+                live.push_commands_and_iterate(vec![]).unwrap();
+            }
+            assert_eq!(signals, ["first", "second"]);
+        }
+
         #[rstest]
         fn rejected_update_with_deferred_la_result(#[values(false, true)] before_task: bool) {
             let mut history = TestHistoryBuilder::default();
