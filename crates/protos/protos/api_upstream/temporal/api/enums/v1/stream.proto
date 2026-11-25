@@ -10,19 +10,6 @@ option ruby_package = "Temporalio::Api::Enums::V1";
 option csharp_namespace = "Temporalio.Api.Enums.V1";
 
 // Experimental. Might change in the future.
-// The status of a Stream, as a describe returns it. A describe of an expired Stream fails with
-// the reason `EXPIRED`, so it has no status.
-// (-- api-linter: core::0216::synonyms=disabled
-//     aip.dev/not-precedent: It has the same form as WorkflowExecutionStatus. --)
-enum StreamStatus {
-    STREAM_STATUS_UNSPECIFIED = 0;
-    // The Stream accepts appends.
-    STREAM_STATUS_OPEN = 1;
-    // The Stream is closed. It accepts no append, and a read ends after its last Record.
-    STREAM_STATUS_CLOSED = 2;
-}
-
-// Experimental. Might change in the future.
 // What a create does if its Stream already exists. Unspecified means `FAIL`, as it does for a
 // Workflow start.
 enum StreamIdConflictPolicy {
@@ -41,29 +28,27 @@ enum StreamErrorReason {
     STREAM_ERROR_REASON_UNSPECIFIED = 0;
     // The Stream was never created (`NOT_FOUND`).
     STREAM_ERROR_REASON_NOT_FOUND = 1;
-    // The Retention of the Stream or its Producer idle TTL has passed (`NOT_FOUND`).
+    // The Retention of the Stream has passed since its create or its last append (`NOT_FOUND`).
     STREAM_ERROR_REASON_EXPIRED = 2;
-    // The Stream is closed (`FAILED_PRECONDITION`).
-    STREAM_ERROR_REASON_CLOSED = 3;
     // A later attempt of the same Producer has already written, and the Store fences
     // (`FAILED_PRECONDITION`).
-    STREAM_ERROR_REASON_FENCED = 4;
+    STREAM_ERROR_REASON_FENCED = 3;
     // The Stream has a newer format than this caller knows (`FAILED_PRECONDITION`).
-    STREAM_ERROR_REASON_FORMAT_TOO_NEW = 5;
+    STREAM_ERROR_REASON_FORMAT_TOO_NEW = 4;
     // The offset is past the newest one, for example after a failover lost the newest Records. A
     // read from it works again once the Stream has Records up to that offset (`OUT_OF_RANGE`).
-    STREAM_ERROR_REASON_OFFSET_TOO_HIGH = 6;
+    STREAM_ERROR_REASON_OFFSET_TOO_HIGH = 5;
     // A Record or a batch is larger than the Store allows (`INVALID_ARGUMENT`).
-    STREAM_ERROR_REASON_TOO_LARGE = 7;
+    STREAM_ERROR_REASON_TOO_LARGE = 6;
     // The request is malformed (`INVALID_ARGUMENT`).
-    STREAM_ERROR_REASON_INVALID_ARGUMENT = 8;
+    STREAM_ERROR_REASON_INVALID_ARGUMENT = 7;
     // The Store failed or didn't answer, and a retry can succeed (`UNAVAILABLE`).
-    STREAM_ERROR_REASON_STORE_UNAVAILABLE = 9;
+    STREAM_ERROR_REASON_STORE_UNAVAILABLE = 8;
     // The Store doesn't support something that the call needs (`UNIMPLEMENTED`).
-    STREAM_ERROR_REASON_UNSUPPORTED = 10;
+    STREAM_ERROR_REASON_UNSUPPORTED = 9;
     // A create with the `FAIL` policy found that the Stream already exists (`ALREADY_EXISTS`).
-    STREAM_ERROR_REASON_ALREADY_EXISTS = 11;
+    STREAM_ERROR_REASON_ALREADY_EXISTS = 10;
     // The Store returned data that isn't valid, such as a stored value of the wrong length. A
     // retry reads the same data (`DATA_LOSS`).
-    STREAM_ERROR_REASON_STORE_CORRUPT = 12;
+    STREAM_ERROR_REASON_STORE_CORRUPT = 11;
 }

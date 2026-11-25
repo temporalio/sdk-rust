@@ -14,9 +14,9 @@ import "temporal/api/failure/v1/message.proto";
 import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
-import "temporal/api/stream/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/common/common.proto";
@@ -50,8 +50,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * Stream results go after the local activity resolutions, because a replay scans ahead for them
-//  too. Appends go first, then closes, then reads, each in `seq` order. If a replay gives several
-//  activations in one, the Stream results keep the order of those activations.
+//  too. Appends go before reads, each in `seq` order. If a replay gives several activations in
+//  one, the Stream results keep the order of those activations.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -155,8 +155,6 @@ message WorkflowActivationJob {
         ResolveStreamRead resolve_stream_read = 17;
         // An append to a Stream finished.
         ResolveStreamAppend resolve_stream_append = 18;
-        // A close of a Stream finished.
-        ResolveStreamClose resolve_stream_close = 19;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -444,9 +442,10 @@ message RemoveFromCache {
 }
 
 // The result of an `AppendToStream`. Core gives it in the next activation after the Store answers.
-// History keeps the index of that activation with the result, counted as for the marker of a local
-// activity, so a replay gives both kinds of result in the order of the first run. A result that
-// arrives while the task completes comes in the first activation of the next task.
+// The `core_stream_append` marker of that activation keeps the result with the index of the
+// activation, counted as for the marker of a local activity, so a replay gives both kinds of result
+// in the order of the first run. A result that arrives while the task completes comes in the first
+// activation of the next task.
 //
 // As for a local activity, a replay gives the result in the same activation as the first run only
 // if workflow task chunking is off. With chunking, a replay can give the jobs of several
@@ -456,7 +455,7 @@ message ResolveStreamAppend {
     uint32 seq = 1;
     oneof status {
         StreamAppended appended = 2;
-        // An `ApplicationFailureInfo` of the type `stream_<reason>`, such as `stream_closed`, with
+        // An `ApplicationFailureInfo` of the type `stream_<reason>`, such as `stream_fenced`, with
         // `non_retryable` set. Its details have one `binary/protobuf` payload of a
         // `temporal.api.stream.v1.StreamErrorDetails`.
         temporal.api.failure.v1.Failure failed = 3;
@@ -468,17 +467,9 @@ message StreamAppended {
     bytes last_offset = 2;
 }
 
-// The result of a `CloseStream`. The activation rules of `ResolveStreamAppend` apply to it too.
-message ResolveStreamClose {
-    // The `seq` of the `CloseStream`.
-    uint32 seq = 1;
-    // Unset if the Stream is closed, also when it was already closed. When set, it has the same
-    // parts as the `failed` of a `ResolveStreamAppend`.
-    temporal.api.failure.v1.Failure failed = 2;
-}
-
 // The result of a `ReadStream`. Each read gets exactly one, unless Core drops the read (see
-// `ReadStream`). The activation rules of `ResolveStreamAppend` apply to it too.
+// `ReadStream`). The activation rules of `ResolveStreamAppend` apply to it too, with the
+// `core_stream_read` marker in place of the `core_stream_append` one.
 message ResolveStreamRead {
     // The `seq` of the `ReadStream`.
     uint32 seq = 1;
@@ -490,13 +481,14 @@ message ResolveStreamRead {
 }
 
 message StreamPage {
-    // The Records of the page, in the order of the Stream. It's empty if the Stream is closed and
-    // has no Record after the `from_offset` of the read, or if no Record came while the read
-    // waited.
+    // The Records of the page, in the order of the Stream. It's empty if no Record came while the
+    // read waited.
     repeated temporal.api.stream.v1.StreamRecord records = 1;
-    // True if the Stream is closed and has no Record after this page.
-    bool done = 2;
     // The offset where the page ends, also for a page with no Record. The next read can pass it as
     // its `from_offset`.
-    bytes last_offset = 3;
+    bytes last_offset = 2;
+    // True if the page has no Record because the read time of the Workflow Task ended the wait
+    // before the `wait` of the read. A reader that waits for a Record can read again from
+    // `last_offset`. It's false for a page that ends a whole wait.
+    bool wait_cut = 3;
 }

@@ -1,31 +1,37 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
-use super::{StreamRuntimes, StreamSettings, ledger::ReadDone};
+use super::{StreamRuntimes, StreamSettings, read::ReadDone};
 use crate::telemetry::metrics::{FailureReason, MetricsContext, failure_reason};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
 use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
-use temporalio_common::protos::temporal::api::{
-    common::v1::{Payload, Payloads},
-    failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
-    sdk::v1::workflow_task_stream_calls::{AppendOffsets, CallFailure, append_result},
+use temporalio_common::protos::{
+    coresdk::external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
+    temporal::api::{
+        common::v1::{Payload, Payloads},
+        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+    },
 };
 use temporalio_streams::{
-    AnyReason, AppendError, CloseError, ReadError, StreamError, StreamRuntime,
+    AnyReason, AppendError, ReadError, ReadPage, StreamError, StreamRuntime,
     proto::{
-        AppendRecordsRequest, CloseStreamRequest, ReadRecordsRequest, ReadRecordsResponse,
         StreamErrorReason,
+        sdk::{AppendRecordsRequest, ReadRecordsRequest},
     },
 };
 use tokio::{runtime::Handle, task::AbortHandle, time::Instant};
 
-/// The maximum length of a failure message that Workflow code gets and a ledger records, in bytes.
+/// The maximum length of a failure message that Workflow code gets and a marker records, in bytes.
 /// A Store can return error text of any size, so the message needs a bound.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
 
 /// The maximum random change of the wait before the next try, as a fraction of that wait. A retry
 /// of a client call has the same value.
 const RETRY_RANDOMIZATION: f64 = 0.2;
+
+/// The shortest time between two asks of a read whose Store answers with no Record before the
+/// wait is up.
+pub(super) const MIN_ASK_AGAIN: Duration = Duration::from_millis(100);
 
 /// A call of a run to start or to stop.
 #[derive(Debug)]
@@ -50,23 +56,24 @@ pub(crate) struct Call {
 pub(crate) enum Op {
     /// An append, with the request id that each of its tries passes.
     Append(AppendRecordsRequest, String),
-    Close(CloseStreamRequest),
     Read(ReadCall),
 }
 
 /// A read to run.
 #[derive(Debug)]
 pub(crate) struct ReadCall {
-    /// The request of the first try, with the `from_offset` and the page size of the read.
+    /// The request of each try, with the `from_offset` and the page size of the read.
     pub(crate) request: ReadRecordsRequest,
     /// How long the read waits for a Record.
     pub(crate) wait: Duration,
+    /// True for a check, which is one try with no wait.
+    pub(crate) check: bool,
     pub(crate) last_try: LastTry,
 }
 
-/// The failure of the last try of a read, while the read waits to try again. The run reads it when
-/// it ends a read that has no answer.
-pub(crate) type LastTry = Arc<Mutex<Option<CallFailure>>>;
+/// The failure of the last try of a read, while the read waits to try again. The run fails its task
+/// if a read has one at the read limit, at the completion or at the heartbeat.
+pub(crate) type LastTry = Arc<Mutex<Option<StreamFailure>>>;
 
 /// The result of a call, for its run.
 #[derive(Debug)]
@@ -78,9 +85,7 @@ pub(crate) struct StreamResolution {
 
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    Append(append_result::Result),
-    /// `None` if the Stream is closed.
-    Close(Option<CallFailure>),
+    Append(stream_append_result::Result),
     Read(ReadDone),
 }
 
@@ -186,10 +191,9 @@ impl StreamManager {
             store,
             op,
         } = call;
-        let stream = match &op {
-            Op::Append(request, _) => &request.r#ref,
-            Op::Close(request) => &request.r#ref,
-            Op::Read(read) => &read.request.r#ref,
+        let (what, stream) = match &op {
+            Op::Append(request, _) => ("append", &request.r#ref),
+            Op::Read(read) => ("read", &read.request.r#ref),
         };
         let stream_id = stream.as_ref().map_or("", |stream| &stream.id);
         let runtime = (self.runtimes.get(&store).cloned())
@@ -199,16 +203,7 @@ impl StreamManager {
             tasks: self.tasks.clone(),
             run_id: run_id.to_string(),
             call_id,
-            what: format!(
-                "{} of Stream \"{}\" on Store \"{}\"",
-                match op {
-                    Op::Append(..) => "append",
-                    Op::Close(_) => "close",
-                    Op::Read(_) => "read",
-                },
-                stream_id,
-                store
-            ),
+            what: format!("{what} of Stream \"{stream_id}\" on Store \"{store}\""),
         };
         let sink = self.sink.clone();
         let task = self.handle.spawn(async move {
@@ -239,8 +234,8 @@ impl Drop for StreamManager {
 }
 
 /// Runs the call `seq` on `runtime`, and returns its outcome. The metrics count each try when it
-/// starts, as those of a Local Activity count each attempt. They time a try of an append or a close
-/// once it ends, so a try that is stopped has only its count, and a read has no latency.
+/// starts, as those of a Local Activity count each attempt. They time a try of an append once it
+/// ends, so a try that is stopped has only its count, and a read has no latency.
 async fn run(
     runtime: &StreamRuntime,
     seq: u32,
@@ -263,33 +258,19 @@ async fn run(
             };
             let answer = tries(settings, note, send, tried).await;
             Outcome::Append(match answer {
-                Ok(appended) => append_result::Result::Appended(AppendOffsets {
+                Ok(appended) => stream_append_result::Result::Appended(StreamAppendOffsets {
                     first_offset: appended.first_offset,
                     last_offset: appended.last_offset,
                 }),
-                Err(error) => append_result::Result::Failure(recorded(&error)),
+                Err(error) => stream_append_result::Result::Failure(recorded(&error)),
             })
-        }
-        Op::Close(request) => {
-            let send = || {
-                metrics.stream_close_executed();
-                runtime.close_stream(request.clone())
-            };
-            let tried = |took: Duration, error: Option<&CloseError>| {
-                metrics.stream_close_exec_latency(took);
-                if let Some(error) = error {
-                    failed(metrics, error).stream_close_execution_failed();
-                }
-            };
-            let answer = tries(settings, note, send, tried).await;
-            Outcome::Close(answer.err().map(|error| recorded(&error)))
         }
         Op::Read(read) => {
             let stream = (read.request.r#ref.clone()).expect("A read has the ref of its command");
             let from_offset = read.request.from_offset.clone();
             let page = read_page(runtime, read, settings, metrics).await;
             if let Ok(page) = &page {
-                metrics.stream_read_records(page.records.len() as u64);
+                metrics.stream_read_records(page.response.records.len() as u64);
             }
             let page = page.map_err(|error| recorded(&error));
             Outcome::Read(ReadDone::new(&stream, seq, from_offset, page))
@@ -297,22 +278,35 @@ async fn run(
     }
 }
 
-/// Reads the page of Records after the `from_offset` of `read`, and waits up to its wait for the
-/// first Record. A try that fails with `StoreUnavailable`, or gets no answer by its deadline, is
-/// the last try of the read, and the read asks again from where it is after a backoff. The run ends
-/// a read that has no answer at the read limit of its task. A read notes no outage in the manager,
-/// since it never holds its task to the heartbeat.
+/// Reads the page of Records after the `from_offset` of `read`. A page is one answer of the Store,
+/// which waits up to the read's wait for the first Record. An answer with no Record before the
+/// wait is up makes the read ask again from its `last_offset`, at most once per
+/// [`MIN_ASK_AGAIN`]. A try that fails with `StoreUnavailable`, or gets no answer by its deadline,
+/// is the last try of the read, and the read asks again after a backoff. A check is one try with
+/// no wait, which returns its outage. The run fails the task of a read whose last try failed, so a
+/// read notes no outage in the manager.
 async fn read_page(
     runtime: &StreamRuntime,
     read: ReadCall,
     settings: StreamSettings,
     metrics: &MetricsContext,
-) -> Result<ReadRecordsResponse, ReadError> {
+) -> Result<ReadPage, ReadError> {
     let ReadCall {
         mut request,
         wait,
+        check,
         last_try,
     } = read;
+    if check {
+        request.wait = None;
+        let deadline = settings.read_check_deadline;
+        return match tokio::time::timeout(deadline, runtime.read_records_with_more(request)).await {
+            Ok(answer) => answer,
+            Err(_) => Err(StreamError::store_unavailable(format!(
+                "The Store gave no answer in {deadline:?}"
+            ))),
+        };
+    }
     // A time past the end of the clock never ends the wait.
     let wait_until = Instant::now().checked_add(wait);
     let mut waits = retry_waits(&settings);
@@ -327,7 +321,7 @@ async fn read_page(
         let deadline = settings.try_deadline.saturating_add(wait);
         let asked = Instant::now();
         metrics.stream_read_executed();
-        let read = runtime.read_records(request.clone());
+        let read = runtime.read_records_with_more(request.clone());
         let answer = match tokio::time::timeout(deadline, read).await {
             Ok(Err(error)) if !is_outage(&error) => {
                 failed(metrics, &error).stream_read_execution_failed();
@@ -339,38 +333,37 @@ async fn read_page(
                 "The Store gave no answer in {deadline:?}"
             ))),
         };
-        let page = match answer {
-            Ok(page) => page,
+        match answer {
+            Ok(page) => {
+                *last_try.lock() = None;
+                let left = wait_until.map(|at| at.saturating_duration_since(Instant::now()));
+                if !page.response.records.is_empty() || left.is_some_and(|left| left.is_zero()) {
+                    return Ok(page);
+                }
+                let next = asked + MIN_ASK_AGAIN;
+                match wait_until {
+                    Some(at) if next >= at => {
+                        tokio::time::sleep_until(at).await;
+                        return Ok(page);
+                    }
+                    _ => tokio::time::sleep_until(next).await,
+                }
+                request.from_offset = page.response.last_offset;
+                waits = retry_waits(&settings);
+            }
             Err(error) => {
                 failed(metrics, &error).stream_read_execution_failed();
                 *last_try.lock() = Some(recorded(&error));
                 tokio::time::sleep(next_wait(&mut waits)).await;
-                continue;
             }
-        };
-        *last_try.lock() = None;
-        waits = retry_waits(&settings);
-        if !page.records.is_empty() || page.done {
-            return Ok(page);
         }
-        // A try that passed entries which aren't Records may have stopped short of a Record, so
-        // the read tries again from where that try ended.
-        if page.last_offset != request.from_offset {
-            request.from_offset = page.last_offset;
-            continue;
-        }
-        if wait_until.is_some_and(|at| at <= Instant::now()) {
-            return Ok(page);
-        }
-        // A Store that answers immediately with nothing would otherwise get the next read
-        // immediately, so the read waits out the rest of the wait first.
-        tokio::time::sleep(wait.saturating_sub(asked.elapsed())).await;
     }
 }
 
-/// Sends the request again while the Store is in an outage, with no time limit. A resend is safe,
-/// because a Store doesn't write a batch whose request id it still remembers, and a second close
-/// succeeds.
+/// Sends the request again while the Store is in an outage. The loop has no time limit of its own,
+/// because the run fails its Workflow Task if, at the task's heartbeat, a call has had no answer
+/// since a try that failed. A resend is safe, because a Store doesn't write a batch whose request
+/// id it still remembers.
 /// `tried` gets the duration of each try, and its error if it failed.
 async fn tries<T, R, F>(
     settings: StreamSettings,
@@ -432,7 +425,6 @@ struct Note {
 }
 
 impl Note {
-    /// Notes the failure of the last try, or clears it with `None`.
     fn set(&self, error: Option<&dyn fmt::Display>) {
         let mut tasks = self.tasks.lock();
         let task = tasks
@@ -477,19 +469,18 @@ pub(super) fn is_outage<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R
     error.reason.into() == StreamErrorReason::StoreUnavailable
 }
 
-/// Returns the reason and the message of `error`, as a ledger records a failed call.
-pub(super) fn recorded<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>) -> CallFailure {
-    let reason: StreamErrorReason = error.reason.into();
-    CallFailure {
-        reason: reason.into(),
+/// Returns the reason and the message of `error`, as a marker records a failed call.
+pub(super) fn recorded<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>) -> StreamFailure {
+    StreamFailure {
+        reason: error.reason.into().as_str_name().to_string(),
         message: cut(error.message.clone()),
     }
 }
 
-/// Returns the failure that Workflow code gets for a failed call that a ledger records.
-pub(super) fn failure_of(recorded: &CallFailure) -> Failure {
-    let reason = StreamErrorReason::try_from(recorded.reason)
-        .expect("The check of a ledger in History refuses a failure with an unknown reason");
+/// Returns the failure that Workflow code gets for a failed call that a marker records.
+pub(super) fn failure_of(recorded: &StreamFailure) -> Failure {
+    let reason = StreamErrorReason::from_str_name(&recorded.reason)
+        .expect("The decode of a marker checks the reason of each failure");
     let message = recorded.message.clone();
     failure(&StreamError { reason, message })
 }
@@ -540,7 +531,7 @@ pub(super) fn cut(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ledger::LedgerBuilder,
+        read::After,
         test_store::{Entry, Fault, Model, ModelStore, client},
     };
     use super::*;
@@ -548,12 +539,13 @@ mod tests {
     use prost::Message;
     use prost_types::Timestamp;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
-    use temporalio_common::protos::coresdk::workflow_activation::resolve_stream_read;
+    use temporalio_common::protos::coresdk::external_data::stream_read_result;
     use temporalio_streams::{
         AnyError, ReadReason, StreamStore,
         proto::{
-            AppendRecord, CreateStreamRequest, Producer, StreamErrorDetails, StreamRecord,
-            StreamRef, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+            AppendRecord, CreateStreamRequest, Producer, ReadRecordsRequest as StoreRead,
+            StreamErrorDetails, StreamRecord, WorkflowProducer, WorkflowTaskAttempt,
+            producer::Kind, sdk::StreamRef,
         },
         record::{StoreLimits, field_len},
     };
@@ -565,7 +557,7 @@ mod tests {
     async fn manager() -> (Arc<MemoryStore>, StreamManager, Results) {
         let store = Arc::new(MemoryStore::default());
         let create = CreateStreamRequest {
-            stream_ref: Some(stream()),
+            stream_id: "s".to_string(),
             ..Default::default()
         };
         store.create_stream(create, "c".to_string()).await.unwrap();
@@ -621,18 +613,6 @@ mod tests {
         })
     }
 
-    fn close(call_id: u64) -> Request {
-        Request::Run(Call {
-            call_id,
-            seq: 2,
-            store: "mem".to_string(),
-            op: Op::Close(CloseStreamRequest {
-                r#ref: Some(stream()),
-                producer: producer(),
-            }),
-        })
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_try_with_no_answer_is_an_outage() {
         let (store, manager, mut results) = manager().await;
@@ -647,7 +627,7 @@ mod tests {
         assert_eq!(run_id, "r");
         assert!(matches!(
             resolution.outcome,
-            Outcome::Append(append_result::Result::Appended(_))
+            Outcome::Append(stream_append_result::Result::Appended(_))
         ));
         assert_eq!(manager.outage("r"), None);
         let tries = store.requests();
@@ -660,19 +640,21 @@ mod tests {
         let (store, manager, mut results) = manager().await;
         let down = || AnyError::store_unavailable("The Store is down");
         store.fail(StoreOp::Append, down(), usize::MAX);
-        store.fail(StoreOp::Close, down(), usize::MAX);
-        manager.dispatch("a", vec![append(1), close(2), append(3)], no_metrics);
-        manager.dispatch("b", vec![close(4)], no_metrics);
+        manager.dispatch("a", vec![append(1), append(2), append(3)], no_metrics);
+        manager.dispatch("b", vec![append(4)], no_metrics);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(manager.outage("a").is_some());
         manager.dispatch("a", vec![Request::Stop(3)], no_metrics);
         manager.cancel_run("a");
         assert_eq!(manager.outage("a"), None);
         assert!(manager.outage("b").is_some());
-        store.fail(StoreOp::Close, down(), 0);
+        store.fail(StoreOp::Append, down(), 0);
         let (run_id, resolution) = results.recv().await.unwrap();
         assert_eq!((run_id.as_str(), resolution.call_id), ("b", 4));
-        assert!(matches!(resolution.outcome, Outcome::Close(None)));
+        assert!(matches!(
+            resolution.outcome,
+            Outcome::Append(stream_append_result::Result::Appended(_))
+        ));
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert!(results.try_recv().is_err());
         let after = store.requests().len();
@@ -695,7 +677,7 @@ mod tests {
         message
     }
 
-    // The failure is built from what a ledger records, so a replay gives the same one as the
+    // The failure is built from what a marker records, so a replay gives the same one as the
     // first run. A long message is cut on a character boundary.
     #[test]
     fn a_failure_reads_back_as_the_failure_of_its_call() {
@@ -767,9 +749,10 @@ mod tests {
     struct Reading {
         from_offset: Vec<u8>,
         max_records: i32,
-        max_bytes: i64,
         /// When the wait of the read is over, unless it never is.
         wait_until: Option<Instant>,
+        /// The tries of the read that the Store answered.
+        answers: usize,
         violations: Vec<String>,
     }
 
@@ -794,11 +777,14 @@ mod tests {
     }
 
     // Workflow code reads a Stream with one read for each page, from the `last_offset` of the page
-    // before. A read waits out its wait, so a Store that answers immediately gets no read in a
-    // loop.
+    // before. Each read gives one answer of the Store as its page, and a page with no Record comes
+    // once the wait is over, so Workflow code doesn't read in a loop. An early answer with no
+    // Record makes the read ask again from its `last_offset`, no sooner than `MIN_ASK_AGAIN` after
+    // it.
     #[tokio::test(start_paused = true)]
-    async fn a_read_gives_the_next_records_or_none_once_its_wait_is_over() {
-        let (mut ends, mut outages, mut early, mut loops, mut moved) = ([0; 3], 0, 0, 0, 0);
+    async fn a_read_gives_one_answer_of_the_store_at_once_or_none_once_its_wait_is_over() {
+        let (mut ends, mut outages, mut early, mut loops, mut moved, mut more, mut again) =
+            ([0; 2], 0, 0, 0, 0, 0, 0);
         for seed in 0..300 {
             let mut rng = StdRng::seed_from_u64(seed);
             let entries = entries(&mut rng);
@@ -812,7 +798,6 @@ mod tests {
                 1 => Duration::from_secs(100),
                 _ => Duration::from_millis(rng.random_range(1..300)),
             };
-            let closed = rng.random_bool(0.5);
             let settings = StreamSettings {
                 retry_initial_interval: Duration::from_millis(1),
                 retry_max_interval: Duration::from_millis(5),
@@ -822,16 +807,17 @@ mod tests {
             let fails = rng.random_bool(0.3);
             let reading = Arc::new(Mutex::new(Reading::default()));
             let checked = reading.clone();
-            let fault = move |rng: &mut StdRng, request: &ReadRecordsRequest| {
+            let fault = move |rng: &mut StdRng, request: &StoreRead| {
                 let mut reading = checked.lock();
                 // The Store waits at most what the read has left to wait.
                 let left = (reading.wait_until).map_or(Duration::MAX, |until| {
                     until.saturating_duration_since(Instant::now())
                 });
                 let wait = (request.wait).map_or(Duration::ZERO, |wait| wait.try_into().unwrap());
+                // The runtime asks for one Record more than the page holds. An ask again starts
+                // where the answer before it ended, which is never before the read's start.
                 let rules = [
-                    request.max_records == reading.max_records,
-                    request.max_bytes == reading.max_bytes,
+                    request.max_records == reading.max_records + 1,
                     request.from_offset >= reading.from_offset,
                     wait <= left,
                 ];
@@ -839,7 +825,7 @@ mod tests {
                     let violation = format!("seed {seed}: rule {rule} of a request");
                     reading.violations.push(violation);
                 }
-                match rng.random_range(0..100) {
+                let fault = match rng.random_range(0..100) {
                     0..=4 => Some(Fault::Fails(StreamError::store_unavailable("Down"))),
                     5..=7 => Some(Fault::Silent),
                     8 if fails => {
@@ -847,11 +833,14 @@ mod tests {
                         Some(Fault::Fails(gone))
                     }
                     _ => None,
-                }
+                };
+                reading.answers += usize::from(fault.is_none());
+                fault
             };
+            let ignores_wait = rng.random_bool(0.3);
             let store = Arc::new(ModelStore::new(Model {
-                ignores_wait: rng.random_bool(0.3),
-                ..Model::new(seed, entries, closed, fault)
+                ignores_wait,
+                ..Model::new(seed, entries, fault)
             }));
             let runtime = StreamRuntime::new(store.clone(), StoreLimits::default());
             let mut runtimes = StreamRuntimes::new([("mem".to_string(), Arc::new(runtime))]);
@@ -859,10 +848,6 @@ mod tests {
             let (tx, mut results) = mpsc::unbounded_channel();
             let sink = move |_, resolution: StreamResolution| tx.send(resolution).unwrap();
             let manager = StreamManager::new(runtimes, Handle::current(), sink);
-            let stream = StreamRef {
-                id: "s".to_string(),
-                store: "mem".to_string(),
-            };
             let (mut cursor, mut got) = (from_offset.clone(), vec![]);
             for call_id in 1.. {
                 let max_records = rng.random_range(1..=10);
@@ -871,11 +856,12 @@ mod tests {
                 {
                     let mut reading = reading.lock();
                     reading.from_offset.clone_from(&cursor);
-                    (reading.max_records, reading.max_bytes) = (max_records, max_bytes);
+                    reading.max_records = max_records;
                     reading.wait_until = started.checked_add(wait);
+                    reading.answers = 0;
                 }
                 let request = ReadRecordsRequest {
-                    r#ref: Some(stream.clone()),
+                    r#ref: Some(stream()),
                     from_offset: cursor.clone(),
                     max_records,
                     max_bytes,
@@ -885,12 +871,13 @@ mod tests {
                 let read = ReadCall {
                     request,
                     wait,
+                    check: false,
                     last_try: last_try.clone(),
                 };
                 let call = Call {
                     call_id,
                     seq: call_id as u32,
-                    store: stream.store.clone(),
+                    store: "mem".to_string(),
                     op: Op::Read(read),
                 };
                 manager.dispatch("r", vec![Request::Run(call)], no_metrics);
@@ -909,45 +896,61 @@ mod tests {
                 let Outcome::Read(done) = resolution.outcome else {
                     panic!("seed {seed}: a read gives the result of a read");
                 };
-                let job = LedgerBuilder::new(settings).read_result(call_id as u32, done, 0);
-                let page = match job.status.unwrap() {
-                    resolve_stream_read::Status::Page(page) => page,
+                let answers = reading.lock().answers;
+                let page = match &done.entry.result {
+                    Some(stream_read_result::Result::Page(page)) => page.clone(),
                     // Only a Store that can fail the read ends it with a failure.
-                    resolve_stream_read::Status::Failed(failure) => {
-                        assert!(fails, "seed {seed}: {failure:?}");
+                    other => {
+                        assert!(fails, "seed {seed}: {other:?}");
                         ends[0] += 1;
                         break;
                     }
                 };
-                // A page is within what the read asked for, or it's one Record.
-                let bytes: usize = (page.records.iter())
+                // The page is the last answer of the Store. Only a read with a wait asks again, and
+                // each ask again comes `MIN_ASK_AGAIN` or more after the ask before it.
+                assert!(answers == 1 || !wait.is_zero(), "seed {seed}");
+                let spaced = MIN_ASK_AGAIN * u32::try_from(answers - 1).unwrap();
+                assert!(started.elapsed() >= spaced, "seed {seed}");
+                again += usize::from(answers > 1);
+                let records = done.records;
+                let bytes: usize = (records.iter())
                     .map(|record| field_len(record.encoded_len()))
                     .sum();
-                assert!(page.records.len() <= max_records as usize, "seed {seed}");
+                assert!(records.len() <= max_records as usize, "seed {seed}");
                 assert!(
-                    bytes <= max_bytes as usize || page.records.len() == 1,
+                    bytes <= max_bytes as usize || records.len() == 1,
                     "seed {seed}"
                 );
-                // The page ends where the last answer of the Store ended, also with no Record.
+                // The page ends where the answer of the Store ended, also with no Record. With
+                // `more` the Stream has a Record after it.
                 let answered = store.model.lock().last_offset.clone();
-                assert_eq!(page.last_offset, answered, "seed {seed}");
-                moved += usize::from(page.records.is_empty() && page.last_offset > cursor);
+                if done.after == After::More {
+                    assert!(
+                        !store.records_after(&page.last_offset).is_empty(),
+                        "seed {seed}"
+                    );
+                    more += 1;
+                } else {
+                    assert_eq!(page.last_offset, answered, "seed {seed}");
+                }
+                let moved_on = records.is_empty() && page.last_offset > cursor;
+                moved += usize::from(moved_on);
                 cursor.clone_from(&page.last_offset);
-                let came = !page.records.is_empty();
-                got.extend(page.records);
+                let came = !records.is_empty();
+                got.extend(records);
                 let all = store.records_after(&from_offset);
                 assert!(all.starts_with(&got), "seed {seed}");
-                if page.done {
-                    assert!(closed && got == all, "seed {seed}");
-                    ends[1] += 1;
-                    break;
-                }
-                // No Record came within the wait, and the last look found none.
+                // A page with no Record comes once the wait is over, even from a Store that
+                // answers before it.
                 if !came {
-                    let came = store.records_came_after(&from_offset);
-                    assert_eq!(got, came, "seed {seed}");
                     assert!(started.elapsed() >= wait, "seed {seed}");
-                    ends[2] += 1;
+                    // A Store that waits answers at the end of the wait with no Record unless it
+                    // passed entries that aren't Records.
+                    if !ignores_wait && !moved_on {
+                        let came = store.records_came_after(&from_offset);
+                        assert_eq!(got, came, "seed {seed}");
+                    }
+                    ends[1] += 1;
                     break;
                 }
                 loops += usize::from(call_id > 1);
@@ -960,8 +963,9 @@ mod tests {
             early += store.model.lock().answered_early;
         }
         // The scripts reach each kind of end, an outage, a Store that answers before the wait, a
-        // Stream that takes several reads, and a page with no Record that ends past its start.
-        let reached = [outages, early, loops, moved];
+        // Stream that takes several reads, a page with no Record that ends past its start, a page
+        // with more Records after it, and a read that asks again.
+        let reached = [outages, early, loops, moved, more, again];
         assert!(
             ends.iter().chain(&reached).all(|count| *count > 0),
             "{ends:?} {reached:?}"

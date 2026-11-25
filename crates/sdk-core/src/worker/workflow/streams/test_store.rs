@@ -1,17 +1,17 @@
 //! The model Store of the unit tests of the Stream reads.
 
+use super::manager::MIN_ASK_AGAIN;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use prost::Message;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use temporalio_streams::{
-    AppendError, CloseError, CreateError, DescribeError, ReadError, StreamStore,
+    AppendError, CreateError, DescribeError, ReadError, StreamStore,
     proto::{
-        AppendRecordsRequest, AppendRecordsResponse, ClientProducer, CloseStreamRequest,
-        CloseStreamResponse, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
-        DescribeStreamResponse, Producer, ReadRecordsRequest, ReadRecordsResponse, StreamRecord,
-        producer::Kind,
+        AppendRecordsRequest, AppendRecordsResponse, ClientProducer, CreateStreamRequest,
+        CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse, Producer,
+        ReadRecordsRequest, ReadRecordsResponse, StreamRecord, producer::Kind,
     },
     record::field_len,
 };
@@ -48,8 +48,6 @@ pub(crate) struct ModelStore {
 pub(crate) struct Model {
     pub(crate) rng: StdRng,
     pub(crate) entries: Vec<Entry>,
-    /// The Stream is closed once its last entry came.
-    pub(crate) closed: bool,
     /// Returns the fault of each read, if it has one. The test checks each request in it too.
     #[allow(clippy::type_complexity)]
     pub(crate) fault: Box<dyn FnMut(&mut StdRng, &ReadRecordsRequest) -> Option<Fault> + Send>,
@@ -59,8 +57,8 @@ pub(crate) struct Model {
     pub(crate) reading: (usize, usize),
     /// The offset that an answer with no Records moved to, where the next read must start.
     pub(crate) moved_to: Option<Vec<u8>>,
-    /// The offset of an answer with nothing after it, and the end of that read's wait. A read from
-    /// that offset must not come before then.
+    /// The offset of an answer with nothing after it, and the time before which no read from that
+    /// offset may come. That's `MIN_ASK_AGAIN` after the ask, or the end of its wait if sooner.
     pub(crate) empty_until: Option<(Vec<u8>, tokio::time::Instant)>,
     /// The answers with nothing that came before the read's wait was up.
     pub(crate) answered_early: usize,
@@ -75,13 +73,11 @@ impl Model {
     pub(crate) fn new(
         seed: u64,
         entries: Vec<Entry>,
-        closed: bool,
         fault: impl FnMut(&mut StdRng, &ReadRecordsRequest) -> Option<Fault> + Send + 'static,
     ) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
             entries,
-            closed,
             fault: Box::new(fault),
             ignores_wait: false,
             reading: (0, 0),
@@ -148,8 +144,7 @@ impl ModelStore {
             if (empty_until.as_ref())
                 .is_some_and(|(offset, until)| *offset == request.from_offset && asked < *until)
             {
-                violations
-                    .push("A read came before the wait of an empty answer was up".to_string());
+                violations.push("A read came too soon after an empty answer".to_string());
             }
             (fault(rng, &request), *ignores_wait)
         };
@@ -187,7 +182,6 @@ impl ModelStore {
         let Model {
             rng,
             entries,
-            closed,
             moved_to,
             empty_until,
             answered_early,
@@ -238,14 +232,12 @@ impl ModelStore {
             .last()
             .map_or(request.from_offset, |e| e.offset.clone());
         *moved_to = records.is_empty().then(|| last_offset.clone());
-        let done = *closed && take == later.len();
-        *empty_until = (take == 0 && !done).then(|| (last_offset.clone(), asked + wait));
+        *empty_until = (take == 0).then(|| (last_offset.clone(), asked + wait.min(MIN_ASK_AGAIN)));
         *answered_early += usize::from(empty_until.is_some() && now < asked + wait);
         last_answer.clone_from(&last_offset);
         Ok(ReadRecordsResponse {
             records,
             last_offset,
-            done,
         })
     }
 }
@@ -305,13 +297,6 @@ impl StreamStore for ModelStore {
             reading.answered = true;
             answer
         })
-    }
-
-    fn close_stream(
-        &self,
-        _: CloseStreamRequest,
-    ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
-        unimplemented!("A model Store only reads")
     }
 
     fn describe_stream(

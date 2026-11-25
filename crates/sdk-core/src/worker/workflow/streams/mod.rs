@@ -3,17 +3,20 @@
 
 mod calls;
 mod digest;
-mod ledger;
 mod manager;
+mod marker;
+mod read;
 mod replay;
 #[cfg(test)]
 mod test_store;
 
 pub(crate) use calls::{Phase, StreamCalls, is_stream_replay_failure, set_replay_failure_type};
-pub(crate) use ledger::{has_ledger, peeked_ledger};
 pub(crate) use manager::{StreamManager, StreamResolution};
+#[cfg(test)]
+pub(crate) use marker::peeked_read_marker;
+pub(crate) use marker::{PeekedMarker, is_stream_marker, marker_details, peeked_marker};
 pub(super) use replay::StreamRecordsReq;
-pub(crate) use replay::{LedgerReads, ReplayReader, ReplayReads};
+pub(crate) use replay::{MarkerReads, ReplayReader, ReplayReads};
 
 use crate::{
     WorkerConfig,
@@ -35,14 +38,17 @@ use temporalio_streams::StreamRuntime;
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tracing::Span;
 
-/// Keeps a completion far below the gRPC message size limit and the size of one write to History
-/// on the server.
-const MAX_LEDGER_BYTES: usize = 256 * 1024;
-
 /// The maximum size of the Records that one Workflow Task gives Workflow code from all of its
-/// reads. A replay reads digested Records again in parts of this size by the bytes that History
-/// recorded. One ledger over it still makes a separate part.
+/// reads.
 const MAX_TASK_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The maximum size of a part of the Records that a replay reads again, by the bytes that History
+/// recorded. One marker over it still makes a separate part.
+const MAX_REPLAY_PART_BYTES: usize = MAX_TASK_RECORD_BYTES;
+
+// The first task of a replay peeks each marker of a completion, so a part smaller than the
+// Records of one task can leave a peeked marker with no Records.
+const _: () = assert!(MAX_REPLAY_PART_BYTES >= MAX_TASK_RECORD_BYTES);
 
 /// The maximum number of Records in the page of a read whose command has no `max_records`.
 const DEFAULT_PAGE_RECORDS: i32 = 256;
@@ -79,8 +85,10 @@ impl StreamRuntimes {
 
 /// The settings of a Worker's Stream calls. A call tries again after
 /// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable) or a try with
-/// no answer within `try_deadline`. An append or a close has no time limit for that. A read has
-/// the read limit of its task, and a replay read has `replay_retry_bound`.
+/// no answer within `try_deadline`. If an append still waits to try again at the heartbeat of its
+/// Workflow Task, the task fails. So does a read that waits to try again at the read limit, at the
+/// completion or at the heartbeat of its task, and a check that fails. A replay read has
+/// `replay_retry_bound`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the
@@ -92,12 +100,21 @@ pub struct StreamSettings {
     /// How long one try waits for the Store, 5 s by default. A read's try also waits as long as the
     /// read asks the Store to wait. It must be more than 0.
     pub try_deadline: Duration,
-    /// How long the reads of a Workflow Task can wait, from the start of the task. With `None` it's
-    /// half the Workflow Task timeout. The read limit is always before the heartbeat of the task,
-    /// so a read alone never makes Core send a heartbeat. At the limit a read with a wait ends, and
-    /// a read with no wait goes on, but holds the task no longer. Appends and closes have no such
-    /// limit.
+    /// How long the reads of a Workflow Task can wait, from the start of the task or the end of its
+    /// replay. With `None` it's half the Workflow Task timeout. The read limit is always before the
+    /// heartbeat of the task, so a read alone never makes Core send a heartbeat. At the limit a
+    /// read with a wait gives a page with no Record, and a read with no wait goes on, but holds the
+    /// task no longer.
     pub read_time: Option<Duration>,
+    /// How long a check waits for the Store, 1 s by default. A check is the one Store call with no
+    /// wait that a read gets before a completion stops it, and each read after the read limit. It
+    /// holds the task, so it must be short. It must be more than 0.
+    pub read_check_deadline: Duration,
+    /// The number of read results after which a Workflow Task starts no new read, 256 by default.
+    /// A read that runs still gives its result. A read that the budget keeps back starts when the
+    /// next task opens, and only a page that Core knows of asks for that task. It must be 1 or
+    /// more.
+    pub max_task_read_results: usize,
     /// How long a replay goes on trying a Store after its first try of that Store fails, each time
     /// it reads a part of the Records of History, 3 s by default. No try or wait goes past that
     /// time, and zero is one try. The first try can take `try_deadline` to fail, so the two
@@ -106,9 +123,14 @@ pub struct StreamSettings {
     /// The maximum number of read entries whose Records a replay reads at the same time, 8 by
     /// default. It must be 1 or more.
     pub replay_concurrency: usize,
-    /// The bounds that a test sets in place of the constants.
+    /// The maximum number of runs of the Worker whose replay reads Records at the same time, 4 by
+    /// default. A run reads a part of at most 16 MiB of recorded Records at a time, or one marker
+    /// over that, so with the default the replay reads of a Worker hold about 64 MiB. It must be 1
+    /// or more.
+    pub replay_read_runs: usize,
+    /// The bound that a test sets in place of [`MAX_TASK_RECORD_BYTES`].
     #[cfg(test)]
-    pub(crate) bounds: TestBounds,
+    pub(crate) max_task_record_bytes: usize,
 }
 
 impl Default for StreamSettings {
@@ -118,10 +140,13 @@ impl Default for StreamSettings {
             retry_max_interval: Duration::from_secs(2),
             try_deadline: Duration::from_secs(5),
             read_time: None,
+            read_check_deadline: Duration::from_secs(1),
+            max_task_read_results: 256,
             replay_retry_bound: Duration::from_secs(3),
             replay_concurrency: 8,
+            replay_read_runs: 4,
             #[cfg(test)]
-            bounds: TestBounds::default(),
+            max_task_record_bytes: MAX_TASK_RECORD_BYTES,
         }
     }
 }
@@ -143,7 +168,10 @@ impl StreamSettings {
                 "read_time",
                 self.read_time.is_some_and(|time| time.is_zero()),
             ),
+            ("read_check_deadline", self.read_check_deadline.is_zero()),
+            ("max_task_read_results", self.max_task_read_results == 0),
             ("replay_concurrency", self.replay_concurrency == 0),
+            ("replay_read_runs", self.replay_read_runs == 0),
         ];
         if let Some((setting, _)) = zeros.iter().find(|(_, zero)| *zero) {
             return Err(format!(
@@ -153,40 +181,22 @@ impl StreamSettings {
         Ok(())
     }
 
-    /// Returns [`MAX_LEDGER_BYTES`], or the bound that a test set.
-    pub(crate) fn max_ledger_bytes(&self) -> usize {
-        #[cfg(test)]
-        let max = self.bounds.max_ledger_bytes;
-        #[cfg(not(test))]
-        let max = MAX_LEDGER_BYTES;
-        max
-    }
-
     /// Returns [`MAX_TASK_RECORD_BYTES`], or the bound that a test set.
     pub(crate) fn max_task_record_bytes(&self) -> usize {
         #[cfg(test)]
-        let max = self.bounds.max_task_record_bytes;
+        let max = self.max_task_record_bytes;
         #[cfg(not(test))]
         let max = MAX_TASK_RECORD_BYTES;
         max
     }
-}
 
-/// The bounds of the Stream calls that a test sets in place of the constants.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TestBounds {
-    pub(crate) max_ledger_bytes: usize,
-    pub(crate) max_task_record_bytes: usize,
-}
-
-#[cfg(test)]
-impl Default for TestBounds {
-    fn default() -> Self {
-        Self {
-            max_ledger_bytes: MAX_LEDGER_BYTES,
-            max_task_record_bytes: MAX_TASK_RECORD_BYTES,
-        }
+    /// Returns [`MAX_REPLAY_PART_BYTES`], or the bound that a test set for the Records of a task.
+    pub(crate) fn max_replay_part_bytes(&self) -> usize {
+        #[cfg(test)]
+        let max = self.max_task_record_bytes;
+        #[cfg(not(test))]
+        let max = MAX_REPLAY_PART_BYTES;
+        max
     }
 }
 
@@ -334,8 +344,8 @@ impl RunStreams {
     }
 }
 
-/// The read limit of the task in hand. After it, a read of the task asks the Store not to wait,
-/// and doesn't hold the task.
+/// The read limit of the task in hand. After it, each new read of the task is a check, and only a
+/// check holds the task.
 #[derive(Debug, Default)]
 pub(super) struct ReadLimit {
     /// `None` until the run knows the Workflow Task timeout.
@@ -349,12 +359,14 @@ pub(super) struct ReadLimit {
 
 impl ReadLimit {
     /// Gives the limit to a task that Core got at `start`, with the Workflow Task timeout
-    /// `timeout`, if it has none.
+    /// `timeout`, if it has none. The caller sets it once the run is live, since a replay reads
+    /// nothing from its task's read time.
     pub(super) fn set(&mut self, settings: &StreamSettings, start: Instant, timeout: Duration) {
         // The limit leaves time for the results of the reads before the heartbeat point.
         let latest = timeout.mul_f32(WFT_HEARTBEAT_TIMEOUT_FRACTION * READ_WAIT_SHARE);
-        let time = settings.read_time.unwrap_or(timeout / 2).min(latest);
-        self.at.get_or_insert(start + time);
+        let time = settings.read_time.unwrap_or(timeout / 2);
+        self.at
+            .get_or_insert_with(|| (Instant::now() + time).min(start + latest));
     }
 
     /// Returns the time that the task has left to its limit.

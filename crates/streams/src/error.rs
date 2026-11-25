@@ -28,8 +28,6 @@ pub enum AnyReason {
 pub enum CreateReason {
     /// The Stream already exists, and the create used the `Fail` conflict policy.
     AlreadyExists,
-    /// The Stream exists and is closed, whatever the conflict policy.
-    Closed,
     /// The Stream expired. A create fails for it with either conflict policy.
     Expired,
     /// A reason that any call can return.
@@ -45,8 +43,6 @@ pub enum AppendReason {
     NotFound,
     /// The Stream expired.
     Expired,
-    /// The Stream is closed.
-    Closed,
     /// A later attempt of the batch's Producer has already written to the Stream. Only a Store that
     /// fences returns it.
     Fenced,
@@ -73,22 +69,6 @@ pub enum ReadReason {
     Other(AnyReason),
 }
 
-/// The reasons that a close returns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
-#[non_exhaustive]
-pub enum CloseReason {
-    /// The close is for a Stream that nobody created, or for one that the Store forgot after it
-    /// expired.
-    NotFound,
-    /// The Stream expired.
-    Expired,
-    /// A later attempt of the closing Producer has already written to the Stream. Only a Store
-    /// that fences returns it.
-    Fenced,
-    /// A reason that any call can return.
-    Other(AnyReason),
-}
-
 /// The reasons that a describe returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Sequence)]
 #[non_exhaustive]
@@ -110,8 +90,8 @@ pub enum DescribeReason {
 /// ```
 /// use temporalio_streams::{AnyError, AnyReason, AppendError, AppendReason, ReadError};
 ///
-/// let closed = AppendError::operation(AppendReason::Closed, "The Stream is closed");
-/// assert_eq!(closed.to_string(), "stream_closed: The Stream is closed");
+/// let expired = AppendError::operation(AppendReason::Expired, "The Stream expired");
+/// assert_eq!(expired.to_string(), "stream_expired: The Stream expired");
 ///
 /// let down = ReadError::store_unavailable("Redis didn't answer");
 ///
@@ -133,8 +113,6 @@ pub type CreateError = StreamError<CreateReason>;
 pub type AppendError = StreamError<AppendReason>;
 /// The error of a read.
 pub type ReadError = StreamError<ReadReason>;
-/// The error of a close.
-pub type CloseError = StreamError<CloseReason>;
 /// The error of a describe.
 pub type DescribeError = StreamError<DescribeReason>;
 /// An error that any call can return. `?` converts it into the error of an operation.
@@ -223,7 +201,6 @@ impl From<CreateReason> for StreamErrorReason {
     fn from(reason: CreateReason) -> Self {
         match reason {
             CreateReason::AlreadyExists => Self::AlreadyExists,
-            CreateReason::Closed => Self::Closed,
             CreateReason::Expired => Self::Expired,
             CreateReason::Other(reason) => reason.into(),
         }
@@ -235,7 +212,6 @@ impl From<AppendReason> for StreamErrorReason {
         match reason {
             AppendReason::NotFound => Self::NotFound,
             AppendReason::Expired => Self::Expired,
-            AppendReason::Closed => Self::Closed,
             AppendReason::Fenced => Self::Fenced,
             AppendReason::TooLarge => Self::TooLarge,
             AppendReason::Other(reason) => reason.into(),
@@ -250,17 +226,6 @@ impl From<ReadReason> for StreamErrorReason {
             ReadReason::Expired => Self::Expired,
             ReadReason::OffsetTooHigh => Self::OffsetTooHigh,
             ReadReason::Other(reason) => reason.into(),
-        }
-    }
-}
-
-impl From<CloseReason> for StreamErrorReason {
-    fn from(reason: CloseReason) -> Self {
-        match reason {
-            CloseReason::NotFound => Self::NotFound,
-            CloseReason::Expired => Self::Expired,
-            CloseReason::Fenced => Self::Fenced,
-            CloseReason::Other(reason) => reason.into(),
         }
     }
 }
@@ -294,13 +259,7 @@ macro_rules! operation_reasons {
     )*};
 }
 
-operation_reasons!(
-    CreateReason,
-    AppendReason,
-    ReadReason,
-    CloseReason,
-    DescribeReason
-);
+operation_reasons!(CreateReason, AppendReason, ReadReason, DescribeReason);
 
 impl<R: WireReason> StreamError<R> {
     /// Creates the error of an operation from the number of a `StreamErrorReason` and a message.
@@ -354,7 +313,6 @@ mod tests {
         check::<CreateReason>();
         check::<AppendReason>();
         check::<ReadReason>();
-        check::<CloseReason>();
         check::<DescribeReason>();
     }
 }

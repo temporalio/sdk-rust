@@ -1,8 +1,8 @@
 // Experimental. Might change in the future.
 // The Stream service as a System Nexus service. Each record maps to a message under
-// ../temporal/api (stream/v1, streamservice/v1 and the Stream enums in enums/v1). Each SDK copies
-// this file and generates its Workflow API and its client from it with nexgen
-// (`--targets workflow,client --system-nexus`).
+// ../temporal/api (sdk/v1/stream.proto, stream/v1, streamservice/v1 and the Stream enums in
+// enums/v1). Each SDK copies this file and generates its Workflow API and its client from it with
+// nexgen (`--targets workflow,client --system-nexus`).
 package temporal:nexus@1.0.0;
 
 world system {
@@ -34,7 +34,7 @@ interface stream-service {
   }
 
   /// @nexus.doc "A reference to one Stream. Callers treat the id as opaque."
-  /// @nexus.proto "temporal.api.stream.v1.StreamRef"
+  /// @nexus.proto "temporal.api.sdk.v1.StreamRef"
   /// @nexus.generic "body-t"
   record stream-ref {
     /// @nexus.doc "The Stream id, 1 to 4096 bytes."
@@ -150,8 +150,7 @@ interface stream-service {
   }
 
   // Offsets are unique and ordered within one Stream, but they have gaps, so they don't count
-  // Records. A read returns only Records. A close stores no Record, so the read response reports
-  // it with `done`.
+  // Records. A read returns only Records.
   /// @nexus.doc "One Record of a Stream, as a read returns it."
   /// @nexus.proto "temporal.api.stream.v1.StreamRecord"
   record stream-record {
@@ -164,7 +163,7 @@ interface stream-service {
 
   /// @nexus.doc
   ///   "Create a Stream. If it already exists, fail, or return it with use-existing."
-  /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamRequest"
+  /// @nexus.proto "temporal.api.sdk.v1.CreateStreamRequest"
   record create-stream-request {
     // This field isn't called `ref`, so the created Stream takes its ref from the response.
     /// @nexus.doc "The Stream to create. Its id must not be empty."
@@ -182,16 +181,8 @@ interface stream-service {
     stream-id-conflict-policy-use-existing,
   }
 
-  /// @nexus.proto "temporal.api.enums.v1.StreamStatus"
-  enum stream-status {
-    /// @nexus.fallback
-    stream-status-unspecified,
-    stream-status-open,
-    stream-status-closed,
-  }
-
   /// @nexus.doc "Append one batch. The Store writes a batch that arrives again only once."
-  /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsRequest"
+  /// @nexus.proto "temporal.api.sdk.v1.AppendRecordsRequest"
   record append-records-request {
     ref: stream-ref,
     records: list<append-record>,
@@ -213,26 +204,8 @@ interface stream-service {
     last-offset: option<list<u8>>,
   }
 
-  // A close has no value, so code with a final value appends it first.
-  /// @nexus.doc "Close a Stream. Readers get the Records that are left. Later appends fail."
-  /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamRequest"
-  record close-stream-request {
-    ref: stream-ref,
-    /// @nexus.doc
-    ///   "The Producer that closes the Stream. Defaults to the Producer of the calling context."
-    /// @nexus.source targets="workflow" python="workflow_producer()"
-    ///   typescript="workflowProducer()" dotnet="StreamWorkflowContext.Producer()"
-    /// @nexus.default targets="client" python="_support.default_producer(self._nexus_client)"
-    ///   typescript="support.defaultProducer()" dotnet="StreamActivityContext.Producer()"
-    producer: producer,
-  }
-
-  /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamResponse"
-  record close-stream-response {
-  }
-
   /// @nexus.doc "Read Records after an offset."
-  /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsRequest"
+  /// @nexus.proto "temporal.api.sdk.v1.ReadRecordsRequest"
   record read-records-request {
     ref: stream-ref,
     // To read only new Records, a caller gets last-offset from a describe and reads after it.
@@ -242,7 +215,7 @@ interface stream-service {
     max-records: option<s32>,
     /// @nexus.doc "The maximum bytes of Records in a page. A larger Record is returned alone."
     max-bytes: option<s64>,
-    /// @nexus.doc "How long the read waits for a new Record or a close before an empty page."
+    /// @nexus.doc "How long the read waits for a new Record before an empty page."
     wait: option<duration>,
   }
 
@@ -251,18 +224,15 @@ interface stream-service {
     records: list<stream-record>,
     /// @nexus.doc "Where the next read goes on. It is never before the last Record in this page."
     last-offset: option<list<u8>>,
-    /// @nexus.doc "True when the Stream is closed and this page has its last Record."
-    done: bool,
   }
 
-  /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamRequest"
+  /// @nexus.proto "temporal.api.sdk.v1.DescribeStreamRequest"
   record describe-stream-request {
     ref: stream-ref,
   }
 
   /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamResponse"
   record describe-stream-response {
-    status: option<stream-status>,
     /// @nexus.doc "The newest offset. A read from it gives only later Records. Empty with none."
     last-offset: option<list<u8>>,
   }
@@ -274,8 +244,7 @@ interface stream-service {
   resource %stream {
     constructor(ref: stream-ref, created: option<bool>);
 
-    // The Workflow `append` and `close` have no `producer`, because the request field has a
-    // Workflow source.
+    // The Workflow `append` has no `producer`, because the request field has a Workflow source.
     /// @nexus.doc "Append values, and return the offsets of the batch."
     /// @nexus.operation "append-records"
     /// @nexus.varargs "records"
@@ -283,11 +252,6 @@ interface stream-service {
       records: list<append-record>,
       producer: option<producer>,
     ) -> append-records-response;
-
-    /// @nexus.doc "Close the Stream. Readers get the Records that are left, then end."
-    /// @nexus.operation "close-stream"
-    /// @nexus.close
-    close: func(producer: option<producer>);
 
     // Workflow code and a client read the same way, with a page read or its poll iterator.
     /// @nexus.doc "Read one page of Records. The poll iterator reads them all."
@@ -299,13 +263,13 @@ interface stream-service {
       max-bytes: option<s64>,
     ) -> read-records-response;
 
-    /// @nexus.doc "Return the status and the newest offset of the Stream."
+    /// @nexus.doc "Return the newest offset of the Stream."
     /// @nexus.operation "describe-stream"
     describe: func() -> describe-stream-response;
   }
 
   // With use-existing, created is false when the Stream existed.
-  /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamResponse"
+  /// @nexus.proto "temporal.api.sdk.v1.CreateStreamResponse"
   type create-stream-result = own<%stream>;
 
   // The Workflow API has no other way to create a Stream, so this function stays public.
@@ -316,10 +280,6 @@ interface stream-service {
   /// @nexus.operation name="AppendRecords"
   /// @nexus.api-omit
   append-records: func(request: append-records-request) -> append-records-response;
-
-  /// @nexus.operation name="CloseStream"
-  /// @nexus.api-omit
-  close-stream: func(request: close-stream-request) -> close-stream-response;
 
   // A WIT stream can't cross a Nexus call, so a read is a request and a response. The SDK's support
   // helper builds the next request from a page for the poll iterator.

@@ -1,5 +1,5 @@
-//! A Stream Store in memory for Core's tests. It implements [`StreamStore`], and each test sets
-//! its faults.
+//! The Stream Store of Core's tests. It implements [`StreamStore`], and each test sets its
+//! faults.
 
 use futures_util::future::BoxFuture;
 use parking_lot::{Condvar, Mutex};
@@ -8,13 +8,13 @@ use std::{
     time::Duration,
 };
 use temporalio_streams::{
-    AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
-    DescribeError, ReadError, ReadReason, StreamError, StreamStore,
+    AnyError, AnyReason, AppendError, AppendReason, CreateError, DescribeError, ReadError,
+    ReadReason, StreamError, StreamStore,
     attempt::{ATTEMPT_KEY_LEN, attempt_key, producer_key},
     proto::{
-        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
-        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        ReadRecordsRequest, ReadRecordsResponse, StreamRecord, StreamRef,
+        AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, CreateStreamResponse,
+        DescribeStreamRequest, DescribeStreamResponse, ReadRecordsRequest, ReadRecordsResponse,
+        StreamRecord,
     },
 };
 use tokio::sync::watch;
@@ -23,7 +23,6 @@ use tokio::sync::watch;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Op {
     Append,
-    Close,
     Read,
 }
 
@@ -32,7 +31,6 @@ pub enum Op {
 pub enum Request {
     /// An append, with the request id of its call.
     Append(AppendRecordsRequest, String),
-    Close(CloseStreamRequest),
     Read(ReadRecordsRequest),
 }
 
@@ -48,7 +46,6 @@ struct Stream {
     /// before it.
     base: u64,
     records: Vec<StreamRecord>,
-    closed: bool,
     /// The last batches of each Producer, by its key, oldest first.
     producers: HashMap<Vec<u8>, VecDeque<Written>>,
 }
@@ -64,6 +61,8 @@ struct State {
     streams: HashMap<String, Stream>,
     requests: Vec<Request>,
     held: HashSet<Op>,
+    /// The held calls of each kind that may go on, one for each.
+    passes: HashMap<Op, usize>,
     held_streams: HashSet<String>,
     failures: HashMap<Op, (AnyError, usize)>,
     lost_answers: HashMap<Op, usize>,
@@ -82,7 +81,7 @@ const WINDOW: usize = 4;
 
 /// A Store in memory. It fences an earlier attempt of a Producer, and writes nothing for a resend
 /// of one of the last `WINDOW` batches of a Producer of a Stream. A read with no Record to give
-/// waits for one, or for a close, up to its `wait`.
+/// waits for one up to its `wait`.
 #[derive(Default)]
 pub struct MemoryStore {
     state: Mutex<State>,
@@ -98,13 +97,23 @@ impl MemoryStore {
         self.state.lock().held.insert(op);
     }
 
-    /// Lets each held call go on, and ends the holds.
-    pub fn release(&self) {
-        self.state.lock().held.clear();
+    /// Lets `count` held calls of `op` go on, each that arrives while the hold lasts. A call that
+    /// stops while it waits takes none.
+    pub fn pass(&self, op: Op, count: usize) {
+        *self.state.lock().passes.entry(op).or_default() += count;
         self.released.send_modify(|count| *count += 1);
     }
 
-    /// Makes each append, close and read of the Stream `id` wait for [`Self::release_stream`].
+    /// Lets each held call go on, and ends the holds.
+    pub fn release(&self) {
+        let mut state = self.state.lock();
+        state.held.clear();
+        state.passes.clear();
+        drop(state);
+        self.released.send_modify(|count| *count += 1);
+    }
+
+    /// Makes each call of the Stream `id` wait for [`Self::release_stream`].
     pub fn hold_stream(&self, id: &str) {
         self.state.lock().held_streams.insert(id.to_string());
     }
@@ -167,11 +176,6 @@ impl MemoryStore {
             .unwrap_or_default()
     }
 
-    pub fn is_closed(&self, id: &str) -> bool {
-        let state = self.state.lock();
-        state.streams.get(id).is_some_and(|stream| stream.closed)
-    }
-
     /// Removes the Stream `id`, as its Retention does, so that a replay finds its Records gone.
     pub fn forget(&self, id: &str) {
         self.state.lock().streams.remove(id);
@@ -182,7 +186,7 @@ impl MemoryStore {
         (self.requests().into_iter())
             .filter_map(|request| match request {
                 Request::Read(read) => Some(read),
-                _ => None,
+                Request::Append(..) => None,
             })
             .collect()
     }
@@ -190,11 +194,9 @@ impl MemoryStore {
     /// Takes the request, and then holds or fails it as the faults say.
     async fn arrive(&self, op: Op, request: Request) -> Result<(), AnyError> {
         let id = match &request {
-            Request::Append(append, _) => stream_id(append.r#ref.as_ref()),
-            Request::Close(close) => stream_id(close.r#ref.as_ref()),
-            Request::Read(read) => stream_id(read.r#ref.as_ref()),
-        }
-        .to_string();
+            Request::Append(append, _) => append.stream_id.clone(),
+            Request::Read(read) => read.stream_id.clone(),
+        };
         let mut released = self.released.subscribe();
         let (held, gated) = {
             let mut state = self.state.lock();
@@ -205,7 +207,20 @@ impl MemoryStore {
             (state.held.contains(&op), gated)
         };
         if held {
-            let _ = released.changed().await;
+            loop {
+                {
+                    let mut state = self.state.lock();
+                    if !state.held.contains(&op) {
+                        break;
+                    }
+                    let passes = state.passes.entry(op).or_default();
+                    if *passes > 0 {
+                        *passes -= 1;
+                        break;
+                    }
+                }
+                let _ = released.changed().await;
+            }
         }
         if let Some(at) = gated {
             while self.state.lock().gated.contains(&at) {
@@ -241,11 +256,6 @@ impl MemoryStore {
 }
 
 const NOT_CREATED: &str = "Nobody created the Stream";
-
-/// Returns the Stream id of the ref of a request.
-fn stream_id(stream_ref: Option<&StreamRef>) -> &str {
-    &stream_ref.expect("A request has a ref").id
-}
 const FENCED: &str = "A later attempt of the Producer wrote";
 
 impl State {
@@ -254,7 +264,7 @@ impl State {
         request: AppendRecordsRequest,
         request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
-        let stream = self.streams.get_mut(stream_id(request.r#ref.as_ref()));
+        let stream = self.streams.get_mut(&request.stream_id);
         let stream =
             stream.ok_or_else(|| AppendError::operation(AppendReason::NotFound, NOT_CREATED))?;
         let producer = request.producer.expect("The runtime checks the Producer");
@@ -274,10 +284,6 @@ impl State {
             if batches.back().is_some_and(|last| key < last.key) {
                 return Err(AppendError::operation(AppendReason::Fenced, FENCED));
             }
-        }
-        if stream.closed {
-            let reason = AppendReason::Closed;
-            return Err(AppendError::operation(reason, "The Stream is closed"));
         }
         let first = stream.records.len();
         for record in &request.records {
@@ -307,24 +313,6 @@ impl State {
             last_offset: offsets.1,
         })
     }
-
-    fn close(&mut self, request: &CloseStreamRequest) -> Result<CloseStreamResponse, CloseError> {
-        let stream = self.streams.get_mut(stream_id(request.r#ref.as_ref()));
-        let stream =
-            stream.ok_or_else(|| CloseError::operation(CloseReason::NotFound, NOT_CREATED))?;
-        let producer = request.producer.as_ref().expect("The runtime checks it");
-        let id = producer_key(producer).expect("The runtime checks the kind");
-        let key = attempt_key(producer.kind.as_ref());
-        if stream.closed {
-            return Ok(CloseStreamResponse {});
-        }
-        let last = stream.producers.get(&id).and_then(VecDeque::back);
-        if last.is_some_and(|last| key < last.key) {
-            return Err(CloseError::operation(CloseReason::Fenced, FENCED));
-        }
-        stream.closed = true;
-        Ok(CloseStreamResponse {})
-    }
 }
 
 impl StreamStore for MemoryStore {
@@ -336,18 +324,16 @@ impl StreamStore for MemoryStore {
         Box::pin(async move {
             let mut state = self.state.lock();
             let base = (state.streams.len() as u64 + 1) << 20;
-            let id = stream_id(request.stream_ref.as_ref()).to_string();
-            let created = !state.streams.contains_key(&id);
-            state.streams.entry(id).or_insert_with(|| Stream {
-                base,
-                records: vec![],
-                closed: false,
-                producers: HashMap::new(),
-            });
-            Ok(CreateStreamResponse {
-                r#ref: request.stream_ref,
-                created,
-            })
+            let created = !state.streams.contains_key(&request.stream_id);
+            state
+                .streams
+                .entry(request.stream_id)
+                .or_insert_with(|| Stream {
+                    base,
+                    records: vec![],
+                    producers: HashMap::new(),
+                });
+            Ok(CreateStreamResponse { created })
         })
     }
 
@@ -384,24 +370,21 @@ impl StreamStore for MemoryStore {
             loop {
                 let page = {
                     let state = self.state.lock();
-                    let stream = state.streams.get(stream_id(request.r#ref.as_ref()));
+                    let stream = state.streams.get(&request.stream_id);
                     let reason = ReadReason::NotFound;
                     let stream = stream.ok_or_else(|| ReadError::operation(reason, NOT_CREATED))?;
-                    let after: Vec<&StreamRecord> = (stream.records.iter())
+                    let records: Vec<StreamRecord> = (stream.records.iter())
                         .filter(|record| record.offset > request.from_offset)
-                        .collect();
-                    let records: Vec<StreamRecord> = (after.iter())
                         .take(request.max_records.max(1) as usize)
-                        .map(|record| (*record).clone())
+                        .cloned()
                         .collect();
                     ReadRecordsResponse {
-                        done: stream.closed && records.len() == after.len(),
                         last_offset: (records.last())
                             .map_or(request.from_offset.clone(), |r| r.offset.clone()),
                         records,
                     }
                 };
-                if !page.records.is_empty() || page.done {
+                if !page.records.is_empty() {
                     return Ok(page);
                 }
                 let changed = tokio::time::timeout_at(until, written.changed()).await;
@@ -409,19 +392,6 @@ impl StreamStore for MemoryStore {
                     return Ok(page);
                 }
             }
-        })
-    }
-
-    fn close_stream(
-        &self,
-        request: CloseStreamRequest,
-    ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
-        Box::pin(async move {
-            self.arrive(Op::Close, Request::Close(request.clone()))
-                .await?;
-            let closed = self.state.lock().close(&request);
-            self.written.send_modify(|count| *count += 1);
-            self.answer(Op::Close, closed)
         })
     }
 

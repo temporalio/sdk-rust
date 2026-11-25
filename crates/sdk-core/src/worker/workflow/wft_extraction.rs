@@ -58,7 +58,7 @@ pub(super) enum HistoryFetchReq {
 #[derive(derive_more::Debug)]
 pub(super) enum FetchedPage {
     History(HistoryUpdate),
-    /// The Records of the next ledgers of the History that the run has.
+    /// The Records of the next read markers of the History that the run has.
     #[debug("StreamRecords")]
     StreamRecords(ReplayReads),
 }
@@ -73,6 +73,7 @@ impl WFTExtractor {
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
         records_stream: impl Stream<Item = StreamRecordsReq> + Send + 'static,
+        replay_read_runs: usize,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
@@ -167,13 +168,14 @@ impl WFTExtractor {
         .buffer_unordered(max_fetch_concurrency);
         // In a separate stage, a Store that gives no answer keeps no poll out of the fetch stage.
         // Each read runs on the Worker's runtime, so no Store code holds the thread of the runs.
+        // The bound on the runs that read at once bounds the Records that the Worker holds.
         let handle = Handle::current();
         let records = records_stream
             .map(move |request| {
                 let read = handle.spawn(request.read());
                 read.map(|output| output.map_err(|e| tonic::Status::internal(e.to_string())))
             })
-            .buffer_unordered(usize::MAX);
+            .buffer_unordered(replay_read_runs);
         stream::select(fetched, records)
     }
 }

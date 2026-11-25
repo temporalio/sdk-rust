@@ -1,5 +1,5 @@
-//! The digest of the Records of a page that a read gave Workflow code. A ledger keeps it in place
-//! of the Records, and a replay checks the Records that it reads again against it.
+//! The digest of the Records of a page that a read gave Workflow code. A read marker keeps it in
+//! place of the Records, and a replay checks the Records that it reads again against it.
 
 use sha2::{Digest as _, Sha256};
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -8,7 +8,7 @@ use temporalio_streams::{
     proto::StreamRecord,
 };
 
-/// The length of a digest in a ledger, in bytes. It's a fact of the ledger's format.
+/// The length of a digest in a read marker, in bytes. It's a fact of the marker's format.
 const DIGEST_LEN: usize = 16;
 
 /// The first byte of the hashed input, so the digest differs from other hashes of the same bytes.
