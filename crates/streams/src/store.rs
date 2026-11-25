@@ -9,10 +9,11 @@ use futures_util::future::BoxFuture;
 
 /// A Stream Store, which serves the operations of the Nexus service
 /// `temporal.api.streamservice.v1.StreamService`. The [API repo](https://github.com/temporalio/api)
-/// defines that service in `nexus/stream-service.wit`, and its request and response messages in
-/// [`request_response.proto`][messages], which [`proto`](crate::proto) has in Rust. The request id
-/// of a create or an append is in the envelope of its Nexus call, so those methods take it next to
-/// the request. The [crate docs](crate) define the terms that these docs use.
+/// defines that service in `nexus/stream-service.wit`, whose requests have the ref of a Stream. A
+/// Store gets the requests of [`request_response.proto`][messages] instead, which have only the
+/// Stream id. [`proto`](crate::proto) has them in Rust. The request id of a create or an append is
+/// in the envelope of its Nexus call, so those methods take it next to the request. The
+/// [crate docs](crate) define the terms that these docs use.
 ///
 /// [messages]: https://github.com/temporalio/api/blob/master/temporal/api/streamservice/v1/request_response.proto
 ///
@@ -108,7 +109,7 @@ pub trait StreamStore: Send + Sync + 'static {
     ///   3. The policy is `UseExisting`, so the create returns `created` false. With `Fail`, or
     ///      with no policy, it fails with
     ///      [`CreateReason::AlreadyExists`](crate::CreateReason::AlreadyExists).
-    /// - A Store may forget an expired Stream after some time beyond its configured retention.
+    /// - A Store may forget an expired Stream after some time beyond its configured Retention.
     ///   From then on it answers a call for that id with `NotFound`, and a create for the id can
     ///   succeed.
     fn create_stream(
