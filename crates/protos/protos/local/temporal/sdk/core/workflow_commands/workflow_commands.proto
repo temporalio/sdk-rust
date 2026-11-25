@@ -425,8 +425,8 @@ message RequestCancelNexusOperation {
 
 // Appends Records to a Stream as the Workflow's Producer. Core calls the Store while the Workflow
 // Task is open, and sends the result in a `ResolveStreamAppend` job. As for a Local Activity, Core
-// keeps the task open while an append runs. History keeps the result in the `core_stream` marker of
-// the activation that gets it.
+// keeps the task open while an append runs. History keeps the result in the `core_stream_append`
+// marker of the activation that gets it.
 //
 // An append is at-least-once. If History has no result of it, a later attempt of the Workflow Task
 // writes the batch again.

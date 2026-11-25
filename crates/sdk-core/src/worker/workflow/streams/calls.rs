@@ -14,7 +14,7 @@ use std::{
 };
 use temporalio_common::protos::{
     coresdk::{
-        external_data::{StreamAppendResult, StreamMarkerData},
+        external_data::{StreamAppendMarkerData, StreamAppendResult},
         workflow_activation::workflow_activation_job,
         workflow_commands::AppendToStream,
     },
@@ -118,7 +118,7 @@ pub(crate) struct StreamCalls {
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
     /// The live results of the activation in hand, which its marker records.
-    marker: StreamMarkerData,
+    marker: StreamAppendMarkerData,
     /// True once the task in hand gave a live result, until the task completes.
     marked: bool,
     requests: Vec<Request>,
@@ -151,7 +151,7 @@ impl StreamCalls {
             held: Held::default(),
             ready: BTreeMap::new(),
             released: None,
-            marker: StreamMarkerData::default(),
+            marker: StreamAppendMarkerData::default(),
             marked: false,
             requests: vec![],
         }
@@ -266,7 +266,7 @@ impl StreamCalls {
     }
 
     /// Holds the entries of a marker from History, each for its call.
-    pub(crate) fn peeked(&mut self, data: StreamMarkerData) -> Result<(), WFMachinesError> {
+    pub(crate) fn peeked(&mut self, data: StreamAppendMarkerData) -> Result<(), WFMachinesError> {
         for append in data.appends {
             let seq = append.seq;
             if self.held.appends.insert(seq, append).is_some() {
@@ -397,19 +397,19 @@ impl StreamCalls {
 
     /// Returns the marker of the live results that the last [`Self::take_jobs`] gave, if it gave
     /// any.
-    pub(crate) fn take_marker(&mut self) -> Option<StreamMarkerData> {
+    pub(crate) fn take_marker(&mut self) -> Option<StreamAppendMarkerData> {
         (!self.marker.appends.is_empty()).then(|| std::mem::take(&mut self.marker))
     }
 
     /// Returns a marker with no entry if the task completes while a call has no result in a marker
     /// and the task recorded none. A replay with chunking on would otherwise take the task as a
     /// heartbeat and join it to the next one, whose activation indexes would then not match.
-    pub(crate) fn take_completion_marker(&mut self) -> Option<StreamMarkerData> {
+    pub(crate) fn take_completion_marker(&mut self) -> Option<StreamAppendMarkerData> {
         if self.phase != Phase::Live || self.marked || !self.needs_next_task() {
             return None;
         }
         self.marked = true;
-        Some(StreamMarkerData::default())
+        Some(StreamAppendMarkerData::default())
     }
 
     /// Returns the calls that the Worker must start or stop.
@@ -425,7 +425,7 @@ impl StreamCalls {
         self.held = Held::default();
         self.ready.clear();
         self.released = None;
-        self.marker = StreamMarkerData::default();
+        self.marker = StreamAppendMarkerData::default();
         self.marked = false;
         self.requests.clear();
     }
@@ -738,7 +738,7 @@ mod tests {
 
     /// Returns the marker of an activation at `activation` that has the result of append `seq` to
     /// the Stream `id`.
-    fn marker(activation: u64, seq: u32, id: &str) -> StreamMarkerData {
+    fn marker(activation: u64, seq: u32, id: &str) -> StreamAppendMarkerData {
         let entry = StreamAppendResult {
             seq,
             stream_id: id.to_string(),
@@ -746,13 +746,13 @@ mod tests {
             activation_index: activation,
             result: Some(appended(seq)),
         };
-        StreamMarkerData {
+        StreamAppendMarkerData {
             appends: vec![entry],
         }
     }
 
     /// Returns the seq and the activation index of each entry of `marker`.
-    fn entries(marker: Option<StreamMarkerData>) -> Vec<(u32, u64)> {
+    fn entries(marker: Option<StreamAppendMarkerData>) -> Vec<(u32, u64)> {
         (marker.into_iter().flat_map(|marker| marker.appends))
             .map(|append| (append.seq, append.activation_index))
             .collect()
@@ -925,7 +925,7 @@ mod tests {
         has_events: bool,
         activations: Vec<Activation>,
         /// The marker of each activation that got a live result, in order.
-        markers: Vec<StreamMarkerData>,
+        markers: Vec<StreamAppendMarkerData>,
         /// True if this task sent the last command of the Workflow.
         ends_workflow: bool,
     }
@@ -962,7 +962,7 @@ mod tests {
         fn activate(
             &mut self,
             commands: &[Command],
-        ) -> Result<(Vec<Variant>, Option<StreamMarkerData>), WFMachinesError> {
+        ) -> Result<(Vec<Variant>, Option<StreamAppendMarkerData>), WFMachinesError> {
             let jobs = self.calls.take_jobs(self.activation, None);
             let marker = self.calls.take_marker();
             self.activation += 1;

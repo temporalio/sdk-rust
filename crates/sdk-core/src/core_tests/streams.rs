@@ -26,13 +26,13 @@ use std::{
     time::{Duration, Instant},
 };
 use temporalio_common::protos::{
-    constants::STREAM_MARKER_NAME,
+    constants::STREAM_APPEND_MARKER_NAME,
     coresdk::{
         ActivityTaskCompletion, FromJsonPayloadExt,
         activity_result::ActivityExecutionResult,
         activity_task::activity_task,
         external_data::{
-            StreamAppendOffsets, StreamAppendResult, StreamMarkerData, stream_append_result,
+            StreamAppendMarkerData, StreamAppendOffsets, StreamAppendResult, stream_append_result,
         },
         workflow_activation::{
             ResolveStreamAppend, StreamAppended, WorkflowActivation,
@@ -348,9 +348,9 @@ fn answer(activation: &WorkflowActivation) -> Option<Command> {
 }
 
 /// Adds a Stream marker with `data` to `t`, as a command of the completion `completed`.
-fn add_stream_marker(t: &mut TestHistoryBuilder, completed: i64, data: &StreamMarkerData) {
+fn add_stream_marker(t: &mut TestHistoryBuilder, completed: i64, data: &StreamAppendMarkerData) {
     t.add(MarkerRecordedEventAttributes {
-        marker_name: STREAM_MARKER_NAME.to_string(),
+        marker_name: STREAM_APPEND_MARKER_NAME.to_string(),
         details: marker_details(data),
         workflow_task_completed_event_id: completed,
         ..Default::default()
@@ -506,14 +506,14 @@ fn complete() -> Command {
 }
 
 /// Returns the data of each Stream marker of `completion`, in order.
-fn markers(completion: &WorkflowTaskCompletion) -> Vec<StreamMarkerData> {
+fn markers(completion: &WorkflowTaskCompletion) -> Vec<StreamAppendMarkerData> {
     (completion.commands.iter())
         .filter_map(|command| match command.attributes.as_ref() {
             Some(Attributes::RecordMarkerCommandAttributes(marker))
-                if marker.marker_name == STREAM_MARKER_NAME =>
+                if marker.marker_name == STREAM_APPEND_MARKER_NAME =>
             {
                 let data = &marker.details["data"].payloads[0];
-                Some(StreamMarkerData::from_json_payload(data).unwrap())
+                Some(StreamAppendMarkerData::from_json_payload(data).unwrap())
             }
             _ => None,
         })
@@ -571,7 +571,7 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
     };
     assert_eq!(live[1], [Job::ResolveStreamAppend(appended)]);
     // The marker of the activation with the result goes before the commands of that activation.
-    let expected = StreamMarkerData {
+    let expected = StreamAppendMarkerData {
         appends: vec![self::appended(1, "s", offset, 1)],
     };
     let sent = &run.sent()[0];
@@ -859,13 +859,13 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
 
         // The completion has a marker for each result that Workflow code took, and then the last
         // command. It forces no task.
-        let expected: Vec<StreamMarkerData> = (1..)
+        let expected: Vec<StreamAppendMarkerData> = (1..)
             .zip(&ending.taken)
             .map(|(activation, at)| {
                 let call = &ending.calls[*at];
                 let offset = store.records(&call.stream)[0].offset.clone();
                 let appends = vec![appended(call.seq, &call.stream, offset, activation)];
-                StreamMarkerData { appends }
+                StreamAppendMarkerData { appends }
             })
             .collect();
         let sent = run.sent();
@@ -1047,7 +1047,7 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     // A marker with no entry keeps the first task apart from the next one in a replay with
     // chunking on. A heartbeat of the forced task can complete it before the result arrives.
     assert!(sent[0].force_create_new_workflow_task);
-    assert_eq!(markers(&sent[0]), [StreamMarkerData::default()]);
+    assert_eq!(markers(&sent[0]), [StreamAppendMarkerData::default()]);
     assert_eq!(command_types(&sent[0]), [CommandType::RecordMarker]);
     assert_eq!(sent[0].query_responses.len(), usize::from(query));
     let recorded: Vec<usize> = (sent[1..].iter().flat_map(markers))
@@ -1374,7 +1374,7 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     other.add_workflow_task_completed();
     let appends = vec![appended(1, "s", vec![7], 0)];
     let completed = other.current_event_id();
-    add_stream_marker(&mut other, completed, &StreamMarkerData { appends });
+    add_stream_marker(&mut other, completed, &StreamAppendMarkerData { appends });
     other.add_we_signaled("done", vec![]);
     let next = next_task(&mut other);
     let workflow: Workflow = |activation| match &activation.jobs[0].variant {
@@ -1627,7 +1627,7 @@ async fn replay_calls(
             }
         }
         if !appends.is_empty() {
-            add_stream_marker(&mut t, completed, &StreamMarkerData { appends });
+            add_stream_marker(&mut t, completed, &StreamAppendMarkerData { appends });
         }
     }
     t.add_workflow_execution_completed();

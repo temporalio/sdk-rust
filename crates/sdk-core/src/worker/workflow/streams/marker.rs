@@ -1,15 +1,15 @@
-//! The `core_stream` marker of an activation, which records the results of appends that Workflow
-//! code got in that activation.
+//! The `core_stream_append` marker of an activation, which records the results of appends that
+//! Workflow code got in that activation.
 
 use super::manager::failure_of;
 use crate::worker::workflow::WFMachinesError;
 use serde::Serialize;
 use std::collections::HashMap;
 use temporalio_common::protos::{
-    constants::STREAM_MARKER_NAME,
+    constants::STREAM_APPEND_MARKER_NAME,
     coresdk::{
         AsJsonPayloadExt, FromJsonPayloadExt,
-        external_data::{StreamAppendResult, StreamMarkerData, stream_append_result},
+        external_data::{StreamAppendMarkerData, StreamAppendResult, stream_append_result},
         workflow_activation::{ResolveStreamAppend, StreamAppended, resolve_stream_append},
     },
     temporal::api::{
@@ -54,27 +54,27 @@ fn json(value: &impl Serialize) -> Payload {
 }
 
 /// Returns the details of the marker command that records `data`.
-pub(crate) fn marker_details(data: &StreamMarkerData) -> HashMap<String, Payloads> {
+pub(crate) fn marker_details(data: &StreamAppendMarkerData) -> HashMap<String, Payloads> {
     HashMap::from([(MARKER_DATA_KEY.to_string(), json(data).into())])
 }
 
-/// Returns true if `event` is a `core_stream` marker.
+/// Returns true if `event` is a `core_stream_append` marker.
 pub(crate) fn is_stream_marker(event: &HistoryEvent) -> bool {
     marker_of(event).is_some()
 }
 
-/// Decodes a `core_stream` marker event, and returns `None` for any other event. A marker that
-/// doesn't decode, or that has a result which Core can't give Workflow code, is an error.
+/// Decodes a `core_stream_append` marker event, and returns `None` for any other event. A marker
+/// that doesn't decode, or that has a result which Core can't give Workflow code, is an error.
 pub(crate) fn peeked_marker(
     event: &HistoryEvent,
-) -> Option<Result<StreamMarkerData, WFMachinesError>> {
+) -> Option<Result<StreamAppendMarkerData, WFMachinesError>> {
     marker_of(event).map(decode)
 }
 
 fn marker_of(event: &HistoryEvent) -> Option<&MarkerRecordedEventAttributes> {
     match event.attributes.as_ref()? {
         history_event::Attributes::MarkerRecordedEventAttributes(marker)
-            if marker.marker_name == STREAM_MARKER_NAME =>
+            if marker.marker_name == STREAM_APPEND_MARKER_NAME =>
         {
             Some(marker)
         }
@@ -82,14 +82,16 @@ fn marker_of(event: &HistoryEvent) -> Option<&MarkerRecordedEventAttributes> {
     }
 }
 
-fn decode(marker: &MarkerRecordedEventAttributes) -> Result<StreamMarkerData, WFMachinesError> {
+fn decode(
+    marker: &MarkerRecordedEventAttributes,
+) -> Result<StreamAppendMarkerData, WFMachinesError> {
     let bad = |why: String| WFMachinesError::Fatal(format!("The Stream marker {why}"));
     let payload = marker
         .details
         .get(MARKER_DATA_KEY)
         .and_then(|payloads| payloads.payloads.first())
         .ok_or_else(|| bad("has no data".to_string()))?;
-    let data = StreamMarkerData::from_json_payload(payload)
+    let data = StreamAppendMarkerData::from_json_payload(payload)
         .map_err(|error| bad(format!("doesn't decode: {error}")))?;
     if let Some(append) = data.appends.iter().find(|append| append.result.is_none()) {
         return Err(bad(format!("has no result of append {}", append.seq)));
@@ -131,7 +133,7 @@ mod tests {
         HistoryEvent {
             attributes: Some(history_event::Attributes::MarkerRecordedEventAttributes(
                 MarkerRecordedEventAttributes {
-                    marker_name: STREAM_MARKER_NAME.to_string(),
+                    marker_name: STREAM_APPEND_MARKER_NAME.to_string(),
                     details,
                     ..Default::default()
                 },
@@ -158,7 +160,7 @@ mod tests {
             activation_index: 1,
             result: Some(result),
         };
-        let marker = StreamMarkerData {
+        let marker = StreamAppendMarkerData {
             appends: vec![entry(3, "orders", appended), entry(4, "audit", failed)],
         };
 
@@ -241,7 +243,7 @@ mod tests {
     }
 
     /// Returns the marker of an activation with random results.
-    fn valid_marker(rng: &mut StdRng) -> StreamMarkerData {
+    fn valid_marker(rng: &mut StdRng) -> StreamAppendMarkerData {
         let activation_index = match rng.random_bool(0.9) {
             true => rng.random_range(0..10),
             false => MAX_ACTIVATION,
@@ -261,7 +263,7 @@ mod tests {
                 }),
             })
             .collect();
-        StreamMarkerData { appends }
+        StreamAppendMarkerData { appends }
     }
 
     #[test]
@@ -278,7 +280,7 @@ mod tests {
     /// the decode gives, or the start of it where the rest is the text of the JSON parser.
     fn corrupt(
         rng: &mut StdRng,
-        mut marker: StreamMarkerData,
+        mut marker: StreamAppendMarkerData,
     ) -> (HashMap<String, Payloads>, String) {
         let why = match rng.random_range(0..5) {
             0 => return (HashMap::new(), "has no data".to_string()),

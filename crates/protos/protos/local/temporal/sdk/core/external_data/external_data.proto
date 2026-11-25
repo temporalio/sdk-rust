@@ -41,18 +41,18 @@ message PatchedMarkerData {
   bool deprecated = 2;
 }
 
-// The data of a `core_stream` marker. Core records one in each activation in which Workflow code
-// got the result of an append. A completion that leaves an append with no result, and that has no
-// such marker, gets one with no entry, so that a replay with chunking on keeps its task apart from
-// the next one. The `data` detail of the marker holds this message as JSON, with each `bytes` field
-// in lower-case hex.
+// The data of a `core_stream_append` marker. Core records one in each activation in which Workflow
+// code got the result of an append. A completion that leaves an append with no result, and that
+// has no such marker, gets one with no entry, so that a replay with chunking on keeps its task
+// apart from the next one. The `data` detail of the marker holds this message as JSON, with each
+// `bytes` field in lower-case hex.
 //
 // Every later version of Core must read the markers in History, so these rules apply to each
 // message of the marker.
 // * A field never changes its name, because the name is its key in the JSON.
 // * A new field is `optional`, because older markers don't have it.
 // * A new `repeated` field gets `#[serde(default)]` in `build.rs`, for the same reason.
-message StreamMarkerData {
+message StreamAppendMarkerData {
   repeated StreamAppendResult appends = 1;
 }
 
