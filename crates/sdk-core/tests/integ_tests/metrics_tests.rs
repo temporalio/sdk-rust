@@ -35,9 +35,9 @@ use temporalio_common::{
             nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
             workflow_commands::{
-                AppendToStream, CancelWorkflowExecution, CloseStream, CompleteWorkflowExecution,
+                AppendToStream, CancelWorkflowExecution, CompleteWorkflowExecution,
                 ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
-                ReadStream, ScheduleActivity, ScheduleLocalActivity, workflow_command,
+                ReadStream, ScheduleActivity, ScheduleLocalActivity, StartTimer, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -1205,7 +1205,7 @@ async fn activity_metrics() {
 }
 
 // Core counts each try of a Stream call of Workflow code for its Store, as it counts each attempt
-// of a Local Activity. It times each try of an append, of a close and of a replay's Store read.
+// of a Local Activity. It times each try of an append and of a replay's Store read.
 #[tokio::test]
 async fn stream_metrics() {
     use workflow_activation_job::Variant as Job;
@@ -1213,7 +1213,7 @@ async fn stream_metrics() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("stream_metrics", rt);
-    let (store, runtimes) = streams::store().await;
+    let (store, runtimes) = streams::store(2).await;
     // The first try of an append finds the Store in an outage, so that append tries again.
     let down = temporalio_streams::StreamError::store_unavailable("The Store is down");
     store.fail(stream_store::Op::Append, down, 1);
@@ -1221,10 +1221,13 @@ async fn stream_metrics() {
     let core = starter.get_core_worker().await;
     starter.start_wf().await;
 
-    // The Workflow appends to and reads `in` and a Stream that nobody created, and then closes
-    // both. The task with the results of the closes fails once, so its retry replays the read.
-    let mut failed = false;
-    let (mut results, mut closes) = (0, 0);
+    // The Workflow appends to and reads `s` and a Stream that nobody created, and then starts a
+    // timer. The task of the timer fails once, so its retry replays the read.
+    let missing = temporalio_streams::proto::sdk::StreamRef {
+        id: "missing".to_string(),
+        ..streams::stream()
+    };
+    let (mut failed, mut fired, mut results) = (false, false, 0);
     loop {
         let activation = core.poll_workflow_activation().await.unwrap();
         let run_id = activation.run_id.clone();
@@ -1241,17 +1244,17 @@ async fn stream_metrics() {
         {
             match job {
                 Job::InitializeWorkflow(_) => {
-                    (results, closes) = (0, 0);
-                    for (seq, id) in [(1, "in"), (2, "missing")] {
+                    results = 0;
+                    for (seq, stream) in [(1, streams::stream()), (2, missing.clone())] {
                         let append = AppendToStream {
                             seq,
-                            stream: Some(streams::stream(id)),
+                            stream: Some(stream.clone()),
                             bodies: vec![Payload::from(b"hello".to_vec())],
                         };
                         commands.push(append.into());
                         let read = ReadStream {
                             seq,
-                            stream: Some(streams::stream(id)),
+                            stream: Some(stream),
                             max_records: 2,
                             ..Default::default()
                         };
@@ -1261,29 +1264,31 @@ async fn stream_metrics() {
                 Job::ResolveStreamAppend(_) | Job::ResolveStreamRead(_) => {
                     results += 1;
                     if results == 4 {
-                        for (seq, id) in [(1, "in"), (2, "missing")] {
-                            let stream = Some(streams::stream(id));
-                            commands.push(CloseStream { seq, stream }.into());
-                        }
+                        let timer = StartTimer {
+                            seq: 1,
+                            start_to_fire_timeout: Some(prost_dur!(from_millis(10))),
+                        };
+                        commands.push(timer.into());
                     }
                 }
-                Job::ResolveStreamClose(_) => closes += 1,
+                Job::FireTimer(_) => fired = true,
                 _ => {}
             }
         }
-        if closes == 2 && !failed {
+        if fired && !failed {
             failed = true;
             let failure = Failure::application_failure("The test fails this task".into(), false);
             let fails = WorkflowActivationCompletion::fail(run_id, failure, None);
             core.complete_workflow_activation(fails).await.unwrap();
+            fired = false;
             continue;
         }
-        if closes == 2 {
+        if fired {
             commands.push(CompleteWorkflowExecution { result: None }.into());
         }
         let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
         core.complete_workflow_activation(completion).await.unwrap();
-        if closes == 2 {
+        if fired {
             break;
         }
     }
@@ -1304,9 +1309,6 @@ async fn stream_metrics() {
         ("append_execution_failed", &outage, 1),
         ("append_execution_failed", &not_found, 1),
         ("append_execution_latency_count", &of_run, 3),
-        ("close_total", &of_run, 4),
-        ("close_execution_failed", &not_found, 2),
-        ("close_execution_latency_count", &of_run, 4),
         ("read_total", &of_run, 2),
         ("read_execution_failed", &not_found, 1),
         ("read_records", &of_run, 2),

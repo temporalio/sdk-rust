@@ -455,7 +455,7 @@ impl Note {
     }
 }
 
-/// Returns `metrics` with the reason of `error` as the `failure_reason`, such as `stream_closed`.
+/// Returns `metrics` with the reason of `error`, such as `stream_not_found`, as `failure_reason`.
 fn failed<R: Copy + Into<StreamErrorReason>>(
     metrics: &MetricsContext,
     error: &StreamError<R>,
