@@ -162,7 +162,6 @@ impl InternalFlags {
             lang_used_flags: lang_newly_used,
             sdk_name,
             sdk_version,
-            ..Default::default()
         }
     }
 
@@ -233,7 +232,6 @@ mod tests {
                 lang_used_flags: vec![2],
                 sdk_name: "".to_string(),
                 sdk_version: "".to_string(),
-                ..Default::default()
             }),
             ..Default::default()
         });
@@ -304,7 +302,6 @@ mod tests {
                 lang_used_flags: vec![2],
                 sdk_name: "name".to_string(),
                 sdk_version: "ver".to_string(),
-                ..Default::default()
             }),
             ..Default::default()
         });

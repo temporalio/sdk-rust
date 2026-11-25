@@ -9,25 +9,13 @@ option java_outer_classname = "MessageProto";
 option ruby_package = "Temporalio::Api::Stream::V1";
 option csharp_namespace = "Temporalio.Api.Stream.V1";
 
+// The Stream types that the SDK messages in `temporal.api.sdk.v1` and the Store messages in
+// `temporal.api.streamservice.v1` both use.
+
 import "google/protobuf/timestamp.proto";
 
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/stream.proto";
-
-// Experimental. Might change in the future.
-// A reference to one Stream, which code passes to other code as data. Callers treat the `id` as
-// opaque. An id is never used for a second Stream while the Store remembers the first one, so a
-// create for a closed or expired Stream fails. A Store can forget an expired Stream after a time
-// of its choice, and a create for its id succeeds after that. Every SDK encodes a ref in a
-// Payload with this message, so a ref that one SDK writes decodes in another.
-message StreamRef {
-    string id = 1;
-    // The name under which the client and Worker config registered the Store of this Stream. An
-    // SDK uses it to send a call on this ref to the right Store. When it's empty, the SDK picks
-    // the Store from its config. Only an SDK sets and reads this field. The server and a Store
-    // ignore it.
-    string store = 2;
-}
 
 // Experimental. Might change in the future.
 // One attempt of a Workflow Task. Two attempts of the same Producer compare by
@@ -68,9 +56,8 @@ message ActivityAttempt {
 }
 
 // Experimental. Might change in the future.
-// The Producer of a Workflow run. Workflow code writes as this Producer when it appends or
-// closes in a Workflow Task. A write from one of its Local Activities uses a
-// `LocalActivityProducer`.
+// The Producer of a Workflow run. Workflow code writes as this Producer when it appends in a
+// Workflow Task. A write from one of its Local Activities uses a `LocalActivityProducer`.
 message WorkflowProducer {
     // Required.
     string namespace = 1;
@@ -178,8 +165,7 @@ message AppendRecord {
 }
 
 // Experimental. Might change in the future.
-// One Record of a Stream, as a read returns it. A read returns only Records. A close stores no
-// Record, so a read reports it with `done` in its response.
+// One Record of a Stream, as a read returns it. A read returns only Records.
 message StreamRecord {
     Producer producer = 1;
     temporal.api.common.v1.Payload body = 2;
