@@ -36,6 +36,9 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Fixed a local activity dispatch race after workflow cache eviction. A queued start or retry from the old workflow instance could supply the result recorded for the rebuilt instance.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

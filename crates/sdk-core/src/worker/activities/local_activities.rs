@@ -230,12 +230,17 @@ struct LAMData {
     la_info: HashMap<ExecutingLAId, LocalActivityInfo>,
     /// Activities that have been issued to lang but not yet completed
     outstanding_activity_tasks: HashMap<TaskToken, LocalInFlightActInfo>,
-    next_tt_num: u32,
+    next_tt_num: u64,
 }
 
 impl LAMData {
+    /// A stale queued request can survive eviction, so a task token
+    /// must never be reused. Allocation panics on exhaustion.
     fn gen_next_token(&mut self) -> TaskToken {
-        self.next_tt_num += 1;
+        self.next_tt_num = self
+            .next_tt_num
+            .checked_add(1)
+            .expect("Local activity task tokens exhausted");
         TaskToken::new_local_activity_token(self.next_tt_num.to_le_bytes())
     }
 }
@@ -349,7 +354,7 @@ impl LocalActivityManager {
                             // activity, so we can enforce idempotency. Prevents two identical LAs
                             // ending up in the queue at once.
                             let lai = ve.insert(LocalActivityInfo {
-                                task_token: tt,
+                                task_token: tt.clone(),
                                 queued_for_dispatch: false,
                                 backing_off_task: None,
                                 timeout_bag: None,
@@ -363,9 +368,14 @@ impl LocalActivityManager {
                                     lai.timeout_bag = Some(tb);
                                     lai.queued_for_dispatch = true;
 
-                                    self.act_req_tx.send(NewOrRetry::New(act)).expect(
-                                        "Receive half of LA request channel cannot be dropped",
-                                    );
+                                    self.act_req_tx
+                                        .send(NewOrRetry::New {
+                                            act,
+                                            task_token: tt,
+                                        })
+                                        .expect(
+                                            "Receive half of LA request channel cannot be dropped",
+                                        );
                                 }
                                 Err(res) => immediate_resolutions.push(res),
                             }
@@ -540,12 +550,16 @@ impl LocalActivityManager {
 
             // It is important that there are no await points after receiving from the channel, as
             // it would mean dropping this future would cause us to drop the activity request.
-            let (new_la, attempt) = match new_or_retry {
-                NewOrRetry::New(n) => {
-                    let explicit_attempt_num_or_1 = n.schedule_cmd.attempt.max(1);
-                    (n, explicit_attempt_num_or_1)
+            let (new_la, attempt, queued_for_token) = match new_or_retry {
+                NewOrRetry::New { act, task_token } => {
+                    let explicit_attempt_num_or_1 = act.schedule_cmd.attempt.max(1);
+                    (act, explicit_attempt_num_or_1, task_token)
                 }
-                NewOrRetry::Retry { in_flight, attempt } => (in_flight, attempt),
+                NewOrRetry::Retry {
+                    in_flight,
+                    attempt,
+                    task_token,
+                } => (in_flight, attempt, task_token),
             };
             let la_info_for_in_flight_map = new_la.clone();
             let id = ExecutingLAId {
@@ -556,7 +570,12 @@ impl LocalActivityManager {
             let sa = new_la.schedule_cmd;
 
             let mut dat = self.dat.lock();
-            if let Some(la_info) = dat.la_info.get_mut(&id) {
+            // An evicted run's registration can be replaced by its rebuilt run's while the request
+            // is still queued. Matching on the token keeps such a request from being dispatched as
+            // the rebuilt run's activity.
+            if let Some(la_info) = dat.la_info.get_mut(&id)
+                && la_info.task_token == queued_for_token
+            {
                 la_info.queued_for_dispatch = false;
                 // If this request originated from a local backoff task, clear the entry for it. We
                 // don't await the handle because we know it must already be done, and there's no
@@ -808,6 +827,7 @@ impl LocalActivityManager {
                         let tt = dlock.gen_next_token();
                         // Send the retry request after waiting the backoff duration
                         let send_chan = self.act_req_tx.clone();
+                        let retry_token = tt.clone();
                         let jh = tokio::spawn(async move {
                             tokio::time::sleep(backoff_dur).await;
 
@@ -815,6 +835,7 @@ impl LocalActivityManager {
                                 .send(NewOrRetry::Retry {
                                     in_flight: info.la_info,
                                     attempt: info.attempt + 1,
+                                    task_token: retry_token,
                                 })
                                 .expect("Receive half of LA request channel cannot be dropped");
                         });
@@ -986,10 +1007,14 @@ pub(crate) enum LACompleteAction {
 
 #[derive(Debug)]
 enum NewOrRetry {
-    New(NewLocalAct),
+    New {
+        act: NewLocalAct,
+        task_token: TaskToken,
+    },
     Retry {
         in_flight: NewLocalAct,
         attempt: u32,
+        task_token: TaskToken,
     },
 }
 
@@ -1143,6 +1168,10 @@ mod tests {
     use super::*;
     use crate::{prost_dur, protosext::LACloseTimeouts, retry_logic::ValidatedRetryPolicy};
     use futures_util::FutureExt;
+    use std::{
+        collections::HashSet,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
     use temporalio_common::protos::temporal::api::{
         common::v1::RetryPolicy,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
@@ -1868,5 +1897,305 @@ mod tests {
             let count = lam.get_nonfirst_attempt_count(run_id);
             assert_eq!(count, 10);
         }
+    }
+
+    fn la_in_wft(run_id: &str, started_event_id: i64) -> NewLocalAct {
+        NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: 1.to_string(),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: run_id.to_string(),
+            },
+            schedule_time: SystemTime::now(),
+            workflow_task: Some(WorkflowTaskAttempt {
+                started_event_id,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn retryable_la_in_wft(run_id: &str, started_event_id: i64) -> NewLocalAct {
+        let mut la = la_in_wft(run_id, started_event_id);
+        la.schedule_cmd.retry_policy =
+            ValidatedRetryPolicy::from_proto_with_defaults(RetryPolicy {
+                initial_interval: Some(prost_dur!(from_millis(10))),
+                backoff_coefficient: 1.0,
+                ..Default::default()
+            });
+        la.schedule_cmd.local_retry_threshold = Duration::from_secs(500);
+        la
+    }
+
+    /// Run ID, started event ID of the requesting workflow task, and attempt of a start
+    fn start_origin(task: &ActivityTask) -> (&str, i64, u32) {
+        match &task.variant {
+            Some(activity_task::Variant::Start(Start {
+                workflow_execution: Some(execution),
+                workflow_task: Some(wft),
+                attempt,
+                ..
+            })) => (execution.run_id.as_str(), wft.started_event_id, *attempt),
+            other => panic!("Expected a local activity start, got {other:?}"),
+        }
+    }
+
+    fn registered_token(lam: &LocalActivityManager, run_id: &str) -> TaskToken {
+        lam.dat.lock().la_info[&ExecutingLAId {
+            run_id: run_id.to_string(),
+            seq_num: 1,
+        }]
+            .task_token
+            .clone()
+    }
+
+    fn evict(lam: &LocalActivityManager, run_id: &str) {
+        lam.enqueue([
+            LocalActRequest::CancelAllInRun(run_id.to_string()),
+            LocalActRequest::InvalidateRun(run_id.to_string()),
+        ]);
+    }
+
+    async fn next_start(lam: &LocalActivityManager) -> ActivityTask {
+        tokio::time::timeout(Duration::from_secs(5), lam.next_pending())
+            .await
+            .expect("no local activity was dispatched")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Evicting a run forgets a start still waiting for a slot, but the request stays queued. When
+    /// the rebuilt run schedules the same seq again, that request must not be dispatched in place of
+    /// the rebuilt run's own, under the token issued to it.
+    #[tokio::test]
+    async fn queued_start_of_evicted_run_is_not_dispatched_for_rebuilt_run() {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([la_in_wft("other_run", 3).into()]);
+        let slot_holder = next_start(&lam).await;
+        lam.enqueue([la_in_wft("run_id", 8).into()]);
+        let evicted_token = registered_token(&lam, "run_id");
+        evict(&lam, "run_id");
+        lam.enqueue([la_in_wft("run_id", 13).into()]);
+        let token = registered_token(&lam, "run_id");
+        assert_ne!(evicted_token, token);
+
+        lam.complete(
+            &slot_holder.task_token.into(),
+            LocalActivityExecutionResult::Completed(Default::default()),
+        );
+        let start = next_start(&lam).await;
+        assert_eq!(
+            start_origin(&start),
+            ("run_id", 13, 1),
+            "dispatched {start:?} under the rebuilt registration's token {token:?}, the evicted \
+             one being {evicted_token:?}"
+        );
+        assert_eq!(TaskToken::from(start.task_token), token);
+        assert_eq!(lam.num_outstanding(), 1);
+        assert_matches!(
+            lam.complete(&token, LocalActivityExecutionResult::Completed(Default::default())),
+            LACompleteAction::Report { run_id, resolution, .. }
+                if run_id == "run_id" && resolution.seq == 1
+        );
+        assert!(lam.dat.lock().la_info.is_empty());
+
+        // Skipping the stale request gave back its slot
+        lam.enqueue([la_in_wft("later_run", 21).into()]);
+        assert_eq!(start_origin(&next_start(&lam).await), ("later_run", 21, 1));
+    }
+
+    /// Like starts, a retry the backoff already queued must not outlive the eviction of its run.
+    #[tokio::test(start_paused = true)]
+    async fn queued_retry_of_evicted_run_is_not_dispatched_for_rebuilt_run() {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([retryable_la_in_wft("run_id", 8).into()]);
+        let failed = next_start(&lam).await;
+        assert_matches!(
+            lam.complete(
+                &failed.task_token.into(),
+                LocalActivityExecutionResult::Failed(Default::default())
+            ),
+            LACompleteAction::WillBeRetried(None)
+        );
+        lam.enqueue([la_in_wft("other_run", 3).into()]);
+        let slot_holder = next_start(&lam).await;
+        let retry_queued = || {
+            lam.dat.lock().la_info[&ExecutingLAId {
+                run_id: "run_id".to_string(),
+                seq_num: 1,
+            }]
+                .backing_off_task
+                .as_ref()
+                .is_some_and(|backoff| backoff.is_finished())
+        };
+        while !retry_queued() {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            yield_now().await;
+        }
+        evict(&lam, "run_id");
+        lam.enqueue([la_in_wft("run_id", 13).into()]);
+        let token = registered_token(&lam, "run_id");
+
+        lam.complete(
+            &slot_holder.task_token.into(),
+            LocalActivityExecutionResult::Completed(Default::default()),
+        );
+        let start = next_start(&lam).await;
+        assert_eq!(
+            start_origin(&start),
+            ("run_id", 13, 1),
+            "dispatched {start:?}"
+        );
+        assert_eq!(TaskToken::from(start.task_token), token);
+        assert_eq!(lam.num_outstanding(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_retry_is_dispatched_under_the_token_issued_for_it() {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([retryable_la_in_wft("run_id", 8).into()]);
+        let failed = next_start(&lam).await;
+        let failed_token = TaskToken::from(failed.task_token);
+        assert_matches!(
+            lam.complete(
+                &failed_token,
+                LocalActivityExecutionResult::Failed(Default::default())
+            ),
+            LACompleteAction::WillBeRetried(None)
+        );
+        let retry_token = registered_token(&lam, "run_id");
+        assert_ne!(retry_token, failed_token);
+
+        let retry = next_start(&lam).await;
+        assert_eq!(start_origin(&retry), ("run_id", 8, 2));
+        assert_eq!(TaskToken::from(retry.task_token), retry_token);
+        assert_matches!(
+            lam.complete(
+                &retry_token,
+                LocalActivityExecutionResult::Completed(Default::default())
+            ),
+            LACompleteAction::Report { resolution, .. } if resolution.attempt == 2
+        );
+        assert_eq!(lam.num_outstanding(), 0);
+    }
+
+    /// Queued requests are told apart from their replacements by token alone, so crossing what used
+    /// to be the 32-bit limit must neither repeat an earlier token nor change how tokens encode.
+    #[tokio::test]
+    async fn local_activity_tokens_stay_unique_past_u32_max() {
+        let lam = LocalActivityManager::test(1);
+        let mut dat = lam.dat.lock();
+        let early: Vec<_> = (0..3).map(|_| dat.gen_next_token()).collect();
+        dat.next_tt_num = (u32::MAX - 2).into();
+        let crossing: Vec<_> = (0..6).map(|_| dat.gen_next_token()).collect();
+
+        let distinct: HashSet<_> = early.iter().chain(&crossing).collect();
+        assert_eq!(
+            distinct.len(),
+            early.len() + crossing.len(),
+            "tokens repeated across the u32 boundary: early {early:?}, crossing {crossing:?}"
+        );
+        let expected = (1..=3).chain(u64::from(u32::MAX) - 1..=u64::from(u32::MAX) + 4);
+        for (token, n) in early.iter().chain(&crossing).zip(expected) {
+            assert!(token.is_local_activity_task());
+            assert_eq!(*token, TaskToken::new_local_activity_token(n.to_le_bytes()));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_activity_token_allocation_stops_at_exhaustion_instead_of_wrapping() {
+        let lam = LocalActivityManager::test(1);
+        let mut dat = lam.dat.lock();
+        let first = dat.gen_next_token();
+        dat.next_tt_num = !0 - 1;
+        let last = dat.gen_next_token();
+        assert_eq!(
+            last,
+            TaskToken::new_local_activity_token(u64::MAX.to_le_bytes())
+        );
+        assert_ne!(first, last);
+        for _ in 0..2 {
+            let exhausted = catch_unwind(AssertUnwindSafe(|| dat.gen_next_token()));
+            assert!(
+                exhausted.is_err(),
+                "allocated {exhausted:?} after the last token"
+            );
+            assert_eq!(dat.next_tt_num, !0);
+        }
+    }
+
+    /// A retry can sit in its backoff while the rest of the worker keeps allocating tokens. Even
+    /// once allocation passes the old 32-bit limit, the queued retry of an evicted run must not be
+    /// taken for the rebuilt run's request.
+    #[tokio::test(start_paused = true)]
+    async fn queued_retry_of_evicted_run_is_not_dispatched_after_tokens_pass_u32_max() {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([retryable_la_in_wft("run_id", 8).into()]);
+        let failed = next_start(&lam).await;
+        assert_matches!(
+            lam.complete(
+                &failed.task_token.into(),
+                LocalActivityExecutionResult::Failed(Default::default())
+            ),
+            LACompleteAction::WillBeRetried(None)
+        );
+        let retry_token = registered_token(&lam, "run_id");
+        // Stands in for the allocations of every other activity that ran during the backoff
+        lam.dat.lock().next_tt_num = (u32::MAX - 1).into();
+        for other in ["other_run_1", "other_run_2"] {
+            lam.enqueue([la_in_wft(other, 3).into()]);
+            let start = next_start(&lam).await;
+            assert_matches!(
+                lam.complete(
+                    &start.task_token.into(),
+                    LocalActivityExecutionResult::Completed(Default::default())
+                ),
+                LACompleteAction::Report { .. }
+            );
+        }
+        lam.enqueue([la_in_wft("other_run_3", 3).into()]);
+        let slot_holder = next_start(&lam).await;
+        let retry_queued = || {
+            lam.dat.lock().la_info[&ExecutingLAId {
+                run_id: "run_id".to_string(),
+                seq_num: 1,
+            }]
+                .backing_off_task
+                .as_ref()
+                .is_some_and(|backoff| backoff.is_finished())
+        };
+        while !retry_queued() {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            yield_now().await;
+        }
+        evict(&lam, "run_id");
+        lam.enqueue([la_in_wft("run_id", 13).into()]);
+        let token = registered_token(&lam, "run_id");
+        lam.enqueue([la_in_wft("marker_run", 21).into()]);
+
+        lam.complete(
+            &slot_holder.task_token.into(),
+            LocalActivityExecutionResult::Completed(Default::default()),
+        );
+        let start = next_start(&lam).await;
+        assert_eq!(
+            start_origin(&start),
+            ("run_id", 13, 1),
+            "dispatched {start:?}; the queued retry holds {retry_token:?}, the rebuilt run's \
+             registration {token:?}"
+        );
+        assert_eq!(TaskToken::from(start.task_token), token);
+        assert_ne!(token, retry_token);
+        assert_matches!(
+            lam.complete(&token, LocalActivityExecutionResult::Completed(Default::default())),
+            LACompleteAction::Report { run_id, resolution, .. }
+                if run_id == "run_id" && resolution.seq == 1 && resolution.attempt == 1
+        );
+        // Nothing else was waiting ahead of the request queued after the replacement
+        assert_eq!(start_origin(&next_start(&lam).await), ("marker_run", 21, 1));
     }
 }
