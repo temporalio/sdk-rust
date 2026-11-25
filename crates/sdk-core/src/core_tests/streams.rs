@@ -1106,6 +1106,57 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+#[tokio::test]
+async fn a_forced_completion_with_an_open_append_keeps_its_task_apart_on_replay() {
+    let store = store(&["s1", "s2"]).await;
+    store.hold_stream("s1");
+    store.hold_stream("s2");
+    let mut opts = StartOpts::new(&store);
+    // An append that waits at the hold must not count as a try with no answer.
+    opts.configure = |wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
+    let held = store.clone();
+    // Append 1 answers once the heartbeat completed task 1, and append 2 once Workflow code has the
+    // result of append 1. So task 2 gives them in two activations.
+    opts.served = Some(Box::new(move |_, t| {
+        held.release_stream("s1");
+        Some(next_task(t))
+    }));
+    // The heartbeat of task 2 must not come before append 2 has its result.
+    let run = start(history(Duration::from_secs(1)), opts);
+    let workflow = |activation: &WorkflowActivation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append(1, "s1"), append(2, "s2")],
+        _ if resolves_append(activation, 2) => vec![complete()],
+        _ => {
+            store.release_stream("s2");
+            vec![]
+        }
+    };
+    let live = run.drive(workflow).await;
+    let results: Vec<Vec<String>> = (live.iter())
+        .map(|jobs| jobs.iter().map(summary).collect())
+        .collect();
+    assert_eq!(
+        results,
+        [["InitializeWorkflow"], ["append 1"], ["append 2"]]
+    );
+    let sent = run.sent();
+    assert!(sent[0].force_create_new_workflow_task);
+    let recorded: Vec<Vec<(u32, u64)>> = (markers(&sent[1]).iter())
+        .map(|marker| {
+            let entries = marker.appends.iter();
+            entries
+                .map(|entry| (entry.seq, entry.activation_index))
+                .collect()
+        })
+        .collect();
+    assert_eq!(recorded, [[(1, 0)], [(2, 1)]]);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    // The marker with no entry is the only command event of task 1. Without it, a replay with
+    // chunking on takes task 1 for a heartbeat and joins it to task 2. The indexes of task 2 then
+    // count from the activation of task 1, so append 2 at index 1 comes with append 1.
+    assert_eq!(run.replay(workflow).await, live);
+}
+
 #[rstest::rstest]
 #[case::with_a_marker_to_send(true, 1)]
 #[case::with_nothing_else(false, 1)]
