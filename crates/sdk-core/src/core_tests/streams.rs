@@ -643,6 +643,50 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
     changed.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+#[tokio::test]
+async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
+    let store = store(&["s"]).await;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append(1, "s")],
+        _ => vec![complete()],
+    };
+    run.drive(workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(markers(&run.sent()[0])[0].appends[0].store, STORE);
+
+    let mut opts = StartOpts::new(&store);
+    opts.replay = true;
+    let replay = start(run.history.lock().clone(), opts);
+    let worker = &replay.worker;
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let Command::AppendToStream(mut command) = append(1, "s") else {
+        unreachable!()
+    };
+    command.stream.as_mut().unwrap().store = "other".to_string();
+    let completion = WorkflowActivationCompletion::from_cmd(init.run_id.clone(), command.into());
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    let evicted = worker.poll_workflow_activation().await.unwrap();
+    let [job] = &evicted.jobs[..] else {
+        panic!("{evicted:?}");
+    };
+    let Some(Job::RemoveFromCache(eviction)) = &job.variant else {
+        panic!("{evicted:?}");
+    };
+    assert_eq!(eviction.reason(), EvictionReason::Nondeterminism);
+    let message = format!(
+        "Stream append 1 is for Stream `s` in Store `other`, and History has it for Stream `s` in \
+         Store `{STORE}`"
+    );
+    assert!(eviction.message.contains(&message), "{}", eviction.message);
+    let done = WorkflowActivationCompletion::empty(evicted.run_id);
+    worker.complete_workflow_activation(done).await.unwrap();
+    worker.drain_pollers_and_shutdown_ref().await;
+}
+
 /// The state of a call when Workflow code sends its last command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AtTheEnd {
