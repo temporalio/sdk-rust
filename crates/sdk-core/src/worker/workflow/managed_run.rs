@@ -2145,7 +2145,8 @@ mod tests {
             temporal::api::{
                 command::v1::command,
                 common::v1::Payload,
-                enums::v1::EventType,
+                enums::v1::{EventType, TimeoutType},
+                failure::v1::failure::FailureInfo,
                 history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes},
                 workflowservice::v1::get_system_info_response::Capabilities,
             },
@@ -2261,6 +2262,67 @@ mod tests {
                 sdk_name: "test",
                 sdk_version: "test",
             })
+        }
+
+        #[test]
+        fn local_activity_timeout_failure_matches_on_replay() {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let workflow_command::Variant::ScheduleLocalActivity(command) =
+                schedule_local_activity_cmd(
+                    1,
+                    "local",
+                    ActivityCancellationType::TryCancel,
+                    Duration::from_secs(10),
+                )
+            else {
+                unreachable!()
+            };
+
+            let mut live = manager(&history);
+            live.get_next_activation().unwrap();
+            live.push_commands_and_iterate(vec![WFCommand::new(
+                WFCommandVariant::AddLocalActivity(command.clone()),
+            )])
+            .unwrap();
+            live.drain_queued_local_activities();
+            live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
+                seq: 1,
+                result: LocalActivityExecutionResult::timeout(TimeoutType::ScheduleToClose),
+                runtime: Duration::ZERO,
+                attempt: 1,
+                backoff: None,
+                original_schedule_time: None,
+            }))
+            .unwrap();
+            let live_resolution = live.get_next_activation().unwrap();
+            assert_matches!(
+                live_resolution.jobs[0].variant.as_ref(),
+                Some(Variant::ResolveActivity(ResolveActivity {
+                    seq: 1,
+                    is_local: true,
+                    result: Some(ActivityResolution {
+                        status: Some(activity_resolution::Status::Failed(failure)),
+                    }),
+                })) if matches!(
+                    failure.failure.as_ref().and_then(|f| f.failure_info.as_ref()),
+                    Some(FailureInfo::ActivityFailureInfo(_))
+                )
+            );
+            live.push_commands_and_iterate(vec![]).unwrap();
+            record_wft_completion(&mut history, &live);
+            history.add_workflow_task_scheduled_and_started();
+
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            replay
+                .push_commands_and_iterate(vec![WFCommand::new(
+                    WFCommandVariant::AddLocalActivity(command),
+                )])
+                .unwrap();
+            let replay_resolution = replay.get_next_activation().unwrap();
+            assert_eq!(replay_resolution.jobs, live_resolution.jobs);
         }
 
         #[rstest]

@@ -2710,6 +2710,7 @@ pub mod temporal {
                     };
                     use anyhow::{anyhow, bail};
                     use http::Uri;
+                    use percent_encoding::percent_decode_str;
                     #[cfg(feature = "serde_serialize")]
                     use prost::Name;
                     #[cfg(feature = "serde_serialize")]
@@ -2755,7 +2756,7 @@ pub mod temporal {
 
                     static SCHEME_PREFIX: &str = "temporal://";
 
-                    /// Attempt to parse a nexus lint into a workflow event link
+                    /// Attempt to parse a Nexus link into a workflow event link.
                     pub fn workflow_event_link_from_nexus(
                         l: &Link,
                     ) -> Result<common::v1::Link, anyhow::Error> {
@@ -2789,6 +2790,13 @@ pub mod temporal {
                         if path_parts.get(6) != Some(&"history") {
                             bail!("Invalid path for nexus link, no history segment: {:?}", l);
                         }
+                        // Decode after splitting so an encoded slash remains part of its ID.
+                        let decode_segment = |segment| {
+                            percent_decode_str(segment)
+                                .decode_utf8()
+                                .map(|decoded| decoded.into_owned())
+                                .map_err(|err| anyhow!("Invalid UTF-8 in nexus link path: {err}"))
+                        };
                         let reference = if let Some(query) = path.query() {
                             let mut eventref = workflow_event::EventReference::default();
                             let query_parts = query.split('&').collect::<Vec<_>>();
@@ -2828,9 +2836,9 @@ pub mod temporal {
                         Ok(common::v1::Link {
                             variant: Some(common::v1::link::Variant::WorkflowEvent(
                                 WorkflowEvent {
-                                    namespace: namespace.to_string(),
-                                    workflow_id: workflow_id.to_string(),
-                                    run_id: run_id.to_string(),
+                                    namespace: decode_segment(namespace)?,
+                                    workflow_id: decode_segment(workflow_id)?,
+                                    run_id: decode_segment(run_id)?,
                                     reference,
                                 },
                             )),
