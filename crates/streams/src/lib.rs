@@ -47,7 +47,7 @@ pub use error::{
     AnyError, AnyReason, AppendError, AppendReason, CreateError, CreateReason, DescribeError,
     DescribeReason, ReadError, ReadReason, StreamError, WireReason,
 };
-pub use runtime::StreamRuntime;
+pub use runtime::{ReadPage, StreamRuntime};
 pub use store::StreamStore;
 
 /// Re-exports the Stream protos from `temporalio-common`, so a Store can use them as they are. The
