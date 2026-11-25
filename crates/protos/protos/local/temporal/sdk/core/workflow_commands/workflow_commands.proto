@@ -56,7 +56,7 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
-        AppendToStream append_to_stream = 25;
+        AppendToStream append_to_stream = 23;
     }
 }
 

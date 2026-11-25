@@ -151,7 +151,7 @@ message WorkflowActivationJob {
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
         // An append to a Stream finished.
-        ResolveStreamAppend resolve_stream_append = 18;
+        ResolveStreamAppend resolve_stream_append = 17;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
