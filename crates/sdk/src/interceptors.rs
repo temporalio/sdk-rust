@@ -21,11 +21,17 @@ use temporalio_common::{
     },
 };
 
-mod activity_execution_value {
+#[cfg(feature = "experimental")]
+pub use crate::nexus::{
+    NexusOperationCancelInput, NexusOperationCancelOutput, NexusOperationInboundInterceptor,
+    NexusOperationStartInput, NexusOperationStartOutput, NexusOperationStartResult,
+};
+
+mod interceptor_value {
     use super::*;
 
     pub trait Sealed {
-        fn to_activity_payload(
+        fn to_interceptor_payload(
             &self,
             context: &SerializationContext<'_>,
         ) -> Result<Payload, PayloadConversionError>;
@@ -35,7 +41,7 @@ mod activity_execution_value {
     where
         T: Any + TemporalSerializable + Send + Sync,
     {
-        fn to_activity_payload(
+        fn to_interceptor_payload(
             &self,
             context: &SerializationContext<'_>,
         ) -> Result<Payload, PayloadConversionError> {
@@ -224,15 +230,15 @@ impl ExecuteActivityInput {
     }
 }
 
-/// Type-erased activity output carried through the activity interceptor chain.
-pub trait ActivityExecutionValue:
-    Any + TemporalSerializable + Send + Sync + activity_execution_value::Sealed
+/// Type-erased output carried through an inbound interceptor chain.
+pub trait InterceptorValue:
+    Any + TemporalSerializable + Send + Sync + interceptor_value::Sealed
 {
     /// Access this value as [`Any`] for type-specific inspection.
     fn as_any(&self) -> &dyn Any;
 }
 
-impl<T> ActivityExecutionValue for T
+impl<T> InterceptorValue for T
 where
     T: Any + TemporalSerializable + Send + Sync,
 {
@@ -241,8 +247,8 @@ where
     }
 }
 
-impl dyn ActivityExecutionValue {
-    /// Attempt to access the activity output as a concrete type.
+impl dyn InterceptorValue {
+    /// Attempt to access the output as a concrete type.
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         self.as_any().downcast_ref()
     }
@@ -251,9 +257,12 @@ impl dyn ActivityExecutionValue {
         &self,
         context: &SerializationContext<'_>,
     ) -> Result<Payload, PayloadConversionError> {
-        self.to_activity_payload(context)
+        self.to_interceptor_payload(context)
     }
 }
+
+/// Type-erased activity output carried through the activity interceptor chain.
+pub use InterceptorValue as ActivityExecutionValue;
 
 /// Result of an activity execution carried through the interceptor chain.
 pub type ExecuteActivityResult = Result<Box<dyn ActivityExecutionValue>, ActivityError>;
