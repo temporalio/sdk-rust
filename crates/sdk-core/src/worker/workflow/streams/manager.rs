@@ -214,7 +214,8 @@ async fn run(runtime: &StreamRuntime, op: Op, settings: StreamSettings, note: &N
     }
 }
 
-/// Sends the request again while the Store is in an outage, with no time limit. A resend is safe,
+/// Sends the request again while the Store is in an outage. The loop has no time limit, because the
+/// run fails its Workflow Task when a call still waits at the task's heartbeat. A resend is safe,
 /// because a Store doesn't write a batch whose request id it still remembers.
 async fn tries<T, R, F>(
     settings: StreamSettings,
