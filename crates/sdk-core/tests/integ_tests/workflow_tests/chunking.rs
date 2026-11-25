@@ -8,26 +8,30 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_client::{NamespacedClient, grpc::WorkflowService};
-use temporalio_common::protos::{
-    coresdk::{
-        AsJsonPayloadExt,
-        workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
-        workflow_completion::WorkflowActivationCompletion,
-    },
-    temporal::api::{
-        common::v1::{WorkflowExecution, WorkflowType},
-        enums::v1::{EventType, TaskQueueKind, TaskQueueType},
-        history::v1::{
-            History, TimerStartedEventAttributes, WorkflowExecutionCompletedEventAttributes,
+use temporalio_client::{
+    NamespacedClient, UntypedSignal, UntypedWorkflow, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowTerminateOptions, grpc::WorkflowService,
+};
+use temporalio_common::{
+    data_converters::RawValue,
+    protos::{
+        coresdk::{
+            AsJsonPayloadExt,
+            workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
+            workflow_completion::WorkflowActivationCompletion,
         },
-        sdk::v1::WorkflowTaskCompletedMetadata,
-        taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
-        workflowservice::v1::{
-            DescribeTaskQueueRequest, GetWorkflowExecutionHistoryRequest,
-            PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
-            SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
-            TerminateWorkflowExecutionRequest,
+        temporal::api::{
+            common::v1::WorkflowExecution,
+            enums::v1::{EventType, TaskQueueKind, TaskQueueType},
+            history::v1::{
+                History, TimerStartedEventAttributes, WorkflowExecutionCompletedEventAttributes,
+            },
+            sdk::v1::WorkflowTaskCompletedMetadata,
+            taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
+            workflowservice::v1::{
+                DescribeTaskQueueRequest, GetWorkflowExecutionHistoryRequest,
+                PollWorkflowTaskQueueRequest, RespondWorkflowTaskCompletedRequest,
+            },
         },
     },
 };
@@ -191,27 +195,19 @@ async fn stale_cache_miss_replays_server_history_newer_than_polled_task(#[case] 
             normal_name: normal_queue.name.clone(),
             kind: TaskQueueKind::Sticky.into(),
         };
-        let started = client
-            .start_workflow_execution(
-                StartWorkflowExecutionRequest {
-                    namespace: namespace.clone(),
-                    workflow_id: workflow_id.clone(),
-                    workflow_type: Some(WorkflowType {
-                        name: DEFAULT_WORKFLOW_TYPE.to_owned(),
-                    }),
-                    task_queue: Some(normal_queue.clone()),
-                    workflow_task_timeout: Some(Duration::from_secs(2).try_into().unwrap()),
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                    ..Default::default()
-                }
-                .into_request(),
+        let handle = client
+            .start_workflow(
+                UntypedWorkflow::new(DEFAULT_WORKFLOW_TYPE),
+                RawValue::empty(),
+                WorkflowStartOptions::new(normal_queue.name.clone(), workflow_id.clone())
+                    .task_timeout(Duration::from_secs(2))
+                    .build(),
             )
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
         let execution = WorkflowExecution {
             workflow_id,
-            run_id: started.run_id,
+            run_id: handle.run_id().unwrap().to_owned(),
         };
         let poll = |queue: TaskQueue| {
             let mut client = client.clone();
@@ -233,25 +229,11 @@ async fn stale_cache_miss_replays_server_history_newer_than_polled_task(#[case] 
             }
         };
         let signal = |name: &str| {
-            let mut client = client.clone();
-            let namespace = namespace.clone();
-            let execution = execution.clone();
-            let signal_name = name.to_owned();
-            async move {
-                client
-                    .signal_workflow_execution(
-                        SignalWorkflowExecutionRequest {
-                            namespace,
-                            workflow_execution: Some(execution),
-                            signal_name,
-                            request_id: uuid::Uuid::new_v4().to_string(),
-                            ..Default::default()
-                        }
-                        .into_request(),
-                    )
-                    .await
-                    .unwrap();
-            }
+            handle.signal(
+                UntypedSignal::new(name.to_owned()),
+                RawValue::empty(),
+                WorkflowSignalOptions::default(),
+            )
         };
         let complete =
             |token: Vec<u8>,
@@ -298,7 +280,7 @@ async fn stale_cache_miss_replays_server_history_newer_than_polled_task(#[case] 
             }
         }
         let first = poll(normal_queue.clone()).await;
-        signal("polled").await;
+        signal("polled").await.unwrap();
         complete(
             first.task_token,
             Some(StickyExecutionAttributes {
@@ -317,18 +299,18 @@ async fn stale_cache_miss_replays_server_history_newer_than_polled_task(#[case] 
         assert!(stale.next_page_token.is_empty());
 
         // A buffered signal makes the timeout and retry visible in persisted history.
-        signal("after-timeout").await;
+        signal("after-timeout").await.unwrap();
         let retry = poll(normal_queue.clone()).await;
-        signal("later").await;
+        signal("later").await.unwrap();
         complete(retry.task_token, None, None).await;
         let next = poll(normal_queue.clone()).await;
-        signal("last").await;
+        signal("last").await.unwrap();
         complete(next.task_token, None, None).await;
         // Signals persist individually while the next task is scheduled, without a running
         // task buffering them into one batch. Exceed the default history page size.
         const PAGE_FILLER_SIGNALS: usize = 1100;
         for _ in 0..PAGE_FILLER_SIGNALS {
-            signal("padding").await;
+            signal("padding").await.unwrap();
         }
         let current = poll(normal_queue.clone()).await;
         assert!(current.started_event_id > stale.started_event_id);
@@ -452,15 +434,11 @@ async fn stale_cache_miss_replays_server_history_newer_than_polled_task(#[case] 
             .expect("history must finish before stale-task reporting");
         assert_eq!(report.task_token.into_inner(), stale_token);
         core.drain_pollers_and_shutdown().await;
-        client
-            .terminate_workflow_execution(
-                TerminateWorkflowExecutionRequest {
-                    namespace,
-                    workflow_execution: Some(execution),
-                    reason: "stale cache miss verification completed".to_owned(),
-                    ..Default::default()
-                }
-                .into_request(),
+        handle
+            .terminate(
+                WorkflowTerminateOptions::builder()
+                    .reason("stale cache miss verification completed".to_owned())
+                    .build(),
             )
             .await
             .unwrap();
