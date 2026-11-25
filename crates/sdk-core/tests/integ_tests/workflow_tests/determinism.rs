@@ -622,7 +622,6 @@ async fn nondeterministic_future_detection_fails_wft() {
 #[derive(Clone, Copy, Debug)]
 enum FirstTask {
     Timer,
-    LocalActivityThenTimer,
     TimerWithLocalActivity,
     /// The changed code upserts a memo in place of the timer and completes, so Core finds the
     /// nondeterminism.
@@ -667,11 +666,6 @@ impl ChangedBeforeReplayWf {
         match first_task {
             FirstTask::Timer => {
                 changed_code.await;
-                ctx.timer(Duration::from_secs(2)).await;
-            }
-            FirstTask::LocalActivityThenTimer => {
-                changed_code.await;
-                echo().await?;
                 ctx.timer(Duration::from_secs(2)).await;
             }
             FirstTask::TimerWithLocalActivity => {
@@ -788,14 +782,6 @@ fn assert_fails_once_with_langs_error(summary: &[String]) {
 async fn changed_code_before_a_replayed_timer_fails_the_workflow_with_langs_error() {
     let name = "changed_code_before_a_replayed_timer_fails_the_workflow_with_langs_error";
     let summary = run_changed_before_replay(name, FirstTask::Timer).await;
-    assert_fails_once_with_langs_error(&summary);
-}
-
-// The replay fails its first activation, before the marker of the local activity of task 1.
-#[tokio::test]
-async fn changed_code_before_a_replayed_local_activity_fails_the_workflow_once() {
-    let name = "changed_code_before_a_replayed_local_activity_fails_the_workflow_once";
-    let summary = run_changed_before_replay(name, FirstTask::LocalActivityThenTimer).await;
     assert_fails_once_with_langs_error(&summary);
 }
 

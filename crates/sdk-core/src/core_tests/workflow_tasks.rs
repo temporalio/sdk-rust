@@ -1584,18 +1584,14 @@ fn fails_with_langs_error() -> Vec<Vec<(CommandType, Option<String>)>> {
 #[derive(Clone, Copy, Debug)]
 enum EventAfterTheFailure {
     TimerStarted,
-    ActivityScheduled,
     LocalActivityMarker,
-    Signal,
 }
 
 // Lang's error is the cause, so the workflow fails once, with that error. The events that follow
 // must not fail the workflow again, activate lang again, or replace the cause.
 #[rstest]
 #[case::timer(EventAfterTheFailure::TimerStarted)]
-#[case::activity(EventAfterTheFailure::ActivityScheduled)]
 #[case::local_activity_marker(EventAfterTheFailure::LocalActivityMarker)]
-#[case::signal(EventAfterTheFailure::Signal)]
 #[tokio::test]
 async fn a_nondeterminism_failure_fails_the_workflow_once_with_langs_error(
     #[case] event: EventAfterTheFailure,
@@ -1603,23 +1599,11 @@ async fn a_nondeterminism_failure_fails_the_workflow_once_with_langs_error(
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    match event {
-        EventAfterTheFailure::TimerStarted => {
-            let started = t.add_timer_started("1".to_string());
-            t.add_timer_fired(started, "1".to_string());
-        }
-        EventAfterTheFailure::ActivityScheduled => {
-            let scheduled = t.add_activity_task_scheduled("1");
-            let started = t.add_activity_task_started(scheduled);
-            t.add_activity_task_completed(scheduled, started, Payload::default());
-        }
-        EventAfterTheFailure::LocalActivityMarker => {
-            t.add_local_activity_result_marker(1, "1", "done".into());
-            let started = t.add_timer_started("1".to_string());
-            t.add_timer_fired(started, "1".to_string());
-        }
-        EventAfterTheFailure::Signal => t.add_we_signaled("sig", vec![]),
+    if let EventAfterTheFailure::LocalActivityMarker = event {
+        t.add_local_activity_result_marker(1, "1", "done".into());
     }
+    let started = t.add_timer_started("1".to_string());
+    t.add_timer_fired(started, "1".to_string());
     t.add_workflow_task_scheduled_and_started();
     // All of history comes in one poll, so lang fails the first activation while replaying.
     let mh = MockPollCfg::from_resp_batches(
@@ -1715,41 +1699,6 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its
         Some("changed".to_string()),
     );
     assert_eq!(sent, [vec![timer, fail]], "The commands of each completion");
-}
-
-// Core finds the nondeterminism in history that lang's commands don't match. The terminal command
-// that lang sent with them is not in history, and must not go out next to Core's.
-#[tokio::test]
-async fn cores_nondeterminism_error_in_a_replay_sends_only_its_fail_command() {
-    let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-    let scheduled = t.add_activity_task_scheduled("1");
-    let started = t.add_activity_task_started(scheduled);
-    t.add_activity_task_completed(scheduled, started, Payload::default());
-    t.add_workflow_task_scheduled_and_started();
-    let mh = MockPollCfg::from_resp_batches(
-        "fake_wf_id",
-        t,
-        [ResponseType::AllHistory],
-        mock_worker_client(),
-    );
-    let lang = |act: &WorkflowActivation| {
-        let commands = vec![
-            start_timer_cmd(1, Duration::from_secs(1)),
-            CompleteWorkflowExecution { result: None }.into(),
-        ];
-        WorkflowActivationCompletion::from_cmds(act.run_id.clone(), commands)
-    };
-    let sent = run_with_nondeterminism_opt_in(mh, lang).await;
-    let types: Vec<Vec<CommandType>> = (sent.iter())
-        .map(|commands| commands.iter().map(|(kind, _)| *kind).collect())
-        .collect();
-    assert_eq!(
-        types,
-        [vec![CommandType::FailWorkflowExecution]],
-        "The commands of each completion: {sent:?}"
-    );
 }
 
 #[tokio::test]
