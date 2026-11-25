@@ -150,7 +150,7 @@ pub(crate) struct Workflows {
     shutdown_token: CancellationToken,
 }
 
-// Keeps Core's workflow input types out of the client-side notification router.
+// Adapts notifications to Core's workflow input queue without making the client depend on Core.
 #[derive(Clone)]
 struct WorkflowHeartbeatRegistrar {
     client: Arc<dyn WorkerClient>,
@@ -159,13 +159,18 @@ struct WorkflowHeartbeatRegistrar {
 }
 
 impl WorkflowHeartbeatRegistrar {
-    fn register(&self, token: TaskToken, run_id: String) -> Option<WorkflowHeartbeatRegistration> {
+    fn register(
+        &self,
+        token: TaskToken,
+        execution: WorkflowExecution,
+    ) -> Option<WorkflowHeartbeatRegistration> {
         let router = self
             .client
             .workers()
             .workflow_heartbeat_notifications(&self.namespace)?;
         let notification_tx = self.notification_tx.clone();
-        Some(router.register(token.clone(), move || {
+        let run_id = execution.run_id.clone();
+        Some(router.register(token.clone(), execution, move || {
             notification_tx
                 .send(LocalInput {
                     input: LocalInputs::HeartbeatNotification {
@@ -433,6 +438,7 @@ impl Workflows {
                         messages,
                         query_responses,
                         force_new_wft,
+                        notification_triggered_heartbeat,
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
@@ -464,6 +470,7 @@ impl Workflows {
                     sticky_attributes: None,
                     return_new_workflow_task: true,
                     force_create_new_workflow_task: force_new_wft,
+                    notification_triggered_heartbeat,
                     sdk_metadata,
                     metering_metadata: MeteringMetadata {
                         nonfirst_local_activity_execution_attempts,
@@ -651,7 +658,7 @@ impl Workflows {
                 .workers()
                 .workflow_heartbeat_notifications(&self.namespace)
         {
-            router.retire(token);
+            router.retire(run_id, token);
         }
 
         match completion_outcome.outcome {
@@ -1140,13 +1147,19 @@ impl PreparedWFT {
 struct OutstandingTask {
     info: WorkflowTaskInfo,
     heartbeat_registration: Option<WorkflowHeartbeatRegistration>,
-    heartbeat_notification_pending: bool,
+    heartbeat_requested: Option<HeartbeatTrigger>,
     /// Set if the outstanding task has quer(ies) which must be fulfilled upon finishing replay
     pending_queries: Vec<QueryWorkflow>,
     start_time: Instant,
     /// The WFT permit owned by this task, ensures we don't exceed max concurrent WFT, and makes
     /// sure the permit is automatically freed when we delete the task.
     permit: UsedMeteredSemPermit<WorkflowSlotKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatTrigger {
+    Timer,
+    Notification,
 }
 
 impl OutstandingTask {
@@ -1272,6 +1285,7 @@ pub(crate) enum ActivationAction {
         messages: Vec<ProtocolMessage>,
         query_responses: Vec<QueryResult>,
         force_new_wft: bool,
+        notification_triggered_heartbeat: bool,
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,

@@ -39,7 +39,13 @@ relevant information.
 ### Added
 * Support best-effort Workflow Heartbeat Notifications on the worker control queue, allowing early
   Workflow Task heartbeats at safe yield points while Local Activity work remains pending. Ready
-  notifications take priority over queued Local Activity completions.
+  notifications take priority over queued Local Activity completions. Heartbeat completions identify
+  notifications as their trigger only when the regular heartbeat timer has not fired before reporting.
+
+### Fixed
+* Consume buffered events through a known Workflow Task boundary before fetching another history
+  page, preventing out-of-order history failures when a cache-miss reload outlives its polled task.
+* Reject history updates that omit unread buffered events before replacing buffered history.
 
 ## [0.12.0] - 2026-11-23
 

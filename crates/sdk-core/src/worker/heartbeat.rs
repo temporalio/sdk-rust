@@ -330,11 +330,9 @@ async fn handle_worker_command_task(
                     temporalio_common::protos::temporal::api::worker::v1::CancelActivityResult {},
                 ))
             }
-            Some(WorkerCommandType::WorkflowTaskHeartbeatNotification(command)) => {
-                Some(WorkerCommandResultType::WorkflowTaskHeartbeatNotification(
-                    temporalio_common::protos::temporal::api::worker::v1::WorkflowTaskHeartbeatNotificationResult {
-                        outcome: notifications.notify(&command.task_token.clone().into()) as i32,
-                    },
+            Some(WorkerCommandType::WorkflowHeartbeatNotification(command)) => {
+                Some(WorkerCommandResultType::WorkflowHeartbeatNotification(
+                    notifications.notify(command),
                 ))
             }
             None => {
@@ -403,8 +401,8 @@ mod tests {
             nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
             worker::v1::{
                 CancelActivityCommand, EnvironmentInfo, WorkerCommand, WorkerHeartbeat,
-                WorkflowTaskHeartbeatNotificationCommand, worker_command, worker_command_result,
-                workflow_task_heartbeat_notification_result::Outcome,
+                WorkflowHeartbeatNotificationCommand, worker_command, worker_command_result,
+                workflow_heartbeat_notification_result::Outcome,
             },
             workflowservice::v1::{
                 DescribeNamespaceResponse, PollNexusTaskQueueResponse,
@@ -743,13 +741,12 @@ mod tests {
                                 )),
                             },
                             WorkerCommand {
-                                r#type: Some(
-                                    worker_command::Type::WorkflowTaskHeartbeatNotification(
-                                        WorkflowTaskHeartbeatNotificationCommand {
-                                            task_token: vec![42],
-                                        },
-                                    ),
-                                ),
+                                r#type: Some(worker_command::Type::WorkflowHeartbeatNotification(
+                                    WorkflowHeartbeatNotificationCommand {
+                                        task_token: vec![42],
+                                        execution: None,
+                                    },
+                                )),
                             },
                         ],
                     };
@@ -858,8 +855,8 @@ mod tests {
             .expect("Should decode ExecuteCommandsResponse");
         assert_eq!(exec_resp.results.len(), 2);
         assert_matches!(exec_resp.results[1].r#type.as_ref(),
-            Some(worker_command_result::Type::WorkflowTaskHeartbeatNotification(result)) =>
-                assert_eq!(result.outcome, Outcome::NoWorkflowTask as i32));
+            Some(worker_command_result::Type::WorkflowHeartbeatNotification(result)) =>
+                assert_eq!(result.outcome, Outcome::TaskTokenMismatch as i32));
         assert!(
             matches!(
                 exec_resp.results[0].r#type,

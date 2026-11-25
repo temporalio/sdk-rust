@@ -11,6 +11,7 @@ option csharp_namespace = "Temporalio.Api.Worker.V1";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "temporal/api/common/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/enums/v1/common.proto";
 
@@ -323,14 +324,16 @@ message EnvironmentInfo {
 message WorkerCommand {
   oneof type {
     CancelActivityCommand cancel_activity = 1;
-    WorkflowTaskHeartbeatNotificationCommand workflow_task_heartbeat_notification = 2;
+    // Experimental. Request an early heartbeat of a running Workflow Task.
+    WorkflowHeartbeatNotificationCommand workflow_heartbeat_notification = 2;
   }
 }
 
-// Request an early heartbeat of the identified Workflow Task if it is still running.
-message WorkflowTaskHeartbeatNotificationCommand {
+// Experimental. Request an early heartbeat of the current Workflow Task.
+message WorkflowHeartbeatNotificationCommand {
   // The token of the Workflow Task returned to the worker.
   bytes task_token = 1;
+  temporal.api.common.v1.WorkflowExecution execution = 2;
 }
 
 // Cancel an activity if it is still running. Otherwise, do nothing.
@@ -342,31 +345,27 @@ message CancelActivityCommand {
 message WorkerCommandResult {
   oneof type {
     CancelActivityResult cancel_activity = 1;
-    WorkflowTaskHeartbeatNotificationResult workflow_task_heartbeat_notification = 2;
+    // Experimental. Result of a Workflow heartbeat notification.
+    WorkflowHeartbeatNotificationResult workflow_heartbeat_notification = 2;
   }
 }
 
-// Result of a WorkflowTaskHeartbeatNotificationCommand.
+// Experimental. Result of a WorkflowHeartbeatNotificationCommand.
 // A successful result acknowledges the notification, not completion of a Workflow Task heartbeat.
-message WorkflowTaskHeartbeatNotificationResult {
+message WorkflowHeartbeatNotificationResult {
   enum Outcome {
-    // No outcome was reported. This is also the value returned by older SDKs.
     OUTCOME_UNSPECIFIED = 0;
-    // Success: the notification was accepted for the matching Workflow Task.
-    OUTCOME_HANDLED = 1;
-    // Success: the matching Workflow Task has already received this notification.
-    OUTCOME_ALREADY_RECEIVED = 2;
-    // Success: the matching Workflow Task has no pending Local Activity and needs no early heartbeat.
-    OUTCOME_NO_LOCAL_ACTIVITY = 3;
-    // Failure: the worker has no active Workflow Task.
-    OUTCOME_NO_WORKFLOW_TASK = 4;
-    // Failure: the worker has active Workflow Tasks, but none has the notification's task token.
-    OUTCOME_TASK_TOKEN_MISMATCH = 5;
+    // The notification was accepted for the matching Workflow Task.
+    OUTCOME_ACCEPTED = 1;
+    // This notification is rejected because its token does not match the current Workflow Task or there is no current Workflow Task.
+    OUTCOME_TASK_TOKEN_MISMATCH = 2;
   }
 
-  // The SDK's result for this notification. The failure outcomes let the server measure
-  // unmatched notifications and decide whether to retry while the target task is still running.
+  // The SDK's result for this notification.
   Outcome outcome = 1;
+  // The token of the Workflow Task currently held for the command's Workflow Execution, if any.
+  // This field may be empty when outcome is OUTCOME_ACCEPTED.
+  bytes current_task_token = 2;
 }
 
 // Result of a CancelActivityCommand.

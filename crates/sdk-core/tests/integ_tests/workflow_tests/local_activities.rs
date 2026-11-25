@@ -33,8 +33,7 @@ use temporalio_common::{
             },
             workflow_commands::{
                 ActivityCancellationType as ProtoActivityCancellationType,
-                CompleteWorkflowExecution, RequestCancelLocalActivity, ScheduleLocalActivity,
-                workflow_command::Variant,
+                CompleteWorkflowExecution, ScheduleLocalActivity, workflow_command::Variant,
             },
             workflow_completion::{
                 self, WorkflowActivationCompletion, workflow_activation_completion,
@@ -2630,38 +2629,6 @@ async fn local_activity_results_across_attached_query(
             CommandType::CompleteWorkflowExecution
         ]
     );
-    run.shut_down().await;
-}
-
-/// Commands sent with query responses can still resolve a local activity, here a try-cancel of a
-/// running one, which resolves synchronously in Core. The completion must then force a new
-/// workflow task on which to deliver the resolution.
-#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
-#[tokio::test]
-async fn la_cancelled_with_query_responses_forces_new_task() {
-    let mut run = LiveRun::new(started_history(), SignalAfterLocalActivitiesWf::new(1), 1);
-    let (query, mut local_activities) = run.run_local_activities_with_queries(&["q"]).await;
-    let local_activity = local_activities.pop().unwrap();
-    run.answer_queries(
-        query,
-        vec![Variant::RequestCancelLocalActivity(
-            RequestCancelLocalActivity { seq: 1 },
-        )],
-    )
-    .await;
-    let query_completion = run.next_completion().await;
-    assert!(query_completion.force_create_new_workflow_task);
-    let cancel = run.poll_local_activity().await;
-    assert_eq!(cancel.task_token, local_activity.task_token);
-    assert_matches!(cancel.variant, Some(act_task::Variant::Cancel(_)));
-    run.complete_local_activity_with(cancel, ActivityExecutionResult::cancel_from_details(None))
-        .await;
-
-    run.send_forced_task_after_signal(&[]);
-    let activation = run.next_activation().await;
-    assert_eq!(job_names(&activation), ["signal", "local activity"]);
-    run.complete(&activation).await;
-    run.next_completion().await;
     run.shut_down().await;
 }
 

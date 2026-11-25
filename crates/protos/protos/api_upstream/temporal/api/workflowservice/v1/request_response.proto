@@ -231,9 +231,16 @@ message StartWorkflowExecutionRequest {
     temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 31;
 
     // Experimental. A dedicated per-worker Nexus task queue for control tasks sent to
-    // the worker processing the eager Workflow Task. Only used when eager execution is accepted.
-    // Setting this field indicates that the worker supports Workflow Task heartbeat notifications.
-    string worker_control_task_queue = 32;
+    // the worker processing the eager Workflow Task. Used only when eager execution is accepted.
+    string eager_worker_control_task_queue = 32;
+    // Experimental. SDK capabilities of the worker processing the eager Workflow Task.
+    // Used only when eager execution is accepted.
+    Capabilities eager_worker_capabilities = 33;
+
+    message Capabilities {
+        // Experimental. Whether this worker supports Workflow heartbeat notifications.
+        bool supports_workflow_heartbeat_notification = 1;
+    }
 }
 
 message StartWorkflowExecutionResponse {
@@ -312,11 +319,16 @@ message PollWorkflowTaskQueueRequest {
     // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
     string worker_instance_key = 8;
 
-    // Experimental. A dedicated per-worker Nexus task queue on which the server sends control
+    // A dedicated per-worker Nexus task queue on which the server sends control
     // tasks (e.g. activity cancellation) to this specific worker instance.
     string worker_control_task_queue = 9;
-    // Experimental. Whether this worker can heartbeat a running Workflow Task on a worker command.
-    bool supports_workflow_task_heartbeat_notification = 11;
+    // SDK capabilities of the worker making this poll.
+    Capabilities capabilities = 12;
+
+    message Capabilities {
+        // Experimental. Whether this worker supports Workflow heartbeat notifications.
+        bool supports_workflow_heartbeat_notification = 1;
+    }
 
     // Deprecated. Use deployment_options instead.
     // Each worker process should provide an ID unique to the specific set of code it is running
@@ -465,7 +477,7 @@ message RespondWorkflowTaskCompletedRequest {
     // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
     string worker_instance_key = 19;
 
-    // Experimental. A dedicated per-worker Nexus task queue on which the server sends control
+    // A dedicated per-worker Nexus task queue on which the server sends control
     // tasks (e.g. activity cancellation) to this specific worker instance.
     string worker_control_task_queue = 20;
 
@@ -478,6 +490,10 @@ message RespondWorkflowTaskCompletedRequest {
     // `page_number` tells the server how many intermediate pages (0..page_number-1) preceded it.
     // May only be used when the namespace capability workflow_task_completion_pagination is true.
     bool intermediate_page = 22;
+
+    // True if this Workflow Task completion is a heartbeat triggered by a
+    // Workflow Heartbeat Notification, rather than the SDK's normal heartbeat timer.
+    bool notification_triggered_heartbeat = 23;
 
     // SDK capability details.
     message Capabilities {
@@ -550,7 +566,7 @@ message PollActivityTaskQueueRequest {
     // This is guaranteed to be unique, whereas identity is not guaranteed to be unique.
     string worker_instance_key = 8;
 
-    // Experimental. A dedicated per-worker Nexus task queue on which the server sends control
+    // A dedicated per-worker Nexus task queue on which the server sends control
     // tasks (e.g. activity cancellation) to this specific worker instance.
     string worker_control_task_queue = 9;
 

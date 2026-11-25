@@ -492,7 +492,9 @@ impl WorkerClient for WorkerClientBag {
         let control_queue = self.worker_control_task_queue();
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollWorkflowTaskQueueRequest {
-            supports_workflow_task_heartbeat_notification: !control_queue.is_empty(),
+            capabilities: Some(temporalio_common::protos::temporal::api::workflowservice::v1::poll_workflow_task_queue_request::Capabilities {
+                supports_workflow_heartbeat_notification: !control_queue.is_empty(),
+            }),
             namespace: self.namespace.clone(),
             task_queue: Some(task_queue),
             identity: self.identity(),
@@ -636,6 +638,7 @@ impl WorkerClient for WorkerClientBag {
             sticky_attributes: request.sticky_attributes,
             return_new_workflow_task: request.return_new_workflow_task,
             force_create_new_workflow_task: request.force_create_new_workflow_task,
+            notification_triggered_heartbeat: request.notification_triggered_heartbeat,
             worker_version_stamp: self.worker_version_stamp(),
             binary_checksum: self.binary_checksum(),
             query_results: request
@@ -1199,6 +1202,8 @@ pub struct WorkflowTaskCompletion {
     pub return_new_workflow_task: bool,
     /// Force a new WFT to be created after this completion
     pub force_create_new_workflow_task: bool,
+    /// Identifies a heartbeat requested by WHN before the normal heartbeat timer fired.
+    pub notification_triggered_heartbeat: bool,
     /// SDK-specific metadata to send
     pub sdk_metadata: WorkflowTaskCompletedMetadata,
     /// Metering info
@@ -1720,7 +1725,8 @@ mod tests {
                 sticky_attributes: None,
                 query_responses: vec![],
                 return_new_workflow_task: false,
-                force_create_new_workflow_task: false,
+                force_create_new_workflow_task: true,
+                notification_triggered_heartbeat: true,
                 sdk_metadata: Default::default(),
                 metering_metadata: Default::default(),
                 versioning_behavior: VersioningBehavior::Unspecified,
@@ -1746,6 +1752,7 @@ mod tests {
             let finals: Vec<_> = sent.iter().filter(|r| !r.intermediate_page).collect();
             assert_eq!(finals.len(), 1);
             assert_eq!(finals[0].page_number as usize, sent.len() - 1);
+            assert!(finals[0].notification_triggered_heartbeat);
             assert!(finals[0].commands.is_empty());
             // Intermediate pages carry sequential page numbers 0..N-1.
             let mut intermediate_numbers: Vec<_> = sent
@@ -1824,6 +1831,7 @@ mod tests {
                 query_responses: vec![],
                 return_new_workflow_task: false,
                 force_create_new_workflow_task: false,
+                notification_triggered_heartbeat: false,
                 sdk_metadata: Default::default(),
                 metering_metadata: Default::default(),
                 versioning_behavior: VersioningBehavior::Unspecified,
@@ -1901,6 +1909,7 @@ mod tests {
                 query_responses: vec![],
                 return_new_workflow_task: false,
                 force_create_new_workflow_task: false,
+                notification_triggered_heartbeat: false,
                 sdk_metadata: Default::default(),
                 metering_metadata: Default::default(),
                 versioning_behavior: VersioningBehavior::Unspecified,
@@ -1988,6 +1997,7 @@ mod tests {
                 query_responses: vec![],
                 return_new_workflow_task: false,
                 force_create_new_workflow_task: false,
+                notification_triggered_heartbeat: false,
                 sdk_metadata: Default::default(),
                 metering_metadata: Default::default(),
                 versioning_behavior: VersioningBehavior::Unspecified,
@@ -2078,6 +2088,7 @@ mod tests {
                 query_responses: vec![],
                 return_new_workflow_task: false,
                 force_create_new_workflow_task: false,
+                notification_triggered_heartbeat: false,
                 sdk_metadata: Default::default(),
                 metering_metadata: Default::default(),
                 versioning_behavior: VersioningBehavior::Unspecified,
@@ -2164,6 +2175,7 @@ mod tests {
                 query_responses: vec![],
                 return_new_workflow_task: false,
                 force_create_new_workflow_task: false,
+                notification_triggered_heartbeat: false,
                 sdk_metadata: Default::default(),
                 metering_metadata: Default::default(),
                 versioning_behavior: VersioningBehavior::Unspecified,

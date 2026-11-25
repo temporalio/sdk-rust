@@ -3444,7 +3444,18 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .await
         .unwrap();
 
-    // Expect to see eviction b/c of history fetching error here.
+    let wf_task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        wf_task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
+        }] if signal.signal_name == "sig1"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
+        .await
+        .unwrap();
+
+    // Buffered work must be processed before the failing fetch can evict the run.
     let wf_task = core.poll_workflow_activation().await.unwrap();
     assert_matches!(
         wf_task.jobs.as_slice(),

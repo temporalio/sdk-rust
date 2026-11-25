@@ -606,8 +606,8 @@ impl HistoryUpdate {
         );
         match next_wft_ix {
             NextWFTSeqEndIndex::Incomplete(siz) => {
-                if self.has_last_wft {
-                    if siz == 0 {
+                if self.has_last_wft || self.ends_at_known_boundary() {
+                    if self.get_events().is_empty() {
                         NextWFT::ReplayOver
                     } else {
                         self.build_next_wft(siz)
@@ -662,7 +662,7 @@ impl HistoryUpdate {
             self.chunking_disabled,
         );
         if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
-            && !self.has_last_wft
+            && !(self.has_last_wft || self.ends_at_known_boundary())
         {
             return false;
         }

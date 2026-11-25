@@ -8,11 +8,11 @@ use crate::{
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
             ActivationOrAuto, BufferedTasks, EvictionRequestResult, FailedActivationWFTReport,
-            HeartbeatTimeoutMsg, HistoryUpdate, LocalActivityRequestSink, LocalResolution,
-            NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, RequestEvictMsg,
-            RunBasics, ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand,
-            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
-            WftFailureKind, WorkflowHeartbeatRegistrar, WorkflowTaskInfo,
+            HeartbeatTimeoutMsg, HeartbeatTrigger, HistoryUpdate, LocalActivityRequestSink,
+            LocalResolution, NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT,
+            RequestEvictMsg, RunBasics, ServerCommandsWithWorkflowInfo, TaskStorageMetrics,
+            WFCommand, WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION,
+            WFTReportStatus, WftFailureKind, WorkflowHeartbeatRegistrar, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -231,19 +231,18 @@ impl ManagedRun {
             None
         } else {
             self.heartbeat_registrar
-                .register(wft_info.task_token.clone(), self.run_id().to_owned())
+                .register(wft_info.task_token.clone(), work.execution.clone())
         };
         self.wft = Some(OutstandingTask {
             info: wft_info,
             heartbeat_registration,
-            heartbeat_notification_pending: false,
+            heartbeat_requested: None,
             pending_queries,
             start_time,
             permit: pwft.permit,
         });
         if let Some(waiting) = self.waiting_on_la.as_mut() {
             waiting.hb_timeout_handle.abort();
-            waiting.heartbeat_timeout_pending = false;
         }
 
         if was_legacy_query
@@ -396,10 +395,11 @@ impl ManagedRun {
                     )));
                 }
             }
-            if self
-                .waiting_on_la
-                .as_ref()
-                .is_some_and(|waiting| waiting.heartbeat_timeout_pending)
+            if self.waiting_on_la.is_some()
+                && self
+                    .wft
+                    .as_ref()
+                    .is_some_and(|task| task.heartbeat_requested.is_some())
             {
                 Ok(Some(ActivationOrAuto::Autocomplete {
                     run_id: self.run_id().to_string(),
@@ -789,11 +789,7 @@ impl ManagedRun {
             || self
                 .wft
                 .as_ref()
-                .is_some_and(|task| task.heartbeat_notification_pending)
-            || self
-                .waiting_on_la
-                .as_ref()
-                .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
+                .is_some_and(|task| task.heartbeat_requested.is_some());
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
@@ -864,40 +860,32 @@ impl ManagedRun {
                 if let Some(wola) = self.waiting_on_la.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
+                let hb_timeout_handle = sink_heartbeat_timeout_start(
+                    self.run_id().to_string(),
+                    self.local_activity_request_sink.as_deref(),
+                    start_t,
+                    wft_timeout,
+                );
+                if self
+                    .wft
+                    .as_ref()
+                    .is_some_and(|task| task.heartbeat_requested == Some(HeartbeatTrigger::Timer))
+                {
+                    hb_timeout_handle.abort();
+                }
+                self.waiting_on_la = Some(WaitingOnLAs {
+                    wft_timeout,
+                    hb_timeout_handle,
+                });
                 if completing_la_heartbeat || !data.query_responses.is_empty() {
                     // Reporting a query while an LA is still running must request another WFT;
                     // otherwise the LA could resolve without a task on which to deliver its job.
-                    let hb_timeout_handle = sink_heartbeat_timeout_start(
-                        self.run_id().to_string(),
-                        self.local_activity_request_sink.as_deref(),
-                        start_t,
-                        wft_timeout,
-                    );
-                    hb_timeout_handle.abort();
-                    self.waiting_on_la = Some(WaitingOnLAs {
-                        wft_timeout,
-                        hb_timeout_handle,
-                        // Keep this set until the replacement WFT arrives. If pending workflow
-                        // jobs prevent this completion from being reported, the heartbeat still
-                        // needs to be honored after those jobs are processed.
-                        heartbeat_timeout_pending: completing_la_heartbeat,
-                    });
                     Ok(Some(self.prepare_complete_resp(
                         completion.resp_chan,
                         data,
                         true,
                     )))
                 } else {
-                    self.waiting_on_la = Some(WaitingOnLAs {
-                        wft_timeout,
-                        hb_timeout_handle: sink_heartbeat_timeout_start(
-                            self.run_id().to_string(),
-                            self.local_activity_request_sink.as_deref(),
-                            start_t,
-                            wft_timeout,
-                        ),
-                        heartbeat_timeout_pending: false,
-                    });
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
@@ -942,19 +930,29 @@ impl ManagedRun {
     }
 
     pub(super) fn heartbeat_notification(&mut self, token: &TaskToken) -> RunUpdateAct {
-        let task = self.wft.as_mut().filter(|task| {
+        self.wft.as_ref().filter(|task| {
             &task.info.task_token == token
                 && task
                     .heartbeat_registration
                     .as_ref()
                     .is_some_and(|registration| registration.is_active())
         })?;
-        task.heartbeat_notification_pending = true;
-        self.heartbeat_timeout()
+        self.request_heartbeat(HeartbeatTrigger::Notification)
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
-        let maybe_act = if self._heartbeat_timeout() {
+        let waiting = self.waiting_on_la.as_mut()?;
+        waiting.hb_timeout_handle.abort();
+        self.request_heartbeat(HeartbeatTrigger::Timer)
+    }
+
+    fn request_heartbeat(&mut self, trigger: HeartbeatTrigger) -> RunUpdateAct {
+        let task = self.wft.as_mut()?;
+        // Once the regular deadline fires, WHN no longer advanced this task's reporting.
+        if trigger == HeartbeatTrigger::Timer || task.heartbeat_requested.is_none() {
+            task.heartbeat_requested = Some(trigger);
+        }
+        let maybe_act = if self.waiting_on_la.is_some() && self.activation.is_none() {
             Some(ActivationOrAuto::Autocomplete {
                 run_id: self.wfm.machines.run_id.clone(),
             })
@@ -962,15 +960,6 @@ impl ManagedRun {
             None
         };
         self.update_to_acts(Ok(maybe_act.into()))
-    }
-    /// Returns `true` if autocompletion should be issued to report the heartbeat WFT completion.
-    fn _heartbeat_timeout(&mut self) -> bool {
-        if let Some(ref mut wait_dat) = self.waiting_on_la {
-            wait_dat.hb_timeout_handle.abort();
-            wait_dat.heartbeat_timeout_pending = true;
-            return self.activation.is_none();
-        }
-        false
     }
 
     /// Returns true if the managed run has any form of pending work
@@ -1253,9 +1242,16 @@ impl ManagedRun {
         &mut self,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
         data: CompletionDataForWFT,
-        due_to_heartbeat_timeout: bool,
+        request_new_wft: bool,
     ) -> FulfillableActivationComplete {
         let outstanding_las = self.wfm.machines.outstanding_local_activity_count() > 0;
+        let notification_triggered_heartbeat = request_new_wft
+            && outstanding_las
+            && !data.activation_was_eviction
+            && data.query_responses.is_empty()
+            && self.wft.as_ref().is_some_and(|task| {
+                task.heartbeat_requested == Some(HeartbeatTrigger::Notification)
+            });
         let workflow_id = self.wfm.machines.workflow_id.clone();
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
@@ -1269,8 +1265,7 @@ impl ManagedRun {
         let is_query_playback = data.has_pending_query && !has_query_responses;
         // Unrecorded LAs must get a replacement task on which to execute after eviction, just
         // like LAs that remain outstanding across a workflow-task heartbeat.
-        let mut force_new_wft =
-            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las);
+        let mut force_new_wft = request_new_wft || (eviction_has_output && outstanding_las);
 
         // We only actually want to send commands back to the server if there are no more pending
         // activations and we are caught up on replay. We don't want to complete a wft if we already
@@ -1281,11 +1276,7 @@ impl ManagedRun {
             || is_query_playback
             || (data.activation_was_eviction && !eviction_has_output)
             || machines_wft_response.have_seen_terminal_event);
-        // LA results arriving while lang answers queries wait for the next WFT, but commands sent
-        // with the query responses can still resolve an LA here (ex: a try-cancel of a running LA,
-        // which resolves synchronously in Core). If so, force a new task, as otherwise once we tell
-        // lang about the LA resolution there wouldn't be any task to reply to with the result of
-        // iterating the workflow.
+        // Pending LA resolutions need a task on which to deliver their resulting commands.
         if has_query_responses && machines_wft_response.have_pending_la_resolutions {
             force_new_wft = true;
         }
@@ -1320,6 +1311,7 @@ impl ManagedRun {
                 workflow_id,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
+                    notification_triggered_heartbeat,
                     commands,
                     messages,
                     query_responses,
@@ -1334,6 +1326,9 @@ impl ManagedRun {
         };
         let replaying = machines_wft_response.replaying;
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
+            if let Some(waiting) = self.waiting_on_la.as_mut() {
+                waiting.hb_timeout_handle.abort();
+            }
             self.wfm.hold_local_resolutions_until_next_wft();
         }
         if evict_after_report {
@@ -1567,9 +1562,6 @@ struct WaitingOnLAs {
     wft_timeout: Duration,
     /// Can be used to abort heartbeat timeouts
     hb_timeout_handle: AbortHandle,
-    /// Defers the heartbeat when lang must finish an outstanding activation before Core can safely
-    /// complete the workflow task.
-    heartbeat_timeout_pending: bool,
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {
@@ -2137,6 +2129,176 @@ mod tests {
         }
     }
 
+    mod heartbeat_trigger_tests {
+        use super::super::*;
+        use crate::{
+            abstractions::tests::fixed_size_permit_dealer,
+            replay::TestHistoryBuilder,
+            test_help::{hist_to_poll_resp, schedule_local_activity_cmd, test_worker_cfg},
+            worker::{
+                LocalActivityExecutionResult, LocalActivityResolution, WorkflowSlotKind,
+                client::mocks::mock_worker_client,
+                workflow::{PermittedWFT, wft_poller::validate_wft},
+            },
+        };
+        use temporalio_client::worker::WorkflowHeartbeatNotifications;
+        use temporalio_common::protos::coresdk::{
+            WorkflowSlotInfo,
+            workflow_commands::{ActivityCancellationType, workflow_command},
+        };
+
+        enum Request {
+            Notification,
+            Timer,
+        }
+
+        #[rstest::rstest]
+        #[case::notification(vec![Request::Notification], true)]
+        #[case::timer(vec![Request::Timer], false)]
+        #[case::notification_then_timer(vec![Request::Notification, Request::Timer], false)]
+        #[case::timer_then_notification(vec![Request::Timer, Request::Notification], false)]
+        #[tokio::test]
+        async fn heartbeat_trigger_survives_activation(
+            #[case] requests: Vec<Request>,
+            #[case] notification_triggered: bool,
+        ) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+            history.add_workflow_task_scheduled_and_started();
+            let poll = hist_to_poll_resp(&history, "heartbeat-trigger", 1.into()).resp;
+            let token: TaskToken = poll.task_token.clone().into();
+            let execution = poll.workflow_execution.clone().unwrap();
+            let client: Arc<dyn crate::worker::client::WorkerClient> =
+                Arc::new(mock_worker_client());
+            let (paginator, work) =
+                HistoryPaginator::from_poll(validate_wft(poll).unwrap(), client.clone())
+                    .await
+                    .unwrap();
+            let dealer = fixed_size_permit_dealer::<WorkflowSlotKind>(1);
+            let permit = dealer.acquire_owned().await.into_used(WorkflowSlotInfo {
+                workflow_type: work.workflow_type.clone(),
+                is_sticky: false,
+            });
+            let (notification_tx, _notification_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (mut run, _) = ManagedRun::new(
+                RunBasics {
+                    worker_config: test_worker_cfg().build().unwrap().into(),
+                    workflow_id: execution.workflow_id.clone(),
+                    workflow_type: work.workflow_type.clone(),
+                    run_id: execution.run_id.clone(),
+                    history: HistoryUpdate::dummy(),
+                    metrics: MetricsContext::no_op(),
+                    capabilities: &Default::default(),
+                    sdk_name: "test",
+                    sdk_version: "test",
+                },
+                PermittedWFT {
+                    work,
+                    permit,
+                    paginator,
+                },
+                None,
+                WorkflowHeartbeatRegistrar {
+                    client,
+                    namespace: "test".to_owned(),
+                    notification_tx,
+                },
+            );
+            let router = Arc::new(WorkflowHeartbeatNotifications::default());
+            run.wft.as_mut().unwrap().heartbeat_registration =
+                Some(router.register(token.clone(), execution, || true));
+            let (tx, rx) = oneshot::channel();
+            run.successful_completion(
+                (1..=2)
+                    .map(|seq| {
+                        let workflow_command::Variant::ScheduleLocalActivity(command) =
+                            schedule_local_activity_cmd(
+                                seq,
+                                "la",
+                                ActivityCancellationType::TryCancel,
+                                Duration::from_secs(60),
+                            )
+                        else {
+                            unreachable!()
+                        };
+                        WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+                    })
+                    .collect(),
+                vec![],
+                VersioningBehavior::Unspecified,
+                Some(tx),
+                false,
+            )
+            .unwrap();
+            assert!(matches!(
+                rx.await.unwrap().outcome,
+                ActivationCompleteOutcome::DoNothing
+            ));
+            run.finish_activation(|_| true);
+            assert!(matches!(
+                run.local_resolution(LocalResolution::LocalActivity(LocalActivityResolution {
+                    seq: 2,
+                    result: LocalActivityExecutionResult::Completed(Default::default()),
+                    runtime: Duration::ZERO,
+                    attempt: 1,
+                    backoff: None,
+                    original_schedule_time: None,
+                })),
+                Some(ActivationOrAuto::LangActivation(_))
+            ));
+
+            for request in requests {
+                let activation = match request {
+                    Request::Notification => run.heartbeat_notification(&token),
+                    Request::Timer => run.heartbeat_timeout(),
+                };
+                assert!(
+                    activation.is_none(),
+                    "heartbeat interrupted workflow execution"
+                );
+            }
+            if notification_triggered {
+                assert!(
+                    !run.waiting_on_la
+                        .as_ref()
+                        .unwrap()
+                        .hb_timeout_handle
+                        .is_aborted()
+                );
+            }
+            let (tx, rx) = oneshot::channel();
+            run.successful_completion(
+                vec![],
+                vec![],
+                VersioningBehavior::Unspecified,
+                Some(tx),
+                false,
+            )
+            .unwrap();
+            let ActivationCompleteOutcome::ReportWFTSuccess(report) = rx.await.unwrap().outcome
+            else {
+                panic!("expected workflow task heartbeat");
+            };
+            let ActivationAction::WftComplete {
+                force_new_wft,
+                notification_triggered_heartbeat,
+                ..
+            } = report.action
+            else {
+                panic!("expected workflow task completion");
+            };
+            assert!(force_new_wft);
+            assert_eq!(notification_triggered_heartbeat, notification_triggered);
+            assert!(
+                run.waiting_on_la
+                    .as_ref()
+                    .unwrap()
+                    .hb_timeout_handle
+                    .is_aborted()
+            );
+        }
+    }
+
     mod local_activity_replay_tests {
         use super::super::WorkflowManager;
         use crate::{
@@ -2288,6 +2450,70 @@ mod tests {
                 sdk_name: "test",
                 sdk_version: "test",
             })
+        }
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum HistoryReplacement {
+            Covered,
+            SkipsPrefix,
+            TruncatesTail,
+            Empty,
+        }
+
+        #[rstest]
+        #[case::covered(HistoryReplacement::Covered)]
+        #[case::skips_unread_prefix(HistoryReplacement::SkipsPrefix)]
+        #[case::truncates_unread_tail(HistoryReplacement::TruncatesTail)]
+        #[case::empty(HistoryReplacement::Empty)]
+        fn history_replacement_preserves_unread_events(
+            #[case] replacement: HistoryReplacement,
+            #[values(false, true)] unchunked: bool,
+        ) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_full_wf_task();
+            if unchunked {
+                history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+            }
+            history.add_we_signaled("first", vec![]);
+            history.add_full_wf_task();
+            history.add_we_signaled("second", vec![]);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            live.get_next_activation().unwrap();
+            live.push_commands_and_iterate(vec![]).unwrap();
+            let update = match replacement {
+                HistoryReplacement::Covered => history.get_full_history_info().unwrap().into(),
+                HistoryReplacement::SkipsPrefix => history.get_one_wft(3).unwrap().into(),
+                HistoryReplacement::TruncatesTail => history.get_history_info(2).unwrap().into(),
+                HistoryReplacement::Empty => crate::worker::workflow::HistoryUpdate::dummy(),
+            };
+            let result = live.feed_history_from_new_page(update);
+            if replacement == HistoryReplacement::Covered {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unprocessed history")
+                );
+            }
+            let mut signals = vec![];
+            loop {
+                let activation = live.get_next_activation().unwrap();
+                if activation.jobs.is_empty() {
+                    break;
+                }
+                for job in activation.jobs {
+                    let Some(Variant::SignalWorkflow(signal)) = job.variant else {
+                        panic!("unexpected job: {job:?}");
+                    };
+                    signals.push(signal.signal_name);
+                }
+                live.push_commands_and_iterate(vec![]).unwrap();
+            }
+            assert_eq!(signals, ["first", "second"]);
         }
 
         #[rstest]

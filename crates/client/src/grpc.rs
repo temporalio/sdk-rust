@@ -772,7 +772,10 @@ proxier! {
                                         .map(|tq| tq.name.clone()).unwrap_or_default();
                     match workers.try_reserve_wft_slot(namespace.clone(), task_queue) {
                         Some(reservation) => {
-                            req_mut.worker_control_task_queue = workers.worker_control_task_queue(&namespace);
+                            req_mut.eager_worker_control_task_queue = workers.worker_control_task_queue(&namespace);
+                            req_mut.eager_worker_capabilities = Some(temporalio_common::protos::temporal::api::workflowservice::v1::start_workflow_execution_request::Capabilities {
+                                supports_workflow_heartbeat_notification: !req_mut.eager_worker_control_task_queue.is_empty(),
+                            });
                             // Populate eager_worker_deployment_options from the slot reservation
                             if let Some(opts) = reservation.deployment_options {
                                 req_mut.eager_worker_deployment_options = Some(temporalio_common::protos::temporal::api::deployment::v1::WorkerDeploymentOptions {
@@ -2442,7 +2445,16 @@ mod tests {
             {
                 let req = request.into_inner();
                 let expected_mode = self.expected_mode;
-                assert_eq!(req.worker_control_task_queue, self.expected_control_queue);
+                assert_eq!(
+                    req.eager_worker_control_task_queue,
+                    self.expected_control_queue
+                );
+                assert_eq!(
+                    req.eager_worker_capabilities
+                        .unwrap()
+                        .supports_workflow_heartbeat_notification,
+                    !self.expected_control_queue.is_empty()
+                );
 
                 assert!(
                     req.eager_worker_deployment_options.is_some(),
