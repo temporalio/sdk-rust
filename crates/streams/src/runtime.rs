@@ -49,9 +49,12 @@ impl StreamRuntime {
         request: sdk::CreateStreamRequest,
         request_id: String,
     ) -> Result<sdk::CreateStreamResponse, CreateError> {
-        let stream_ref = request.stream_ref.unwrap_or_default();
+        let sdk::CreateStreamRequest {
+            stream_ref,
+            id_conflict_policy: policy,
+        } = request;
+        let stream_ref = stream_ref.unwrap_or_default();
         validate_stream_id(&stream_ref.id)?;
-        let policy = request.id_conflict_policy;
         if StreamIdConflictPolicy::try_from(policy).is_err() {
             return Err(StreamError::invalid_argument(format!(
                 "The conflict policy {policy} is unknown"
@@ -77,10 +80,15 @@ impl StreamRuntime {
         request: sdk::AppendRecordsRequest,
         request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
+        let sdk::AppendRecordsRequest {
+            r#ref,
+            producer,
+            records,
+        } = request;
         let request = AppendRecordsRequest {
-            stream_id: stream_id(request.r#ref),
-            producer: request.producer,
-            records: request.records,
+            stream_id: stream_id(r#ref),
+            producer,
+            records,
         };
         self.limits.validate_append(&request)?;
         let appended = self.store.append_records(request, request_id).await?;
@@ -111,12 +119,19 @@ impl StreamRuntime {
         &self,
         request: sdk::ReadRecordsRequest,
     ) -> Result<ReadRecordsResponse, ReadError> {
+        let sdk::ReadRecordsRequest {
+            r#ref,
+            from_offset,
+            max_records,
+            max_bytes,
+            wait,
+        } = request;
         let request = ReadRecordsRequest {
-            stream_id: stream_id(request.r#ref),
-            from_offset: request.from_offset,
-            max_records: request.max_records,
-            max_bytes: request.max_bytes,
-            wait: request.wait,
+            stream_id: stream_id(r#ref),
+            from_offset,
+            max_records,
+            max_bytes,
+            wait,
         };
         validate_stream_id(&request.stream_id)?;
         validate_offset(
@@ -154,8 +169,9 @@ impl StreamRuntime {
         &self,
         request: sdk::DescribeStreamRequest,
     ) -> Result<DescribeStreamResponse, DescribeError> {
+        let sdk::DescribeStreamRequest { r#ref } = request;
         let request = DescribeStreamRequest {
-            stream_id: stream_id(request.r#ref),
+            stream_id: stream_id(r#ref),
         };
         validate_stream_id(&request.stream_id)?;
         let described = self.store.describe_stream(request).await?;
@@ -268,7 +284,7 @@ mod tests {
         AnyError, AppendReason,
         proto::{AppendRecord, CreateStreamResponse, StreamRecord},
         record::DEFAULT_MAX_RECORD_BYTES,
-        test_store::{Scripted, client, runtime, task, workflow},
+        test_store::{Received, Scripted, client, runtime, task, workflow},
     };
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::fmt::Debug;
@@ -453,6 +469,56 @@ mod tests {
             let response = runtime.create_stream(valid_create(), "r".to_string());
             assert_eq!(response.await, Ok(answer));
         }
+    }
+
+    #[tokio::test]
+    async fn the_store_gets_each_request_with_only_the_stream_id_of_its_ref() {
+        let (store, runtime) = runtime();
+        store.answers.lock().appended = AppendRecordsResponse {
+            first_offset: b"a".to_vec(),
+            last_offset: b"a".to_vec(),
+        };
+        let (create, append) = (valid_create(), valid_append());
+        let read = sdk::ReadRecordsRequest {
+            from_offset: b"a".to_vec(),
+            max_records: 3,
+            max_bytes: 7,
+            wait: seconds(2),
+            ..valid_read()
+        };
+        let created = runtime.create_stream(create.clone(), "c".to_string());
+        created.await.unwrap();
+        let appended = runtime.append_records(append.clone(), "a".to_string());
+        appended.await.unwrap();
+        runtime.read_records(read.clone()).await.unwrap();
+        runtime.describe_stream(valid_describe()).await.unwrap();
+        let id = || "s".to_string();
+        let expected = [
+            Received::Create(
+                CreateStreamRequest {
+                    stream_id: id(),
+                    id_conflict_policy: create.id_conflict_policy,
+                },
+                "c".to_string(),
+            ),
+            Received::Append(
+                AppendRecordsRequest {
+                    stream_id: id(),
+                    producer: append.producer,
+                    records: append.records,
+                },
+                "a".to_string(),
+            ),
+            Received::Read(ReadRecordsRequest {
+                stream_id: id(),
+                from_offset: read.from_offset,
+                max_records: read.max_records,
+                max_bytes: read.max_bytes,
+                wait: read.wait,
+            }),
+            Received::Describe(DescribeStreamRequest { stream_id: id() }),
+        ];
+        assert_eq!(*store.received.lock(), expected);
     }
 
     #[tokio::test]
