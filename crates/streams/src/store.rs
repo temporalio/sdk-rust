@@ -139,6 +139,8 @@ pub trait StreamStore: Send + Sync + 'static {
     ///      with [`AppendReason::Fenced`](crate::AppendReason::Fenced).
     /// - An append returns the offsets of its first and its last Record, and the first cannot be
     ///   above the last.
+    /// - An append that writes its batch starts the Retention of the Stream again. A resend writes
+    ///   nothing, so it doesn't, and neither does a create of a Stream that exists.
     fn append_records(
         &self,
         request: AppendRecordsRequest,
