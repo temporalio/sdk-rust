@@ -98,6 +98,13 @@ mod integ_tests {
 
     pub(crate) async fn mk_nexus_endpoint(starter: &mut CoreWfStarter) -> String {
         let client = starter.get_core_client().await;
+        mk_nexus_endpoint_for_client(&client, starter.get_task_queue()).await
+    }
+
+    pub(crate) async fn mk_nexus_endpoint_for_client(
+        client: &temporalio_client::Client,
+        task_queue: &str,
+    ) -> String {
         let endpoint = format!("mycoolendpoint-{}", rand_6_chars());
         client
             .connection()
@@ -111,7 +118,7 @@ mod integ_tests {
                             variant: Some(endpoint_target::Variant::Worker(
                                 endpoint_target::Worker {
                                     namespace: client.namespace(),
-                                    task_queue: starter.get_task_queue().to_owned(),
+                                    task_queue: task_queue.to_owned(),
                                 },
                             )),
                         }),
