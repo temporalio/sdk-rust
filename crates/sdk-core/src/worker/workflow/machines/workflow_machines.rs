@@ -369,6 +369,7 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
+        // History updates replace this buffer, so they must preserve any events replay has not processed.
         let unread = self.last_history_from_server.get_events();
         if let Some(first) = unread
             .iter()
@@ -388,6 +389,7 @@ impl WorkflowMachines {
                 ));
             }
         }
+
         self.note_wft_events(update.get_events());
         update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
