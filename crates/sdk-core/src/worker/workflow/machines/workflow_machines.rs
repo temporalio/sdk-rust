@@ -1828,6 +1828,9 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
+                WFCommandVariant::ReadStream(read) => {
+                    return Err(fatal!("This Worker can't run Stream read {}", read.seq));
+                }
             }
         }
         Ok(())

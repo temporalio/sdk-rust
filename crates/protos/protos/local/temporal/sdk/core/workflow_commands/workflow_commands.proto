@@ -56,6 +56,7 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        ReadStream read_stream = 23;
         AppendToStream append_to_stream = 25;
     }
 }
@@ -447,4 +448,79 @@ message AppendToStream {
     uint32 seq = 1;
     temporal.api.sdk.v1.StreamRef stream = 2;
     repeated temporal.api.common.v1.Payload bodies = 3;
+}
+
+// Reads one page of a Stream, with the Records after `from_offset`. The result comes in one
+// `ResolveStreamRead` job, by the activation rules of `ResolveStreamAppend`. To read on, lang sends
+// a new `ReadStream` from the `last_offset` of the page. A Stream has no end that a read reports,
+// so the application's own last Record tells a reader to stop.
+//
+// A page is one answer of the Store. It has the Records that the Store has at once, up to
+// `max_records` and `max_bytes`, and Core never waits to fill it. A read with no Record after
+// `from_offset` waits up to `wait`, but at most the read time that its Workflow Task has left
+// (`StreamSettings::read_time`, half the task timeout by default, from the end of a replay). If
+// the Store answers with no Record before the wait is up, Core asks again from that answer's
+// `last_offset`, at most once per 100 ms. A page with no Record has the `last_offset` of the
+// Store's answer, which is `from_offset` if the Store moved past nothing. Its `wait_cut` is true if
+// the read time ended the wait before `wait`.
+//
+// At the read limit a read with a `wait` gives a page with no Record and `wait_cut`. A read with no
+// `wait` goes on, since only the Store can say that the Stream has no Record after its offset.
+// Before the limit Core keeps the task open while a read runs, unless the task has a command or a
+// message for the server.
+//
+// Before the task completes, each read that had no answer in it gets a check, which is one Store
+// call with no wait and a short deadline (`StreamSettings::read_check_deadline`). A command waits
+// for the check and no longer. If the check gets Records, the task gives them, or holds them for
+// the first activation of the next task if it has a command. If it gets no Record, a read with a
+// `wait` stops and starts again when the next task opens, and a read with no `wait` gives the page
+// with no Record. After the read limit each new read of the task is a check. So a read on an idle
+// Stream never makes a new task, and a drain with no `wait` ends in its task.
+//
+// Core asks for a new task when it knows that the Stream has Records for an open read. It knows
+// that when the Store gave Records after the page that the read continues from, or when the task
+// holds back the read's page. A query answer and the heartbeat of a Local Activity or an append
+// ask for a new task whatever the reads say.
+//
+// A Store outage fails the Workflow Task, as for an append, and never reaches lang as a read
+// result. That's the case if a check fails or gets no answer by its deadline, or if a read has had
+// no answer since a failed try at the read limit, at the completion or at the heartbeat. The
+// failure message then starts with `StreamStoreUnavailable:`.
+//
+// One Workflow Task gives at most 16 MiB of Records. A page that doesn't fit comes in the first
+// activation of the next task. Once a task gave `StreamSettings::max_task_read_results` read
+// results, 256 by default, its new reads start when the next task opens.
+//
+// No command cancels a read, so lang must accept the job of a read that nothing awaits. Core drops
+// a read that has no result when lang sends the Workflow's last command.
+//
+// The `core_stream_read` marker of the activation that gets the page keeps its offsets, the count
+// and a digest of its Records, and never the Records. A replay, also the replay for a query of a
+// closed Workflow, reads the page from the Store again, and fails if the Records are gone or
+// differ. So the Retention of the Stream must cover the life of the Workflow and the time in which
+// it gets queries. A replay reads the Records of all the read markers of History again, so a
+// reader should continue as new before those pass the 16 MiB that a Worker reads in one task. A
+// Worker with no runtime for the Store of a marker can't replay, and fails the task, or gives the
+// error as the answer of a legacy query.
+//
+// A replay compares the `seq`, the `stream` and the `from_offset` of the command with History, and
+// not the `max_records`, the `max_bytes` or the `wait`. It accepts a marker with no entry after any
+// task. After a replay Core doesn't know which Streams have Records after the pages of History, so
+// it learns that from the next answer of the Store. A negative `wait`, `max_records` or
+// `max_bytes`, a `from_offset` over 1024 bytes, or a bad `seq` or `stream` fails the Workflow Task.
+message ReadStream {
+    // Lang's incremental sequence number for reads, starting at 1.
+    uint32 seq = 1;
+    temporal.api.sdk.v1.StreamRef stream = 2;
+    // The page has the Records after this offset. If it's empty, the page starts at the beginning
+    // of the Stream.
+    bytes from_offset = 3;
+    // How long the read waits for a Record if the Stream has none after `from_offset`. If it's
+    // unset, the read doesn't wait.
+    google.protobuf.Duration wait = 4;
+    // The maximum number of Records in the page, which is 256 if this is zero.
+    int32 max_records = 5;
+    // The maximum size of the Records in the page, which is 4 MiB if this is zero. Core asks the
+    // Store for at most 16 MiB. One larger Record still comes as a page.
+    int64 max_bytes = 6;
 }

@@ -16,6 +16,7 @@ import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
+import "temporal/api/stream/v1/message.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/common/common.proto";
@@ -49,8 +50,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * Stream results go after the local activity resolutions, because a replay scans ahead for them
-//  too. They are in `seq` order. If a replay gives several activations in one, the Stream results
-//  keep the order of those activations.
+//  too. Appends go before reads, each in `seq` order. If a replay gives several activations in
+//  one, the Stream results keep the order of those activations.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -150,6 +151,8 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A read of a Stream finished.
+        ResolveStreamRead resolve_stream_read = 17;
         // An append to a Stream finished.
         ResolveStreamAppend resolve_stream_append = 18;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
@@ -462,4 +465,30 @@ message ResolveStreamAppend {
 message StreamAppended {
     bytes first_offset = 1;
     bytes last_offset = 2;
+}
+
+// The result of a `ReadStream`. Each read gets exactly one, unless Core drops the read (see
+// `ReadStream`). The activation rules of `ResolveStreamAppend` apply to it too, with the
+// `core_stream_read` marker in place of the `core_stream_append` one.
+message ResolveStreamRead {
+    // The `seq` of the `ReadStream`.
+    uint32 seq = 1;
+    oneof status {
+        StreamPage page = 2;
+        // The failure of the read. It has the parts of the `failed` of a `ResolveStreamAppend`.
+        temporal.api.failure.v1.Failure failed = 3;
+    }
+}
+
+message StreamPage {
+    // The Records of the page, in the order of the Stream. It's empty if no Record came while the
+    // read waited.
+    repeated temporal.api.stream.v1.StreamRecord records = 1;
+    // The offset where the page ends, also for a page with no Record. The next read can pass it as
+    // its `from_offset`.
+    bytes last_offset = 2;
+    // True if the page has no Record because the read time of the Workflow Task ended the wait
+    // before the `wait` of the read. A reader that waits for a Record can read again from
+    // `last_offset`. It's false for a page that ends a whole wait.
+    bool wait_cut = 3;
 }

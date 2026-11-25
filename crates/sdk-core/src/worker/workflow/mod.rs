@@ -1642,6 +1642,7 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    ReadStream(ReadStream),
     AppendToStream(AppendToStream),
 }
 
@@ -1704,6 +1705,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::ReadStream(s) => WFCommandVariant::ReadStream(s),
             workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
         };
         Ok(Self {
@@ -1937,7 +1939,8 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::SignalWorkflow(_) => 3,
                 workflow_activation_job::Variant::DoUpdate(_) => 3,
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
-                workflow_activation_job::Variant::ResolveStreamAppend(_) => 5,
+                workflow_activation_job::Variant::ResolveStreamAppend(_)
+                | workflow_activation_job::Variant::ResolveStreamRead(_) => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.

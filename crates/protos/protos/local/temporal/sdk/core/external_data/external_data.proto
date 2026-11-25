@@ -82,3 +82,42 @@ message StreamFailure {
   // The message of the failure, of at most 4096 bytes.
   string message = 2;
 }
+
+// The data of a `core_stream_read` marker. Core records one in each activation in which Workflow
+// code got the page of a read, and one with no entry by the rule of `StreamAppendMarkerData`. The
+// marker keeps the offsets, the count and a digest of each page, never its Records. A replay reads
+// the Records from the Store again. The JSON rules of `StreamAppendMarkerData` apply.
+message StreamReadMarkerData {
+  repeated StreamReadResult reads = 1;
+}
+
+message StreamReadResult {
+  uint32 seq = 1;
+  string stream_id = 2;
+  // The Store name of the Stream's ref.
+  string store = 3;
+  // The index of the activation, within its Workflow Task, in which Workflow code got the result.
+  uint64 activation_index = 4;
+  // The `from_offset` of the read. A replay reads the Records of the page after it.
+  bytes from_offset = 5;
+  oneof result {
+    StreamReadPage page = 6;
+    StreamFailure failure = 7;
+  }
+}
+
+// A page that a read gave Workflow code, without its Records.
+message StreamReadPage {
+  uint32 record_count = 1;
+  // The first 16 bytes of a SHA-256 over the Records, in an encoding that Core owns. It's empty if
+  // the page has no Record.
+  bytes digest = 2;
+  // The size of the Records, as the `max_bytes` of a read measures it. A replay asks the Store for
+  // this much.
+  uint64 record_bytes = 3;
+  // The `last_offset` that Workflow code got. A replay gives the same value, since another read of
+  // the Store can end at another offset.
+  bytes last_offset = 4;
+  // The `wait_cut` that Workflow code got with the page.
+  bool wait_cut = 5;
+}
