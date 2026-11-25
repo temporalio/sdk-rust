@@ -679,6 +679,11 @@ impl ManagedRun {
             )
         {
             warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            // While replaying, the server already has the task that these commands came from, so
+            // sending them again would repeat or contradict its history.
+            if self.wfm.machines.replaying {
+                self.wfm.machines.drop_unmatched_commands();
+            }
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -808,8 +813,12 @@ impl ManagedRun {
                 self.wfm.feed_history_from_new_page(update)?;
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
-            // or are otherwise broken.
-            if !completion.activation_was_eviction && !self.am_broken {
+            // or are otherwise broken. After a forced failure, lang sent none of the commands the
+            // next task's history records, so applying it would fail the workflow again.
+            if !completion.activation_was_eviction
+                && !self.am_broken
+                && !completion.is_forced_failure
+            {
                 self.wfm.apply_next_task_if_ready()?;
             }
             let mut new_local_acts = self.wfm.drain_queued_local_activities();
