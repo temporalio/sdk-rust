@@ -423,6 +423,23 @@ pub enum OutgoingError {
     /// An error produced from a workflow.
     #[error(transparent)]
     Workflow(#[from] OutgoingWorkflowError),
+    /// An error produced while serving a Nexus request.
+    #[cfg(feature = "experimental")]
+    #[error(transparent)]
+    Nexus(#[from] Box<OutgoingNexusError>),
+}
+
+/// A Nexus operation outcome or handler failure, classified before failure conversion.
+#[cfg(feature = "experimental")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum OutgoingNexusError {
+    /// A terminal failed or canceled operation.
+    #[error(transparent)]
+    Operation(#[from] nexus_rpc::OperationError),
+    /// A failure to handle the request, with its protocol retry behavior.
+    #[error(transparent)]
+    Handler(#[from] nexus_rpc::HandlerError),
 }
 
 /// A typed outbound activity error.

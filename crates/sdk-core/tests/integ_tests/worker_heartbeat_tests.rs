@@ -95,26 +95,35 @@ fn to_system_time(ts: Timestamp) -> SystemTime {
 #[allow(deprecated)]
 async fn list_worker_heartbeats(client: &Client, query: impl Into<String>) -> Vec<WorkerHeartbeat> {
     let mut raw_client = client.clone();
-    let response = WorkflowService::list_workers(
-        &mut raw_client,
-        ListWorkersRequest {
-            namespace: client.namespace().to_owned(),
-            page_size: 200,
-            next_page_token: Vec::new(),
-            query: query.into(),
-            include_system_workers: false,
+    let query = query.into();
+    let mut next_page_token = Vec::new();
+    let mut heartbeats = Vec::new();
+    loop {
+        let response = WorkflowService::list_workers(
+            &mut raw_client,
+            ListWorkersRequest {
+                namespace: client.namespace().to_owned(),
+                page_size: 200,
+                next_page_token,
+                query: query.clone(),
+                include_system_workers: false,
+            }
+            .into_request(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        heartbeats.extend(
+            response
+                .workers_info
+                .into_iter()
+                .filter_map(|info| info.worker_heartbeat),
+        );
+        next_page_token = response.next_page_token;
+        if next_page_token.is_empty() {
+            return heartbeats;
         }
-        .into_request(),
-    )
-    .await
-    .unwrap()
-    .into_inner();
-    #[allow(deprecated)]
-    let workers_info = response.workers_info;
-    workers_info
-        .into_iter()
-        .filter_map(|info| info.worker_heartbeat)
-        .collect()
+    }
 }
 
 fn assert_worker_environment(heartbeat: &WorkerHeartbeat) {
@@ -315,12 +324,14 @@ async fn worker_heartbeat_basic(backing: &str) {
     let test_fut = async {
         acts_started.notified().await;
         let client = starter.get_core_client().await;
-        let raw_client = client.clone();
         let heartbeat = eventually(
             || {
                 let client = client.clone();
                 async move {
-                    let heartbeat = list_worker_heartbeats(&client, String::new())
+                    let heartbeat = list_worker_heartbeats(
+                        &client,
+                        format!("WorkerInstanceKey=\"{worker_instance_key}\""),
+                    )
                         .await
                         .into_iter()
                         .find(|heartbeat| {
@@ -359,34 +370,18 @@ async fn worker_heartbeat_basic(backing: &str) {
         // The worker stays alive (join! waits for both futures) so heartbeats keep firing.
         eventually(
             || {
-                let mut rc = raw_client.clone();
-                let ns = client.namespace().to_owned();
+                let client = client.clone();
                 async move {
-                    let workers_list = WorkflowService::list_workers(
-                        &mut rc,
-                        ListWorkersRequest {
-                            namespace: ns,
-                            page_size: 100,
-                            next_page_token: Vec::new(),
-                            query: String::new(),
-                            include_system_workers: false,
-                        }
-                        .into_request(),
+                    let hb = list_worker_heartbeats(
+                        &client,
+                        format!("WorkerInstanceKey=\"{worker_instance_key}\""),
                     )
                     .await
-                    .unwrap()
-                    .into_inner();
-                    #[allow(deprecated)]
-                    let hb = workers_list
-                        .workers_info
-                        .iter()
-                        .find_map(|wi| {
-                            wi.worker_heartbeat.as_ref().filter(|hb| {
-                                hb.worker_instance_key == worker_instance_key.to_string()
-                            })
-                        })
-                        .unwrap()
-                        .clone();
+                    .into_iter()
+                    .find(|heartbeat| {
+                        heartbeat.worker_instance_key == worker_instance_key.to_string()
+                    })
+                    .ok_or_else(|| anyhow!("worker shutdown heartbeat has not been recorded"))?;
                     let tasks_done = hb
                         .workflow_task_slots_info
                         .as_ref()
@@ -502,7 +497,7 @@ async fn docker_worker_heartbeat_tuner() {
             namespace: client.namespace().to_owned(),
             page_size: 100,
             next_page_token: Vec::new(),
-            query: String::new(),
+            query: format!("WorkerInstanceKey=\"{worker_instance_key}\""),
             include_system_workers: false,
         }
         .into_request(),
@@ -510,8 +505,6 @@ async fn docker_worker_heartbeat_tuner() {
     .await
     .unwrap()
     .into_inner();
-    // Since list_workers finds all workers in the namespace, must find specific worker used in this
-    // test
     #[allow(deprecated)]
     let worker_info = workers_list
         .workers_info
@@ -1240,7 +1233,7 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
             namespace: client.namespace().to_owned(),
             page_size: 100,
             next_page_token: Vec::new(),
-            query: String::new(),
+            query: format!("WorkerInstanceKey=\"{worker_instance_key}\""),
             include_system_workers: false,
         }
         .into_request(),
@@ -1313,7 +1306,7 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
             namespace: client.namespace().to_owned(),
             page_size: 100,
             next_page_token: Vec::new(),
-            query: String::new(),
+            query: format!("WorkerInstanceKey=\"{worker_instance_key}\""),
             include_system_workers: false,
         }
         .into_request(),

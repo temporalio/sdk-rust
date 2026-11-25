@@ -42,6 +42,10 @@ relevant information.
   own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
   append of client code against them with `StoreLimits::validate_append`.
 
+### Fixed
+* Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
+  matching live execution.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
