@@ -1,6 +1,6 @@
 use crate::{
     AnyReason, AppendError, CreateError, DescribeError, ReadError, StreamError, StreamStore,
-    ids::{validate_offset, validate_stream_id},
+    ids::{MAX_OFFSET_BYTES, validate_offset, validate_stream_id},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest, DescribeStreamRequest,
         DescribeStreamResponse, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy,
@@ -110,16 +110,17 @@ impl StreamRuntime {
         Ok(appended)
     }
 
-    /// Reads one page of Records after `from_offset`. The Store gets `max_records` and `wait` as
-    /// the caller set them, and a `max_records` of 0 leaves the page size to the Store. If the
-    /// Store returns more than the read asked for, the page is trimmed. The first Record is always
-    /// kept, so a read makes progress whenever the Store has something to return. `max_bytes`
-    /// counts each Record as the page encodes it, with the tag and the length of its field. The
-    /// runtime checks only the Records that are left after the trim.
+    /// Reads one page of Records after `from_offset`. A `max_records` or `max_bytes` of 0 leaves
+    /// that size to the Store. The Store gets caps that take one Record more than the page holds,
+    /// and the runtime trims the answer to the caps of the read. So [`ReadPage::more`] is true only
+    /// when the Store returned a Record after the page. The first Record is always kept, so a read
+    /// makes progress whenever the Store has something to return. `max_bytes` counts each Record
+    /// as the page encodes it, with the tag and the length of its field. The runtime checks only
+    /// the Records that it keeps.
     pub async fn read_records(
         &self,
         request: sdk::ReadRecordsRequest,
-    ) -> Result<ReadRecordsResponse, ReadError> {
+    ) -> Result<ReadPage, ReadError> {
         let sdk::ReadRecordsRequest {
             r#ref,
             from_offset,
@@ -160,8 +161,13 @@ impl StreamRuntime {
             max => usize::try_from(max).unwrap_or(usize::MAX),
         };
         let from_offset = request.from_offset.clone();
-        let page = self.store.read_records(request).await?;
         let max_record_bytes = self.limits.max_record_bytes;
+        let request = ReadRecordsRequest {
+            max_records: one_more_record(request.max_records),
+            max_bytes: one_more_record_bytes(request.max_bytes, max_record_bytes),
+            ..request
+        };
+        let page = self.store.read_records(request).await?;
         fit_page(page, &from_offset, max_records, max_bytes, max_record_bytes)
     }
 
@@ -193,13 +199,46 @@ fn stream_id(stream_ref: Option<sdk::StreamRef>) -> String {
         .unwrap_or_default()
 }
 
+/// A page of Records that a read gives its caller.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReadPage {
+    /// The Store's answer, trimmed to the caps of the read and checked.
+    pub response: ReadRecordsResponse,
+    /// True if the Store returned a Record after the page, which the trim removed. So the Stream
+    /// has more Records after `response.last_offset`. False says nothing about the Stream.
+    pub more: bool,
+}
+
+/// Returns the `max_records` that the Store gets for a read with `max_records`.
+fn one_more_record(max_records: i32) -> i32 {
+    match max_records {
+        0 => 0,
+        max => max.saturating_add(1),
+    }
+}
+
+/// Returns the `max_bytes` that the Store gets for a read with `max_bytes`. It adds the largest
+/// Record that the runtime takes, as a page encodes it with its offset. A sum over `i64` is no cap.
+fn one_more_record_bytes(max_bytes: i64, max_record_bytes: usize) -> i64 {
+    if max_bytes == 0 {
+        return 0;
+    }
+    let record = max_record_bytes
+        .checked_add(field_len(MAX_OFFSET_BYTES))
+        .map(field_len);
+    let extra = record.and_then(|record| i64::try_from(record).ok());
+    extra
+        .and_then(|extra| max_bytes.checked_add(extra))
+        .unwrap_or(0)
+}
+
 fn fit_page(
     mut page: ReadRecordsResponse,
     from_offset: &[u8],
     max_records: usize,
     max_bytes: usize,
     max_record_bytes: usize,
-) -> Result<ReadRecordsResponse, ReadError> {
+) -> Result<ReadPage, ReadError> {
     // The trim comes first, so a Record that the caller doesn't get can't fail the read.
     let mut bytes = 0;
     let mut keep = 0;
@@ -210,7 +249,8 @@ fn fit_page(
         }
         keep += 1;
     }
-    if keep < page.records.len() {
+    let more = keep < page.records.len();
+    if more {
         page.records.truncate(keep);
         page.last_offset = page.records[keep - 1].offset.clone();
     }
@@ -275,7 +315,10 @@ fn fit_page(
             "The Store gave a last_offset that is lower than the offset of the last Record"
         }));
     }
-    Ok(page)
+    Ok(ReadPage {
+        response: page,
+        more,
+    })
 }
 
 #[cfg(test)]
@@ -284,9 +327,11 @@ mod tests {
     use crate::{
         AnyError, AppendReason,
         proto::{AppendRecord, CreateStreamResponse, StreamRecord},
-        record::DEFAULT_MAX_RECORD_BYTES,
+        record::{DEFAULT_MAX_RECORD_BYTES, producer_len, stored_len},
         test_store::{Received, Scripted, client, runtime, task, workflow},
     };
+    use futures_util::future::BoxFuture;
+    use parking_lot::Mutex;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::fmt::Debug;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -510,11 +555,12 @@ mod tests {
                 },
                 "a".to_string(),
             ),
+            // The caps take one Record more, which has at most 1572864 bytes and its offset.
             Received::Read(ReadRecordsRequest {
                 stream_id: id(),
                 from_offset: read.from_offset,
-                max_records: read.max_records,
-                max_bytes: read.max_bytes,
+                max_records: 4,
+                max_bytes: 7 + 1573895,
                 wait: read.wait,
             }),
             Received::Describe(DescribeStreamRequest { stream_id: id() }),
@@ -571,6 +617,10 @@ mod tests {
                 expected.records.truncate(keep);
                 expected.last_offset = expected.records[keep - 1].offset.clone();
             }
+            let expected = ReadPage {
+                response: expected,
+                more: keep < count,
+            };
             store.answers.lock().page = answer;
             let read = sdk::ReadRecordsRequest {
                 max_records: max_records as i32,
@@ -590,6 +640,149 @@ mod tests {
             spared += usize::from(broken.is_some_and(|at| at >= keep));
         }
         assert!(spared > 0, "No trim removed a Record with no body");
+    }
+
+    /// A Store that keeps the contract. It answers with the first Records after `from_offset`
+    /// that fit the caps of the request.
+    #[derive(Default)]
+    struct Stream(Mutex<Vec<StreamRecord>>);
+
+    impl StreamStore for Stream {
+        fn create_stream(
+            &self,
+            _: CreateStreamRequest,
+            _: String,
+        ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
+            unreachable!("The test only reads")
+        }
+
+        fn append_records(
+            &self,
+            _: AppendRecordsRequest,
+            _: String,
+        ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
+            unreachable!("The test only reads")
+        }
+
+        fn read_records(
+            &self,
+            request: ReadRecordsRequest,
+        ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
+            let max_records = match request.max_records {
+                0 => usize::MAX,
+                max => max as usize,
+            };
+            let max_bytes = match request.max_bytes {
+                0 => usize::MAX,
+                max => max as usize,
+            };
+            let mut bytes = 0;
+            let records: Vec<StreamRecord> = (self.0.lock().iter())
+                .filter(|record| record.offset > request.from_offset)
+                .take(max_records)
+                .take_while(|record| {
+                    let first = bytes == 0;
+                    bytes += field_len(record.encoded_len());
+                    first || bytes <= max_bytes
+                })
+                .cloned()
+                .collect();
+            let page = ReadRecordsResponse {
+                records,
+                ..Default::default()
+            };
+            Box::pin(async move { Ok(page) })
+        }
+
+        fn describe_stream(
+            &self,
+            _: DescribeStreamRequest,
+        ) -> BoxFuture<'_, Result<DescribeStreamResponse, DescribeError>> {
+            unreachable!("The test only reads")
+        }
+    }
+
+    #[tokio::test]
+    async fn more_says_that_the_stream_has_a_record_after_the_page() {
+        const MAX_RECORD: usize = 400;
+        let store = Arc::new(Stream::default());
+        let limits = StoreLimits::default().with_max_record_bytes(MAX_RECORD);
+        let runtime = StreamRuntime::new(store.clone(), limits.unwrap());
+        let (mut told, mut over_size_spared) = (0, 0);
+        for seed in 0..1000 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            // Some Records are over the Record size of the runtime.
+            let records: Vec<StreamRecord> = (0..rng.random_range(0..8_u8))
+                .map(|at| StreamRecord {
+                    producer: Some(client()),
+                    body: Some(Payload {
+                        data: vec![0; rng.random_range(0..MAX_RECORD + 100)],
+                        ..Default::default()
+                    }),
+                    offset: vec![b'a' + at],
+                })
+                .collect();
+            let size = |record: &StreamRecord| field_len(record.encoded_len());
+            let over_size = |record: &StreamRecord| {
+                let stored = stored_len(producer_len(&client()), record.body.as_ref());
+                stored > MAX_RECORD
+            };
+            *store.0.lock() = records.clone();
+            let max_records = rng.random_range(0..4);
+            let max_bytes = match rng.random_bool(0.3) {
+                true => 0,
+                false => rng.random_range(1..1500),
+            };
+            let read = sdk::ReadRecordsRequest {
+                max_records: max_records as i32,
+                max_bytes: max_bytes as i64,
+                ..valid_read()
+            };
+            let result = runtime.read_records(read).await;
+            // The page has the first Records that fit the caps of the read, and at least one.
+            let (mut keep, mut bytes) = (0, 0);
+            for record in &records {
+                bytes += size(record);
+                let fits = (max_records == 0 || keep < max_records)
+                    && (max_bytes == 0 || bytes <= max_bytes);
+                if keep > 0 && !fits {
+                    break;
+                }
+                keep += 1;
+            }
+            let page = &records[..keep];
+            if let Some(at) = page.iter().position(over_size) {
+                let Err(error) = result else {
+                    panic!("seed {seed}: a Record over the size of the runtime passed");
+                };
+                assert_eq!(error.reason, AnyReason::Unsupported.into(), "seed {seed}");
+                assert!(
+                    error
+                        .message
+                        .starts_with(&format!("The Store gave Record {at} "))
+                );
+                continue;
+            }
+            let ReadPage { response, more } = result.unwrap();
+            assert_eq!(response.records, page, "seed {seed}");
+            let next = records.get(keep);
+            over_size_spared += usize::from(more && next.is_some_and(over_size));
+            // `more` is never a guess.
+            assert!(!more || next.is_some(), "seed {seed}");
+            // With a page within its byte cap, the extra cap has room for any Record that the
+            // runtime takes, so the Store returns it.
+            let page_bytes: usize = page.iter().map(size).sum();
+            let room = max_bytes == 0 || page_bytes <= max_bytes;
+            if next.is_some_and(|next| !over_size(next)) && room {
+                assert!(more, "seed {seed}");
+            }
+            told += usize::from(more);
+        }
+        assert!(told > 100, "Only {told} pages had more");
+        assert!(
+            over_size_spared > 0,
+            "No trim removed a Record over the size"
+        );
     }
 
     #[tokio::test]
@@ -651,7 +844,8 @@ mod tests {
                 from_offset: from_offset.as_bytes().to_vec(),
                 ..valid_read()
             };
-            expect(runtime.read_records(read).await, answer, corrupt);
+            let read = runtime.read_records(read).await;
+            expect(read.map(|read| read.response), answer, corrupt);
         }
         // A Store can leave last_offset empty. The page then ends at its last Record, or where its
         // read started.
@@ -662,7 +856,8 @@ mod tests {
                 ..valid_read()
             };
             let filled = page(offsets, ends_at);
-            assert_eq!(runtime.read_records(read).await, Ok(filled));
+            let read = runtime.read_records(read).await;
+            assert_eq!(read.map(|read| read.response), Ok(filled));
         }
         // The Record size is the limit of the runtime, so a Record over the default is one that
         // this runtime can't take, and a larger limit takes it.
@@ -674,7 +869,8 @@ mod tests {
         assert_eq!(runtime.read_records(valid_read()).await, Err(refused));
         let larger = StoreLimits::default().with_max_record_bytes(size).unwrap();
         let larger = StreamRuntime::new(store.clone(), larger);
-        assert_eq!(larger.read_records(valid_read()).await, Ok(large));
+        let read = larger.read_records(valid_read()).await;
+        assert_eq!(read.map(|read| read.response), Ok(large));
         let no_offset = "The Store answered an append with no offset";
         let reversed =
             "The Store answered an append with a first offset that is higher than its last offset";
