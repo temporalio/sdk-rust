@@ -10,7 +10,9 @@ option ruby_package = "Temporalio::Api::StreamService::V1";
 option csharp_namespace = "Temporalio.Api.StreamService.V1";
 
 // The messages of the Stream service. An SDK Store (Redis or memory) and the server answer the
-// same five operations with them. A field that is only read by the server says so.
+// same four operations with them. A field that is only read by the server says so. A request has
+// only the id of its Stream, and an SDK builds it from the request of the same name in
+// `temporal.api.sdk.v1`, which has a `StreamRef`.
 //
 // The request id of a call is in its envelope, as for every Nexus operation. An SDK that calls a
 // Store with no envelope passes the request id next to the request.
@@ -22,32 +24,28 @@ import "temporal/api/stream/v1/message.proto";
 
 // Experimental. Might change in the future.
 // Creates a Stream. If the Stream already exists, the result depends on `id_conflict_policy`.
-// `FAIL` fails with `ALREADY_EXISTS`, and `USE_EXISTING` returns the Stream with `created` false. A
-// retry of the create that made the Stream, with the same request id, returns `created` true. The
-// Store remembers the request id of that create, so a retry after a lost response doesn't fail with
-// `ALREADY_EXISTS`. Either policy fails with `CLOSED` for a closed Stream and with `EXPIRED` for an
-// expired one.
+// `FAIL` fails with `ALREADY_EXISTS`, and `USE_EXISTING` succeeds with `created` false. A retry of
+// the create that made the Stream, with the same request id, returns `created` true. The Store
+// remembers the request id of that create, so a retry after a lost response doesn't fail with
+// `ALREADY_EXISTS`. Either policy fails with `EXPIRED` for an expired Stream.
 //
 // A create has no Retention. Retention is a setting of the Store, as it's a setting of the
-// namespace for Workflows.
+// namespace for Workflows. It's the only lifetime setting of a Stream. It starts at the create,
+// and each append starts it again. When it passes, the Stream is expired.
 // (-- api-linter: core::0133=disabled
-//     aip.dev/not-precedent: The request identifies a Stream by its ref. --)
+//     aip.dev/not-precedent: The request identifies a Stream by its id. --)
 message CreateStreamRequest {
-    // Required. The Stream to create. Its `id` must not be empty.
-    temporal.api.stream.v1.StreamRef stream_ref = 1;
+    // Required. The id of the Stream to create. It must not be empty.
+    string stream_id = 1;
     // What the create does if the Stream already exists. Unspecified means `FAIL`.
     temporal.api.enums.v1.StreamIdConflictPolicy id_conflict_policy = 2;
 }
 
 // Experimental. Might change in the future.
-// The Stream that the create made or found.
+// The result of a create.
 message CreateStreamResponse {
-    // The ref of the Stream. The caller can pass it to other code as data. A Store and the server
-    // return the ref as the request had it, because they don't know the Store names of an SDK.
-    // The SDK then sets `store` to the Store that it picked, before the caller gets the ref.
-    temporal.api.stream.v1.StreamRef ref = 1;
-    // False when `USE_EXISTING` returned a Stream that already existed.
-    bool created = 2;
+    // False when `USE_EXISTING` found a Stream that already existed.
+    bool created = 1;
 }
 
 // Experimental. Might change in the future.
@@ -60,9 +58,8 @@ message CreateStreamResponse {
 // again.
 message AppendRecordsRequest {
     // Required.
-    temporal.api.stream.v1.StreamRef ref = 1;
-    // Required. The Producer that writes the batch. A Producer sends the same value in its
-    // appends and in its close, so the Store orders all of its writes the same way.
+    string stream_id = 1;
+    // Required. The Producer that writes the batch.
     temporal.api.stream.v1.Producer producer = 2;
     // Required. A batch has at least one Record.
     repeated temporal.api.stream.v1.AppendRecord records = 3;
@@ -76,27 +73,11 @@ message AppendRecordsResponse {
 }
 
 // Experimental. Might change in the future.
-// Closes a Stream. Readers still get the Records that are left, and then their reads end. Later
-// appends fail with `CLOSED`. A close writes no Record and has no value, so code with a final
-// value appends it before the close.
-message CloseStreamRequest {
-    // Required.
-    temporal.api.stream.v1.StreamRef ref = 1;
-    // Required. The Producer that closes the Stream.
-    temporal.api.stream.v1.Producer producer = 2;
-}
-
-// Experimental. Might change in the future.
-// The response to a close. The Store sends it after it has recorded the close.
-message CloseStreamResponse {
-}
-
-// Experimental. Might change in the future.
 // Reads one page of Records after an offset. When no Record is left, the read waits for a new
-// one or for the close of the Stream, so a reader long-polls.
+// one, so a reader long-polls.
 message ReadRecordsRequest {
     // Required.
-    temporal.api.stream.v1.StreamRef ref = 1;
+    string stream_id = 1;
     // The read returns the Records after this offset. Empty means from the beginning. An offset
     // past the newest one fails with `OFFSET_TOO_HIGH`. To read only new Records, a caller gets
     // `last_offset` from a describe and reads after it.
@@ -110,8 +91,8 @@ message ReadRecordsRequest {
     // this is still returned, alone in its page, so a read always makes progress. Zero means no
     // limit.
     int64 max_bytes = 4;
-    // How long the read waits for a new Record, or for the close of the Stream, before it returns
-    // an empty page. When it's unset, the read returns immediately.
+    // How long the read waits for a new Record before it returns an empty page. When it's unset,
+    // the read returns immediately.
     google.protobuf.Duration wait = 5;
 }
 
@@ -125,25 +106,20 @@ message ReadRecordsResponse {
     // offset that skips only entries of its own that aren't Records, so the next read doesn't
     // scan them again.
     bytes last_offset = 2;
-    // True when the Stream is closed and this page has its last Record. A read has no other sign
-    // of a close, because a close stores no Record. A read of a closed Stream with no Record left
-    // returns immediately with `done`.
-    bool done = 3;
 }
 
 // Experimental. Might change in the future.
-// Gets the status and the newest offset of a Stream.
+// Gets the newest offset of a Stream.
 message DescribeStreamRequest {
     // Required.
-    temporal.api.stream.v1.StreamRef ref = 1;
+    string stream_id = 1;
 }
 
 // Experimental. Might change in the future.
 // The state of a Stream. It doesn't include Retention, which is a setting of the Store and not
 // of one Stream.
 message DescribeStreamResponse {
-    temporal.api.enums.v1.StreamStatus status = 1;
     // The offset of the newest Record, or an offset after it that skips no Record. A read from it
     // returns only the Records that come later. It's empty when the Stream has no Record.
-    bytes last_offset = 2;
+    bytes last_offset = 1;
 }

@@ -1,11 +1,11 @@
 use crate::{
-    AppendError, CloseError, CreateError, DescribeError, ReadError, StreamRuntime, StreamStore,
+    AppendError, CreateError, DescribeError, ReadError, StreamRuntime, StreamStore,
     proto::{
         ActivityAttempt, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
-        CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
-        DescribeStreamRequest, DescribeStreamResponse, LocalActivityAttempt, LocalActivityProducer,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StandaloneActivityProducer,
-        WorkflowActivityProducer, WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
+        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
+        LocalActivityAttempt, LocalActivityProducer, Producer, ReadRecordsRequest,
+        ReadRecordsResponse, StandaloneActivityProducer, WorkflowActivityProducer,
+        WorkflowProducer, WorkflowTaskAttempt, producer::Kind,
     },
     record::StoreLimits,
 };
@@ -22,46 +22,57 @@ pub(crate) struct Answers {
     pub(crate) described: DescribeStreamResponse,
 }
 
+/// A request that the Store got, with the request id of a create or an append.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Received {
+    Create(CreateStreamRequest, String),
+    Append(AppendRecordsRequest, String),
+    Read(ReadRecordsRequest),
+    Describe(DescribeStreamRequest),
+}
+
 #[derive(Default)]
 pub(crate) struct Scripted {
     pub(crate) answers: Mutex<Answers>,
+    pub(crate) received: Mutex<Vec<Received>>,
 }
 
 impl StreamStore for Scripted {
     fn create_stream(
         &self,
-        _: CreateStreamRequest,
-        _: String,
+        request: CreateStreamRequest,
+        request_id: String,
     ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
-        Box::pin(async move { Ok(self.answers.lock().created.clone()) })
+        self.received
+            .lock()
+            .push(Received::Create(request, request_id));
+        Box::pin(async move { Ok(self.answers.lock().created) })
     }
 
     fn append_records(
         &self,
-        _: AppendRecordsRequest,
-        _: String,
+        request: AppendRecordsRequest,
+        request_id: String,
     ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
+        self.received
+            .lock()
+            .push(Received::Append(request, request_id));
         Box::pin(async move { Ok(self.answers.lock().appended.clone()) })
     }
 
     fn read_records(
         &self,
-        _: ReadRecordsRequest,
+        request: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
+        self.received.lock().push(Received::Read(request));
         Box::pin(async move { Ok(self.answers.lock().page.clone()) })
-    }
-
-    fn close_stream(
-        &self,
-        _: CloseStreamRequest,
-    ) -> BoxFuture<'_, Result<CloseStreamResponse, CloseError>> {
-        Box::pin(async move { Ok(CloseStreamResponse {}) })
     }
 
     fn describe_stream(
         &self,
-        _: DescribeStreamRequest,
+        request: DescribeStreamRequest,
     ) -> BoxFuture<'_, Result<DescribeStreamResponse, DescribeError>> {
+        self.received.lock().push(Received::Describe(request));
         Box::pin(async move { Ok(self.answers.lock().described.clone()) })
     }
 }

@@ -9,8 +9,6 @@ option java_outer_classname = "TaskCompleteMetadataProto";
 option ruby_package = "Temporalio::Api::Sdk::V1";
 option csharp_namespace = "Temporalio.Api.Sdk.V1";
 
-import "temporal/api/sdk/v1/stream_calls.proto";
-
 message WorkflowTaskCompletedMetadata {
   // Internal flags used by the core SDK. SDKs using flags must comply with the following behavior:
   //
@@ -53,10 +51,4 @@ message WorkflowTaskCompletedMetadata {
   // usually the same as client-version gRPC header. This should only be set if its value changed
   // since the last time recorded on the workflow (or be set on the first task).
   string sdk_version = 4;
-
-  // Experimental. Might change in the future.
-  // The Stream calls of this Workflow Task. An SDK sets it if Workflow code got the result of a
-  // Stream call in the task, asked for a close, or has a call with no result yet. So it can have
-  // no entry.
-  WorkflowTaskStreamCalls stream_calls = 5;
 }

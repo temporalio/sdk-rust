@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "./protos/local/temporal/sdk/core/core_interface.proto",
         "./protos/api_upstream/temporal/api/sdk/v1/external_storage.proto",
         "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
+        "./protos/api_upstream/temporal/api/sdk/v1/stream.proto",
         "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
         "./protos/api_upstream/temporal/api/nexusservices/workerservice/v1/request_response.proto",
         "./protos/api_upstream/temporal/api/operatorservice/v1/service.proto",
@@ -175,9 +176,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "coresdk.external_data.StreamAppendOffsets.last_offset",
             "#[serde(with = \"sdk_helpers::hex_bytes\")]",
         )
-        // Few completions have Stream calls, and Core keeps the metadata of a completion inline
-        // in its enums.
-        .boxed(".temporal.api.sdk.v1.WorkflowTaskCompletedMetadata.stream_calls")
         .skip_debug(["temporal.api.common.v1.Payload"]);
 
     for prefix in SERDE_DERIVE_PREFIXES {
