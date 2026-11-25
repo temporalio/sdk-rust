@@ -18,9 +18,9 @@
 //! - An **offset** is the position of a Record in its Stream. The Store assigns it as opaque
 //!   bytes, and the offsets of one Stream sort bytewise in the order of their Records.
 //! - A **Store** is the system that keeps the Records, such as Redis.
-//! - A Stream **expires** when **Retention** has elapsed since its create or its last append.
-//!   Retention is a setting of the Store. A Store answers a call for an expired Stream with
-//!   `Expired`, and no longer keeps its Records.
+//! - A Stream **expires** when **Retention** has elapsed since its create or the last append that
+//!   wrote a batch. Retention is a setting of the Store. A Store answers a call for an expired
+//!   Stream with `Expired`, and no longer keeps its Records.
 //! - A **Producer** is one writer of a Stream. It's a Workflow run, an Activity, a Local Activity
 //!   or a client. Its kind and the ids of that kind identify it, and [`attempt::producer_key`]
 //!   encodes them.
