@@ -1922,12 +1922,82 @@ async fn an_update_whose_append_has_its_result_in_its_task_replays_as_its_first_
     assert_eq!(store.requests().len(), writes);
 }
 
+// A Stream result and a Local Activity result that arrive while one activation is outstanding go
+// in the next activation with one index. The Stream result goes first, and a replay with chunking
+// on or off gives the same activations.
+#[tokio::test]
+async fn a_stream_result_goes_before_a_local_activity_result_of_its_activation() {
+    let store = store(&["a", "b"]).await;
+    store.hold_stream("b");
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let worker = &run.worker;
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![local_activity(1), append(1, "a"), append(2, "b")],
+        _ if activation.jobs.len() == 2 => vec![complete()],
+        _ => vec![],
+    };
+    let variants = |activation: &WorkflowActivation| -> Vec<Job> {
+        (activation.jobs.iter())
+            .filter_map(|job| job.variant.clone())
+            .collect()
+    };
+    let mut live = vec![];
+    let init = worker.poll_workflow_activation().await.unwrap();
+    live.push(variants(&init));
+    let completion = WorkflowActivationCompletion::from_cmds(init.run_id.clone(), workflow(&init));
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    let local = worker.poll_activity_task().await.unwrap();
+    // Append 1 answers at once. The Local Activity and the held append have no result yet.
+    let first = worker.poll_workflow_activation().await.unwrap();
+    live.push(variants(&first));
+    // Both results arrive while that activation is outstanding. Each input reaches the run in the
+    // order that it was sent, and the Store sends its answer as soon as it writes.
+    store.release_stream("b");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.records("b").is_empty() {
+        assert!(Instant::now() < deadline, "The Store never wrote append 2");
+        tokio::task::yield_now().await;
+    }
+    let result = ActivityTaskCompletion {
+        task_token: local.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    };
+    worker.complete_activity_task(result).await.unwrap();
+    let completion = WorkflowActivationCompletion::from_cmds(first.run_id.clone(), vec![]);
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    live.extend(run.drive(workflow).await);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+
+    let live = with_events(&live);
+    let expected = [
+        vec!["InitializeWorkflow".to_string()],
+        vec!["append 1".to_string()],
+        vec!["append 2".to_string(), "local 1".to_string()],
+    ];
+    assert_eq!(live, expected);
+    let sent = run.sent();
+    let indexes: Vec<Vec<u64>> = (markers(&sent[0]).iter())
+        .map(|marker| marker.appends.iter().map(|a| a.activation_index).collect())
+        .collect();
+    assert_eq!(indexes, [[1], [2]]);
+    for chunking in [true, false] {
+        let replayed = with_events(&run.replay_with(chunking, workflow).await);
+        assert_eq!(replayed, live, "Chunking {chunking}");
+    }
+}
+
 /// The kind of a call of a first run that [`replay_calls`] replays. In one activation the first
-/// run gave the results of Local Activities before those of appends.
+/// run gave the results of appends before those of Local Activities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
-    LocalActivity,
     Append,
+    LocalActivity,
 }
 
 /// A call of a first run whose task 2 gave its result. Its seq is its place in the list of calls.
@@ -1972,8 +2042,8 @@ async fn replay_calls(
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_completed();
     let completed = t.current_event_id();
-    // History has the results in the order that the first run gave them. In each activation the
-    // Local Activity markers come before the Stream marker.
+    // History has the activations of the first run in order. In each activation the Local Activity
+    // markers come before the Stream marker, as Core writes them.
     for seqs in first_run(calls) {
         let mut appends = vec![];
         for seq in seqs {
@@ -2063,7 +2133,7 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
             1 => (false, 0, vec![(append, 0, None), (local, 1, None)]),
             2 => (true, 1, vec![(append, 0, None), (local, 1, None)]),
             // Workflow code makes Local Activity 4 at the result of call 1, and the first run got
-            // its result with the one of append 2, after the one of append 3.
+            // its result after the one of append 2, in one activation after the one of append 3.
             3 => (
                 true,
                 1,
@@ -2157,9 +2227,9 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                     assert_eq!(replays[2], first_run(&calls), "{case}");
                 }
                 // Append 2 waits for the result of Local Activity 4, which the first run gave
-                // with it.
+                // with it, and goes first.
                 if seed == 3 {
-                    assert_eq!(replays[2], [vec![1, 3], vec![4, 2]], "{case}");
+                    assert_eq!(replays[2], [vec![1, 3], vec![2, 4]], "{case}");
                 }
                 batched += usize::from(replays[0] != first_run(&all(local)));
                 apart += usize::from(replays[2].len() > replays[0].len());

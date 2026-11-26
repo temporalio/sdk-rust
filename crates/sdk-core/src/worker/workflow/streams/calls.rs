@@ -226,7 +226,8 @@ impl StreamCalls {
 
     /// Returns true if activation `activation` of the task has a Stream result to give. A result
     /// from History is held back while the index of the next Local Activity marker, `marker`, is at
-    /// or below the result's own index, so that the Local Activity result goes first.
+    /// or below the result's own index, so that a Local Activity result with the same index goes in
+    /// the same activation.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -235,20 +236,20 @@ impl StreamCalls {
     }
 
     /// Returns the results for the activation at index `activation` of the task, as
-    /// [`Self::has_jobs`] decides them. The marker of the activation records each live result with
-    /// that index, and [`Self::take_marker`] returns it.
+    /// [`Self::has_jobs`] decides them, each with the index that its marker has. The marker of the
+    /// activation records each live result with that index, and [`Self::take_marker`] returns it.
     pub(crate) fn take_jobs(
         &mut self,
         activation: u64,
         marker: Option<u64>,
-    ) -> Vec<workflow_activation_job::Variant> {
+    ) -> Vec<(u64, workflow_activation_job::Variant)> {
         let mut jobs = vec![];
         while let Some(key) = self.ready.keys().next().copied()
             && self.is_due(&key, activation, marker)
         {
             let entry = self.ready.remove(&key).expect("The key was just read");
             self.leave(key.1);
-            jobs.push(append_job(&entry).into());
+            jobs.push((key.0, append_job(&entry).into()));
         }
         self.released = None;
         if !self.task.is_open() {
@@ -260,7 +261,7 @@ impl StreamCalls {
             };
             self.done.remove(&call);
             self.leave(call);
-            jobs.push(job);
+            jobs.push((activation, job));
         }
         jobs
     }
@@ -814,7 +815,7 @@ mod tests {
     /// Returns the results of the activation at `activation`, as `append 1` or `append 2: <text>`.
     fn jobs(calls: &mut StreamCalls, activation: u64) -> Vec<String> {
         (calls.take_jobs(activation, None).into_iter())
-            .map(|job| match job {
+            .map(|(_, job)| match job {
                 Variant::ResolveStreamAppend(ResolveStreamAppend {
                     seq,
                     status: Some(resolve_stream_append::Status::Failed(failure)),
@@ -970,7 +971,9 @@ mod tests {
             &mut self,
             commands: &[Command],
         ) -> Result<(Vec<Variant>, Option<StreamAppendMarkerData>), WFMachinesError> {
-            let jobs = self.calls.take_jobs(self.activation, None);
+            let jobs = (self.calls.take_jobs(self.activation, None).into_iter())
+                .map(|(_, job)| job)
+                .collect();
             let marker = self.calls.take_marker();
             self.activation += 1;
             for command in commands {

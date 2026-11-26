@@ -201,6 +201,9 @@ pub(crate) struct WorkflowMachines {
     /// for rejected updates, from shifting the positions of later ones. Local Activity and Stream
     /// results share it.
     activation_index: u64,
+    /// The index that History gives each Local Activity result of the next activation, by seq. A
+    /// live result has the index of the activation that gets it.
+    local_result_activations: HashMap<u32, u64>,
     /// The Stream calls of the run
     pub(crate) stream_calls: StreamCalls,
 
@@ -361,6 +364,7 @@ impl WorkflowMachines {
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
             activation_index: 0,
+            local_result_activations: Default::default(),
             stream_calls,
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
@@ -610,10 +614,10 @@ impl WorkflowMachines {
     /// It fails if the Stream marker of the activation is over its size bound.
     pub(crate) fn get_wf_activation(&mut self) -> Result<WorkflowActivation> {
         let jobs = if self.activation_needed() {
-            let mut jobs = self.drive_me.drain_jobs();
+            let jobs = self.drive_me.drain_jobs();
             let (activation, marker) = self.result_activations();
             let results = self.stream_calls.take_jobs(activation, marker);
-            jobs.extend(results.into_iter().map(OutgoingJob::from));
+            let jobs = self.order_results(jobs, results, activation);
             // A replay places these results by their marker, so the marker must go where Workflow
             // code gets them, before the commands of this activation.
             if let Some(data) = self.stream_calls.take_marker() {
@@ -677,6 +681,36 @@ impl WorkflowMachines {
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
         })
+    }
+
+    /// Puts the results of an activation in the order of the first run. They go by the index of
+    /// the activation that gave them, and at one index the Stream results (`streams`, each with its
+    /// index) go before the Local Activity results. The other jobs keep their order.
+    fn order_results(
+        &mut self,
+        jobs: Vec<OutgoingJob>,
+        streams: Vec<(u64, workflow_activation_job::Variant)>,
+        activation: u64,
+    ) -> Vec<OutgoingJob> {
+        let locals = std::mem::take(&mut self.local_result_activations);
+        let (mut others, mut results) = (vec![], vec![]);
+        for job in jobs {
+            match &job.variant {
+                workflow_activation_job::Variant::ResolveActivity(resolved)
+                    if resolved.is_local =>
+                {
+                    let index = locals.get(&resolved.seq).copied().unwrap_or(activation);
+                    results.push((index, true, job));
+                }
+                _ => others.push(job),
+            }
+        }
+        results.extend((streams.into_iter()).map(|(index, job)| (index, false, job.into())));
+        // The sort is stable, so the results of one kind at one index keep their order. The sort
+        // by job kind before the activation goes out keeps the order of these results.
+        results.sort_by_key(|(index, local, _)| (*index, *local));
+        others.extend(results.into_iter().map(|(_, _, job)| job));
+        others
     }
 
     pub(crate) fn activation_needed(&self) -> bool {
@@ -2027,6 +2061,9 @@ impl WorkflowMachines {
                 .local_activity_data
                 .take_preresolution(seq)
                 .expect("This seq was just returned by peek_preresolution_seq");
+            if let Some(index) = dat.activation_index {
+                self.local_result_activations.insert(seq, index);
+            }
             if let Machines::LocalActivityMachine(lam) = self.machine_mut(mk) {
                 let responses = lam.try_resolve_with_dat(dat)?;
                 self.process_machine_responses(mk, responses)?;
