@@ -1,5 +1,7 @@
 //! Interceptors for high-level client operations.
 
+#[cfg(feature = "experimental")]
+use crate::nexus::NexusClientError;
 use crate::{
     ActivityHeartbeatResponse, ActivityIdentifier, WorkflowCancelOptions, WorkflowCountOptions,
     WorkflowDescribeOptions, WorkflowFetchHistoryOptions, WorkflowQueryOptions,
@@ -16,6 +18,13 @@ use crate::{
 };
 use futures_util::future::BoxFuture;
 use std::{any::Any, sync::Arc};
+#[cfg(feature = "experimental")]
+use temporalio_common::protos::temporal::api::workflowservice::v1::{
+    CountNexusOperationExecutionsResponse, DescribeNexusOperationExecutionResponse,
+    ListNexusOperationExecutionsResponse, PollNexusOperationExecutionResponse,
+    RequestCancelNexusOperationExecutionResponse, StartNexusOperationExecutionResponse,
+    TerminateNexusOperationExecutionResponse,
+};
 use temporalio_common::{
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, SerializationContext, TemporalSerializable,
@@ -1259,6 +1268,105 @@ impl HeartbeatAsyncActivityInput {
 ///     .build();
 /// ```
 pub trait ClientInterceptor: Send + Sync + 'static {
+    /// Intercept a standalone Nexus start after payload encoding. Nexus headers may be
+    /// injected into `input.request.nexus_header`; they are transmitted without encryption.
+    #[cfg(feature = "experimental")]
+    fn start_nexus_operation<'a>(
+        &'a self,
+        input: StartNexusOperationInput,
+        next: Next<
+            'a,
+            StartNexusOperationInput,
+            BoxFuture<'a, Result<StartNexusOperationExecutionResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartNexusOperationExecutionResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept each standalone Nexus poll before transport and payload decoding.
+    #[cfg(feature = "experimental")]
+    fn poll_nexus_operation<'a>(
+        &'a self,
+        input: PollNexusOperationInput,
+        next: Next<
+            'a,
+            PollNexusOperationInput,
+            BoxFuture<'a, Result<PollNexusOperationExecutionResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<PollNexusOperationExecutionResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a standalone Nexus cancellation request.
+    #[cfg(feature = "experimental")]
+    fn cancel_nexus_operation<'a>(
+        &'a self,
+        input: CancelNexusOperationInput,
+        next: Next<
+            'a,
+            CancelNexusOperationInput,
+            BoxFuture<'a, Result<RequestCancelNexusOperationExecutionResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<RequestCancelNexusOperationExecutionResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a standalone Nexus description before payload decoding.
+    #[cfg(feature = "experimental")]
+    fn describe_nexus_operation<'a>(
+        &'a self,
+        input: DescribeNexusOperationInput,
+        next: Next<
+            'a,
+            DescribeNexusOperationInput,
+            BoxFuture<'a, Result<DescribeNexusOperationExecutionResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<DescribeNexusOperationExecutionResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a standalone Nexus termination request.
+    #[cfg(feature = "experimental")]
+    fn terminate_nexus_operation<'a>(
+        &'a self,
+        input: TerminateNexusOperationInput,
+        next: Next<
+            'a,
+            TerminateNexusOperationInput,
+            BoxFuture<'a, Result<TerminateNexusOperationExecutionResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<TerminateNexusOperationExecutionResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a page of standalone Nexus visibility results.
+    #[cfg(feature = "experimental")]
+    fn list_nexus_operations_page<'a>(
+        &'a self,
+        input: ListNexusOperationsPageInput,
+        next: Next<
+            'a,
+            ListNexusOperationsPageInput,
+            BoxFuture<'a, Result<ListNexusOperationExecutionsResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<ListNexusOperationExecutionsResponse, NexusClientError>> {
+        next.run(input)
+    }
+
+    /// Intercept a standalone Nexus visibility count.
+    #[cfg(feature = "experimental")]
+    fn count_nexus_operations<'a>(
+        &'a self,
+        input: CountNexusOperationsInput,
+        next: Next<
+            'a,
+            CountNexusOperationsInput,
+            BoxFuture<'a, Result<CountNexusOperationExecutionsResponse, NexusClientError>>,
+        >,
+    ) -> BoxFuture<'a, Result<CountNexusOperationExecutionsResponse, NexusClientError>> {
+        next.run(input)
+    }
+
     /// Intercept a `start_workflow` operation.
     fn start_workflow<'a>(
         &'a self,
@@ -1585,6 +1693,90 @@ interceptor_chain!(
     start_workflow,
     StartWorkflowInput,
     BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>
+);
+
+#[cfg(feature = "experimental")]
+macro_rules! nexus_interceptor {
+    ($input:ident, $request:ident, $response:ident, $call:ident, $method:ident) => {
+        /// Transport input for a standalone Nexus operation. Payloads are already encoded.
+        #[derive(Debug)]
+        #[non_exhaustive]
+        pub struct $input {
+            /// The RPC request. Start requests carry interceptor-owned Nexus headers.
+            pub request: temporalio_common::protos::temporal::api::workflowservice::v1::$request,
+            /// Per-call transport controls.
+            pub rpc_options: crate::RpcOptions,
+        }
+        interceptor_chain!(
+            $call,
+            $method,
+            $input,
+            BoxFuture<
+                'a,
+                Result<
+                    temporalio_common::protos::temporal::api::workflowservice::v1::$response,
+                    crate::nexus::NexusClientError,
+                >,
+            >
+        );
+    };
+}
+
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    StartNexusOperationInput,
+    StartNexusOperationExecutionRequest,
+    StartNexusOperationExecutionResponse,
+    call_start_nexus_operation,
+    start_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    PollNexusOperationInput,
+    PollNexusOperationExecutionRequest,
+    PollNexusOperationExecutionResponse,
+    call_poll_nexus_operation,
+    poll_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    CancelNexusOperationInput,
+    RequestCancelNexusOperationExecutionRequest,
+    RequestCancelNexusOperationExecutionResponse,
+    call_cancel_nexus_operation,
+    cancel_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    DescribeNexusOperationInput,
+    DescribeNexusOperationExecutionRequest,
+    DescribeNexusOperationExecutionResponse,
+    call_describe_nexus_operation,
+    describe_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    TerminateNexusOperationInput,
+    TerminateNexusOperationExecutionRequest,
+    TerminateNexusOperationExecutionResponse,
+    call_terminate_nexus_operation,
+    terminate_nexus_operation
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    ListNexusOperationsPageInput,
+    ListNexusOperationExecutionsRequest,
+    ListNexusOperationExecutionsResponse,
+    call_list_nexus_operations_page,
+    list_nexus_operations_page
+);
+#[cfg(feature = "experimental")]
+nexus_interceptor!(
+    CountNexusOperationsInput,
+    CountNexusOperationExecutionsRequest,
+    CountNexusOperationExecutionsResponse,
+    call_count_nexus_operations,
+    count_nexus_operations
 );
 
 interceptor_chain!(

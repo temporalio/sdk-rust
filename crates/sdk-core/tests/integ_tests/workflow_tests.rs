@@ -12,6 +12,7 @@ mod interceptors;
 mod local_activities;
 mod modify_wf_properties;
 mod nexus;
+mod nexus_standalone;
 mod nexus_typed;
 mod nexus_workers;
 mod patches;

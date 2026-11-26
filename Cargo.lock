@@ -4488,6 +4488,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mockall",
+ "nexus-rpc",
  "opentelemetry",
  "parking_lot",
  "prost",

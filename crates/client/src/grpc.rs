@@ -1821,6 +1821,7 @@ proxier! {
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
+            r.extensions_mut().insert(IsUserLongPoll);
         }
     );
     (
