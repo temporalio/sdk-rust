@@ -38,6 +38,8 @@ pub enum CoreInternalFlags {
     /// Recorded on the first successful workflow task completion to preserve task boundaries on
     /// replay, without activating lang for tasks that have no jobs.
     DisableWorkflowTaskChunking = 5,
+    /// Resolves child workflows using WaitCancellationRequested on the server acknowledgment.
+    ChildWorkflowCancelOnRequest = 6,
     /// We received a value higher than this code can understand.
     TooHigh = u32::MAX,
 }
@@ -198,6 +200,7 @@ impl CoreInternalFlags {
             3 => Self::MoveTerminalCommands,
             4 => Self::NexusOperationDeterminismChecks,
             5 => Self::DisableWorkflowTaskChunking,
+            6 => Self::ChildWorkflowCancelOnRequest,
             _ => Self::TooHigh,
         }
     }

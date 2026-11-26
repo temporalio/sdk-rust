@@ -316,7 +316,7 @@ impl CancelledChildGetsReasonParent {
                 (),
                 ChildWorkflowOptions::builder()
                     .workflow_id(format!("{}-child", ctx.task_queue()))
-                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationRequested)
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
                     .build(),
             )
             .await
@@ -1609,7 +1609,7 @@ impl CancelExternalThenChildParent {
                 (),
                 ChildWorkflowOptions::builder()
                     .workflow_id(format!("{}-child", ctx.task_queue()))
-                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationRequested)
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
                     .build(),
             )
             .await

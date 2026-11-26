@@ -78,7 +78,7 @@ use temporalio_common::{
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
-slotmap::new_key_type! { struct MachineKey; }
+slotmap::new_key_type! { pub(super) struct MachineKey; }
 
 /// The maximum number of failed workflow tasks in a local activity start.
 const MAX_FAILED_WFTS: usize = 100;
@@ -232,6 +232,8 @@ pub(super) enum MachineResponse {
         attrs: ProtoCmdAttrs,
         annotations: CommandAnnotations,
     },
+    #[display("ChildWorkflowCancelRequested({_0:?})")]
+    ChildWorkflowCancelRequested(MachineKey),
     #[display("TriggerWFTaskStarted")]
     TriggerWFTaskStarted {
         task_started_event_id: i64,
@@ -1353,6 +1355,15 @@ impl WorkflowMachines {
                         self.drive_me.send_job(a);
                     }
                 }
+                MachineResponse::ChildWorkflowCancelRequested(child) => {
+                    let Machines::ChildWorkflowMachine(machine) = self.machine_mut(child) else {
+                        return Err(fatal!(
+                            "Expected a child workflow machine for cancellation acknowledgment"
+                        ));
+                    };
+                    let responses = machine.cancel_request_acknowledged()?;
+                    self.process_machine_responses(child, responses)?;
+                }
                 MachineResponse::TriggerWFTaskStarted {
                     task_started_event_id,
                     time,
@@ -1384,6 +1395,16 @@ impl WorkflowMachines {
                     ProtoCmdAttrs::RequestCancelExternalWorkflowExecutionCommandAttributes(
                         attrs,
                     ) => {
+                        // Choose the behavior when issuing the cancel so an upgrade while
+                        // waiting for its acknowledgment cannot change replay.
+                        let child_waiting_for_cancel_request = (matches!(
+                            self.machine(smk), Machines::ChildWorkflowMachine(child)
+                                if child.waits_for_cancel_request()
+                        ) && self.try_use_flag(
+                            CoreInternalFlags::ChildWorkflowCancelOnRequest,
+                            !self.replaying,
+                        ))
+                        .then_some(smk);
                         #[allow(deprecated)]
                         let we = NamespacedWorkflowExecution {
                             namespace: attrs.namespace,
@@ -1391,7 +1412,13 @@ impl WorkflowMachines {
                             run_id: attrs.run_id,
                         };
                         self.add_cmd_to_wf_task(
-                            new_external_cancel(0, we, attrs.child_workflow_only, attrs.reason),
+                            new_external_cancel(
+                                0,
+                                we,
+                                attrs.child_workflow_only,
+                                attrs.reason,
+                                child_waiting_for_cancel_request,
+                            ),
                             annotations,
                             CommandIdKind::CoreInternal,
                         );
@@ -1680,6 +1707,7 @@ impl WorkflowMachines {
                                 "Cancel requested by workflow with run id {} with reason: {}",
                                 self.run_id, attrs.reason
                             ),
+                            None,
                         ),
                         annotations,
                         CommandID::CancelExternal(attrs.seq).into(),
