@@ -42,43 +42,22 @@ relevant information.
   own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
   append of client code against them with `StoreLimits::validate_append`.
 * [lang-internal] Workflow code can append to a Stream with the experimental `AppendToStream`
-  command, on a Store in `WorkerConfig::stream_runtimes`. Core calls the Store, gives the result in
-  a `ResolveStreamAppend` job, and records it in a `core_stream_append` marker, so a replay makes
-  no Store call. A task fails with `StreamStoreUnavailable:` if the Store is still unavailable at
-  the task's heartbeat, and with `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
-* [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. A read
-  gives one page, which is one answer of the Store, in a `ResolveStreamRead` job. The page has the
-  Records that the Store has at once. A read with no Record waits up to its `wait`, but at most to
-  the read limit of its task, and then gives a page with no Record whose new `wait_cut` says if the
-  limit cut the wait. The new `StreamSettings::read_time` sets that limit, which is half the
-  Workflow Task timeout by default, from the end of a replay. Before a task completes, each read
-  with no answer in it gets one Store call with no wait, within 1 s. Its Records come in the task,
-  or first in the next task if the task has a command. With no Record a read with a `wait` starts
-  again in the next task, so an idle Stream makes no new task. Core asks for a new task only if it
-  knows that the Stream has Records for an open read, or if the result budget holds back a read. A
-  Store outage at a read fails the Workflow Task with a message that starts with
-  `StreamStoreUnavailable:`, as for an append. A task gives at most 16 MiB of Records, and starts no
-  new read once it gave 256 results. A read that this budget holds back starts in the next task.
-  Each activation that gives pages records their offsets, their count and a digest of their Records
-  in a `core_stream_read` marker. A replay, also the replay for a query of a closed Workflow, reads
-  the Records from the Store again, with 8 reads at a time, for at most 4 runs of the Worker at a
-  time. It tries a Store in an outage for at most 3 s. So the Retention of a Stream must cover the
-  life of each Workflow that reads it and the time in which that Workflow gets queries. A replay
-  whose Store lost the Records fails with the new `WorkflowErrorType::StreamReplay`. A
-  `core_stream_read` marker has the same 1 MiB bound as an append marker.
-* [lang-internal] The Worker's metrics count each try of a Stream call of Workflow code when it
-  starts, as they count each attempt of a Local Activity, with the attribute `stream_store`. An
-  append has `stream_append_total`, `stream_append_execution_failed` and
-  `stream_append_execution_latency`. A try that ends has its latency, and a try that Core stops has
-  only its count. A read has no latency. Its `stream_read_total` counts each time the read asks the
-  Store, also when it asks again after an outage or after an answer with no Record, and for the
-  check of a read before a completion. It also has `stream_read_execution_failed`, also for a check
-  with no answer within its deadline of 1 s, and `stream_read_records`, which counts the Records
-  that the Store gave, also those of a page that Core dropped. A try of a replay's Store read that
-  ends has `stream_replay_read_execution_latency`, and a try that the 3 s retry bound of a replay
-  stops has no sample. Each `_execution_failed` counter has the attribute `failure_reason` with the
-  reason of the Stream error, such as `stream_not_found`, or `stream_store_unavailable` for a try in
-  an outage.
+  command, on a Store in `WorkerConfig::stream_runtimes`. A ref with no Store name uses the only
+  Store there. Core calls the Store, gives the result in a `ResolveStreamAppend` job, and records
+  it in a `core_stream_append` marker, so a replay makes no Store call. A task fails with
+  `StreamStoreUnavailable:` if the Store is still unavailable at the task's heartbeat, and with
+  `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
+* [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. Each
+  read gives one page of the Store in a `ResolveStreamRead` job, and waits for a Record at most to
+  the read limit of its task, the new `StreamSettings::read_time`. A `core_stream_read` marker
+  records each page with a digest of its Records, and a replay reads the Records from the Store
+  again. A replay whose Store lost them fails with the new `WorkflowErrorType::StreamReplay`.
+* [lang-internal] The Worker's metrics count each try of a Stream call of Workflow code, with the
+  attribute `stream_store`. Appends have `stream_append_total`, `stream_append_execution_failed` and
+  `stream_append_execution_latency`. Reads have `stream_read_total`, `stream_read_execution_failed`
+  and `stream_read_records`, and the Store reads of a replay have
+  `stream_replay_read_execution_latency`. Each `_execution_failed` counter has the attribute
+  `failure_reason`.
 * [lang-internal] The `Start` of an activity task has the new `scheduled_event_id`, the event id of
   the `ActivityTaskScheduled` event of an activity that a workflow scheduled. The server has no API
   field for it, so Core reads it from the task token. It's 0 for a local activity, for a standalone
