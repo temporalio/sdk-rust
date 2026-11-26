@@ -2060,9 +2060,9 @@ async fn update_with_start(#[case] scenario: UpdateWithStartScenario) {
 /// from polling (without being shut down and losing its cache) while another worker takes a task.
 /// Released slots do not return tickets, which keeps a poll that was already in flight when the
 /// test stopped granting from taking a task the test wants another worker to get.
-struct TicketedWftSlots {
-    nonsticky: Semaphore,
-    sticky: Semaphore,
+pub(crate) struct TicketedWftSlots {
+    pub(crate) nonsticky: Semaphore,
+    pub(crate) sticky: Semaphore,
 }
 
 impl TicketedWftSlots {
@@ -2074,7 +2074,7 @@ impl TicketedWftSlots {
         }
     }
 
-    fn grant_all(&self) {
+    pub(crate) fn grant_all(&self) {
         self.nonsticky.add_permits(1000);
         self.sticky.add_permits(1000);
     }
