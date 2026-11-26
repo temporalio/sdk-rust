@@ -14,14 +14,17 @@ use temporalio_common::{
     UntypedActivity, UntypedWorkflow,
     data_converters::RawValue,
     protos::{
-        coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
+        coresdk::{
+            AsJsonPayloadExt, FromJsonPayloadExt, common::extract_local_activity_marker_details,
+        },
         temporal::api::{
             enums::v1::{EventType, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
                 HistoryEvent,
                 history_event::Attributes::{
-                    WorkflowExecutionFailedEventAttributes, WorkflowTaskFailedEventAttributes,
+                    MarkerRecordedEventAttributes, WorkflowExecutionFailedEventAttributes,
+                    WorkflowTaskFailedEventAttributes,
                 },
             },
         },
@@ -623,6 +626,9 @@ async fn nondeterministic_future_detection_fails_wft() {
 enum FirstTask {
     Timer,
     TimerWithLocalActivity,
+    /// Two local activities start together and end apart, so each result has its own activation
+    /// of task 1. The timer starts after both.
+    TwoLocalActivitiesThenTimer,
     /// The changed code upserts a memo in place of the timer and completes, so Core finds the
     /// nondeterminism.
     TimerReplacedByMemoUpsert,
@@ -677,6 +683,22 @@ impl ChangedBeforeReplayWf {
                 let (_, echoed) = workflows::join!(ctx.timer(Duration::from_secs(2)), after_echo);
                 echoed?;
             }
+            FirstTask::TwoLocalActivitiesThenTimer => {
+                let after_echo = async {
+                    let echoed = echo().await;
+                    changed_code.await;
+                    echoed
+                };
+                let delayed = ctx.execute_local_activity(
+                    StdActivities::delay,
+                    Duration::from_secs(1),
+                    LocalActivityOptions::default(),
+                );
+                let (echoed, delayed) = workflows::join!(after_echo, delayed);
+                echoed?;
+                delayed?;
+                ctx.timer(Duration::from_secs(2)).await;
+            }
             FirstTask::TimerReplacedByMemoUpsert if changed => {
                 ctx.upsert_memo([("deployed", Some(MemoValue::new(true)))])?;
             }
@@ -688,11 +710,16 @@ impl ChangedBeforeReplayWf {
     }
 }
 
-/// Returns the type of each event of `events`, with the cause and the message of a failed task
-/// and the message of the workflow's failure.
+/// Returns the type of each event of `events`, with the cause and the message of a failed task,
+/// the message of the workflow's failure, and the activation index of a local activity's result.
 fn history_summary(events: &[HistoryEvent]) -> Vec<String> {
     (events.iter())
         .map(|event| match &event.attributes {
+            Some(MarkerRecordedEventAttributes(marker)) => {
+                let (data, _) = extract_local_activity_marker_details(&mut marker.details.clone());
+                let data = data.expect("Only local activities record markers here");
+                format!("MarkerRecorded({:?})", data.activation_index)
+            }
             Some(WorkflowTaskFailedEventAttributes(failed)) => format!(
                 "WorkflowTaskFailed({:?}: {})",
                 failed.cause(),
@@ -806,6 +833,27 @@ async fn changed_code_at_a_replayed_local_activity_result_starts_no_second_timer
         1,
         "Expected the replayed timer not to be started a second time: {summary:#?}"
     );
+}
+
+// Task 1 records the second result for a later activation than the first, so replay holds it
+// while the SDK fails the first. The SDK's answer to the held result must not replace its failure.
+#[tokio::test]
+async fn changed_code_at_the_first_of_two_replayed_local_activity_results_fails_the_workflow_once()
+{
+    let name =
+        "changed_code_at_the_first_of_two_replayed_local_activity_results_fails_the_workflow_once";
+    let summary = run_changed_before_replay(name, FirstTask::TwoLocalActivitiesThenTimer).await;
+    let first_task = [
+        "MarkerRecorded(Some(1))",
+        "MarkerRecorded(Some(2))",
+        "TimerStarted",
+    ];
+    assert!(
+        summary.windows(3).any(|w| w == first_task),
+        "Expected task 1 to record the two results for activations 1 and 2, then the timer: \
+         {summary:#?}"
+    );
+    assert_fails_once_with_langs_error(&summary);
 }
 
 // Core finds that history has the timer where the changed code upserts a memo. The changed code's
