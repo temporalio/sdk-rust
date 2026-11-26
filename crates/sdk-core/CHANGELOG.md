@@ -42,10 +42,11 @@ relevant information.
   own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
   append of client code against them with `StoreLimits::validate_append`.
 * [lang-internal] Workflow code can append to a Stream with the experimental `AppendToStream`
-  command, on a Store in `WorkerConfig::stream_runtimes`. Core calls the Store, gives the result in
-  a `ResolveStreamAppend` job, and records it in a `core_stream_append` marker, so a replay makes
-  no Store call. A task fails with `StreamStoreUnavailable:` if the Store is still unavailable at
-  the task's heartbeat, and with `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
+  command, on a Store in `WorkerConfig::stream_runtimes`. A ref with no Store name uses the only
+  Store there. Core calls the Store, gives the result in a `ResolveStreamAppend` job, and records
+  it in a `core_stream_append` marker, so a replay makes no Store call. A task fails with
+  `StreamStoreUnavailable:` if the Store is still unavailable at the task's heartbeat, and with
+  `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,

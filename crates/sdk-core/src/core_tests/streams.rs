@@ -108,6 +108,14 @@ fn runtimes(store: &Arc<MemoryStore>) -> StreamRuntimes {
     StreamRuntimes::new([(STORE.to_string(), Arc::new(runtime))])
 }
 
+/// Returns a runtime on a new Store for each name of `stores`.
+fn runtimes_of(stores: &[&str]) -> StreamRuntimes {
+    StreamRuntimes::new(stores.iter().map(|name| {
+        let runtime = StreamRuntime::new(Arc::new(MemoryStore::default()), StoreLimits::default());
+        (name.to_string(), Arc::new(runtime))
+    }))
+}
+
 /// Prints the seed of a generated test if the test panics while this lives. A panic on a thread of
 /// Core reaches the test with no seed in its message.
 struct SeedOnPanic(u64);
@@ -216,6 +224,7 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
     if replay {
         let mut config = test_worker_cfg().build().unwrap();
         config.stream_runtimes = runtimes(&store);
+        configure(&mut config);
         let t = HistoryForReplay::new(t.get_full_history_info().unwrap(), "fake_wf_id");
         let input = ReplayWorkerInput::new(config, stream::once(async move { t }));
         let worker = init_replay_worker(input).unwrap();
@@ -548,6 +557,14 @@ fn append(seq: u32, id: &str) -> Command {
     .into()
 }
 
+fn append_with_no_store_name(seq: u32, id: &str) -> Command {
+    let Command::AppendToStream(mut command) = append(seq, id) else {
+        unreachable!()
+    };
+    command.stream.as_mut().unwrap().store.clear();
+    command.into()
+}
+
 fn complete() -> Command {
     CompleteWorkflowExecution { result: None }.into()
 }
@@ -694,8 +711,11 @@ async fn a_nondeterminism_failure_before_a_stream_marker_sends_one_fail_command(
     assert_eq!(store.requests(), []);
 }
 
+#[rstest::rstest]
+#[case::named(false)]
+#[case::with_no_store_name(true)]
 #[tokio::test]
-async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
+async fn a_replayed_append_to_another_store_is_a_nondeterminism_error(#[case] nameless: bool) {
     let store = store(&["s"]).await;
     let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
     let workflow: Workflow = |activation| match &activation.jobs[0].variant {
@@ -708,13 +728,16 @@ async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
 
     let mut opts = StartOpts::new(&store);
     opts.replay = true;
+    if nameless {
+        opts.configure = |wc| wc.stream_runtimes = runtimes_of(&["other"]);
+    }
     let replay = start(run.history.lock().clone(), opts);
     let worker = &replay.worker;
     let init = worker.poll_workflow_activation().await.unwrap();
     let Command::AppendToStream(mut command) = append(1, "s") else {
         unreachable!()
     };
-    command.stream.as_mut().unwrap().store = "other".to_string();
+    command.stream.as_mut().unwrap().store = if nameless { "" } else { "other" }.to_string();
     let completion = WorkflowActivationCompletion::from_cmd(init.run_id.clone(), command.into());
     worker
         .complete_workflow_activation(completion)
@@ -736,6 +759,62 @@ async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
     let done = WorkflowActivationCompletion::empty(evicted.run_id);
     worker.complete_workflow_activation(done).await.unwrap();
     worker.drain_pollers_and_shutdown_ref().await;
+}
+
+#[tokio::test]
+async fn an_append_with_no_store_name_runs_on_the_only_runtime_and_replays_on_it() {
+    let store = store(&["s"]).await;
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let nameless: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append_with_no_store_name(1, "s")],
+        _ => vec![complete()],
+    };
+    let live = run.drive(nameless).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(store.records("s").len(), 1);
+    assert_eq!(markers(&run.sent()[0])[0].appends[0].store, STORE);
+    let writes = store.requests().len();
+    assert_eq!(run.replay(nameless).await, live);
+    let named: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append(1, "s")],
+        _ => vec![complete()],
+    };
+    assert_eq!(run.replay(named).await, live);
+    assert_eq!(store.requests().len(), writes);
+}
+
+#[rstest::rstest]
+#[case::no_runtime(0)]
+#[case::two_runtimes(2)]
+#[tokio::test]
+async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_runtime(
+    #[case] count: usize,
+) {
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    opts.fails = 1;
+    opts.configure = match count {
+        0 => |wc| wc.stream_runtimes = StreamRuntimes::default(),
+        2 => |wc| wc.stream_runtimes = runtimes_of(&[STORE, "other"]),
+        _ => unreachable!(),
+    };
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow: Workflow = |_| vec![append_with_no_store_name(1, "s")];
+    assert_eq!(run.drive(workflow).await.len(), 1);
+    let message = format!(
+        "A Stream call with no Store name needs exactly one Stream runtime, and this Worker has \
+         {count}"
+    );
+    let failed = run.failed.lock().clone();
+    assert_eq!(
+        failed,
+        [(
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+            message
+        )]
+    );
+    assert!(run.sent().is_empty());
+    run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
 /// The state of a call when Workflow code sends its last command.

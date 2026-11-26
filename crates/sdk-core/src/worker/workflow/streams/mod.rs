@@ -48,6 +48,18 @@ impl StreamRuntimes {
     pub(crate) fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
         self.runtimes.get(store)
     }
+
+    /// Returns the Store name of the only runtime, which a ref with no Store name uses.
+    pub(crate) fn only_store(&self) -> Option<&str> {
+        if self.runtimes.len() != 1 {
+            return None;
+        }
+        self.runtimes.keys().next().map(String::as_str)
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.runtimes.len()
+    }
 }
 
 /// The retry settings of a Worker's Stream calls. A call tries again after

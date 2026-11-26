@@ -284,7 +284,9 @@ pub struct WorkerConfig {
     pub storage_drivers: HashSet<StorageDriverInfo>,
 
     /// The Stream runtimes of this Worker by Store name, with the settings of its Stream calls. A
-    /// Stream call on a Store with no runtime here fails the Workflow Task.
+    /// Stream call on a Store with no runtime here fails the Workflow Task. A call with no Store
+    /// name uses the only runtime, also in a replay, and fails the task if there are none or
+    /// several.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,
