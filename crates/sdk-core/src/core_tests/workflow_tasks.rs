@@ -1519,15 +1519,34 @@ async fn fail_wft_then_recover() {
     core.drain_pollers_and_shutdown().await;
 }
 
+/// The type of each command of each completion, with the message of its failure if any.
+type SentCommands = Arc<Mutex<Vec<Vec<(CommandType, Option<String>)>>>>;
+
 /// Runs the tasks of `mh` with `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`,
 /// so nondeterminism fails the workflow rather than the task, and completes each activation with
-/// `lang` until the run is evicted. Returns the type of each command of each completion, with the
-/// message of its failure if any.
+/// `lang` until the run is evicted. Returns the commands of each completion.
 async fn run_failing_workflow_on_nondeterminism(
-    mut mh: MockPollCfg,
+    mh: MockPollCfg,
     mut lang: impl FnMut(&WorkflowActivation) -> WorkflowActivationCompletion,
 ) -> Vec<Vec<(CommandType, Option<String>)>> {
-    let sent = Arc::new(Mutex::new(vec![]));
+    let (core, sent) = worker_failing_workflows_on_nondeterminism(mh);
+    loop {
+        let act = core.poll_workflow_activation().await.unwrap();
+        if act.is_only_eviction() {
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+                .await
+                .unwrap();
+            break;
+        }
+        core.complete_workflow_activation(lang(&act)).await.unwrap();
+    }
+    core.drain_pollers_and_shutdown().await;
+    sent.lock().clone()
+}
+
+/// Returns a worker for `mh` that fails workflows on nondeterminism, and the commands it sends.
+fn worker_failing_workflows_on_nondeterminism(mut mh: MockPollCfg) -> (Worker, SentCommands) {
+    let sent = SentCommands::default();
     let kept = sent.clone();
     mh.completion_mock_fn = Some(Box::new(move |c| {
         let commands = c.commands.iter().map(|command| {
@@ -1547,20 +1566,7 @@ async fn run_failing_workflow_on_nondeterminism(
         wc.max_cached_workflows = 1;
         wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
     });
-    let core = mock_worker(mock);
-
-    loop {
-        let act = core.poll_workflow_activation().await.unwrap();
-        if act.is_only_eviction() {
-            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
-                .await
-                .unwrap();
-            break;
-        }
-        core.complete_workflow_activation(lang(&act)).await.unwrap();
-    }
-    core.drain_pollers_and_shutdown().await;
-    sent.lock().clone()
+    (mock_worker(mock), sent)
 }
 
 /// Fails `act` with the nondeterminism error that lang found.
@@ -1705,6 +1711,89 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its
         [vec![timer, fail]],
         "Expected exactly one completion, containing the live task's StartTimer followed by a \
          FailWorkflowExecution with lang's error"
+    );
+}
+
+/// The state of the local activity of a live task when lang fails the task.
+#[derive(Clone, Copy, Debug)]
+enum LocalActivityAtTheFailure {
+    Running,
+    ResultCameDuringTheActivation,
+}
+
+// The workflow fails, so the failure must not wait for the local activity. A result that came
+// while lang had the activation must not activate lang again or follow the fail command. The
+// result and the completion go through one ordered queue, so the result reaches the run first.
+#[rstest]
+#[case::running(LocalActivityAtTheFailure::Running)]
+#[case::result_came_during_the_activation(LocalActivityAtTheFailure::ResultCameDuringTheActivation)]
+#[tokio::test]
+async fn a_nondeterminism_failure_in_a_live_task_with_a_local_activity_sends_one_command(
+    #[case] local_activity: LocalActivityAtTheFailure,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    let (core, sent) = worker_failing_workflows_on_nondeterminism(mh);
+    let act = core.poll_workflow_activation().await.unwrap();
+    // A cancel of an activity that Core never sent resolves at once, in a second activation.
+    let activity = ScheduleActivity {
+        seq: 2,
+        activity_id: "2".to_string(),
+        cancellation_type: ActivityCancellationType::TryCancel as i32,
+        ..default_act_sched()
+    };
+    let commands = vec![
+        schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        ),
+        activity.into(),
+        RequestCancelActivity { seq: 2 }.into(),
+    ];
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        act.run_id.clone(),
+        commands,
+    ))
+    .await
+    .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    if let LocalActivityAtTheFailure::ResultCameDuringTheActivation = local_activity {
+        let task = core.poll_activity_task().await.unwrap();
+        core.complete_activity_task(ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+    }
+    core.complete_workflow_activation(langs_nondeterminism_failure(&act))
+        .await
+        .unwrap();
+    let act = tokio::time::timeout(Duration::from_secs(10), core.poll_workflow_activation())
+        .await
+        .expect("Expected the eviction within 10 seconds")
+        .unwrap();
+    assert!(
+        act.is_only_eviction(),
+        "Expected lang to get only the eviction after its failure: {act:?}"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+    core.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *sent.lock(),
+        fails_with_langs_error(),
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
     );
 }
 
