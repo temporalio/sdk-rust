@@ -1166,7 +1166,7 @@ fn marker_sizes(completion: &WorkflowTaskCompletion) -> Vec<usize> {
 // fill one marker. The results of `streams` appends all arrive while one activation is
 // outstanding, so the next activation gives them all and its marker records them all.
 #[rstest::rstest]
-#[case::under_the_bound(240, false)]
+#[case::under_the_bound(200, false)]
 #[case::over_the_bound(300, true)]
 #[tokio::test]
 async fn a_stream_marker_over_1_mib_fails_its_task(#[case] streams: u32, #[case] over: bool) {
@@ -2203,6 +2203,19 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                     (local, 2, Some(1)),
                 ],
             ),
+            // Workflow code makes append 4 at the result of call 1, and the first run got its
+            // result before the one of Local Activity 2, in one activation after the one of
+            // Local Activity 3.
+            4 => (
+                true,
+                1,
+                vec![
+                    (local, 0, None),
+                    (local, 2, None),
+                    (local, 1, None),
+                    (append, 2, Some(1)),
+                ],
+            ),
             _ => {
                 let kind = |rng: &mut StdRng| [local, append][rng.random_range(0..2)];
                 let mut picked: Vec<(Kind, u64, Option<u32>)> = (0..rng.random_range(1..=3))
@@ -2289,6 +2302,10 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                 // with it, and goes first.
                 if seed == 3 {
                     assert_eq!(replays[2], [vec![1, 3], vec![2, 4]], "{case}");
+                }
+                // Local Activity 2 waits until Workflow code makes append 4, and goes after it.
+                if seed == 4 {
+                    assert_eq!(replays[2], [vec![1, 3], vec![4, 2]], "{case}");
                 }
                 batched += usize::from(replays[0] != first_run(&all(local)));
                 apart += usize::from(replays[2].len() > replays[0].len());

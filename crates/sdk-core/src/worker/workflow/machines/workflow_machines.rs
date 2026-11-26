@@ -699,6 +699,8 @@ impl WorkflowMachines {
                 workflow_activation_job::Variant::ResolveActivity(resolved)
                     if resolved.is_local =>
                 {
+                    // A live result, a cancel and a marker of an older Core have no index from
+                    // History. Each of them gets the activation that it goes in.
                     let index = locals.get(&resolved.seq).copied().unwrap_or(activation);
                     results.push((index, true, job));
                 }
@@ -2047,10 +2049,14 @@ impl WorkflowMachines {
             .local_activity_data
             .peek_preresolution_seq(include_held, self.activation_index)
         {
-            // Core first gives a Stream result that the first run gave in an earlier activation.
+            // Core first gives a Stream result that the first run gave in an earlier activation. At
+            // the same index the Stream result goes first, so the Local Activity result also waits
+            // for a result whose call Workflow code hasn't issued yet.
             let (_, marker) = self.result_activations();
-            if let Some(stream) = self.stream_calls.first_result_activation()
-                && marker.is_some_and(|marker| stream < marker)
+            let ready = self.stream_calls.next_ready_activation();
+            let held = self.stream_calls.first_held_activation();
+            if let Some(marker) = marker
+                && (ready.is_some_and(|at| at < marker) || held.is_some_and(|at| at <= marker))
             {
                 break;
             }

@@ -226,8 +226,8 @@ impl StreamCalls {
 
     /// Returns true if activation `activation` of the task has a Stream result to give. A result
     /// from History is held back while the index of the next Local Activity marker, `marker`, is at
-    /// or below the result's own index, so that a Local Activity result with the same index goes in
-    /// the same activation.
+    /// or below the result's own index. So a Local Activity result of an earlier activation goes
+    /// first, and one with the same index goes in the same activation.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -381,10 +381,10 @@ impl StreamCalls {
         self.ready.keys().next().map(|(at, _)| *at)
     }
 
-    /// Returns the activation of the first result from History that Workflow code doesn't have.
-    pub(crate) fn first_result_activation(&self) -> Option<u64> {
-        let held = self.held.first_result().map(|(at, _)| at);
-        self.next_ready_activation().into_iter().chain(held).min()
+    /// Returns the activation of the first result from History whose call Workflow code hasn't
+    /// issued.
+    pub(crate) fn first_held_activation(&self) -> Option<u64> {
+        self.held.first_result().map(|(at, _)| at)
     }
 
     /// Releases the results from History to the next activation in the order of the first run,
