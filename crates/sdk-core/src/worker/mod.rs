@@ -750,6 +750,9 @@ impl Worker {
         worker_heartbeat_options: Option<WorkerHeartbeatOptions>,
         shared_namespace_worker: bool,
     ) -> Result<Worker, anyhow::Error> {
+        // The settings are public fields, so a config can change them after its builder checked
+        // them.
+        (config.stream_runtimes.settings.check()).map_err(anyhow::Error::msg)?;
         let (metrics, meter) = if let Some(wt) = worker_telemetry.as_ref() {
             (
                 MetricsContext::top_level_with_meter(

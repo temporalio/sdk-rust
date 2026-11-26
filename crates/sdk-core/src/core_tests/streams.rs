@@ -817,6 +817,27 @@ async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_r
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+// The settings are public fields, so a config can change them after the check of its builder.
+#[rstest::rstest]
+#[case::worker(false)]
+#[case::replay_worker(true)]
+#[tokio::test]
+async fn stream_settings_out_of_bounds_fail_the_start_of_a_worker(#[case] replay: bool) {
+    let mut config = test_worker_cfg().build().unwrap();
+    config.stream_runtimes.settings.try_deadline = Duration::ZERO;
+    let started = if replay {
+        let histories = stream::empty::<HistoryForReplay>();
+        init_replay_worker(ReplayWorkerInput::new(config, histories)).map(drop)
+    } else {
+        let client = Arc::new(mock_worker_client());
+        Worker::new(config, None, client, None, None, None).map(drop)
+    };
+    assert_eq!(
+        started.map_err(|error| error.to_string()),
+        Err("The Stream setting `try_deadline` must be more than 0".to_string())
+    );
+}
+
 /// The state of a call when Workflow code sends its last command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AtTheEnd {

@@ -65,7 +65,7 @@ impl StreamRuntimes {
 /// The retry settings of a Worker's Stream calls. A call tries again after
 /// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable) or a try with
 /// no answer within `try_deadline`. If it still waits to try again at the heartbeat of its Workflow
-/// Task, the task fails.
+/// Task, the task fails. A Worker with a setting out of its bounds fails to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the
