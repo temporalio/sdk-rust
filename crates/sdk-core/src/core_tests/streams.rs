@@ -643,6 +643,57 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
     changed.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+/// Returns the type of each command of `completion`, with the message of its failure if any.
+fn with_failures(completion: &WorkflowTaskCompletion) -> Vec<(CommandType, Option<String>)> {
+    (completion.commands.iter())
+        .map(|command| {
+            let failure = match command.attributes.as_ref() {
+                Some(Attributes::FailWorkflowExecutionCommandAttributes(fail)) => {
+                    fail.failure.as_ref().map(|failure| failure.message.clone())
+                }
+                _ => None,
+            };
+            (command.command_type(), failure)
+        })
+        .collect()
+}
+
+// Lang's error is the cause, so the Workflow fails with it alone. The marker that follows in
+// History has an append that lang never sent, and it must not fail the Workflow a second time.
+#[tokio::test]
+async fn a_nondeterminism_failure_before_a_stream_marker_sends_one_fail_command() {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let completed = t.current_event_id();
+    let appends = vec![appended(1, "s", vec![7], 1)];
+    add_stream_marker(&mut t, completed, &StreamAppendMarkerData { appends });
+    t.add_workflow_task_scheduled_and_started();
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    opts.configure = |wc| {
+        wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    };
+    let run = start(t, opts);
+    let activation = run.worker.poll_workflow_activation().await.unwrap();
+    let cause = WorkflowTaskFailedCause::NonDeterministicError;
+    let failed =
+        WorkflowActivationCompletion::fail(activation.run_id, "changed".into(), Some(cause));
+    run.worker
+        .complete_workflow_activation(failed)
+        .await
+        .unwrap();
+    assert_eq!(run.drive(|_| vec![]).await.len(), 0);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let sent: Vec<_> = run.sent().iter().map(with_failures).collect();
+    let expected = (
+        CommandType::FailWorkflowExecution,
+        Some("changed".to_string()),
+    );
+    assert_eq!(sent, [vec![expected]], "The commands of each completion");
+    assert_eq!(store.requests(), []);
+}
+
 #[tokio::test]
 async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
     let store = store(&["s"]).await;
