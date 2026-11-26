@@ -405,13 +405,16 @@ where
                             _ = shutdown_clone.cancelled() => break,
                         }
                     }
+                    // Shutdown first in both, so a slot freed as shutdown starts can't start a poll
                     let permit = tokio::select! {
-                        p = permit_dealer.acquire_owned() => p,
+                        biased;
                         _ = shutdown_clone.cancelled() => break,
+                        p = permit_dealer.acquire_owned() => p,
                     };
                     let active_guard = tokio::select! {
-                        ag = poll_scaler.wait_until_allowed() => ag,
+                        biased;
                         _ = shutdown_clone.cancelled() => break,
+                        ag = poll_scaler.wait_until_allowed() => ag,
                     };
                     // Spawn poll task
                     let shutdown = shutdown_clone.clone();
@@ -1458,6 +1461,59 @@ mod tests {
         }
 
         pb.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn slot_freed_with_shutdown_does_not_start_a_poll() {
+        // Without the bias, both selects skip shutdown about one time in four.
+        for _ in 0..100 {
+            let mut mock_client = mock_manual_worker_client();
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let call_count_clone = call_count.clone();
+            mock_client
+                .expect_poll_workflow_task()
+                .returning(move |_, _| {
+                    call_count_clone.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok(PollWorkflowTaskQueueResponse {
+                            task_token: vec![1],
+                            ..Default::default()
+                        })
+                    }
+                    .boxed()
+                });
+
+            let shutdown_token = CancellationToken::new();
+            let pb = LongPollBuffer::new_workflow_task(
+                Arc::new(mock_client),
+                "sometq".to_string(),
+                None,
+                PollerBehavior::SimpleMaximum(1),
+                fixed_size_permit_dealer(1),
+                shutdown_token.clone(),
+                None::<fn(usize)>,
+                WorkflowTaskOptions {
+                    wft_poller_shared: None,
+                },
+                PollerHeartbeatState::default(),
+                Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                    worker_poll_complete_on_shutdown: true,
+                    ..Default::default()
+                })),
+            );
+
+            // The first task holds the only slot, so the poller waits for one.
+            let (_, permit) = pb.poll().await.unwrap().unwrap();
+            shutdown_token.cancel();
+            drop(permit);
+
+            assert!(
+                pb.poll().await.is_none(),
+                "No poll should start after shutdown"
+            );
+            pb.shutdown().await;
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[rstest]

@@ -49,6 +49,10 @@ relevant information.
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
 
+* If a workflow, activity, or Nexus task slot frees up as a worker starts to shut down, the worker
+  does not start one more poll. Before, that poll could take a new task during shutdown, and with a
+  full workflow cache it could evict a cached workflow.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
