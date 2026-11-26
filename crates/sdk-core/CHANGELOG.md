@@ -52,19 +52,12 @@ relevant information.
   the read limit of its task, the new `StreamSettings::read_time`. A `core_stream_read` marker
   records each page with a digest of its Records, and a replay reads the Records from the Store
   again. A replay whose Store lost them fails with the new `WorkflowErrorType::StreamReplay`.
-* [lang-internal] The Worker's metrics count each try of a Stream call of Workflow code when it
-  starts, as they count each attempt of a Local Activity, with the attribute `stream_store`. An
-  append has `stream_append_total`, `stream_append_execution_failed` and
-  `stream_append_execution_latency`. A try that ends has its latency, and a try that Core stops has
-  only its count. A read has no latency. Its `stream_read_total` counts each time the read asks the
-  Store, also when it asks again after an outage or after an answer with no Record, and for the
-  check of a read before a completion. It also has `stream_read_execution_failed`, also for a check
-  with no answer within its deadline of 1 s, and `stream_read_records`, which counts the Records
-  that the Store gave, also those of a page that Core dropped. A try of a replay's Store read that
-  ends has `stream_replay_read_execution_latency`, and a try that the 3 s retry bound of a replay
-  stops has no sample. Each `_execution_failed` counter has the attribute `failure_reason` with the
-  reason of the Stream error, such as `stream_not_found`, or `stream_store_unavailable` for a try in
-  an outage.
+* [lang-internal] The Worker's metrics count each try of a Stream call of Workflow code, with the
+  attribute `stream_store`. Appends have `stream_append_total`, `stream_append_execution_failed` and
+  `stream_append_execution_latency`. Reads have `stream_read_total`, `stream_read_execution_failed`
+  and `stream_read_records`, and the Store reads of a replay have
+  `stream_replay_read_execution_latency`. Each `_execution_failed` counter has the attribute
+  `failure_reason`.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
