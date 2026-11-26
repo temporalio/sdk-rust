@@ -390,7 +390,7 @@ impl ManagedRun {
                     .unwrap_or_default();
                 if has_pending_queries {
                     return Ok(Some(ActivationOrAuto::ReadyForQueries(
-                        self.wfm.machines.get_wf_activation(),
+                        self.wfm.machines.get_wf_activation()?,
                     )));
                 }
             }
@@ -1748,7 +1748,7 @@ impl WorkflowManager {
             self.machines.apply_next_wft_from_history()?;
         }
         self.awaiting_activation_completion = self.machines.activation_needed();
-        Ok(self.machines.get_wf_activation())
+        self.machines.get_wf_activation()
     }
 
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need

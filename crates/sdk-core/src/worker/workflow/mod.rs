@@ -1781,9 +1781,10 @@ pub(crate) enum WFMachinesError {
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
-    /// A Stream call that this Worker can't serve, on a Store with no runtime or in an outage. The
-    /// Workflow Task fails with this message as-is. For an outage it starts with
-    /// `StreamStoreUnavailable:`.
+    /// A Stream call that this Worker can't serve, on a Store with no runtime or in an outage, or a
+    /// Stream marker over its size bound. The Workflow Task fails with this message as-is. For an
+    /// outage it starts with `StreamStoreUnavailable:`, and for a marker with
+    /// `StreamMarkerTooLarge:`.
     #[error("{0}")]
     Stream(String),
 }

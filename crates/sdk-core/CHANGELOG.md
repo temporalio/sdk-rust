@@ -51,7 +51,9 @@ relevant information.
   Core drops a call that has no result when the Workflow's last command arrives, as it drops a
   Local Activity. If a call is waiting to try again at the task's heartbeat, because a try failed
   with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
-  message starts with `StreamStoreUnavailable:`.
+  message starts with `StreamStoreUnavailable:`. The data of one marker can have at most 1 MiB.
+  An activation whose marker has more fails its task with a message that starts with
+  `StreamMarkerTooLarge:`.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,

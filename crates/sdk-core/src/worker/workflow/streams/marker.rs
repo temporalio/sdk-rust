@@ -23,6 +23,11 @@ use temporalio_streams::proto::StreamErrorReason;
 /// index of an entry for each later activation, and the bound prevents an overflow of that sum.
 const MAX_ACTIVATION: u64 = u32::MAX as u64;
 
+/// The maximum size of the data of one marker, half the limit of the server for one event. A
+/// marker holds each result of its activation, so many results with long Store messages can pass
+/// it.
+const MAX_MARKER_DATA_BYTES: usize = 1024 * 1024;
+
 /// The key of the marker's details that holds its data. It can't change, because History keeps
 /// the markers that earlier releases wrote.
 const MARKER_DATA_KEY: &str = "data";
@@ -53,9 +58,23 @@ fn json(value: &impl Serialize) -> Payload {
     (value.as_json_payload()).expect("The data of a Stream marker has a JSON form")
 }
 
-/// Returns the details of the marker command that records `data`.
-pub(crate) fn marker_details(data: &StreamAppendMarkerData) -> HashMap<String, Payloads> {
-    HashMap::from([(MARKER_DATA_KEY.to_string(), json(data).into())])
+/// Returns the details of the marker command that records `data`. Data over
+/// [`MAX_MARKER_DATA_BYTES`] fails the Workflow Task, because the server would refuse its event.
+pub(crate) fn marker_details(
+    data: &StreamAppendMarkerData,
+) -> Result<HashMap<String, Payloads>, WFMachinesError> {
+    let payload = json(data);
+    let size = payload.data.len();
+    if size > MAX_MARKER_DATA_BYTES {
+        return Err(WFMachinesError::Stream(format!(
+            "StreamMarkerTooLarge: The data of a Stream marker has {size} bytes, more than \
+             {MAX_MARKER_DATA_BYTES}"
+        )));
+    }
+    Ok(HashMap::from([(
+        MARKER_DATA_KEY.to_string(),
+        payload.into(),
+    )]))
 }
 
 /// Returns true if `event` is a `core_stream_append` marker.
@@ -164,7 +183,7 @@ mod tests {
             appends: vec![entry(3, "orders", appended), entry(4, "audit", failed)],
         };
 
-        let details = marker_details(&marker);
+        let details = marker_details(&marker).unwrap();
         let keys: Vec<&str> = details.keys().map(String::as_str).collect();
         assert_eq!(keys, ["data"]);
         let encoding = |name: &str| HashMap::from([("encoding".to_string(), name.into())]);
@@ -182,6 +201,34 @@ mod tests {
         ];
         assert_eq!(std::str::from_utf8(&data.data).unwrap(), json.concat());
         assert_eq!(peeked_marker(&event(details)), Some(Ok(marker)));
+    }
+
+    // The server refuses an event over 2 MB, so the data of a marker can have at most 1 MiB.
+    #[test]
+    fn a_marker_with_more_than_1_mib_of_data_fails_its_task() {
+        let marker = |message: usize| StreamAppendMarkerData {
+            appends: vec![StreamAppendResult {
+                seq: 1,
+                stream_id: "s".to_string(),
+                store: "redis".to_string(),
+                activation_index: 0,
+                result: Some(stream_append_result::Result::Failure(StreamFailure {
+                    reason: "STREAM_ERROR_REASON_INVALID_ARGUMENT".to_string(),
+                    message: "x".repeat(message),
+                })),
+            }],
+        };
+        let rest = json(&marker(0)).data.len();
+        let full = marker(1024 * 1024 - rest);
+        assert_eq!(json(&full).data.len(), 1024 * 1024);
+        assert!(marker_details(&full).is_ok());
+        let over = marker(1024 * 1024 - rest + 1);
+        let error = "StreamMarkerTooLarge: The data of a Stream marker has 1048577 bytes, more \
+                     than 1048576";
+        assert_eq!(
+            marker_details(&over),
+            Err(WFMachinesError::Stream(error.to_string()))
+        );
     }
 
     // A marker records a failed call by the name of its reason, and a replay reads that name.
@@ -271,7 +318,7 @@ mod tests {
         for seed in 0..1000 {
             let mut rng = StdRng::seed_from_u64(seed);
             let marker = valid_marker(&mut rng);
-            let read_back = peeked_marker(&event(marker_details(&marker)));
+            let read_back = peeked_marker(&event(marker_details(&marker).unwrap()));
             assert_eq!(read_back, Some(Ok(marker)), "seed {seed}");
         }
     }
@@ -285,7 +332,7 @@ mod tests {
         let why = match rng.random_range(0..5) {
             0 => return (HashMap::new(), "has no data".to_string()),
             1 => {
-                let mut details = marker_details(&marker);
+                let mut details = marker_details(&marker).unwrap();
                 let payload = &mut details.get_mut(MARKER_DATA_KEY).unwrap().payloads[0];
                 let text = String::from_utf8(payload.data.clone()).unwrap();
                 // One more character makes the hex of an offset odd, and a `g` isn't hex.
@@ -333,7 +380,7 @@ mod tests {
                     .to_string()
             }
         };
-        (marker_details(&marker), why)
+        (marker_details(&marker).unwrap(), why)
     }
 
     #[test]

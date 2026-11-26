@@ -51,17 +51,19 @@ impl From<CommandSent> for Recorded {
 }
 
 /// Creates the marker command that records `data`, with its machine.
-pub(super) fn stream_marker(data: &StreamAppendMarkerData) -> NewMachineWithCommand {
+pub(super) fn stream_marker(
+    data: &StreamAppendMarkerData,
+) -> Result<NewMachineWithCommand, WFMachinesError> {
     let command = RecordMarkerCommandAttributes {
         marker_name: STREAM_APPEND_MARKER_NAME.to_string(),
-        details: marker_details(data),
+        details: marker_details(data)?,
         header: None,
         failure: None,
     };
-    NewMachineWithCommand {
+    Ok(NewMachineWithCommand {
         command: command.into(),
         machine: StreamMarkerMachine::from_parts(Created {}.into(), ()).into(),
-    }
+    })
 }
 
 impl WFMachinesAdapter for StreamMarkerMachine {

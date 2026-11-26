@@ -476,7 +476,8 @@ impl WorkflowMachines {
         let Some(data) = self.stream_calls.take_completion_marker() else {
             return;
         };
-        let marker = self.add_new_command_machine(stream_marker(&data), Default::default());
+        let marker = stream_marker(&data).expect("A marker with no entry is under the bound");
+        let marker = self.add_new_command_machine(marker, Default::default());
         self.machine_is_core_created.insert(marker.machine, ());
         let responses = self
             .machine_mut(marker.machine)
@@ -606,7 +607,8 @@ impl WorkflowMachines {
     ///
     /// The job list may be empty, in which case it is expected the caller handles what to do in a
     /// "no work" situation. Possibly, it may know about some work the machines don't, like queries.
-    pub(crate) fn get_wf_activation(&mut self) -> WorkflowActivation {
+    /// It fails if the Stream marker of the activation is over its size bound.
+    pub(crate) fn get_wf_activation(&mut self) -> Result<WorkflowActivation> {
         let jobs = if self.activation_needed() {
             let mut jobs = self.drive_me.drain_jobs();
             let (activation, marker) = self.result_activations();
@@ -615,7 +617,7 @@ impl WorkflowMachines {
             // A replay places these results by their marker, so the marker must go where Workflow
             // code gets them, before the commands of this activation.
             if let Some(data) = self.stream_calls.take_marker() {
-                let marker = stream_marker(&data);
+                let marker = stream_marker(&data)?;
                 self.add_cmd_to_wf_task(marker, Default::default(), CommandIdKind::CoreInternal);
             }
             jobs
@@ -656,7 +658,7 @@ impl WorkflowMachines {
             self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
             self.current_wft_deployment_info.clone()
         };
-        WorkflowActivation {
+        Ok(WorkflowActivation {
             timestamp: self.current_wf_time.map(Into::into),
             is_replaying,
             run_id: self.run_id.clone(),
@@ -674,7 +676,7 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
-        }
+        })
     }
 
     pub(crate) fn activation_needed(&self) -> bool {
