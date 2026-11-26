@@ -2240,6 +2240,76 @@ async fn a_nondeterminism_failure_before_the_next_page_of_a_timed_out_task_sends
     );
 }
 
+// As above, a sticky task for an uncached run reads a history that goes past its started event.
+// Here no task has a command. The first page ends inside a task, so the first update ends at the
+// task of signal "2", which only the events after it on that page show to be complete. Lang must
+// still get every signal once, in order, before Core completes the task.
+#[tokio::test]
+async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang() {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled("1", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    let sticky_task = hist_to_poll_resp(&t, wf_id, ResponseType::OneTask(2)).resp;
+    assert_eq!(
+        (
+            sticky_task.previous_started_event_id,
+            sticky_task.started_event_id
+        ),
+        (3, 7)
+    );
+    // That task times out, and another worker completes the next attempt and three more signals.
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    for signal in ["2", "3", "4"] {
+        t.add_we_signaled(signal, vec![]);
+        t.add_full_wf_task();
+    }
+    let pages = vec![
+        (vec![], history_page(&t, 1..=18, vec![1])),
+        (vec![1], history_page(&t, 19..=23, vec![])),
+    ];
+    let (mut mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
+    // With no matching expectation, mockall panics with the arguments, so with Core's error.
+    mh.expect_fail_wft_matcher = Box::new(|_, _, _| false);
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+    let mut signals = vec![];
+    let replay = async {
+        while signals.len() < 4 {
+            let act = core.poll_workflow_activation().await.unwrap();
+            for job in &act.jobs {
+                if let Some(workflow_activation_job::Variant::SignalWorkflow(signal)) = &job.variant
+                {
+                    signals.push(signal.signal_name.clone());
+                    if signal.signal_name == "2" {
+                        assert_eq!(
+                            fetches.load(Ordering::SeqCst),
+                            1,
+                            "Expected the task of signal 2 to end the update of the first page"
+                        );
+                    }
+                }
+            }
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+                .await
+                .unwrap();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), replay)
+        .await
+        .expect("Expected lang to get every signal within 10 seconds");
+    assert_eq!(
+        signals,
+        ["1", "2", "3", "4"],
+        "Expected lang to get every signal once, in order"
+    );
+    core.drain_pollers_and_shutdown().await;
+}
+
 #[tokio::test]
 async fn default_wft_fail_cause_is_worker_unhandled() {
     let t = canned_histories::single_timer("1");

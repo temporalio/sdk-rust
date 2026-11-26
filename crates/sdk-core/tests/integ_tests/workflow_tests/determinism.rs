@@ -25,8 +25,9 @@ use temporalio_common::{
     data_converters::RawValue,
     protos::{
         coresdk::{
-            AsJsonPayloadExt, FromJsonPayloadExt, common::extract_local_activity_marker_details,
-            workflow_activation::WorkflowActivation,
+            AsJsonPayloadExt, FromJsonPayloadExt,
+            common::extract_local_activity_marker_details,
+            workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
@@ -51,13 +52,13 @@ use temporalio_sdk::{
     WorkflowResult, runtime::WorkflowErrorType, workflows,
 };
 use temporalio_sdk_core::{
-    TunerBuilder,
+    PollError, TunerBuilder, Worker,
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         CoreInternalFlags, MockPollCfg, ResponseType, mock_worker_client, start_timer_cmd,
     },
 };
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use tonic::IntoRequest;
 
 #[workflow]
@@ -1063,10 +1064,9 @@ async fn a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once()
     assert_fails_once_with_langs_error(&after_the_restart);
 }
 
-/// The signals that the other worker handles in
-/// [`a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns`]. The server pages
-/// history by about 256 stored batches, and each signal's task adds three, so these fill more
-/// than one page.
+/// The signals that the other worker handles in [`a_task_that_reads_a_newer_history`]. The server
+/// pages history by about 256 stored batches, and each signal's task adds three, so these fill
+/// more than one page.
 const SIGNALS_ON_THE_OTHER_WORKER: usize = 150;
 
 /// Completes `act` as the workflows of
@@ -1142,14 +1142,27 @@ fn end_of_the_first_update(pages: &[Vec<HistoryEvent>], previous_started: i64) -
     None
 }
 
-// A sticky task comes for a run that the worker no longer caches while lang holds the only cache
-// slot, so the task waits in Core until it times out, and another worker runs the workflow on.
-// Core then fetches the history from the start, which goes past the task's own started event. The
-// paginator stops at a page that ends inside a later task, and lang fails the activation of the
-// last task of that page. Its completion must return.
-#[tokio::test]
-async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
-    let name = "a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns";
+/// A sticky task that reads a history newer than itself, from
+/// [`a_task_that_reads_a_newer_history`].
+struct TaskThatReadsANewerHistory {
+    core: Arc<Worker>,
+    slots: Arc<TicketedWftSlots>,
+    run_id: String,
+    /// The last event of the first update that Core builds from the history it fetches.
+    first_update_end: i64,
+    /// Lang's poll that gets the first activation of the task.
+    first_activation: JoinHandle<Result<WorkflowActivation, PollError>>,
+}
+
+/// A sticky task comes for a run that the worker no longer caches while lang holds the only cache
+/// slot, so the task waits in Core until it times out, and another worker runs the workflow on.
+/// Both workers complete each activation with `complete`. Lang then completes the activation that
+/// holds the slot, so Core fetches the history from the start for the task. That history goes past
+/// the task's own started event, and the paginator stops at a page that ends inside a later task.
+async fn a_task_that_reads_a_newer_history(
+    name: &str,
+    complete: fn(&WorkflowActivation) -> WorkflowActivationCompletion,
+) -> TaskThatReadsANewerHistory {
     let mut starter = CoreWfStarter::new(name);
     starter.set_core_task_types(WorkerTaskTypes::workflow_only());
     let mut other_starter = starter.clone_no_worker();
@@ -1189,7 +1202,7 @@ async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
         .unwrap();
     let act = core.poll_workflow_activation().await.unwrap();
     let run_id = act.run_id.clone();
-    core.complete_workflow_activation(start_an_hour_timer(&act))
+    core.complete_workflow_activation(complete(&act))
         .await
         .unwrap();
     // A sticky poll waits for the signal's task.
@@ -1248,7 +1261,7 @@ async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
     loop {
         let act = other_core.poll_workflow_activation().await.unwrap();
         other_core
-            .complete_workflow_activation(start_an_hour_timer(&act))
+            .complete_workflow_activation(complete(&act))
             .await
             .unwrap();
         if !act.is_replaying {
@@ -1259,7 +1272,7 @@ async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
         signal().await.unwrap();
         let act = other_core.poll_workflow_activation().await.unwrap();
         other_core
-            .complete_workflow_activation(start_an_hour_timer(&act))
+            .complete_workflow_activation(complete(&act))
             .await
             .unwrap();
     }
@@ -1314,8 +1327,44 @@ async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(kept.run_id))
         .await
         .unwrap();
+    TaskThatReadsANewerHistory {
+        core,
+        slots,
+        run_id,
+        first_update_end,
+        first_activation: next_activation,
+    }
+}
+
+/// Lets `core` take every task again, and shuts it down.
+async fn shut_down(core: &Worker, slots: &TicketedWftSlots) {
+    slots.grant_all();
+    core.initiate_shutdown();
+    while let Ok(act) = core.poll_workflow_activation().await {
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+            .await
+            .unwrap();
+    }
+    core.shutdown().await;
+}
+
+// Each task starts a timer, and lang fails the activation of the last task of the first update.
+// Its completion must return.
+#[tokio::test]
+async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
+    let TaskThatReadsANewerHistory {
+        core,
+        slots,
+        run_id,
+        first_update_end,
+        first_activation,
+    } = a_task_that_reads_a_newer_history(
+        "a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns",
+        start_an_hour_timer,
+    )
+    .await;
     let replay = async {
-        let mut act = next_activation.await.unwrap().unwrap();
+        let mut act = first_activation.await.unwrap().unwrap();
         let mut failed = false;
         loop {
             let ends_the_first_update =
@@ -1344,14 +1393,61 @@ async fn a_nondeterminism_failure_at_the_end_of_a_newer_history_page_returns() {
         failed,
         "Expected lang to get the activation that ends at event {first_update_end}"
     );
-    slots.grant_all();
-    core.initiate_shutdown();
-    while let Ok(act) = core.poll_workflow_activation().await {
-        core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+    shut_down(&core, &slots).await;
+}
+
+// No task has a command, so the first update ends at a task that only the events after it on the
+// first page show to be complete. Lang must get every signal of the history once, before the
+// server refuses the completion of the timed out task and Core evicts the run.
+#[tokio::test]
+async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang() {
+    let TaskThatReadsANewerHistory {
+        core,
+        slots,
+        run_id,
+        first_activation,
+        ..
+    } = a_task_that_reads_a_newer_history(
+        "a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang",
+        |act| WorkflowActivationCompletion::empty(act.run_id.clone()),
+    )
+    .await;
+    let replay = async {
+        let mut act = first_activation.await.unwrap().unwrap();
+        let mut signals = vec![];
+        loop {
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(
+                act.run_id.clone(),
+            ))
             .await
             .unwrap();
-    }
-    core.shutdown().await;
+            if act.run_id == run_id {
+                if act.is_only_eviction() {
+                    break (signals, act);
+                }
+                signals.extend((act.jobs.iter()).filter_map(|job| match &job.variant {
+                    Some(workflow_activation_job::Variant::SignalWorkflow(signal)) => {
+                        Some(signal.originating_event_id)
+                    }
+                    _ => None,
+                }));
+            }
+            act = core.poll_workflow_activation().await.unwrap();
+        }
+    };
+    let (signals, eviction) = tokio::time::timeout(Duration::from_secs(30), replay)
+        .await
+        .expect("Expected lang's completions to return within 30 seconds");
+    assert_eq!(
+        signals.len(),
+        SIGNALS_ON_THE_OTHER_WORKER + 1,
+        "Expected lang to get every signal of the history once before the eviction {eviction:?}"
+    );
+    assert!(
+        signals.windows(2).all(|pair| pair[0] < pair[1]),
+        "Expected lang to get the signals in history order: {signals:?}"
+    );
+    shut_down(&core, &slots).await;
 }
 
 #[workflow]
