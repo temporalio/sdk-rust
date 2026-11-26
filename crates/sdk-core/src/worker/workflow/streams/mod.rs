@@ -103,6 +103,18 @@ impl StreamRuntimes {
     pub(crate) fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
         self.runtimes.get(store)
     }
+
+    /// Returns the Store name of the only runtime, which a ref with no Store name uses.
+    pub(crate) fn only_store(&self) -> Option<&str> {
+        if self.runtimes.len() != 1 {
+            return None;
+        }
+        self.runtimes.keys().next().map(String::as_str)
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.runtimes.len()
+    }
 }
 
 /// The settings of a Worker's Stream calls. A call tries again after
@@ -110,7 +122,8 @@ impl StreamRuntimes {
 /// no answer within `try_deadline`. If an append still waits to try again at the heartbeat of its
 /// Workflow Task, the task fails. So does a read that waits to try again at the read limit, at the
 /// completion or at the heartbeat of its task, and a check that fails. A replay read tries again
-/// for at most 3 s after its first failed try.
+/// for at most 3 s after its first failed try. A Worker with a setting out of its bounds fails to
+/// start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the

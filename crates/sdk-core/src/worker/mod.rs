@@ -284,7 +284,9 @@ pub struct WorkerConfig {
     pub storage_drivers: HashSet<StorageDriverInfo>,
 
     /// The Stream runtimes of this Worker by Store name, with the settings of its Stream calls. A
-    /// Stream call on a Store with no runtime here fails the Workflow Task.
+    /// Stream call on a Store with no runtime here fails the Workflow Task. A call with no Store
+    /// name uses the only runtime, also in a replay, and fails the task if there are none or
+    /// several.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,
@@ -748,6 +750,9 @@ impl Worker {
         worker_heartbeat_options: Option<WorkerHeartbeatOptions>,
         shared_namespace_worker: bool,
     ) -> Result<Worker, anyhow::Error> {
+        // The settings are public fields, so a config can change them after its builder checked
+        // them.
+        (config.stream_runtimes.settings.check()).map_err(anyhow::Error::msg)?;
         let (metrics, meter) = if let Some(wt) = worker_telemetry.as_ref() {
             (
                 MetricsContext::top_level_with_meter(
