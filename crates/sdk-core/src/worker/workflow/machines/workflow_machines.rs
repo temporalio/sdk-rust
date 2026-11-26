@@ -1299,24 +1299,7 @@ impl WorkflowMachines {
 
         // A replay sends no Stream marker, so only a cached run has a command for this event.
         if is_stream_marker(event) {
-            if let Err(error) = self.stream_calls.marker_recorded() {
-                // Core fails the Workflow with this error, so a command of lang that ends the
-                // Workflow must not go out with Core's.
-                let ending: Vec<MachineKey> = (self.commands.iter())
-                    .filter(|c| {
-                        matches!(
-                            self.machine(c.machine),
-                            Machines::CompleteWorkflowMachine(_)
-                                | Machines::FailWorkflowMachine(_)
-                                | Machines::CancelWorkflowMachine(_)
-                                | Machines::ContinueAsNewWorkflowMachine(_)
-                        )
-                    })
-                    .map(|c| c.machine)
-                    .collect();
-                self.commands.retain(|c| !ending.contains(&c.machine));
-                return Err(error);
-            }
+            self.stream_calls.marker_recorded()?;
             let sent = (self.commands.iter())
                 .any(|c| matches!(self.machine(c.machine), Machines::StreamMarkerMachine(_)));
             if !sent {

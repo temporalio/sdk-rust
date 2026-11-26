@@ -849,6 +849,37 @@ async fn a_nondeterminism_failure_before_a_stream_marker_sends_one_fail_command(
     assert_eq!(store.requests(), []);
 }
 
+// Core finds the error at the marker, so the Workflow fails with Core's error alone. Lang's
+// command that ends the Workflow came from the replayed task, and the server has that task.
+#[tokio::test]
+async fn a_stream_marker_with_no_call_fails_the_workflow_with_one_command() {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let completed = t.current_event_id();
+    let appends = vec![appended(1, "s", vec![7], 1)];
+    add_stream_marker(&mut t, completed, &StreamAppendMarkerData { appends });
+    t.add_workflow_task_scheduled_and_started();
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    opts.configure = Box::new(|wc| {
+        wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    });
+    let run = start(t, opts);
+    assert_eq!(run.drive(|_| vec![complete()]).await.len(), 1);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let sent: Vec<_> = run.sent().iter().map(with_failures).collect();
+    let [completion] = &sent[..] else {
+        panic!("One completion: {sent:?}");
+    };
+    let [(CommandType::FailWorkflowExecution, Some(message))] = &completion[..] else {
+        panic!("One fail command: {completion:?}");
+    };
+    let error = "History has a result of Stream append 1 that Workflow code never issued";
+    assert!(message.contains(error), "{message}");
+    assert_eq!(store.requests(), []);
+}
+
 #[tokio::test]
 async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
     let store = store(&["s"]).await;
