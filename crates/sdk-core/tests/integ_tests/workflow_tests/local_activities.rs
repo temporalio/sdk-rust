@@ -2732,8 +2732,8 @@ async fn legacy_query_before_forced_task_leaves_la_result_held() {
 
 /// After a timer, starts a local activity and signals another workflow, then once that signal is
 /// acknowledged records whether the local activity had already finished: a memo if not, a timer if
-/// so. The acknowledgement and the result are applied together before that check, as Python's
-/// default job scheduling does for jobs that are neither signals nor updates.
+/// so. It applies every job in an activation before making that check, so the decision depends on
+/// whether the acknowledgement and the result arrive in the same activation.
 #[derive(Default)]
 struct AckThenLocalActivityWf {
     acked: bool,

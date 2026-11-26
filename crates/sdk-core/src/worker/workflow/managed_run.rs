@@ -91,10 +91,10 @@ pub(super) struct ManagedRun {
     task_buffer: BufferedTasks,
     /// Is set if an eviction has been requested for this run
     trying_to_evict: Option<RequestEvictMsg>,
-    /// Set once lang has run workflow code against history a legacy query was prepared with. That
-    /// code ran at a point no workflow task records, so neither its commands nor what it observed
-    /// (jobs, history length, time) can be reproduced by replay, and the run must not be reused
-    /// for the next workflow task.
+    /// Set as soon as a normal (non-query) activation is issued to lang during the preparation of a
+    /// legacy query that applied new events, without waiting for lang to complete it. No workflow
+    /// task records that activation boundary, so replay cannot reconstruct it, and the next
+    /// workflow task must go to a run rebuilt from history. Stays set until this run is evicted.
     legacy_query_ran_workflow_code: bool,
 
     /// We track if we have recorded useful debugging values onto a certain span yet, to overcome
@@ -186,10 +186,23 @@ impl ManagedRun {
         if self.wft.is_some() {
             dbg_panic!("Trying to send a new WFT for a run which already has one!");
         }
-        // Applying a real workflow task on top of workflow code that ran for a legacy query would
-        // commit decisions made at a point replay cannot reproduce, so hand it to a fresh run.
+        // Lang already handled work from a legacy query's preparation in activations that no
+        // workflow task recorded. Applying this task on top of them could commit commands from an
+        // activation boundary replay cannot reconstruct, so the task waits for a run rebuilt from
+        // history.
         if self.legacy_query_ran_workflow_code && pwft.work.legacy_query.is_none() {
-            return Ok(self.evict_for_legacy_query_effects(pwft));
+            self.task_buffer.buffer(pwft);
+            if self.trying_to_evict.is_none() {
+                self.trying_to_evict = Some(RequestEvictMsg {
+                    run_id: self.run_id().to_string(),
+                    message: "Legacy query ran workflow code on history no workflow task has \
+                              committed"
+                        .to_string(),
+                    reason: EvictionReason::Unspecified,
+                    auto_reply_fail: None,
+                });
+            }
+            return Ok(None);
         }
         let start_time = Instant::now();
 
@@ -1002,21 +1015,6 @@ impl ManagedRun {
         self.task_buffer.has_tasks()
     }
 
-    fn evict_for_legacy_query_effects(&mut self, pwft: PermittedWFT) -> Option<ActivationOrAuto> {
-        self.task_buffer.buffer(pwft);
-        if self.trying_to_evict.is_none() {
-            self.trying_to_evict = Some(RequestEvictMsg {
-                run_id: self.run_id().to_string(),
-                message: "Legacy query ran workflow code on history no workflow task has \
-                          committed"
-                    .to_string(),
-                reason: EvictionReason::Unspecified,
-                auto_reply_fail: None,
-            });
-        }
-        None
-    }
-
     pub(super) fn request_eviction(&mut self, info: RequestEvictMsg) -> EvictionRequestResult {
         // If we were waiting on a page fetch and we're getting evicted because fetching failed,
         // then make sure we allow the completion to proceed, otherwise we're stuck waiting forever.
@@ -1243,7 +1241,7 @@ impl ManagedRun {
         };
         if matches!(act_type, OutstandingActivation::Normal)
             && self.pending_work_is_legacy_query()
-            && self.wfm.machines.legacy_query_applied_uncommitted_events()
+            && self.wfm.machines.legacy_query_applied_new_events()
         {
             self.legacy_query_ran_workflow_code = true;
         }

@@ -44,9 +44,11 @@ const WFID: &str = "legacy-query-replay";
 const UPDATE_ID: &str = "upd";
 
 /// Stand-in for a workflow that signals another workflow, upserts a memo once that signal is
-/// acknowledged, starts a timer per incoming signal, and accepts and completes updates. Like the
-/// Python SDK, it handles updates and signals before other jobs in the same activation, which is
-/// what makes the grouping of jobs into activations visible in the command order.
+/// acknowledged, starts a timer per incoming signal, and accepts and completes updates. Within one
+/// activation it handles queries, updates and signals before any other job, so an update or signal
+/// delivered with the acknowledgement produces its commands ahead of the memo upsert, while one
+/// delivered in a later activation produces them after it. The committed command order therefore
+/// shows how jobs were grouped into activations.
 fn lang(act: &WorkflowActivation) -> Vec<workflow_command::Variant> {
     let jobs: Vec<&Job> = act.jobs.iter().filter_map(|j| j.variant.as_ref()).collect();
     let mut cmds = vec![];
@@ -455,7 +457,7 @@ async fn live_then_replay(queries: Queries, next: NextWft, lang: Lang) -> (Obser
 async fn update_after_query_advanced_workflow_commits_replayable_history() {
     let (live, _) = live_then_replay(Queries::Advancing(1), NextWft::Update, lang).await;
     assert_eq!(live.count("Evict"), 1);
-    assert!(live.position("Evict") < live.position("DoUpdate"));
+    assert!(live.position("Evict").unwrap() < live.position("DoUpdate").unwrap());
     assert_eq!(live.count("DoUpdate"), 1);
     let update_act = &live.activations[live.position("DoUpdate").unwrap()];
     assert!(update_act.contains(&"ResolveSignalExternal".to_string()));
@@ -466,7 +468,7 @@ async fn update_after_query_advanced_workflow_commits_replayable_history() {
 async fn signal_after_query_advanced_workflow_commits_replayable_history() {
     let (live, _) = live_then_replay(Queries::Advancing(1), NextWft::Signal, lang).await;
     assert_eq!(live.count("Evict"), 1);
-    assert!(live.position("Evict") < live.position("Signal"));
+    assert!(live.position("Evict").unwrap() < live.position("Signal").unwrap());
 }
 
 /// Even when the next task adds no work of its own, the run is rebuilt rather than reused: what
@@ -510,5 +512,5 @@ async fn task_after_two_queries_advanced_workflow_commits_replayable_history() {
 async fn query_that_runs_no_workflow_code_keeps_cached_run() {
     let (live, _) = live_then_replay(Queries::BeforeAck, NextWft::NothingNew, lang).await;
     assert_eq!(live.count("Evict"), 0);
-    assert!(live.position("Query") < live.position("ResolveSignalExternal"));
+    assert!(live.position("Query").unwrap() < live.position("ResolveSignalExternal").unwrap());
 }

@@ -124,10 +124,12 @@ pub(crate) struct WorkflowMachines {
     /// Legacy queries cannot produce commands, so catching up on their history must not cause any
     /// side effects, like dispatching LA requests.
     preparing_legacy_query: bool,
-    /// Set when preparing a legacy query applied events newer than the last started workflow task.
-    /// Workflow code reacting to those events runs at a point no workflow task records, which
-    /// replay cannot reproduce.
-    legacy_query_applied_uncommitted_events: bool,
+    /// Set when preparing a legacy query applied an event that would end replay for a real
+    /// workflow task: a non-command event other than `WorkflowTaskCompleted`, newer than the
+    /// update's `previous_wft_started_id`, in the history's final workflow task. The event is
+    /// already in history, but no workflow task records the activation boundary at which workflow
+    /// code reacts to it, so replay cannot reconstruct that boundary.
+    legacy_query_applied_new_events: bool,
     /// Rejection-only tasks can be discarded, so they must not release LAs waiting on replay.
     update_only_task: bool,
     /// Workflow identifier
@@ -311,7 +313,7 @@ impl WorkflowMachines {
             drive_me: DrivenWorkflow::default(),
             replaying,
             preparing_legacy_query: false,
-            legacy_query_applied_uncommitted_events: false,
+            legacy_query_applied_new_events: false,
             update_only_task: false,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -368,7 +370,7 @@ impl WorkflowMachines {
         }
         self.protocol_msgs = protocol_messages;
         self.preparing_legacy_query = preparing_legacy_query;
-        self.legacy_query_applied_uncommitted_events = false;
+        self.legacy_query_applied_new_events = false;
         self.update_only_task = false;
         self.new_history_from_server(update)?;
         Ok(())
@@ -515,8 +517,8 @@ impl WorkflowMachines {
         }
     }
 
-    pub(crate) fn legacy_query_applied_uncommitted_events(&self) -> bool {
-        self.legacy_query_applied_uncommitted_events
+    pub(crate) fn legacy_query_applied_new_events(&self) -> bool {
+        self.legacy_query_applied_new_events
     }
 
     pub(crate) fn history_size_bytes(&self) -> u64 {
@@ -860,7 +862,7 @@ impl WorkflowMachines {
                 && event.event_type() != EventType::WorkflowTaskCompleted
                 && !event.is_command_event();
             if self.preparing_legacy_query && is_new_event {
-                self.legacy_query_applied_uncommitted_events = true;
+                self.legacy_query_applied_new_events = true;
             }
             if self.replaying && !self.preparing_legacy_query && is_new_event {
                 // Replay is finished
