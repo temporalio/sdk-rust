@@ -37,8 +37,10 @@ relevant information.
 ## Unreleased
 
 ### Fixed
-* Consume buffered events through a known Workflow Task boundary before fetching another history
-  page, preventing out-of-order history failures when a cache-miss reload outlives its polled task.
+* Preserve unread history while fetching marker lookahead during replay, preventing missing patch
+  markers and out-of-order history failures when a cache-miss reload outlives its polled task.
+* Continue fetching history after replaying Workflow Tasks with no activation jobs instead of
+  failing replay.
 * Reject history updates that omit unread buffered events before replacing buffered history.
 
 ## [0.12.0] - 2026-11-23

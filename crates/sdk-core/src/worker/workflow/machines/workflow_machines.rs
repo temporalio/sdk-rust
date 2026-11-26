@@ -736,6 +736,10 @@ impl WorkflowMachines {
         Ok(())
     }
 
+    pub(crate) fn buffered_history(&self) -> &[HistoryEvent] {
+        self.last_history_from_server.get_events()
+    }
+
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
     /// to be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn ready_to_apply_next_wft(&self) -> bool {

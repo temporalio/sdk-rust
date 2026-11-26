@@ -228,6 +228,12 @@ impl HistoryPaginator {
         }
     }
 
+    pub(crate) fn prepend_events(&mut self, events: &[HistoryEvent]) {
+        for event in events.iter().rev() {
+            self.event_queue.push_front(event.clone());
+        }
+    }
+
     /// Return at least the next two WFT sequences (as determined by the passed-in ID) as a
     /// [HistoryUpdate]. Two sequences supports the required peek-ahead during replay without
     /// unnecessary back-and-forth.
@@ -605,23 +611,19 @@ impl HistoryUpdate {
             self.chunking_disabled,
         );
         match next_wft_ix {
-            NextWFTSeqEndIndex::Incomplete(siz) => {
-                if self.has_last_wft || self.ends_at_known_boundary() {
-                    if self.get_events().is_empty() {
-                        NextWFT::ReplayOver
-                    } else {
-                        self.build_next_wft(siz)
-                    }
+            NextWFTSeqEndIndex::Incomplete(siz) if self.has_last_wft => {
+                if self.get_events().is_empty() {
+                    NextWFT::ReplayOver
                 } else {
-                    if siz != 0 {
-                        panic!(
-                            "HistoryUpdate was created with an incomplete WFT. This is an SDK bug."
-                        );
-                    }
-                    NextWFT::NeedFetch
+                    self.build_next_wft(siz)
                 }
             }
-            NextWFTSeqEndIndex::Complete(next_wft_ix) => self.build_next_wft(next_wft_ix),
+            NextWFTSeqEndIndex::Complete(ix)
+                if self.has_last_wft || ix + 1 < self.get_events().len() =>
+            {
+                self.build_next_wft(ix)
+            }
+            _ => NextWFT::NeedFetch,
         }
     }
 
@@ -661,12 +663,14 @@ impl HistoryUpdate {
             self.has_last_wft || self.ends_at_known_boundary(),
             self.chunking_disabled,
         );
-        if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
-            && !(self.has_last_wft || self.ends_at_known_boundary())
-        {
-            return false;
+        // The last buffered task supplies lookahead for its predecessor. Its own markers may
+        // still be in the paginator, so it cannot run until more history arrives.
+        match next_wft_ix {
+            NextWFTSeqEndIndex::Complete(ix) => {
+                self.has_last_wft || ix + 1 < self.get_events().len()
+            }
+            NextWFTSeqEndIndex::Incomplete(_) => self.has_last_wft,
         }
-        true
     }
 
     /// Returns the next WFT completed event attributes, if any, starting at (inclusive) the
@@ -1092,6 +1096,7 @@ mod tests {
                 if from_id == last_started_id {
                     break;
                 }
+                paginator.prepend_events(update.get_events());
             }
             assert_eq!(boundaries, expected, "page size {page_size}");
         }
@@ -1268,6 +1273,7 @@ mod tests {
                 match update.take_next_wft_sequence(last_started_id) {
                     NextWFT::WFT(seq, _) => seq,
                     NextWFT::NeedFetch => {
+                        paginator.prepend_events(update.get_events());
                         update = paginator.extract_next_update().await.unwrap();
                         update
                             .take_next_wft_sequence(last_started_id)
@@ -1346,10 +1352,10 @@ mod tests {
         assert_eq!(seq.last().unwrap().event_id, 3);
         let seq = update.take_next_wft_sequence(3).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 7);
-        let seq = update.take_next_wft_sequence(7).unwrap_events();
-        assert_eq!(seq.last().unwrap().event_id, 11);
-        let next = update.take_next_wft_sequence(11);
-        assert_matches!(next, NextWFT::NeedFetch);
+        assert!(!update.can_take_next_wft_sequence(7));
+        assert_matches!(update.take_next_wft_sequence(7), NextWFT::NeedFetch);
+        assert_eq!(update.get_events().first().unwrap().event_id, 8);
+        assert_eq!(update.get_events().last().unwrap().event_id, 11);
     }
 
     #[rstest::rstest]
@@ -1368,6 +1374,7 @@ mod tests {
                     last_id = seq.last().unwrap().event_id;
                 }
                 NextWFT::NeedFetch => {
+                    paginator.prepend_events(update.get_events());
                     update = paginator.extract_next_update().await.unwrap();
                 }
                 NextWFT::ReplayOver => break,

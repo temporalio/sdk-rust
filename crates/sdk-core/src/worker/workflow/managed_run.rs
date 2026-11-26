@@ -361,6 +361,15 @@ impl ManagedRun {
             Ok(Some(ActivationOrAuto::LangActivation(
                 self.wfm.get_next_activation()?,
             )))
+        } else if !self.am_broken
+            && self.wfm.machines.replaying
+            && !self.wfm.ready_to_apply_next_wft()
+        {
+            // Replay can exhaust a page without producing jobs. Autocomplete reaches the same
+            // fetch path as a language completion, without running workflow code again.
+            Ok(Some(ActivationOrAuto::Autocomplete {
+                run_id: self.run_id().to_string(),
+            }))
         } else if self.waiting_on_la.is_some()
             && self.wfm.machines.outstanding_local_activity_count() == 0
         {
@@ -527,8 +536,11 @@ impl ManagedRun {
             // applying the completion to machines. If we can't, return early indicating we need
             // to fetch a page.
             if !self.wfm.ready_to_apply_next_wft() {
-                return if let Some(paginator) = self.paginator.take() {
+                return if let Some(mut paginator) = self.paginator.take() {
                     debug!("Need to fetch a history page before next WFT can be applied");
+                    // Retain unread events until the fetch supplies their marker lookahead. Keep
+                    // the machines' copy intact in case fetching fails and the task must fail.
+                    paginator.prepend_events(self.wfm.machines.buffered_history());
                     self.completion_waiting_on_page_fetch = Some(rac);
                     Err(Box::new(NextPageReq {
                         paginator,
@@ -1653,7 +1665,7 @@ impl WorkflowManager {
         if self.machines.activation_needed() {
             return Ok(());
         }
-        loop {
+        while self.machines.ready_to_apply_next_wft() {
             let consumed_events = self.machines.apply_next_wft_from_history()?;
 
             if consumed_events == 0 || !self.machines.replaying || self.machines.activation_needed()

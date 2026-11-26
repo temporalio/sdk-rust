@@ -18,7 +18,7 @@ use crate::{
         client::mocks::{mock_manual_worker_client, mock_worker_client},
     },
 };
-use futures_util::{FutureExt, stream};
+use futures_util::{FutureExt, StreamExt, stream};
 use mockall::TimesRange;
 use rstest::{fixture, rstest};
 use siphasher::sip::SipHasher13;
@@ -62,7 +62,7 @@ use temporalio_common::{
             enums::v1::{CommandType, EventType, RetryState, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
-                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes,
+                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes, History,
                 TimerFiredEventAttributes, WorkflowPropertiesModifiedExternallyEventAttributes,
                 history_event,
             },
@@ -3448,18 +3448,6 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
     assert_matches!(
         wf_task.jobs.as_slice(),
         [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-        }] if signal.signal_name == "sig1"
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
-        .await
-        .unwrap();
-
-    // Buffered work must be processed before the failing fetch can evict the run.
-    let wf_task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        wf_task.jobs.as_slice(),
-        [WorkflowActivationJob {
             variant: Some(workflow_activation_job::Variant::RemoveFromCache(c)),
         }] if c.message.contains("Fetching history")
     );
@@ -3714,6 +3702,148 @@ async fn _do_post_terminal_commands_test(
     .await
     .unwrap();
 
+    core.drain_pollers_and_shutdown().await;
+}
+
+#[rstest]
+#[case::signals(false, true)]
+#[case::command(true, true)]
+#[case::jobless_task(false, false)]
+#[tokio::test]
+async fn stale_cache_miss_replays_with_paginated_lookahead(
+    #[case] earlier_command: bool,
+    #[case] signals_before_patch: bool,
+    #[values(false, true)] paginated: bool,
+) {
+    let patch_id = "late-patch";
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    if !signals_before_patch {
+        // A recorded command keeps initialization separate from the following jobless task.
+        history.add_timer_started("3".to_owned());
+    }
+    if signals_before_patch {
+        history.add_we_signaled("stale", vec![]);
+    }
+    history.add_workflow_task_scheduled_and_started();
+    let stale = hist_to_poll_resp(&history, "wfid", ResponseType::OneTask(2)).resp;
+    history.add_workflow_task_timed_out();
+    if signals_before_patch {
+        history.add_we_signaled("before-patch", vec![]);
+    }
+    history.add_full_wf_task();
+    if earlier_command {
+        history.add_timer_started("2".to_owned());
+    }
+    history.add_we_signaled("patched", vec![]);
+    history.add_full_wf_task();
+    history.add_has_change_marker(patch_id, false);
+    let page_end_event_id = history.add_timer_started("1".to_owned());
+    history.add_workflow_task_scheduled_and_started();
+
+    let mut first_page: GetWorkflowExecutionHistoryResponse =
+        history.get_full_history_info().unwrap().into();
+    // The page contains the completed task and its marker, but the paginator retains the
+    // marker as lookahead after splitting the update at the task's started event.
+    let second_events = if paginated {
+        first_page.next_page_token = vec![1];
+        first_page
+            .history
+            .as_mut()
+            .unwrap()
+            .events
+            .split_off(page_end_event_id.try_into().unwrap())
+    } else {
+        vec![]
+    };
+    let second_page = GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: second_events,
+        }),
+        ..Default::default()
+    };
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let count = fetches.clone();
+    let mut pages = VecDeque::from([first_page, second_page]);
+    let mut client = mock_worker_client();
+    client
+        .expect_get_workflow_execution_history()
+        .returning(move |_, _, _| {
+            count.fetch_add(1, Ordering::Relaxed);
+            Ok(pages.pop_front().unwrap())
+        });
+    client
+        .expect_fail_workflow_task()
+        .returning(|_, _, failure| panic!("replay unexpectedly failed: {failure:?}"));
+    client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Err(tonic::Status::not_found("stale task expired")));
+    let core = mock_worker(MocksHolder::from_wft_stream(
+        client,
+        stream::iter([stale]).chain(stream::pending()),
+    ));
+    let initial = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(fetches.load(Ordering::Relaxed), 1);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        initial.run_id,
+        if signals_before_patch {
+            vec![]
+        } else {
+            vec![start_timer_cmd(3, Duration::from_secs(1))]
+        },
+    ))
+    .await
+    .unwrap();
+    if signals_before_patch {
+        let before_patch = core.poll_workflow_activation().await.unwrap();
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            before_patch.run_id,
+            if earlier_command {
+                vec![start_timer_cmd(2, Duration::from_secs(1))]
+            } else {
+                vec![]
+            },
+        ))
+        .await
+        .unwrap();
+    }
+    let patched = core.poll_workflow_activation().await.unwrap();
+    assert!(patched.is_replaying);
+    assert_matches!(
+        patched.jobs.as_slice(),
+        [
+            WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::NotifyHasPatch(patch)),
+            },
+            WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
+            },
+        ] if patch.patch_id == patch_id && signal.signal_name == "patched"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        patched.run_id,
+        vec![
+            SetPatchMarker {
+                patch_id: patch_id.to_owned(),
+                deprecated: false,
+            }
+            .into(),
+            start_timer_cmd(1, Duration::from_secs(1)),
+        ],
+    ))
+    .await
+    .unwrap();
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert!(eviction.eviction_reason().is_some());
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        fetches.load(Ordering::Relaxed),
+        if paginated { 2 } else { 1 }
+    );
     core.drain_pollers_and_shutdown().await;
 }
 
