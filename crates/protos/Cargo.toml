@@ -24,6 +24,7 @@ anyhow = "1.0"
 base64 = "0.23"
 derive_more = { workspace = true }
 http = "1"
+percent-encoding = "2"
 prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }

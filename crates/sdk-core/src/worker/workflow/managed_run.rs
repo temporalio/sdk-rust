@@ -40,7 +40,7 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
+        enums::v1::{CommandType, VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
@@ -819,8 +819,12 @@ impl ManagedRun {
                 self.wfm.feed_history_from_new_page(update)?;
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
-            // or are otherwise broken.
-            if !completion.activation_was_eviction && !self.am_broken {
+            // or are otherwise broken. After a forced failure, lang sent none of the commands the
+            // next task's history records, so applying it would fail the workflow again.
+            if !completion.activation_was_eviction
+                && !self.am_broken
+                && !completion.is_forced_failure
+            {
                 self.wfm.apply_next_task_if_ready()?;
             }
             let mut new_local_acts = self.wfm.drain_queued_local_activities();
@@ -1313,10 +1317,19 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                (
-                    machines_wft_response.commands().collect(),
-                    machines_wft_response.messages(),
-                )
+                let mut commands: Vec<_> = machines_wft_response.commands().collect();
+                // The server already has the replayed task that lang's queued commands came from,
+                // so sending them again would repeat or contradict its history. Core pushes the
+                // forced FailWorkflow after anything lang queued.
+                if data.is_forced_failure
+                    && machines_wft_response.replaying
+                    && let Some(fail_ix) = commands
+                        .iter()
+                        .rposition(|c| c.command_type() == CommandType::FailWorkflowExecution)
+                {
+                    commands = vec![commands.swap_remove(fail_ix)];
+                }
+                (commands, machines_wft_response.messages())
             };
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
@@ -2177,7 +2190,8 @@ mod tests {
             temporal::api::{
                 command::v1::command,
                 common::v1::Payload,
-                enums::v1::EventType,
+                enums::v1::{EventType, TimeoutType},
+                failure::v1::failure::FailureInfo,
                 history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes},
                 workflowservice::v1::get_system_info_response::Capabilities,
             },
@@ -2293,6 +2307,67 @@ mod tests {
                 sdk_name: "test",
                 sdk_version: "test",
             })
+        }
+
+        #[test]
+        fn local_activity_timeout_failure_matches_on_replay() {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let workflow_command::Variant::ScheduleLocalActivity(command) =
+                schedule_local_activity_cmd(
+                    1,
+                    "local",
+                    ActivityCancellationType::TryCancel,
+                    Duration::from_secs(10),
+                )
+            else {
+                unreachable!()
+            };
+
+            let mut live = manager(&history);
+            live.get_next_activation().unwrap();
+            live.push_commands_and_iterate(vec![WFCommand::new(
+                WFCommandVariant::AddLocalActivity(command.clone()),
+            )])
+            .unwrap();
+            live.drain_queued_local_activities();
+            live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
+                seq: 1,
+                result: LocalActivityExecutionResult::timeout(TimeoutType::ScheduleToClose),
+                runtime: Duration::ZERO,
+                attempt: 1,
+                backoff: None,
+                original_schedule_time: None,
+            }))
+            .unwrap();
+            let live_resolution = live.get_next_activation().unwrap();
+            assert_matches!(
+                live_resolution.jobs[0].variant.as_ref(),
+                Some(Variant::ResolveActivity(ResolveActivity {
+                    seq: 1,
+                    is_local: true,
+                    result: Some(ActivityResolution {
+                        status: Some(activity_resolution::Status::Failed(failure)),
+                    }),
+                })) if matches!(
+                    failure.failure.as_ref().and_then(|f| f.failure_info.as_ref()),
+                    Some(FailureInfo::ActivityFailureInfo(_))
+                )
+            );
+            live.push_commands_and_iterate(vec![]).unwrap();
+            record_wft_completion(&mut history, &live);
+            history.add_workflow_task_scheduled_and_started();
+
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            replay
+                .push_commands_and_iterate(vec![WFCommand::new(
+                    WFCommandVariant::AddLocalActivity(command),
+                )])
+                .unwrap();
+            let replay_resolution = replay.get_next_activation().unwrap();
+            assert_eq!(replay_resolution.jobs, live_resolution.jobs);
         }
 
         #[rstest]
