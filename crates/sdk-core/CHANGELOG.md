@@ -64,6 +64,11 @@ relevant information.
   than itself, such as a sticky task that timed out while it waited for a cache slot. Previously,
   it waited for a history page that Core never fetched.
 
+* A workflow task that reads a history newer than itself, such as a sticky task that timed out
+  while it waited for a cache slot, gives lang every task of that history. Previously, when the
+  last whole task of the history pages that Core had fetched had no commands, Core could lose that
+  task and fail the workflow task with "History is out of order".
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

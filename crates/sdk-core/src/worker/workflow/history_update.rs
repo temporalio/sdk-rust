@@ -867,7 +867,11 @@ fn find_end_index_of_next_wft_seq_chunked(
                         continue;
                     }
                 }
-            } else if !has_last_wft && !saw_command_or_started {
+            } else if has_last_wft {
+                // The slice ends with a task. Either it holds the last task of history, or
+                // `from_events` found this end from the events that it split off.
+                return NextWFTSeqEndIndex::Complete(ix);
+            } else if !saw_command_or_started {
                 // Don't have enough events to look ahead of the WorkflowTaskStarted. Need to fetch
                 // more.
                 continue;
