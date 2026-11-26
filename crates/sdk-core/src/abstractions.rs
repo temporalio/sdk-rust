@@ -11,7 +11,7 @@ use std::{
     },
 };
 use temporalio_common::{telemetry::metrics::TemporalMeter, worker::WorkerDeploymentVersion};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Wraps a [SlotSupplier] and turns successful slot reservations into permit structs, as well
@@ -33,6 +33,10 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     /// we add user-defined cache sizing, that logic will need to live with the supplier and
     /// there will need to be some associated refactoring.
     max_permits: Option<usize>,
+    /// Holds `max_permits` permits. A caller takes one before it asks the supplier for a slot, so
+    /// concurrent callers can't all pass the limit before any of them counts its slot. A caller
+    /// keeps its permit while the supplier blocks.
+    max_permits_sem: Option<Arc<Semaphore>>,
     metrics_ctx: MetricsContext,
     slot_metric_version: Arc<AtomicU64>,
     meter: Option<TemporalMeter>,
@@ -101,6 +105,7 @@ where
             slot_metric_version: Default::default(),
             meter,
             max_permits,
+            max_permits_sem: max_permits.map(|max| Arc::new(Semaphore::new(max))),
             is_sticky_poller: false,
             context_data,
         }
@@ -126,26 +131,26 @@ where
     }
 
     pub(crate) async fn acquire_owned(&self) -> OwnedMeteredSemPermit<SK> {
-        if let Some(max) = self.max_permits {
-            self.extant_permits
-                .1
-                .clone()
-                .wait_for(|&ep| ep < max)
-                .await
-                .expect("Extant permit channel is never closed");
-        }
+        let max_permits_permit = match &self.max_permits_sem {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .expect("Max permits semaphore is never closed"),
+            ),
+            None => None,
+        };
         let res = self.supplier.reserve_slot(self).await;
-        self.build_owned(res)
+        self.build_owned(res, max_permits_permit)
     }
 
     pub(crate) fn try_acquire_owned(&self) -> Result<OwnedMeteredSemPermit<SK>, ()> {
-        if let Some(max) = self.max_permits
-            && *self.extant_permits.1.borrow() >= max
-        {
-            return Err(());
-        }
+        let max_permits_permit = match &self.max_permits_sem {
+            Some(sem) => Some(sem.clone().try_acquire_owned().map_err(|_| ())?),
+            None => None,
+        };
         if let Some(res) = self.supplier.try_reserve_slot(self) {
-            Ok(self.build_owned(res))
+            Ok(self.build_owned(res, max_permits_permit))
         } else {
             Err(())
         }
@@ -155,7 +160,11 @@ where
         self.extant_permits.1.clone()
     }
 
-    fn build_owned(&self, res: SlotSupplierPermit) -> OwnedMeteredSemPermit<SK> {
+    fn build_owned(
+        &self,
+        res: SlotSupplierPermit,
+        max_permits_permit: Option<OwnedSemaphorePermit>,
+    ) -> OwnedMeteredSemPermit<SK> {
         self.unused_claimants.fetch_add(1, Ordering::Release);
         self.extant_permits.0.send_modify(|ep| *ep += 1);
         // Eww
@@ -208,6 +217,7 @@ where
                 drop(std::mem::take(&mut info.permit));
                 mrc()
             }),
+            _max_permits_permit: max_permits_permit,
         }
     }
 }
@@ -400,6 +410,9 @@ pub(crate) struct OwnedMeteredSemPermit<SK: SlotKind> {
     use_fn: Box<dyn Fn(&UseCtx<SK>) + Send + Sync>,
     #[allow(clippy::type_complexity)] // not really tho, bud
     release_fn: Box<dyn Fn(&mut ReleaseCtx<SK>) + Send + Sync>,
+    /// Dropped after `release_fn` returns the slot and lowers the extant count, so a caller woken
+    /// by the limit sees both.
+    _max_permits_permit: Option<OwnedSemaphorePermit>,
 }
 impl<SK: SlotKind> Drop for OwnedMeteredSemPermit<SK> {
     fn drop(&mut self) {
@@ -650,8 +663,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn respects_max_extant_permits() {
-        let mut sem = fixed_size_permit_dealer::<WorkflowSlotKind>(2);
-        sem.max_permits = Some(1);
+        let sem = MeteredPermitDealer::<WorkflowSlotKind>::new(
+            Arc::new(FixedSizeSlotSupplier::new(2)),
+            MetricsContext::no_op(),
+            Some(1),
+            Arc::new(Default::default()),
+            None,
+        );
         let perm = sem.try_acquire_owned().unwrap();
         sem.try_acquire_owned().unwrap_err();
         let acquire_fut = sem.acquire_owned();

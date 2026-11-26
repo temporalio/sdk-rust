@@ -1,1 +1,1 @@
-If a task slot frees up as a Worker starts to shut down, the Worker does not poll for one more task. Before, that poll could take a new task during shutdown and evict a cached Workflow when the cache was full.
+If a task slot frees up as a Worker starts to shut down, the Worker does not poll for one more task. Before, that poll could take a new task during shutdown and evict a cached Workflow when the cache was full. Also, the Worker does not reserve more Workflow task slots than the Workflow cache size.
