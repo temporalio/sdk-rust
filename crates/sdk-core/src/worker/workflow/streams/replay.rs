@@ -518,7 +518,7 @@ mod tests {
     fn marker_event(event_id: i64, data: &StreamReadMarkerData) -> HistoryEvent {
         let marker = MarkerRecordedEventAttributes {
             marker_name: STREAM_READ_MARKER_NAME.to_string(),
-            details: marker_details(data),
+            details: marker_details(data).unwrap(),
             ..Default::default()
         };
         HistoryEvent {

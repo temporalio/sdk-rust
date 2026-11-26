@@ -51,7 +51,9 @@ relevant information.
   Core drops a call that has no result when the Workflow's last command arrives, as it drops a
   Local Activity. If a call is waiting to try again at the task's heartbeat, because a try failed
   with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
-  message starts with `StreamStoreUnavailable:`.
+  message starts with `StreamStoreUnavailable:`. The data of one marker can have at most 1 MiB.
+  An activation whose marker has more fails its task with a message that starts with
+  `StreamMarkerTooLarge:`.
 * [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. A
   read gives one page, which is one answer of the Store, in a `ResolveStreamRead` job. The page has
   the Records that the Store has at once. A read with no Record waits up to its `wait`, but at most
@@ -74,7 +76,8 @@ relevant information.
   Store in an outage for at most `StreamSettings::replay_retry_bound`. So the Retention of a Stream
   must cover the life of each Workflow that reads it and the time in which that Workflow gets
   queries. A replay whose Store lost the Records fails with the new
-  `WorkflowErrorType::StreamReplay`.
+  `WorkflowErrorType::StreamReplay`. A `core_stream_read` marker has the same 1 MiB bound as an
+  append marker.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,

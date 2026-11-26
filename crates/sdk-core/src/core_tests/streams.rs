@@ -460,7 +460,7 @@ fn answer(activation: &WorkflowActivation) -> Option<Command> {
 fn add_stream_marker(t: &mut TestHistoryBuilder, completed: i64, data: &StreamAppendMarkerData) {
     t.add(MarkerRecordedEventAttributes {
         marker_name: STREAM_APPEND_MARKER_NAME.to_string(),
-        details: marker_details(data),
+        details: marker_details(data).unwrap(),
         workflow_task_completed_event_id: completed,
         ..Default::default()
     });
@@ -1253,6 +1253,83 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     // The task that the outage failed sent no completion, so it forced no task.
     assert!(run.sent().is_empty());
     assert!(store.requests().len() > 1, "{:?}", store.requests());
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+/// Returns the bytes of the data of each Stream marker of `completion`.
+fn marker_sizes(completion: &WorkflowTaskCompletion) -> Vec<usize> {
+    (completion.commands.iter())
+        .filter_map(|command| match command.attributes.as_ref() {
+            Some(Attributes::RecordMarkerCommandAttributes(marker))
+                if marker.marker_name == STREAM_APPEND_MARKER_NAME =>
+            {
+                Some(marker.details["data"].payloads[0].data.len())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// The server refuses an event over 2 MB, so the data of one marker can have at most 1 MiB. Each
+// failed append has a Store message of 4 KiB, the most that a marker keeps, so about 247 results
+// fill one marker. Core can give the results in a few activations, so the case over the bound has
+// enough for several markers.
+#[rstest::rstest]
+#[case::under_the_bound(240, false)]
+#[case::over_the_bound(1200, true)]
+#[tokio::test]
+async fn a_stream_marker_over_1_mib_fails_its_task(#[case] streams: u32, #[case] over: bool) {
+    const BOUND: usize = 1024 * 1024;
+    let store = store(&[]).await;
+    let refused = StreamError::invalid_argument("x".repeat(4096));
+    store.fail(Op::Append, refused, usize::MAX);
+    let mut opts = StartOpts::new(&store);
+    opts.fails = usize::from(over);
+    let run = start(history(Duration::from_secs(60)), opts);
+    let mut results = 0;
+    let workflow = |activation: &WorkflowActivation| {
+        let mut commands = vec![];
+        for job in &activation.jobs {
+            match &job.variant {
+                Some(Job::InitializeWorkflow(_)) => {
+                    commands.extend((1..=streams).map(|seq| append(seq, &format!("s{seq}"))));
+                }
+                Some(Job::ResolveStreamAppend(_)) => results += 1,
+                _ => {}
+            }
+        }
+        if results == streams {
+            commands.push(complete());
+        }
+        commands
+    };
+    let driven = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow)).await;
+    driven.expect("The run never ended");
+    let failed = run.failed.lock().clone();
+    let sizes: Vec<usize> = run.sent().iter().flat_map(marker_sizes).collect();
+    if over {
+        let [(cause, message)] = &failed[..] else {
+            panic!("One task fails: {failed:?}");
+        };
+        assert_eq!(
+            *cause,
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+        );
+        let size = (message.strip_prefix("StreamMarkerTooLarge: The data of a Stream marker has "))
+            .and_then(|rest| rest.strip_suffix(&format!(" bytes, more than {BOUND}")))
+            .and_then(|size| size.parse::<usize>().ok());
+        assert!(size.is_some_and(|size| size > BOUND), "{message}");
+        // The task that the marker failed sent no completion.
+        assert_eq!(sizes, Vec::<usize>::new());
+    } else {
+        assert_eq!(failed, []);
+        assert_eq!(results, streams);
+        let entries: usize = (run.sent().iter().flat_map(markers))
+            .map(|marker| marker.appends.len())
+            .sum();
+        assert_eq!(entries, streams as usize);
+        assert!(sizes.iter().all(|size| *size <= BOUND), "{sizes:?}");
+    }
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
