@@ -46,8 +46,9 @@ relevant information.
   the attempt of its Workflow Task. Its result comes back in a `ResolveStreamAppend` job. Each
   activation that gives results records them in a `core_stream_append` marker, with the index of
   the activation, which a replay counts as for a Local Activity result. So a replay doesn't make a
-  Store call. A completion that leaves an append with no result, and has no such marker, records
-  one with no entry, so that a replay with chunking on keeps its task apart from the next one.
+  Store call. In one activation the Stream results go before the Local Activity results. A
+  completion that leaves an append with no result, and has no such marker, records one with no
+  entry, so that a replay with chunking on keeps its task apart from the next one.
   Core drops a call that has no result when the Workflow's last command arrives, as it drops a
   Local Activity. If a call is waiting to try again at the task's heartbeat, because a try failed
   with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
@@ -95,6 +96,15 @@ relevant information.
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
+
+* With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, a workflow that lang fails
+  for nondeterminism during replay now fails once, with lang's failure, and the completion has only
+  that `FailWorkflowExecution` command. Previously, the next event in history could replace that
+  failure with a nondeterminism error from Core, or add a second terminal command after it, which
+  the server refused, so the workflow task timed out and later attempts failed it without failing
+  the workflow. A nondeterminism error that Core finds during replay no longer sends lang's
+  commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
+  command.
 
 ## [0.12.0] - 2026-11-23
 

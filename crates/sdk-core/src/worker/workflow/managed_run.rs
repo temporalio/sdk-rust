@@ -45,7 +45,7 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
+        enums::v1::{CommandType, VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
@@ -570,7 +570,7 @@ impl ManagedRun {
     }
 
     /// Returns true for a completion that fails the Workflow while its replay has Stream Records
-    /// left to read. It's the last one of the run, so it applies no next task and reads none.
+    /// left to read. It's the last one of the run, so it waits for no page.
     fn fails_before_stream_records(&self, is_forced_failure: bool) -> bool {
         let paginator = self.paginator.as_ref();
         is_forced_failure && paginator.is_some_and(ReplayReader::has_unread_in)
@@ -872,7 +872,6 @@ impl ManagedRun {
         }
 
         let mut waits_for_page = false;
-        let fails_before_records = self.fails_before_stream_records(data.is_forced_failure);
         let unread_records = (self.paginator.as_ref()).is_some_and(ReplayReader::has_unread_in);
         // A heartbeat, and a query answer while work is open, force the next task, so they stop no
         // read.
@@ -891,8 +890,12 @@ impl ManagedRun {
                 None => {}
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
-            // or are otherwise broken.
-            if !completion.activation_was_eviction && !self.am_broken && !fails_before_records {
+            // or are otherwise broken. After a forced failure, lang sent none of the commands the
+            // next task's history records, so applying it would fail the workflow again.
+            if !completion.activation_was_eviction
+                && !self.am_broken
+                && !completion.is_forced_failure
+            {
                 self.wfm.apply_next_task_if_ready(unread_records)?;
                 waits_for_page = unread_records
                     && !self.wfm.machines.activation_needed()
@@ -1535,10 +1538,19 @@ impl ManagedRun {
                 (vec![], vec![])
             } else {
                 machines_wft_response.end_stream_calls_of_task(force_new_wft);
-                (
-                    machines_wft_response.commands().collect(),
-                    machines_wft_response.messages(),
-                )
+                let mut commands: Vec<_> = machines_wft_response.commands().collect();
+                // The server already has the replayed task that lang's queued commands came from,
+                // so sending them again would repeat or contradict its history. Core pushes the
+                // forced FailWorkflow after anything lang queued.
+                if data.is_forced_failure
+                    && machines_wft_response.replaying
+                    && let Some(fail_ix) = commands
+                        .iter()
+                        .rposition(|c| c.command_type() == CommandType::FailWorkflowExecution)
+                {
+                    commands = vec![commands.swap_remove(fail_ix)];
+                }
+                (commands, machines_wft_response.messages())
             };
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
