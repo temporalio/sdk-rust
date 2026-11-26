@@ -96,7 +96,8 @@ pub struct StreamRuntimes {
 }
 
 impl StreamRuntimes {
-    /// Creates the runtimes, identified by Store name, with the default settings.
+    /// Creates the runtimes, identified by Store name, with the default settings. Each runtime can
+    /// have only one name.
     pub fn new(runtimes: impl IntoIterator<Item = (String, Arc<StreamRuntime>)>) -> Self {
         Self {
             runtimes: Arc::new(runtimes.into_iter().collect()),
@@ -124,7 +125,7 @@ impl StreamRuntimes {
         self.runtimes.len()
     }
 
-    /// Checks the Store names and the settings.
+    /// Checks the Store names, that each runtime is under one name, and the settings.
     pub(crate) fn check(&self) -> Result<(), String> {
         let longest = self.runtimes.keys().map(String::len).max().unwrap_or(0);
         if longest > MAX_STORE_NAME_BYTES {
@@ -132,6 +133,24 @@ impl StreamRuntimes {
                 "The Store name of a Stream runtime has {longest} bytes, more than \
                  {MAX_STORE_NAME_BYTES}"
             ));
+        }
+        // Core orders the appends of a Stream per Store name, so a runtime under two names could
+        // get two appends to one Stream out of order.
+        let mut runtimes: Vec<_> = self.runtimes.iter().collect();
+        runtimes.sort_unstable_by_key(|(name, _)| *name);
+        let mut first_names = HashMap::with_capacity(runtimes.len());
+        for (name, runtime) in runtimes {
+            if let Some(first) = first_names.insert(Arc::as_ptr(runtime), name) {
+                let first = if first.is_empty() {
+                    "the empty name".to_string()
+                } else {
+                    format!("`{first}`")
+                };
+                return Err(format!(
+                    "The Stream runtime for Store `{name}` is also registered under {first}. \
+                     Register each runtime under one name."
+                ));
+            }
         }
         self.settings.check()
     }
@@ -512,6 +531,40 @@ mod tests {
         assert_eq!(check(&["é".repeat(2049)]), too_long(4098));
         let names = ["x".repeat(4097), "x".repeat(5000), "mem".to_string()];
         assert_eq!(check(&names), too_long(5000));
+    }
+
+    #[test]
+    fn the_check_refuses_one_runtime_under_two_names() {
+        let runtime = || {
+            let store = Arc::new(MemoryStore::default());
+            Arc::new(StreamRuntime::new(store, StoreLimits::default()))
+        };
+        let check = |runtimes: &[(&str, &Arc<StreamRuntime>)]| {
+            let runtimes = runtimes.iter();
+            StreamRuntimes::new(
+                runtimes.map(|&(name, runtime)| (name.to_string(), runtime.clone())),
+            )
+            .check()
+        };
+        let (mem, other) = (runtime(), runtime());
+        assert_eq!(check(&[("", &mem), ("other", &other)]), Ok(()));
+        assert_eq!(
+            check(&[("mem", &mem), ("", &mem), ("other", &other)]),
+            Err(
+                "The Stream runtime for Store `mem` is also registered under the empty name. \
+                 Register each runtime under one name."
+                    .to_string()
+            )
+        );
+        // The names are in order, so the message is the same for each order of the map.
+        assert_eq!(
+            check(&[("c", &mem), ("b", &other), ("a", &mem), ("d", &other)]),
+            Err(
+                "The Stream runtime for Store `c` is also registered under `a`. Register each \
+                 runtime under one name."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
