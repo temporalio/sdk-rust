@@ -95,7 +95,8 @@ where
                 )
                 .await?
                 .into_inner();
-            retrieve_external_payloads(&mut resp, client.data_converter()).await?;
+            let ctx = SerializationContextData::Activity(ActivitySerializationContext::new());
+            retrieve_external_payloads(&mut resp, client.data_converter(), &ctx).await?;
 
             // If resp.outcome.value is None, poll again
             let Some(ActivityExecutionOutcome {
@@ -107,7 +108,6 @@ where
             };
 
             let dc = client.data_converter();
-            let ctx = SerializationContextData::Activity(ActivitySerializationContext::new());
 
             return match outcome {
                 activity_execution_outcome::Value::Result(payloads) => {

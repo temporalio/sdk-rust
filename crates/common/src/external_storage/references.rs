@@ -25,6 +25,8 @@ const REFERENCE_ENCODING: &str = "json/protobuf";
 // Spelled out rather than taken from `prost::Name` so that a proto-side rename fails
 // `reference_message_type_matches_the_proto` instead of silently changing what we put on the wire.
 const REFERENCE_MESSAGE_TYPE: &str = "temporal.api.sdk.v1.ExternalStorageReference";
+const REFERENCE_MARKER_KEY: &str = "__temporal_external_storage_reference";
+const REFERENCE_MARKER_VALUE: &[u8] = b"true";
 
 /// Whether the given payload is a plain external storage reference and so has to be retrieved.
 /// Reads metadata only, so one that needs no retrieval is not touched.
@@ -40,14 +42,36 @@ pub(crate) fn is_plain_reference(payload: &Payload) -> bool {
             == Some(REFERENCE_MESSAGE_TYPE.as_bytes())
 }
 
-/// Fail if any payload in the message is a reference, for a caller with no external storage to
-/// retrieve it with.
+/// Whether the given payload carries the reference marker, which stays readable after a payload
+/// codec has encoded the reference. A marked payload has to be decoded before it can be read as a
+/// reference.
+pub(crate) fn is_marked_reference(payload: &Payload) -> bool {
+    payload
+        .metadata
+        .get(REFERENCE_MARKER_KEY)
+        .map(Vec::as_slice)
+        == Some(REFERENCE_MARKER_VALUE)
+}
+
+/// Mark a payload as a reference, so it can still be found once a payload codec has encoded it.
+pub(crate) fn mark_reference(payload: &mut Payload) {
+    payload.metadata.insert(
+        REFERENCE_MARKER_KEY.to_owned(),
+        REFERENCE_MARKER_VALUE.to_vec(),
+    );
+}
+
+/// Fail if any payload in the message is a reference, plain or marked, for a caller with no
+/// external storage to retrieve it with.
 pub(crate) fn reject_references_in<M: PayloadFieldCollectable + Send>(
     message: &mut M,
 ) -> Result<(), ExternalStorageError> {
-    if transformable_fields(message)
-        .any(|field| field.into_payloads_mut().iter().any(is_plain_reference))
-    {
+    if transformable_fields(message).any(|field| {
+        field
+            .into_payloads_mut()
+            .iter()
+            .any(|payload| is_plain_reference(payload) || is_marked_reference(payload))
+    }) {
         return Err(ExternalStorageError::NotConfigured);
     }
     Ok(())
@@ -238,6 +262,40 @@ mod tests {
             payloads: vec![ordinary],
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_marked_reference_with_no_storage_to_retrieve_it_is_tmprl1105() {
+        let encoded = Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"binary/encrypted".to_vec()),
+                (
+                    REFERENCE_MARKER_KEY.to_owned(),
+                    REFERENCE_MARKER_VALUE.to_vec(),
+                ),
+            ]),
+            data: b"ciphertext".to_vec(),
+            external_payloads: vec![],
+        };
+
+        let err = reject_references_in(&mut Payloads {
+            payloads: vec![encoded],
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, ExternalStorageError::NotConfigured));
+    }
+
+    #[test]
+    fn only_a_true_marker_marks_a_reference() {
+        let marked = |value: &[u8]| Payload {
+            metadata: HashMap::from([(REFERENCE_MARKER_KEY.to_owned(), value.to_vec())]),
+            ..Default::default()
+        };
+
+        assert!(is_marked_reference(&marked(b"true")));
+        assert!(!is_marked_reference(&marked(b"false")));
+        assert!(!is_marked_reference(&Payload::default()));
     }
 
     #[test]

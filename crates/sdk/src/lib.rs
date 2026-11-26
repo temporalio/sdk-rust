@@ -1063,26 +1063,30 @@ async fn encode_workflow_completion(
 ) {
     let run_id = completion.run_id.clone();
     let mut uploads = Vec::new();
+    let context = SerializationContextData::Workflow(WorkflowSerializationContext::new());
     let encoded = async {
-        encode_payloads(
-            completion,
-            data_converter.codec(),
-            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-        )
-        .await?;
+        encode_payloads(completion, data_converter.codec(), &context).await?;
         match &mut completion.status {
             Some(workflow_activation_completion::Status::Successful(success)) => {
                 for command in &mut success.commands {
                     let target = run.and_then(|run| run.for_command(command));
                     uploads.push(
-                        store_external_payloads(command, data_converter, namespace, target).await?,
+                        store_external_payloads(
+                            command,
+                            data_converter,
+                            &context,
+                            namespace,
+                            target,
+                        )
+                        .await?,
                     );
                 }
             }
             Some(workflow_activation_completion::Status::Failed(failed)) => {
                 let target = run.map(RunStoreTargets::current);
                 uploads.push(
-                    store_external_payloads(failed, data_converter, namespace, target).await?,
+                    store_external_payloads(failed, data_converter, &context, namespace, target)
+                        .await?,
                 );
             }
             None => {}
@@ -1144,14 +1148,10 @@ async fn encode_activity_completion(
     namespace: &str,
     target: Option<StoreTarget>,
 ) {
+    let context = SerializationContextData::Activity(ActivitySerializationContext::new());
     let encoded = async {
-        encode_payloads(
-            completion,
-            data_converter.codec(),
-            &SerializationContextData::Activity(ActivitySerializationContext::new()),
-        )
-        .await?;
-        store_external_payloads(completion, data_converter, namespace, target).await?;
+        encode_payloads(completion, data_converter.codec(), &context).await?;
+        store_external_payloads(completion, data_converter, &context, namespace, target).await?;
         Ok::<_, PayloadConversionError>(())
     }
     .await;
@@ -1487,16 +1487,20 @@ impl Worker {
                                     })?,
                                 };
                             let mut download = None;
+                            let context = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
                             let decoded = async {
                                 download = retrieve_external_payloads(
                                     &mut activation,
                                     &common.data_converter,
+                                    &context,
                                 )
                                 .await?;
                                 decode_payloads(
                                     &mut activation,
                                     common.data_converter.codec(),
-                                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                                    &context,
                                 )
                                 .await?;
                                 Ok::<_, PayloadConversionError>(())
@@ -1610,17 +1614,17 @@ impl Worker {
                             }
                             _ => None,
                         };
+                        let context =
+                            SerializationContextData::Activity(ActivitySerializationContext::new());
                         let decoded = async {
-                            retrieve_external_payloads(&mut activity, &common.data_converter)
-                                .await?;
-                            decode_payloads(
+                            retrieve_external_payloads(
                                 &mut activity,
-                                common.data_converter.codec(),
-                                &SerializationContextData::Activity(
-                                    ActivitySerializationContext::new(),
-                                ),
+                                &common.data_converter,
+                                &context,
                             )
                             .await?;
+                            decode_payloads(&mut activity, common.data_converter.codec(), &context)
+                                .await?;
                             Ok::<_, PayloadConversionError>(())
                         }
                         .await;

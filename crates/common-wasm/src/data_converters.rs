@@ -343,6 +343,13 @@ pub enum ExternalStorageError {
          storage is configured to retrieve it"
     )]
     NotConfigured,
+    /// A payload marked as an external storage reference did not decode to one, which usually
+    /// means the payload codec that wrote it is not the one configured to read it.
+    #[error(
+        "[TMPRL1106] Encountered an encoded external storage reference that could not be \
+         decoded. Check that the payload codec used to write it is configured."
+    )]
+    UndecodableReference,
     /// A payload is marked as a reference but its contents cannot be read as one.
     #[error("Invalid external storage reference: {0}")]
     InvalidReference(#[source] Box<dyn std::error::Error + Send + Sync>),
