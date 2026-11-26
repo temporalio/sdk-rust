@@ -425,6 +425,9 @@ for a synchronous result, or use `client.start_workflow`
 to attach the Nexus completion callback to a typed workflow. Nexus polling is enabled only when
 services are registered.
 
+To wrap start and cancel requests across services, register a `NexusOperationInboundInterceptor`
+with `WorkerOptions::nexus_operation_inbound_interceptor`.
+
 Return `nexus_rpc::OperationError::failed(...)` or `OperationError::canceled(...)` through
 `TemporalOperationError` for terminal operation outcomes. Both support `with_source` to preserve an
 application cause and its details. `nexus_rpc::HandlerError` retains its error type, optional cause,

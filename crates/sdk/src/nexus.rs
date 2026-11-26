@@ -43,7 +43,11 @@
 pub use temporalio_macros::{temporal_nexus_service_handler, temporal_operation};
 pub use temporalio_workflow::nexus::*;
 
-use crate::{ApplicationFailure, CommonWorker, OutgoingError, WorkerRunError, panic_formatter};
+use crate::{
+    ApplicationFailure, CommonWorker, OutgoingError, WorkerRunError,
+    interceptors::{InterceptorValue, Next},
+    panic_formatter,
+};
 use base64::{
     Engine,
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig, general_purpose},
@@ -57,8 +61,8 @@ use parking_lot::Mutex;
 use prost::Name;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, future::Future, marker::PhantomData, mem, panic::AssertUnwindSafe,
-    sync::Arc, time::SystemTime,
+    any::Any, collections::HashMap, future::Future, marker::PhantomData, mem,
+    panic::AssertUnwindSafe, sync::Arc, time::SystemTime,
 };
 use temporalio_client::{
     Client, NamespacedClient, Url, WorkflowCancelOptions, WorkflowExecutionInfo,
@@ -440,7 +444,7 @@ impl<S: NexusService> NexusServiceHandler<S> {
         let handler = Arc::new(handler);
         self.operations.insert(
             name,
-            Arc::new(move |context, client, converter| {
+            Arc::new(move |context, client, converter, interceptors| {
                 let handler = handler.clone();
                 async move {
                     let payload = client.request.payload.clone().unwrap_or_default();
@@ -470,18 +474,37 @@ impl<S: NexusService> NexusServiceHandler<S> {
                         )
                         .map_err(TemporalOperationError::input_conversion_error)?;
                     let outbound_links = client.outbound_links.clone();
-                    match handler(context, client, input).await? {
+                    let input = NexusOperationStartInput {
+                        context,
+                        input: Box::new(input),
+                    };
+                    let start = Next::new(move |input: NexusOperationStartInput| {
+                        async move {
+                            let arg = *input.input.downcast::<O::Input>().expect(
+                                "Nexus start input type is set by the operation registration",
+                            );
+                            Ok(match handler(input.context, client, arg).await? {
+                                TemporalOperationResult::Sync(value) => {
+                                    TemporalOperationResult::Sync(
+                                        Box::new(value) as Box<dyn InterceptorValue>
+                                    )
+                                }
+                                TemporalOperationResult::Async(token) => {
+                                    TemporalOperationResult::Async(TemporalOperationToken {
+                                        token: token.token,
+                                        output: PhantomData,
+                                    })
+                                }
+                            })
+                        }
+                        .boxed()
+                    });
+                    match call_start_interceptors(interceptors, input, start).await? {
                         TemporalOperationResult::Sync(output) => {
-                            let payload = converter
-                                .payload_converter()
-                                .to_payload(
-                                    &SerializationContext::new(
-                                        &serialization_context(),
-                                        converter.payload_converter(),
-                                    ),
-                                    &output,
-                                )
-                                .map_err(TemporalOperationError::from)?;
+                            let payload = output.serialize_payload(&SerializationContext::new(
+                                &serialization_context(),
+                                converter.payload_converter(),
+                            ))?;
                             Ok(start_operation_response::Variant::SyncSuccess(
                                 start_operation_response::Sync {
                                     payload: Some(payload),
@@ -550,29 +573,39 @@ impl TemporalOperationError {
     }
 
     fn into_status(self, converter: &DataConverter) -> nexus_task_completion::Status {
+        let error = self.classify();
+        let operation_failure = matches!(error, OutgoingNexusError::Operation(_));
+        let failure = converter.to_failure(
+            &serialization_context(),
+            OutgoingError::Nexus(Box::new(error)),
+        );
+        if operation_failure {
+            start_status(start_operation_response::Variant::Failure(failure))
+        } else {
+            nexus_task_completion::Status::Failure(failure)
+        }
+    }
+
+    fn classify(self) -> OutgoingNexusError {
         match self {
-            Self::Operation(error) => start_status(start_operation_response::Variant::Failure(
-                converter.to_failure(
-                    &serialization_context(),
-                    OutgoingError::Nexus(Box::new(OutgoingNexusError::Operation(error))),
-                ),
-            )),
-            Self::Application(failure) => Self::Unexpected(failure).into_status(converter),
+            Self::Operation(error) => OutgoingNexusError::Operation(error),
+            Self::Handler(error) => OutgoingNexusError::Handler(error),
+            Self::Application(failure) => Self::Unexpected(failure).classify(),
             Self::Unexpected(error) => {
                 let error = match error.downcast::<HandlerError>() {
-                    Ok(handler) => return Self::Handler(*handler).into_status(converter),
+                    Ok(handler) => return OutgoingNexusError::Handler(*handler),
                     Err(error) => error,
                 };
                 let error = match error.downcast::<OperationError>() {
-                    Ok(operation) => return Self::Operation(*operation).into_status(converter),
+                    Ok(operation) => return OutgoingNexusError::Operation(*operation),
                     Err(error) => error,
                 };
                 let error = match error.downcast::<WorkflowStartError>() {
-                    Ok(error) => return Self::from(*error).into_status(converter),
+                    Ok(error) => return Self::from(*error).classify(),
                     Err(error) => error,
                 };
                 let error = match error.downcast::<WorkflowInteractionError>() {
-                    Ok(error) => return Self::from(*error).into_status(converter),
+                    Ok(error) => return Self::from(*error).classify(),
                     Err(error) => error,
                 };
                 let handler = if let Some(app) = error.downcast_ref::<ApplicationFailure>() {
@@ -592,12 +625,8 @@ impl TemporalOperationError {
                 } else {
                     HandlerError::new(HandlerErrorType::Internal, "Internal handler error")
                 };
-                Self::Handler(handler.with_source(error)).into_status(converter)
+                OutgoingNexusError::Handler(handler.with_source(error))
             }
-            Self::Handler(error) => nexus_task_completion::Status::Failure(converter.to_failure(
-                &serialization_context(),
-                OutgoingError::Nexus(Box::new(OutgoingNexusError::Handler(error))),
-            )),
         }
     }
 
@@ -728,8 +757,9 @@ type OperationHandler = Arc<
             NexusContext,
             TemporalNexusClient,
             DataConverter,
+            &[Arc<dyn NexusOperationInboundInterceptor>],
         )
-            -> BoxFuture<'static, Result<start_operation_response::Variant, TemporalOperationError>>
+            -> BoxFuture<'_, Result<start_operation_response::Variant, TemporalOperationError>>
         + Send
         + Sync,
 >;
@@ -737,7 +767,7 @@ type OperationHandler = Arc<
 #[derive(Clone, Default)]
 pub(crate) struct NexusServices {
     operations: HashMap<String, HashMap<String, OperationHandler>>,
-    interceptors: Vec<Arc<dyn NexusHandlerInterceptor>>,
+    interceptors: Vec<Arc<dyn NexusOperationInboundInterceptor>>,
 }
 
 impl std::fmt::Debug for NexusServices {
@@ -753,7 +783,7 @@ impl NexusServices {
         self.operations.is_empty()
     }
 
-    pub(crate) fn interceptor(&mut self, interceptor: Arc<dyn NexusHandlerInterceptor>) {
+    pub(crate) fn interceptor(&mut self, interceptor: Arc<dyn NexusOperationInboundInterceptor>) {
         self.interceptors.push(interceptor);
     }
 
@@ -771,6 +801,21 @@ impl NexusServices {
         }
         self.operations.insert(name.to_owned(), handler.operations);
         Ok(())
+    }
+
+    fn operation(&self, service: &str, operation: &str) -> Result<&OperationHandler, HandlerError> {
+        let operations = self.operations.get(service).ok_or_else(|| {
+            HandlerError::new(
+                HandlerErrorType::NotFound,
+                format!("Unknown Nexus service {service:?}"),
+            )
+        })?;
+        operations.get(operation).ok_or_else(|| {
+            HandlerError::new(
+                HandlerErrorType::NotFound,
+                format!("Unknown Nexus operation {operation:?}"),
+            )
+        })
     }
 }
 
@@ -873,19 +918,8 @@ async fn dispatch(
     })?;
     match request.variant {
         Some(request::Variant::StartOperation(mut start)) => {
-            let service = services.operations.get(&start.service).ok_or_else(|| {
-                HandlerError::new(
-                    HandlerErrorType::NotFound,
-                    format!("Unknown Nexus service {:?}", start.service),
-                )
-            })?;
-            let handler = service.get(&start.operation).ok_or_else(|| {
-                HandlerError::new(
-                    HandlerErrorType::NotFound,
-                    format!("Unknown Nexus operation {:?}", start.operation),
-                )
-            })?;
-            let mut info = NexusInfo {
+            let handler = services.operation(&start.service, &start.operation)?;
+            let info = NexusInfo {
                 headers: request.header,
                 endpoint,
                 service: start.service.clone(),
@@ -894,59 +928,64 @@ async fn dispatch(
                 deadline,
                 cancellation_token: cancellation,
             };
-            for interceptor in &services.interceptors {
-                interceptor.on_start(&mut info).await?;
-            }
             retrieve_external_payloads(&mut start, &converter)
                 .await
                 .map_err(TemporalOperationError::from)?;
-            let result = handler(
-                NexusContext { info: info.clone() },
+            handler(
+                NexusContext { info },
                 TemporalNexusClient {
                     client,
                     request: start,
                     outbound_links: Arc::default(),
                 },
                 converter,
+                &services.interceptors,
             )
-            .await;
-            for interceptor in services.interceptors.iter().rev() {
-                interceptor
-                    .on_finish(&info, result.as_ref().map(|_| ()))
-                    .await;
-            }
-            result.map(start_status)
+            .await
+            .map(start_status)
         }
         Some(request::Variant::CancelOperation(cancel)) => {
-            let service = services.operations.get(&cancel.service).ok_or_else(|| {
-                HandlerError::new(
-                    HandlerErrorType::NotFound,
-                    format!("Unknown Nexus service {:?}", cancel.service),
-                )
-            })?;
-            if !service.contains_key(&cancel.operation) {
-                return Err(HandlerError::new(
-                    HandlerErrorType::NotFound,
-                    format!("Unknown Nexus operation {:?}", cancel.operation),
-                )
-                .into());
-            }
-            let token = WorkflowOperationToken::decode_token(&cancel.operation_token)?;
-            if token.namespace != client.namespace() {
-                return Err(TemporalOperationError::handler(
-                    "BAD_REQUEST",
-                    "Operation token targets a different namespace",
-                    false,
-                ));
-            }
-            WorkflowExecutionInfo::builder()
-                .namespace(token.namespace)
-                .workflow_id(token.workflow_id)
-                .build()
-                .bind_untyped(client)
-                .cancel(WorkflowCancelOptions::default())
+            services.operation(&cancel.service, &cancel.operation)?;
+            let input = NexusOperationCancelInput {
+                headers: request.header,
+                endpoint,
+                service: cancel.service,
+                operation: cancel.operation,
+                operation_token: cancel.operation_token,
+                deadline,
+                cancellation_token: cancellation,
+            };
+            let cancel = Next::new(move |input: NexusOperationCancelInput| {
+                async move {
+                    let token = WorkflowOperationToken::decode_token(input.operation_token())?;
+                    if token.namespace != client.namespace() {
+                        return Err(TemporalOperationError::handler(
+                            "BAD_REQUEST",
+                            "Operation token targets a different namespace",
+                            false,
+                        ));
+                    }
+                    WorkflowExecutionInfo::builder()
+                        .namespace(token.namespace)
+                        .workflow_id(token.workflow_id)
+                        .build()
+                        .bind_untyped(client)
+                        .cancel(WorkflowCancelOptions::default())
+                        .await
+                        .map_err(TemporalOperationError::from)
+                }
+                .boxed()
+            });
+            call_cancel_interceptors(&services.interceptors, input, cancel)
                 .await
-                .map_err(TemporalOperationError::from)?;
+                .map_err(|error| match error.classify() {
+                    OutgoingNexusError::Handler(handler) => handler,
+                    // A cancel response cannot report a terminal operation outcome.
+                    error => {
+                        HandlerError::new(HandlerErrorType::Internal, "Internal handler error")
+                            .with_source(error)
+                    }
+                })?;
             Ok(nexus_task_completion::Status::Completed(proto::Response {
                 variant: Some(response::Variant::CancelOperation(
                     proto::CancelOperationResponse {},
@@ -958,6 +997,36 @@ async fn dispatch(
             "Missing request variant",
             false,
         )),
+    }
+}
+
+fn call_start_interceptors<'a>(
+    interceptors: &'a [Arc<dyn NexusOperationInboundInterceptor>],
+    input: NexusOperationStartInput,
+    next: Next<'a, NexusOperationStartInput, NexusOperationStartOutput<'a>>,
+) -> NexusOperationStartOutput<'a> {
+    if let Some((first, rest)) = interceptors.split_first() {
+        first.start_operation(
+            input,
+            Next::new(move |input| call_start_interceptors(rest, input, next)),
+        )
+    } else {
+        next.run(input)
+    }
+}
+
+fn call_cancel_interceptors<'a>(
+    interceptors: &'a [Arc<dyn NexusOperationInboundInterceptor>],
+    input: NexusOperationCancelInput,
+    next: Next<'a, NexusOperationCancelInput, NexusOperationCancelOutput<'a>>,
+) -> NexusOperationCancelOutput<'a> {
+    if let Some((first, rest)) = interceptors.split_first() {
+        first.cancel_operation(
+            input,
+            Next::new(move |input| call_cancel_interceptors(rest, input, next)),
+        )
+    } else {
+        next.run(input)
     }
 }
 
@@ -1042,19 +1111,96 @@ fn failure_building_completion(error: String) -> nexus_task_completion::Status {
     })
 }
 
-/// Observe handler requests and outcomes, including propagated headers.
-///
-/// Request cancellation drops the handler future and does not invoke `on_finish`. Interceptors
-/// should use drop guards for cleanup that must also happen when a request is canceled.
-#[async_trait::async_trait]
-pub trait NexusHandlerInterceptor: Send + Sync {
-    /// Inspect or update request information before running the handler.
-    async fn on_start(&self, _info: &mut NexusInfo) -> Result<(), TemporalOperationError> {
-        Ok(())
+/// Input to [`NexusOperationInboundInterceptor::start_operation`].
+pub struct NexusOperationStartInput {
+    context: NexusContext,
+    input: Box<dyn Any + Send>,
+}
+
+impl NexusOperationStartInput {
+    /// Information about the start request.
+    pub fn info(&self) -> &NexusInfo {
+        self.context.info()
     }
 
-    /// Observe a completed request. Hooks run in reverse registration order.
-    async fn on_finish(&self, _info: &NexusInfo, _result: Result<(), &TemporalOperationError>) {}
+    /// Mutably access the headers propagated by the Nexus caller.
+    pub fn headers_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.context.info.headers
+    }
+
+    /// Attempt to access the decoded operation input as a concrete type.
+    pub fn input_ref<T: Any>(&self) -> Option<&T> {
+        self.input.downcast_ref()
+    }
+
+    /// Attempt to mutably access the decoded operation input as a concrete type.
+    pub fn input_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.input.downcast_mut()
+    }
+}
+
+/// Start result carried through the interceptor chain, with synchronous output type-erased.
+pub type NexusOperationStartResult = TemporalOperationResult<Box<dyn InterceptorValue>>;
+
+/// Future produced by an inbound Nexus start interceptor.
+pub type NexusOperationStartOutput<'a> =
+    BoxFuture<'a, Result<NexusOperationStartResult, TemporalOperationError>>;
+
+/// Input to [`NexusOperationInboundInterceptor::cancel_operation`].
+#[non_exhaustive]
+pub struct NexusOperationCancelInput {
+    /// Headers propagated by the Nexus caller.
+    pub headers: HashMap<String, String>,
+    /// Endpoint addressed by the caller.
+    pub endpoint: String,
+    /// Nexus service wire name.
+    pub service: String,
+    /// Nexus operation wire name.
+    pub operation: String,
+    /// Deadline of the cancel request, not the lifetime of the operation.
+    pub deadline: Option<SystemTime>,
+    /// Cancellation of the cancel request itself due to its deadline or worker shutdown.
+    pub cancellation_token: CancellationToken,
+    operation_token: String,
+}
+
+impl NexusOperationCancelInput {
+    /// Opaque token that identifies the operation the caller requested to cancel.
+    pub fn operation_token(&self) -> &str {
+        &self.operation_token
+    }
+}
+
+/// Future produced by an inbound Nexus cancel interceptor.
+pub type NexusOperationCancelOutput<'a> = BoxFuture<'a, Result<(), TemporalOperationError>>;
+
+/// Intercept incoming Nexus start and cancel requests.
+///
+/// Interceptors are entered in registration order. Await [`Next::run`] to observe the outcome of
+/// the next interceptor or handler, or return an error without calling it to reject the request.
+///
+/// Cancellation of an in-flight request (for example, on deadline) drops the request future.
+/// Interceptors should use drop guards for cleanup that must also happen in that case.
+#[async_trait::async_trait]
+pub trait NexusOperationInboundInterceptor: Send + Sync + 'static {
+    /// Wrap a Nexus start request. A successful start may complete the operation synchronously
+    /// or acknowledge that it will complete asynchronously.
+    async fn start_operation<'a>(
+        &'a self,
+        input: NexusOperationStartInput,
+        next: Next<'a, NexusOperationStartInput, NexusOperationStartOutput<'a>>,
+    ) -> Result<NexusOperationStartResult, TemporalOperationError> {
+        next.run(input).await
+    }
+
+    /// Wrap an explicit request to cancel a Nexus operation.
+    async fn cancel_operation<'a>(
+        &'a self,
+        input: NexusOperationCancelInput,
+        next: Next<'a, NexusOperationCancelInput, NexusOperationCancelOutput<'a>>,
+    ) -> Result<(), TemporalOperationError> {
+        next.run(input).await
+    }
 }
 
 #[cfg(test)]
@@ -1218,17 +1364,29 @@ mod tests {
     struct HeaderInterceptor;
 
     #[async_trait::async_trait]
-    impl NexusHandlerInterceptor for HeaderInterceptor {
-        async fn on_start(&self, info: &mut NexusInfo) -> Result<(), TemporalOperationError> {
-            assert_eq!(info.headers["caller"], "original");
-            info.headers
+    impl NexusOperationInboundInterceptor for HeaderInterceptor {
+        async fn start_operation<'a>(
+            &'a self,
+            mut input: NexusOperationStartInput,
+            next: Next<'a, NexusOperationStartInput, NexusOperationStartOutput<'a>>,
+        ) -> Result<NexusOperationStartResult, TemporalOperationError> {
+            assert_eq!(input.info().headers["caller"], "original");
+            input
+                .headers_mut()
                 .insert("intercepted".to_owned(), "yes".to_owned());
-            Ok(())
-        }
-
-        async fn on_finish(&self, info: &NexusInfo, result: Result<(), &TemporalOperationError>) {
-            assert_eq!(info.headers["intercepted"], "yes");
-            assert!(result.is_ok());
+            input
+                .input_mut::<String>()
+                .unwrap()
+                .push_str("-intercepted");
+            let result = next.run(input).await?;
+            let TemporalOperationResult::Sync(output) = &result else {
+                panic!("expected synchronous result");
+            };
+            assert_eq!(
+                output.downcast_ref::<String>().unwrap(),
+                "request-id-intercepted"
+            );
+            Ok(result)
         }
     }
 
@@ -1248,7 +1406,7 @@ mod tests {
             assert_eq!(info.endpoint, "payments");
             assert_eq!(info.service, Payments::name());
             assert_eq!(info.operation, "quote");
-            assert_eq!(info.request_id, input);
+            assert_eq!(info.request_id, "request-id");
             assert_eq!(info.deadline, Some(SystemTime::UNIX_EPOCH));
             assert!(!info.cancellation_token.is_cancelled());
             assert_eq!(client.client().namespace(), "test");
@@ -2300,13 +2458,74 @@ mod tests {
         );
     }
 
+    struct CancelInterceptor(Arc<Mutex<Vec<&'static str>>>);
+
+    #[async_trait::async_trait]
+    impl NexusOperationInboundInterceptor for CancelInterceptor {
+        async fn cancel_operation<'a>(
+            &'a self,
+            input: NexusOperationCancelInput,
+            next: Next<'a, NexusOperationCancelInput, NexusOperationCancelOutput<'a>>,
+        ) -> Result<(), TemporalOperationError> {
+            assert_eq!(input.endpoint, "payments");
+            assert_eq!(input.service, Payments::name());
+            assert_eq!(input.operation, "quote");
+            self.0.lock().push("before cancel");
+            match input.headers["cancel-behavior"].as_str() {
+                "allow" => {}
+                "reject" => {
+                    return Err(TemporalOperationError::handler(
+                        "BAD_REQUEST",
+                        "Cancellation rejected by interceptor",
+                        false,
+                    ));
+                }
+                "operation-error" => {
+                    return Err(OperationError::failed("Not a cancel response").into());
+                }
+                behavior => panic!("unexpected cancel behavior {behavior}"),
+            }
+            let result = next.run(input).await;
+            assert!(result.is_err());
+            self.0.lock().push("after cancel");
+            result
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::allow(
+        "allow",
+        "NOT_FOUND",
+        NexusHandlerErrorRetryBehavior::Unspecified,
+        "workflow no longer exists"
+    )]
+    #[case::reject(
+        "reject",
+        "BAD_REQUEST",
+        NexusHandlerErrorRetryBehavior::NonRetryable,
+        "Cancellation rejected by interceptor"
+    )]
+    #[case::operation_error(
+        "operation-error",
+        "INTERNAL",
+        NexusHandlerErrorRetryBehavior::Unspecified,
+        "Internal handler error"
+    )]
     #[tokio::test]
-    async fn canceling_a_missing_workflow_reports_not_found() {
+    async fn cancel_interceptor_can_reject_or_observe_workflow_cancel_rpc(
+        #[case] behavior: &str,
+        #[case] error_type: &str,
+        #[case] retry_behavior: NexusHandlerErrorRetryBehavior,
+        #[case] message: &str,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let rpc_events = events.clone();
         let mut options = ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
             .dns_load_balancing(None)
             .service_override(CallbackBasedGrpcService {
-                callback: Arc::new(|request| {
+                callback: Arc::new(move |request| {
                     assert_eq!(request.rpc, "RequestCancelWorkflowExecution");
+                    rpc_events.lock().push("cancel RPC");
                     async { Err(Status::not_found("workflow no longer exists")) }.boxed()
                 }),
             })
@@ -2319,12 +2538,14 @@ mod tests {
         .unwrap();
         let mut services = NexusServices::default();
         services.register(service()).unwrap();
+        services.interceptor(Arc::new(CancelInterceptor(events.clone())));
         let converter = DataConverter::default();
         let execute = dispatch(
             services,
             client,
             converter.clone(),
             Some(proto::Request {
+                header: [("cancel-behavior".to_owned(), behavior.to_owned())].into(),
                 variant: Some(request::Variant::CancelOperation(
                     proto::CancelOperationRequest {
                         service: Payments::name().to_owned(),
@@ -2346,13 +2567,23 @@ mod tests {
         let nexus_task_completion::Status::Failure(failure) =
             execute_request(execute, &CancellationToken::new(), &converter, "test").await
         else {
-            panic!("missing workflows must not be acknowledged as successfully canceled")
+            panic!("expected a Nexus handler failure");
         };
-        assert!(matches!(failure.failure_info,
-            Some(FailureInfo::NexusHandlerFailureInfo(info)) if info.r#type == "NOT_FOUND"
-                && info.retry_behavior == NexusHandlerErrorRetryBehavior::Unspecified as i32));
-        assert_eq!(failure.message, "workflow no longer exists");
-        assert!(failure.cause.is_some());
+        let Some(FailureInfo::NexusHandlerFailureInfo(info)) = failure.failure_info else {
+            panic!("expected Nexus handler failure info");
+        };
+        assert_eq!(info.r#type, error_type);
+        assert_eq!(info.retry_behavior, retry_behavior as i32);
+        assert_eq!(failure.message, message);
+        if behavior == "allow" {
+            assert_eq!(
+                *events.lock(),
+                ["before cancel", "cancel RPC", "after cancel"]
+            );
+            assert!(failure.cause.is_some());
+        } else {
+            assert_eq!(*events.lock(), ["before cancel"]);
+        }
     }
 
     #[tokio::test]

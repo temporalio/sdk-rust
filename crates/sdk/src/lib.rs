@@ -423,13 +423,13 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         Ok(self)
     }
 
-    /// Observe experimental Nexus handler requests and outcomes.
+    /// Intercept experimental Nexus start and cancel requests.
     #[cfg(feature = "experimental")]
-    pub fn nexus_handler_interceptor(
+    pub fn nexus_operation_inbound_interceptor<I: nexus::NexusOperationInboundInterceptor>(
         mut self,
-        interceptor: Arc<dyn nexus::NexusHandlerInterceptor>,
+        interceptor: I,
     ) -> Self {
-        self.nexus_services.interceptor(interceptor);
+        self.nexus_services.interceptor(Arc::new(interceptor));
         self
     }
 
@@ -612,13 +612,13 @@ impl WorkerOptions {
         self.nexus_services.register(handler)
     }
 
-    /// Observe experimental Nexus handler requests and outcomes.
+    /// Intercept experimental Nexus start and cancel requests.
     #[cfg(feature = "experimental")]
-    pub fn nexus_handler_interceptor(
+    pub fn nexus_operation_inbound_interceptor<I: nexus::NexusOperationInboundInterceptor>(
         &mut self,
-        interceptor: Arc<dyn nexus::NexusHandlerInterceptor>,
+        interceptor: I,
     ) -> &mut Self {
-        self.nexus_services.interceptor(interceptor);
+        self.nexus_services.interceptor(Arc::new(interceptor));
         self
     }
 
