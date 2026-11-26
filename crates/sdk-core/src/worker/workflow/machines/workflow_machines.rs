@@ -523,13 +523,6 @@ impl WorkflowMachines {
         }
     }
 
-    /// Drops each command that waits for its event in history, so that none of them is sent. Only
-    /// for a run about to fail, since the dropped commands' machines are never matched.
-    pub(crate) fn drop_unmatched_commands(&mut self) {
-        self.commands.clear();
-        self.current_wf_task_commands.clear();
-    }
-
     /// Fetches commands which are ready for processing from the state machines, generally to be
     /// sent off to the server. They are not removed from the internal queue, that happens when
     /// corresponding history events from the server are being handled.

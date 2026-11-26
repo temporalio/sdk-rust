@@ -40,7 +40,7 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
+        enums::v1::{CommandType, VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
@@ -679,11 +679,6 @@ impl ManagedRun {
             )
         {
             warn!(failure=?failure, "Failing workflow due to nondeterminism error");
-            // While replaying, the server already has the task that these commands came from, so
-            // sending them again would repeat or contradict its history.
-            if self.wfm.machines.replaying {
-                self.wfm.machines.drop_unmatched_commands();
-            }
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -1290,10 +1285,19 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                (
-                    machines_wft_response.commands().collect(),
-                    machines_wft_response.messages(),
-                )
+                let mut commands: Vec<_> = machines_wft_response.commands().collect();
+                // The server already has the replayed task that lang's queued commands came from,
+                // so sending them again would repeat or contradict its history. Core pushes the
+                // forced FailWorkflow after anything lang queued.
+                if data.is_forced_failure
+                    && machines_wft_response.replaying
+                    && let Some(fail_ix) = commands
+                        .iter()
+                        .rposition(|c| c.command_type() == CommandType::FailWorkflowExecution)
+                {
+                    commands = vec![commands.swap_remove(fail_ix)];
+                }
+                (commands, machines_wft_response.messages())
             };
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
