@@ -43,10 +43,11 @@ relevant information.
   append of client code against them with `StoreLimits::validate_append`.
 * [lang-internal] Workflow code can append to a Stream with the experimental `AppendToStream`
   command, on a Store in `WorkerConfig::stream_runtimes`. A ref with no Store name uses the Store
-  under the empty name there, else the only Store. Core calls the Store, gives the result in a
-  `ResolveStreamAppend` job, and records it in a `core_stream_append` marker, so a replay makes no
-  Store call. A task fails with `StreamStoreUnavailable:` if the Store is still unavailable at the
-  task's heartbeat, and with `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
+  under the empty name there, else the only Store. A Worker with one runtime under two names
+  fails to start. Core calls the Store, gives the result in a `ResolveStreamAppend` job, and
+  records it in a `core_stream_append` marker, so a replay makes no Store call. A task fails with
+  `StreamStoreUnavailable:` if the Store is still unavailable at the task's heartbeat, and with
+  `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,

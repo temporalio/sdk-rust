@@ -289,7 +289,9 @@ pub struct WorkerConfig {
     /// a replay. If there is neither, the task fails. A replay compares the name that it picks
     /// with History. So a change of the runtime that it picks, such as a new runtime under the
     /// empty name or a renamed only runtime, makes the replay of a call with no Store name a
-    /// nondeterminism error. A Store name of more than 4096 bytes fails the start of the Worker.
+    /// nondeterminism error. Give each Store one name, since Core orders the appends of a Stream
+    /// per Store name. A runtime under two names, or a Store name of more than 4096 bytes, fails
+    /// the start of the Worker. Core can't see two runtimes on one Store, so such a Worker starts.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,
