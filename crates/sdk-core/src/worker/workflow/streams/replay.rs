@@ -289,7 +289,7 @@ impl ReplayReader {
                     reader.read_entry(&entry, deadline).await,
                 )
             })
-            .buffer_unordered(self.runtimes.settings.replay_concurrency);
+            .buffer_unordered(self.runtimes.settings.replay_concurrency());
         while let Some((event_id, index, result)) = read.next().await {
             let marker = (reads.reads.get_mut(&event_id)).expect("Each entry has its marker");
             marker[index] = Some(result);
@@ -392,7 +392,7 @@ impl ReplayReader {
             // Once the deadline passed, no try starts, and one in flight stops.
             let answer = match future::select(pin!(deadline.passed()), pin!(read)).await {
                 Either::Left((first_error, _)) => {
-                    let bound = settings.replay_retry_bound;
+                    let bound = settings.replay_retry_bound();
                     return Err(ReplayError::Unavailable(cut(format!(
                         "The Store is unavailable, so the replay can't read {} within {bound:?} \
                          of its first failed try: {first_error}",
@@ -442,7 +442,7 @@ impl ReplayReader {
                 Ok(Err(error)) => error.to_string(),
                 Err(_) => format!("The Store gave no answer in {:?}", settings.try_deadline),
             };
-            let left = deadline.start(settings.replay_retry_bound, error);
+            let left = deadline.start(settings.replay_retry_bound(), error);
             let wait = next_wait(&mut waits);
             tokio::time::sleep(wait.min(left)).await;
         }
@@ -545,7 +545,7 @@ mod tests {
     fn marker_event(event_id: i64, data: &StreamReadMarkerData) -> HistoryEvent {
         let marker = MarkerRecordedEventAttributes {
             marker_name: STREAM_READ_MARKER_NAME.to_string(),
-            details: marker_details(data),
+            details: marker_details(data).unwrap(),
             ..Default::default()
         };
         HistoryEvent {

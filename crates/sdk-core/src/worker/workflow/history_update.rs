@@ -1977,7 +1977,7 @@ mod tests {
         let data = StreamReadMarkerData { reads: vec![read] };
         MarkerRecordedEventAttributes {
             marker_name: STREAM_READ_MARKER_NAME.to_string(),
-            details: marker_details(&data),
+            details: marker_details(&data).unwrap(),
             workflow_task_completed_event_id: completed,
             ..Default::default()
         }

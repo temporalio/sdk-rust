@@ -50,10 +50,10 @@ impl From<CommandSent> for Recorded {
 }
 
 /// Creates the marker command that records `data`, with its machine.
-pub(super) fn stream_marker(data: &PeekedMarker) -> NewMachineWithCommand {
+pub(super) fn stream_marker(data: &PeekedMarker) -> Result<NewMachineWithCommand, WFMachinesError> {
     let (marker_name, details) = match data {
-        PeekedMarker::Append(data) => (STREAM_APPEND_MARKER_NAME, marker_details(data)),
-        PeekedMarker::Read(data) => (STREAM_READ_MARKER_NAME, marker_details(data)),
+        PeekedMarker::Append(data) => (STREAM_APPEND_MARKER_NAME, marker_details(data)?),
+        PeekedMarker::Read(data) => (STREAM_READ_MARKER_NAME, marker_details(data)?),
     };
     let command = RecordMarkerCommandAttributes {
         marker_name: marker_name.to_string(),
@@ -61,10 +61,10 @@ pub(super) fn stream_marker(data: &PeekedMarker) -> NewMachineWithCommand {
         header: None,
         failure: None,
     };
-    NewMachineWithCommand {
+    Ok(NewMachineWithCommand {
         command: command.into(),
         machine: StreamMarkerMachine::from_parts(Created {}.into(), ()).into(),
-    }
+    })
 }
 
 impl WFMachinesAdapter for StreamMarkerMachine {

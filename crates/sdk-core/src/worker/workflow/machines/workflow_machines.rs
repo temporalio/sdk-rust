@@ -1,4 +1,7 @@
+mod activation_index;
 mod local_acts;
+
+pub(crate) use activation_index::HasActivationIndex;
 
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
@@ -192,6 +195,12 @@ pub(crate) struct WorkflowMachines {
 
     /// Contains extra local-activity related data
     local_activity_data: LocalActivityData,
+    /// Position of the next activation within the current WFT. Recorded on markers so replay can
+    /// deliver each resolution in the same activation it was delivered in originally. Counting
+    /// from the start of the WFT keeps activations that leave no trace in history, such as those
+    /// for rejected updates, from shifting the positions of later ones. Local Activity and Stream
+    /// results share it.
+    activation_index: u64,
     /// The Stream calls of the run
     pub(crate) stream_calls: StreamCalls,
 
@@ -351,6 +360,7 @@ impl WorkflowMachines {
             message_outbox: Default::default(),
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
+            activation_index: 0,
             stream_calls,
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
@@ -420,7 +430,7 @@ impl WorkflowMachines {
             }) => {
                 let act_id = CommandID::LocalActivity(seq);
                 let mk = self.get_machine_key(act_id)?;
-                let activation_index = self.local_activity_data.current_activation_index();
+                let activation_index = self.activation_index;
                 let mach = self.machine_mut(mk);
                 if let Machines::LocalActivityMachine(ref mut lam) = *mach {
                     let resps = lam.try_resolve(
@@ -496,7 +506,8 @@ impl WorkflowMachines {
         let Some(data) = marker else {
             return;
         };
-        let marker = self.add_new_command_machine(stream_marker(&data), Default::default());
+        let marker = stream_marker(&data).expect("A marker with no entry is under the bound");
+        let marker = self.add_new_command_machine(marker, Default::default());
         self.machine_is_core_created.insert(marker.machine, ());
         let responses = self
             .machine_mut(marker.machine)
@@ -509,10 +520,10 @@ impl WorkflowMachines {
     /// Returns the index of the next activation of the task, and the one of the next Local
     /// Activity result of History. Stream results count activations with the same index.
     fn result_activations(&self) -> (u64, Option<u64>) {
-        let data = &self.local_activity_data;
+        let next = self.local_activity_data.next_resolution();
         (
-            data.current_activation_index(),
-            data.next_resolution_activation(),
+            self.activation_index,
+            next.and_then(HasActivationIndex::activation),
         )
     }
 
@@ -626,7 +637,8 @@ impl WorkflowMachines {
     ///
     /// The job list may be empty, in which case it is expected the caller handles what to do in a
     /// "no work" situation. Possibly, it may know about some work the machines don't, like queries.
-    pub(crate) fn get_wf_activation(&mut self) -> WorkflowActivation {
+    /// It fails if the Stream marker of the activation is over its size bound.
+    pub(crate) fn get_wf_activation(&mut self) -> Result<WorkflowActivation> {
         let jobs = if self.activation_needed() {
             let mut jobs = self.drive_me.drain_jobs();
             let (activation, marker) = self.result_activations();
@@ -637,7 +649,7 @@ impl WorkflowMachines {
             let appends = self.stream_calls.take_marker().map(PeekedMarker::Append);
             let reads = self.stream_calls.take_read_marker().map(PeekedMarker::Read);
             for data in appends.into_iter().chain(reads) {
-                let marker = stream_marker(&data);
+                let marker = stream_marker(&data)?;
                 self.add_cmd_to_wf_task(marker, Default::default(), CommandIdKind::CoreInternal);
             }
             jobs
@@ -658,7 +670,7 @@ impl WorkflowMachines {
         });
         // Query-only activations are never recorded in history, so replay can't count them.
         if !all_query {
-            self.local_activity_data.activation_dispatched();
+            self.activation_index += 1;
         }
         let is_replaying = self.replaying || all_query;
         // Replayed history may have been produced by a worker that never saw lang flags from one of
@@ -678,7 +690,7 @@ impl WorkflowMachines {
             self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
             self.current_wft_deployment_info.clone()
         };
-        WorkflowActivation {
+        Ok(WorkflowActivation {
             timestamp: self.current_wf_time.map(Into::into),
             is_replaying,
             run_id: self.run_id.clone(),
@@ -696,7 +708,7 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
-        }
+        })
     }
 
     pub(crate) fn activation_needed(&self) -> bool {
@@ -852,7 +864,7 @@ impl WorkflowMachines {
         };
         let num_events_to_process = events.len();
         if num_events_to_process > 0 {
-            self.local_activity_data.wft_applied();
+            self.activation_index = 0;
         }
 
         // Process any WFT completed events in the next sequence, as well as peek ahead to the
@@ -1552,7 +1564,10 @@ impl WorkflowMachines {
                 MachineResponse::RequestCancelLocalActivity(seq) => {
                     // A resolution recorded for a later activation must wait for it, even when lang
                     // cancels the activity during an earlier one.
-                    if self.local_activity_data.has_held_preresolution(seq) {
+                    if self
+                        .local_activity_data
+                        .has_held_preresolution(seq, self.activation_index)
+                    {
                         continue;
                     }
                     // We might already know about the status from a pre-resolution. Apply it if so.
@@ -1574,7 +1589,7 @@ impl WorkflowMachines {
                         self.local_activity_data.remove_from_queue(seq)
                     {
                         // We removed it. Notify the machine that the activity cancelled.
-                        let activation_index = self.local_activity_data.current_activation_index();
+                        let activation_index = self.activation_index;
                         if let Machines::LocalActivityMachine(lam) = self.machine_mut(smk) {
                             let more_responses = lam.try_resolve(
                                 LocalActivityExecutionResult::empty_cancel(),
@@ -1711,7 +1726,7 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::RequestCancelLocalActivity(attrs) => {
-                    let activation_index = self.local_activity_data.current_activation_index();
+                    let activation_index = self.activation_index;
                     cancel_machine!(
                         self,
                         CommandID::LocalActivity(attrs.seq),
@@ -2013,19 +2028,25 @@ impl WorkflowMachines {
             if self.last_history_from_server.chunking_disabled {
                 // Advance to the next marker's activation index without sending an empty activation.
                 // Stop there so resolutions recorded in later activations remain separate.
-                if let Some(seq) = self.local_activity_data.peek_preresolution_seq(true)
-                    && self.get_machine_key(CommandID::LocalActivity(seq)).is_ok()
+                if let Some(next) = self.local_activity_data.next_resolution()
+                    && self
+                        .get_machine_key(CommandID::LocalActivity(next.seq))
+                        .is_ok()
                 {
-                    let stream = self.stream_calls.next_ready_activation();
-                    self.local_activity_data
-                        .advance_to_next_resolution_activation(stream);
+                    // Core stops at a Stream result that the first run gave before this one.
+                    match self.stream_calls.next_ready() {
+                        Some(stream) if stream.is_before(next) => {
+                            stream.advance(&mut self.activation_index)
+                        }
+                        _ => next.advance(&mut self.activation_index),
+                    }
                     self.apply_local_activity_peeked_resolutions(false)?;
                 }
                 // With no Local Activity result to give, Core gives the next Stream result.
                 if !self.activation_needed()
-                    && let Some(stream) = self.stream_calls.next_ready_activation()
+                    && let Some(stream) = self.stream_calls.next_ready()
                 {
-                    self.local_activity_data.advance_to_activation(stream);
+                    stream.advance(&mut self.activation_index);
                 }
             } else {
                 self.apply_local_activity_peeked_resolutions(true)?;
@@ -2044,7 +2065,7 @@ impl WorkflowMachines {
     fn apply_local_activity_peeked_resolutions(&mut self, include_held: bool) -> Result<()> {
         while let Some(seq) = self
             .local_activity_data
-            .peek_preresolution_seq(include_held)
+            .peek_preresolution_seq(include_held, self.activation_index)
         {
             // Core first gives a Stream result that the first run gave in an earlier activation.
             let (_, marker) = self.result_activations();

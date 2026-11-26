@@ -56,6 +56,29 @@ const DEFAULT_PAGE_RECORDS: i32 = 256;
 /// The maximum size of the Records in the page of a read whose command has no `max_bytes`.
 const DEFAULT_PAGE_BYTES: i64 = 4 * 1024 * 1024;
 
+/// How long a check waits for the Store. A check is the one Store call with no wait that a read
+/// gets before a completion stops it, and each read after the read limit. It holds the task, so it
+/// is short.
+const READ_CHECK_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The number of read results after which a Workflow Task starts no new read. A read that runs
+/// still gives its result. A read that the budget keeps back starts when the next task opens, and
+/// Core asks for that task immediately.
+const MAX_TASK_READ_RESULTS: usize = 256;
+
+/// How long a replay goes on trying a Store after its first try of that Store fails, each time it
+/// reads a part of the Records of History. No try or wait goes past that time. The first try can
+/// take `try_deadline` to fail, so the two together must stay under the Workflow Task timeout.
+const REPLAY_RETRY_BOUND: Duration = Duration::from_secs(3);
+
+/// The maximum number of read entries whose Records a replay reads at the same time.
+const REPLAY_CONCURRENCY: usize = 8;
+
+/// The maximum number of runs of the Worker whose replay reads Records at the same time. A run
+/// reads a part of at most 16 MiB of recorded Records at a time, or one marker over that, so the
+/// replay reads of a Worker hold about 64 MiB.
+const REPLAY_READ_RUNS: usize = 4;
+
 /// The share of the time to a deadline that a read uses. The rest leaves room for the answer of a
 /// Store that answers at the end of its wait, before the deadline.
 const READ_WAIT_SHARE: f32 = 0.9;
@@ -87,8 +110,8 @@ impl StreamRuntimes {
 /// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable) or a try with
 /// no answer within `try_deadline`. If an append still waits to try again at the heartbeat of its
 /// Workflow Task, the task fails. So does a read that waits to try again at the read limit, at the
-/// completion or at the heartbeat of its task, and a check that fails. A replay read has
-/// `replay_retry_bound`.
+/// completion or at the heartbeat of its task, and a check that fails. A replay read tries again
+/// for at most 3 s after its first failed try.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the
@@ -98,7 +121,9 @@ pub struct StreamSettings {
     /// The maximum wait between two tries before its random part, 2 s by default.
     pub retry_max_interval: Duration,
     /// How long one try waits for the Store, 5 s by default. A read's try also waits as long as the
-    /// read asks the Store to wait. It must be more than 0.
+    /// read asks the Store to wait. It must be more than 0. A replay tries a Store again for 3 s
+    /// after its first failed try, so that and `try_deadline` together must stay under the
+    /// Workflow Task timeout.
     pub try_deadline: Duration,
     /// How long the reads of a Workflow Task can wait, from the start of the task or the end of its
     /// replay. With `None` it's half the Workflow Task timeout. The read limit is always before the
@@ -106,30 +131,24 @@ pub struct StreamSettings {
     /// read with a wait gives a page with no Record, and a read with no wait goes on, but holds the
     /// task no longer.
     pub read_time: Option<Duration>,
-    /// How long a check waits for the Store, 1 s by default. A check is the one Store call with no
-    /// wait that a read gets before a completion stops it, and each read after the read limit. It
-    /// holds the task, so it must be short. It must be more than 0.
-    pub read_check_deadline: Duration,
-    /// The number of read results after which a Workflow Task starts no new read, 256 by default.
-    /// A read that runs still gives its result. A read that the budget keeps back starts when the
-    /// next task opens, and Core asks for that task at once. It must be 1 or more.
-    pub max_task_read_results: usize,
-    /// How long a replay goes on trying a Store after its first try of that Store fails, each time
-    /// it reads a part of the Records of History, 3 s by default. No try or wait goes past that
-    /// time, and zero is one try. The first try can take `try_deadline` to fail, so the two
-    /// together must stay under the Workflow Task timeout.
-    pub replay_retry_bound: Duration,
-    /// The maximum number of read entries whose Records a replay reads at the same time, 8 by
-    /// default. It must be 1 or more.
-    pub replay_concurrency: usize,
-    /// The maximum number of runs of the Worker whose replay reads Records at the same time, 4 by
-    /// default. A run reads a part of at most 16 MiB of recorded Records at a time, or one marker
-    /// over that, so with the default the replay reads of a Worker hold about 64 MiB. It must be 1
-    /// or more.
-    pub replay_read_runs: usize,
     /// The bound that a test sets in place of [`MAX_TASK_RECORD_BYTES`].
     #[cfg(test)]
     pub(crate) max_task_record_bytes: usize,
+    /// The bound that a test sets in place of [`READ_CHECK_DEADLINE`].
+    #[cfg(test)]
+    pub(crate) read_check_deadline: Duration,
+    /// The bound that a test sets in place of [`MAX_TASK_READ_RESULTS`].
+    #[cfg(test)]
+    pub(crate) max_task_read_results: usize,
+    /// The bound that a test sets in place of [`REPLAY_RETRY_BOUND`]. Zero is one try.
+    #[cfg(test)]
+    pub(crate) replay_retry_bound: Duration,
+    /// The bound that a test sets in place of [`REPLAY_CONCURRENCY`].
+    #[cfg(test)]
+    pub(crate) replay_concurrency: usize,
+    /// The bound that a test sets in place of [`REPLAY_READ_RUNS`].
+    #[cfg(test)]
+    pub(crate) replay_read_runs: usize,
 }
 
 impl Default for StreamSettings {
@@ -139,13 +158,18 @@ impl Default for StreamSettings {
             retry_max_interval: Duration::from_secs(2),
             try_deadline: Duration::from_secs(5),
             read_time: None,
-            read_check_deadline: Duration::from_secs(1),
-            max_task_read_results: 256,
-            replay_retry_bound: Duration::from_secs(3),
-            replay_concurrency: 8,
-            replay_read_runs: 4,
             #[cfg(test)]
             max_task_record_bytes: MAX_TASK_RECORD_BYTES,
+            #[cfg(test)]
+            read_check_deadline: READ_CHECK_DEADLINE,
+            #[cfg(test)]
+            max_task_read_results: MAX_TASK_READ_RESULTS,
+            #[cfg(test)]
+            replay_retry_bound: REPLAY_RETRY_BOUND,
+            #[cfg(test)]
+            replay_concurrency: REPLAY_CONCURRENCY,
+            #[cfg(test)]
+            replay_read_runs: REPLAY_READ_RUNS,
         }
     }
 }
@@ -168,10 +192,6 @@ impl StreamSettings {
                 "read_time",
                 self.read_time.is_some_and(|time| time.is_zero()),
             ),
-            ("read_check_deadline", self.read_check_deadline.is_zero()),
-            ("max_task_read_results", self.max_task_read_results == 0),
-            ("replay_concurrency", self.replay_concurrency == 0),
-            ("replay_read_runs", self.replay_read_runs == 0),
         ];
         if let Some((setting, _)) = zeros.iter().find(|(_, zero)| *zero) {
             return Err(format!(
@@ -196,6 +216,51 @@ impl StreamSettings {
         let max = self.max_task_record_bytes;
         #[cfg(not(test))]
         let max = MAX_REPLAY_PART_BYTES;
+        max
+    }
+
+    /// Returns [`READ_CHECK_DEADLINE`], or the bound that a test set.
+    pub(crate) fn read_check_deadline(&self) -> Duration {
+        #[cfg(test)]
+        let deadline = self.read_check_deadline;
+        #[cfg(not(test))]
+        let deadline = READ_CHECK_DEADLINE;
+        deadline
+    }
+
+    /// Returns [`MAX_TASK_READ_RESULTS`], or the bound that a test set.
+    pub(crate) fn max_task_read_results(&self) -> usize {
+        #[cfg(test)]
+        let max = self.max_task_read_results;
+        #[cfg(not(test))]
+        let max = MAX_TASK_READ_RESULTS;
+        max
+    }
+
+    /// Returns [`REPLAY_RETRY_BOUND`], or the bound that a test set.
+    pub(crate) fn replay_retry_bound(&self) -> Duration {
+        #[cfg(test)]
+        let bound = self.replay_retry_bound;
+        #[cfg(not(test))]
+        let bound = REPLAY_RETRY_BOUND;
+        bound
+    }
+
+    /// Returns [`REPLAY_CONCURRENCY`], or the bound that a test set.
+    pub(crate) fn replay_concurrency(&self) -> usize {
+        #[cfg(test)]
+        let max = self.replay_concurrency;
+        #[cfg(not(test))]
+        let max = REPLAY_CONCURRENCY;
+        max
+    }
+
+    /// Returns [`REPLAY_READ_RUNS`], or the bound that a test set.
+    pub(crate) fn replay_read_runs(&self) -> usize {
+        #[cfg(test)]
+        let max = self.replay_read_runs;
+        #[cfg(not(test))]
+        let max = REPLAY_READ_RUNS;
         max
     }
 }
@@ -445,34 +510,6 @@ mod tests {
                 "read_time",
                 StreamSettings {
                     read_time: Some(Duration::ZERO),
-                    ..settings
-                },
-            ),
-            (
-                "read_check_deadline",
-                StreamSettings {
-                    read_check_deadline: Duration::ZERO,
-                    ..settings
-                },
-            ),
-            (
-                "max_task_read_results",
-                StreamSettings {
-                    max_task_read_results: 0,
-                    ..settings
-                },
-            ),
-            (
-                "replay_concurrency",
-                StreamSettings {
-                    replay_concurrency: 0,
-                    ..settings
-                },
-            ),
-            (
-                "replay_read_runs",
-                StreamSettings {
-                    replay_read_runs: 0,
                     ..settings
                 },
             ),

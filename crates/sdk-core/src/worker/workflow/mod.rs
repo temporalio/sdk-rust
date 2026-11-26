@@ -210,7 +210,7 @@ impl Workflows {
                 .worker_config
                 .stream_runtimes
                 .settings
-                .replay_read_runs,
+                .replay_read_runs(),
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang
@@ -1795,9 +1795,10 @@ pub(crate) enum WFMachinesError {
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
-    /// A Stream call that this Worker can't serve, on a Store with no runtime or in an outage. The
-    /// Workflow Task fails with this message as-is. For an outage it starts with
-    /// `StreamStoreUnavailable:`.
+    /// A Stream call that this Worker can't serve, on a Store with no runtime or in an outage, or a
+    /// Stream marker over its size bound. The Workflow Task fails with this message as-is. For an
+    /// outage it starts with `StreamStoreUnavailable:`, and for a marker with
+    /// `StreamMarkerTooLarge:`.
     #[error("{0}")]
     Stream(String),
     /// A replay whose Store has lost or changed the Records that a read of the first run got.

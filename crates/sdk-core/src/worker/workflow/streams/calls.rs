@@ -9,7 +9,7 @@ use super::{
     read::{After, ReadDone, read_job},
     replay::{ReplayError, needs_records, offset_text},
 };
-use crate::worker::workflow::WFMachinesError;
+use crate::worker::workflow::{WFMachinesError, machines::HasActivationIndex};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt, mem,
@@ -177,6 +177,28 @@ impl Held {
     }
 }
 
+/// A result from History whose call Workflow code issued, with the Records of a read.
+enum Ready {
+    Append(StreamAppendResult),
+    Read(StreamReadResult, Vec<StreamRecord>),
+}
+
+impl Ready {
+    fn entry(&self) -> &dyn HasActivationIndex {
+        match self {
+            Ready::Append(entry) => entry,
+            Ready::Read(entry, _) => entry,
+        }
+    }
+
+    fn job(self) -> workflow_activation_job::Variant {
+        match self {
+            Ready::Append(entry) => append_job(&entry).into(),
+            Ready::Read(entry, records) => read_job(&entry, records).into(),
+        }
+    }
+}
+
 /// The Stream calls of one run. A call is removed from the run once its result is in a marker.
 pub(crate) struct StreamCalls {
     /// The Producer of the run. A write adds the attempt of its Workflow Task.
@@ -208,7 +230,7 @@ pub(crate) struct StreamCalls {
     done: BTreeSet<CallKey>,
     held: Held,
     /// Results from History whose calls Workflow code has issued, by the activation that gets them.
-    ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
+    ready: BTreeMap<(u64, CallKey), Ready>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
     /// The live results of the activation in hand, which its markers record.
@@ -456,9 +478,9 @@ impl StreamCalls {
         while let Some(key) = self.ready.keys().next().copied()
             && self.is_due(&key, activation, marker)
         {
-            let job = self.ready.remove(&key).expect("The key was just read");
+            let ready = self.ready.remove(&key).expect("The key was just read");
             self.leave(key.1);
-            jobs.push(job);
+            jobs.push(ready.job());
         }
         self.released = None;
         if !self.task.is_open() {
@@ -618,7 +640,7 @@ impl StreamCalls {
     fn budget_holds(&self, read: &Read) -> bool {
         matches!(read.state, ReadState::Waiting)
             && !read.checked
-            && self.task_read_results >= self.runtimes.settings.max_task_read_results
+            && self.task_read_results >= self.runtimes.settings.max_task_read_results()
     }
 
     /// Stops each live read that Core knows no result for in the next task, before the task
@@ -757,6 +779,11 @@ impl StreamCalls {
         Ok(())
     }
 
+    /// Returns the first result from History whose call Workflow code issued.
+    pub(crate) fn next_ready(&self) -> Option<&dyn HasActivationIndex> {
+        self.ready.values().next().map(Ready::entry)
+    }
+
     /// Returns the activation of the first result from History whose call Workflow code issued.
     pub(crate) fn next_ready_activation(&self) -> Option<u64> {
         self.ready.keys().next().map(|(at, _)| *at)
@@ -892,7 +919,7 @@ impl StreamCalls {
         }
         append.state = AppendState::Replayed;
         let at = (entry.activation_index, call);
-        self.ready.insert(at, append_job(&entry).into());
+        self.ready.insert(at, Ready::Append(entry));
         Ok(())
     }
 
@@ -921,7 +948,7 @@ impl StreamCalls {
         let records = held.records?;
         read.state = ReadState::Replayed;
         let at = (entry.activation_index, call);
-        self.ready.insert(at, read_job(entry, records).into());
+        self.ready.insert(at, Ready::Read(held.entry, records));
         Ok(())
     }
 

@@ -252,6 +252,74 @@ enum Outage {
     AtACheck,
 }
 
+// A read marker has the same 1 MiB bound as an append marker. Each failed read has a Store message
+// of 4 KiB, so about 247 results fill one marker. The read result budget of the task is raised
+// above the reads of the case over the bound, which has enough for several markers.
+#[rstest::rstest]
+#[case::under_the_bound(240, false)]
+#[case::over_the_bound(1200, true)]
+#[tokio::test]
+async fn a_read_marker_over_1_mib_fails_its_task(#[case] reads: u32, #[case] over: bool) {
+    const BOUND: usize = 1024 * 1024;
+    let store = store(&[]).await;
+    let refused = StreamError::invalid_argument("x".repeat(4096));
+    store.fail(Op::Read, refused, usize::MAX);
+    let mut opts = StartOpts::new(&store);
+    opts.fails = usize::from(over);
+    opts.configure = Box::new(|wc| wc.stream_runtimes.settings.max_task_read_results = 2000);
+    let run = start(history(Duration::from_secs(60)), opts);
+    let mut results = 0;
+    let workflow = |activation: &WorkflowActivation| {
+        let mut commands: Vec<Command> = vec![];
+        for job in &activation.jobs {
+            match &job.variant {
+                Some(Job::InitializeWorkflow(_)) => {
+                    let read = |seq: u32| ReadStream {
+                        seq,
+                        stream: Some(stream(&format!("s{seq}"))),
+                        ..Default::default()
+                    };
+                    commands.extend((1..=reads).map(|seq| read(seq).into()));
+                }
+                Some(Job::ResolveStreamRead(_)) => results += 1,
+                _ => {}
+            }
+        }
+        if results == reads {
+            commands.push(complete());
+        }
+        commands
+    };
+    let driven = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow)).await;
+    driven.expect("The run never ended");
+    let failed = run.failed.lock().clone();
+    let sizes: Vec<usize> = run.sent().iter().flat_map(marker_sizes).collect();
+    if over {
+        let [(cause, message)] = &failed[..] else {
+            panic!("One task fails: {failed:?}");
+        };
+        assert_eq!(
+            *cause,
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+        );
+        let size = (message.strip_prefix("StreamMarkerTooLarge: The data of a Stream marker has "))
+            .and_then(|rest| rest.strip_suffix(&format!(" bytes, more than {BOUND}")))
+            .and_then(|size| size.parse::<usize>().ok());
+        assert!(size.is_some_and(|size| size > BOUND), "{message}");
+        // The task that the marker failed sent no completion.
+        assert_eq!(sizes, Vec::<usize>::new());
+    } else {
+        assert_eq!(failed, []);
+        assert_eq!(results, reads);
+        let entries: usize = (run.sent().iter().flat_map(read_markers))
+            .map(|marker| marker.reads.len())
+            .sum();
+        assert_eq!(entries, reads as usize);
+        assert!(sizes.iter().all(|size| *size <= BOUND), "{sizes:?}");
+    }
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
 // A read outage fails the task as an append outage does, at the read limit and at a check. So
 // Workflow code gets no `StoreUnavailable`, History keeps no failure of the read, and the task
 // asks for no new task.
@@ -2822,8 +2890,8 @@ async fn the_read_limit_counts_from_the_end_of_the_replay() {
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-// The replays of a Worker read their Records from the Stores for at most `replay_read_runs` runs
-// at a time, which bounds the Records that the Worker holds for them.
+// The replays of a Worker read their Records from the Stores for at most `REPLAY_READ_RUNS` runs
+// at a time, which bounds the Records that the Worker holds for them. The test sets other bounds.
 #[rstest::rstest]
 #[case::one_run_at_a_time(1)]
 #[case::two_runs_at_a_time(2)]
