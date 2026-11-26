@@ -1934,7 +1934,7 @@ enum RunAtTheUpdate {
 
 // A live task that only delivers an update has no new events but its own scheduled and started
 // events. The forced fail command is not an update response, so it must not trip Core's check
-// for commands in an update-only activation. The workflow fails once.
+// for commands in an update-only activation. The workflow fails once, with the error found.
 #[rstest]
 #[case::lang_cached(UpdateOnlyNondeterminism::Lang, RunAtTheUpdate::Cached)]
 #[case::core_cached(UpdateOnlyNondeterminism::Core, RunAtTheUpdate::Cached)]
@@ -1988,10 +1988,28 @@ async fn a_nondeterminism_failure_in_an_update_only_task_fails_the_workflow_once
         1,
         "Expected one FailWorkflowExecution. Completions: {sent:?}"
     );
+    let expected_error = match found_by {
+        UpdateOnlyNondeterminism::Lang => "changed",
+        UpdateOnlyNondeterminism::Core => {
+            "[TMPRL1100] Nondeterminism error: Update-only activation produced commands without \
+             accepting an update"
+        }
+    };
     assert_matches!(
         sent.last().map(Vec::as_slice),
-        Some([(CommandType::FailWorkflowExecution, Some(_))]),
-        "Expected the last completion to only fail the workflow. Completions: {sent:?}"
+        Some([(CommandType::FailWorkflowExecution, Some(error))]) if error == expected_error,
+        "Expected the last completion to only fail the workflow with {expected_error:?}. \
+         Completions: {sent:?}"
+    );
+    let activations = activations.into_inner();
+    let expected_activations = match run_at_the_update {
+        RunAtTheUpdate::Cached => 2,
+        RunAtTheUpdate::Cold => 1,
+    };
+    assert_eq!(
+        activations.len(),
+        expected_activations,
+        "Expected lang to get no activation after the one it failed: {activations:?}"
     );
 }
 

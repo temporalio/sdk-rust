@@ -2,6 +2,7 @@ use crate::common::{
     CoreWfStarter, TestWorker, WorkflowHandleExt, activity_functions::StdActivities,
     integ_sdk_config,
 };
+use assert_matches::assert_matches;
 use futures::FutureExt;
 use std::{
     collections::HashSet,
@@ -12,7 +13,9 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
-use temporalio_client::{WorkflowExecuteUpdateOptions, WorkflowStartOptions};
+use temporalio_client::{
+    WorkflowExecuteUpdateOptions, WorkflowStartOptions, errors::WorkflowUpdateError,
+};
 use temporalio_common::{
     UntypedActivity, UntypedWorkflow,
     data_converters::RawValue,
@@ -903,8 +906,8 @@ impl NonSdkFutureInUpdateWf {
     }
 }
 
-/// Set in the process that [`a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once`]
-/// starts, to the task queue of the workflow.
+/// Set to the workflow's task queue in the worker process that
+/// [`a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once`] starts.
 const UPDATE_WORKER_TASK_QUEUE: &str = "UPDATE_WORKER_TASK_QUEUE";
 
 /// Returns a starter for [`NonSdkFutureInUpdateWf`] that fails workflows on nondeterminism and
@@ -1037,6 +1040,11 @@ async fn a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once()
         child.status.success(),
         "Expected the worker to keep running. Exit: {:?}, end: {child_end:?}",
         child.status
+    );
+    assert_matches!(
+        &update,
+        Ok(Err(WorkflowUpdateError::NotFound(status))) if status.message().contains("aborted"),
+        "Expected the failure to abort the update: {update:?}"
     );
     assert_fails_once_with_langs_error(&after_the_restart);
 }
