@@ -662,6 +662,83 @@ pub(crate) mod tests {
         acquire_fut.await;
     }
 
+    /// Yields before it reserves, so a second caller can run while the first is in the supplier.
+    struct YieldingSlotSupplier(FixedSizeSlotSupplier<WorkflowSlotKind>);
+
+    #[async_trait::async_trait]
+    impl SlotSupplier for YieldingSlotSupplier {
+        type SlotKind = WorkflowSlotKind;
+
+        async fn reserve_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
+            tokio::task::yield_now().await;
+            self.0.reserve_slot(ctx).await
+        }
+
+        fn try_reserve_slot(&self, ctx: &dyn SlotReservationContext) -> Option<SlotSupplierPermit> {
+            self.0.try_reserve_slot(ctx)
+        }
+
+        fn mark_slot_used(&self, ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {
+            self.0.mark_slot_used(ctx);
+        }
+
+        fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
+            self.0.release_slot(ctx);
+        }
+
+        fn available_slots(&self) -> Option<usize> {
+            self.0.available_slots()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_acquires_cannot_exceed_max_permits() {
+        let dealer = MeteredPermitDealer::new(
+            Arc::new(YieldingSlotSupplier(FixedSizeSlotSupplier::new(2))),
+            MetricsContext::no_op(),
+            Some(1),
+            Default::default(),
+            None,
+        );
+        let first = dealer.acquire_owned();
+        let second = dealer.acquire_owned();
+        futures_util::pin_mut!(first, second);
+        // Both callers start before either one has its slot from the supplier
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(second.as_mut().now_or_never().is_none());
+        let permit = first.await;
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "second permit was handed out over the limit"
+        );
+        assert_eq!(dealer.num_issued_slots(), 1);
+        drop(permit);
+        second.await;
+    }
+
+    #[test]
+    fn try_acquire_cannot_take_the_slot_of_a_pending_sticky_acquire() {
+        let dealer = MeteredPermitDealer::new(
+            Arc::new(YieldingSlotSupplier(FixedSizeSlotSupplier::new(2))),
+            MetricsContext::no_op(),
+            Some(1),
+            Default::default(),
+            None,
+        );
+        let sticky = dealer.clone().into_sticky();
+        {
+            let pending = sticky.acquire_owned();
+            futures_util::pin_mut!(pending);
+            assert!(pending.as_mut().now_or_never().is_none());
+            assert!(
+                dealer.try_acquire_owned().is_err(),
+                "eager permit was handed out over the limit"
+            );
+        }
+        // The dropped acquire gives its place back
+        let _permit = dealer.try_acquire_owned().unwrap();
+    }
+
     #[test]
     fn captures_slot_supplier_kind() {
         let dealer = fixed_size_permit_dealer::<WorkflowSlotKind>(1);
