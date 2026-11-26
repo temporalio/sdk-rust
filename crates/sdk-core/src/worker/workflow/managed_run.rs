@@ -1253,8 +1253,10 @@ impl ManagedRun {
         // activations and we are caught up on replay. We don't want to complete a wft if we already
         // saw the final event in the workflow, or if we are playing back for the express purpose of
         // fulfilling a query. Eviction only reports output buffered by prior normal activations.
-        let should_respond = !(machines_wft_response.activation_needed
-            || (machines_wft_response.replaying && !data.is_forced_failure)
+        // Lang's reply to a pending job would replace a forced failure, so the failure can't wait.
+        let waits_for_more_activations = !data.is_forced_failure
+            && (machines_wft_response.activation_needed || machines_wft_response.replaying);
+        let should_respond = !(waits_for_more_activations
             || is_query_playback
             || (data.activation_was_eviction && !eviction_has_output)
             || machines_wft_response.have_seen_terminal_event);

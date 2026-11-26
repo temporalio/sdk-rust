@@ -49,6 +49,13 @@ relevant information.
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
 
+* With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, the completion of the
+  activation that lang fails for nondeterminism carries the `FailWorkflowExecution` command, and
+  lang gets only the eviction after it, even when a Local Activity result is still pending.
+  Previously, lang got one more activation, and the completion could have a nondeterminism error
+  from Core in place of lang's failure, or a Local Activity marker and a second
+  `FailWorkflowExecution` command after the first.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

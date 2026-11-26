@@ -1,0 +1,1 @@
+With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, a nondeterminism error that the SDK reports while a local activity result is still pending fails the workflow once, with that error. Before, the workflow could fail with another error, or the completion could have two fail commands.
