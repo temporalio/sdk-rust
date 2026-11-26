@@ -32,7 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 use temporalio_common::protos::{
-    constants::STREAM_APPEND_MARKER_NAME,
+    constants::{STREAM_APPEND_MARKER_NAME, STREAM_READ_MARKER_NAME},
     coresdk::{
         ActivityTaskCompletion, FromJsonPayloadExt,
         activity_result::ActivityExecutionResult,
@@ -1256,12 +1256,13 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-/// Returns the bytes of the data of each Stream marker of `completion`.
+/// Returns the bytes of the data of each Stream marker of `completion`, of either kind.
 fn marker_sizes(completion: &WorkflowTaskCompletion) -> Vec<usize> {
+    let names = [STREAM_APPEND_MARKER_NAME, STREAM_READ_MARKER_NAME];
     (completion.commands.iter())
         .filter_map(|command| match command.attributes.as_ref() {
             Some(Attributes::RecordMarkerCommandAttributes(marker))
-                if marker.marker_name == STREAM_APPEND_MARKER_NAME =>
+                if names.contains(&marker.marker_name.as_str()) =>
             {
                 Some(marker.details["data"].payloads[0].data.len())
             }

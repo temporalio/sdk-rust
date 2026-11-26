@@ -332,32 +332,46 @@ mod tests {
         assert_eq!(peeked_read_marker(&event), Some(Ok(data)));
     }
 
-    // The server refuses an event over 2 MB, so the data of a marker can have at most 1 MiB.
+    // The server refuses an event over 2 MB, so the data of a marker of either kind can have at
+    // most 1 MiB.
     #[test]
     fn a_marker_with_more_than_1_mib_of_data_fails_its_task() {
-        let marker = |message: usize| StreamAppendMarkerData {
+        fn check<T: Serialize>(marker: impl Fn(String) -> T) {
+            let rest = json(&marker(String::new())).data.len();
+            let full = marker("x".repeat(1024 * 1024 - rest));
+            assert_eq!(json(&full).data.len(), 1024 * 1024);
+            assert!(marker_details(&full).is_ok());
+            let over = marker("x".repeat(1024 * 1024 - rest + 1));
+            let error = "StreamMarkerTooLarge: The data of a Stream marker has 1048577 bytes, \
+                         more than 1048576";
+            assert_eq!(
+                marker_details(&over),
+                Err(WFMachinesError::Stream(error.to_string()))
+            );
+        }
+        let failure = |message| StreamFailure {
+            reason: "STREAM_ERROR_REASON_INVALID_ARGUMENT".to_string(),
+            message,
+        };
+        check(|message| StreamAppendMarkerData {
             appends: vec![StreamAppendResult {
                 seq: 1,
                 stream_id: "s".to_string(),
                 store: "redis".to_string(),
                 activation_index: 0,
-                result: Some(stream_append_result::Result::Failure(StreamFailure {
-                    reason: "STREAM_ERROR_REASON_INVALID_ARGUMENT".to_string(),
-                    message: "x".repeat(message),
-                })),
+                result: Some(stream_append_result::Result::Failure(failure(message))),
             }],
-        };
-        let rest = json(&marker(0)).data.len();
-        let full = marker(1024 * 1024 - rest);
-        assert_eq!(json(&full).data.len(), 1024 * 1024);
-        assert!(marker_details(&full).is_ok());
-        let over = marker(1024 * 1024 - rest + 1);
-        let error = "StreamMarkerTooLarge: The data of a Stream marker has 1048577 bytes, more \
-                     than 1048576";
-        assert_eq!(
-            marker_details(&over),
-            Err(WFMachinesError::Stream(error.to_string()))
-        );
+        });
+        check(|message| StreamReadMarkerData {
+            reads: vec![StreamReadResult {
+                seq: 1,
+                stream_id: "s".to_string(),
+                store: "redis".to_string(),
+                activation_index: 0,
+                from_offset: vec![],
+                result: Some(stream_read_result::Result::Failure(failure(message))),
+            }],
+        });
     }
 
     // A marker records a failed call by the name of its reason, and a replay reads that name.
