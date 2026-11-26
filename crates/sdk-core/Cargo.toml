@@ -167,8 +167,10 @@ hyper-util = { version = "0.1", features = [
   "http2",
   "tokio",
 ] }
+lambda_runtime = "1.3"
 nexus-rpc = { workspace = true }
 opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["testing", "trace"] }
 rstest = "0.28"
 semver = "1.0"
@@ -180,6 +182,7 @@ temporalio-sdk = { path = "../sdk", features = [
   "wasm-workflows",
 ] }
 temporalio-common = { path = "../common", version = "~1.3.0", default-features = false }
+temporalio-sdk-aws-lambda = { path = "../sdk-aws-lambda", features = ["otel"] }
 temporalio-workflow = { path = "../workflow", version = "~1.3.0", features = [
   "experimental",
 ] }

@@ -93,6 +93,10 @@ relevant information.
   field for it, so Core reads it from the task token. It's 0 for a local activity, for a standalone
   activity, and for a token that Core can't read.
 
+### Fixed
+* Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
+  matching live execution.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
