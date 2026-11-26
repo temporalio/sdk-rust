@@ -285,8 +285,11 @@ pub struct WorkerConfig {
 
     /// The Stream runtimes of this Worker by Store name, with the settings of its Stream calls. A
     /// Stream call on a Store with no runtime here fails the Workflow Task. A call with no Store
-    /// name uses the only runtime, also in a replay, and fails the task if there are none or
-    /// several.
+    /// name uses the runtime under the empty name if there is one, else the only runtime, also in
+    /// a replay. If there is neither, the task fails. A replay compares the name that it picks
+    /// with History. So a change of the runtime that it picks, such as a new runtime under the
+    /// empty name or a renamed only runtime, makes the replay of a call with no Store name a
+    /// nondeterminism error.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,

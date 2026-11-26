@@ -28,7 +28,7 @@ use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tracing::Span;
 
 /// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
-/// with the settings of its Stream calls.
+/// with the settings of its Stream calls. The runtime under the empty name is the default.
 #[derive(Clone, Debug, Default)]
 pub struct StreamRuntimes {
     runtimes: Arc<HashMap<String, Arc<StreamRuntime>>>,
@@ -49,8 +49,12 @@ impl StreamRuntimes {
         self.runtimes.get(store)
     }
 
-    /// Returns the Store name of the only runtime, which a ref with no Store name uses.
-    pub(crate) fn only_store(&self) -> Option<&str> {
+    /// Returns the Store name that a ref with no Store name uses. That is the empty name if a
+    /// runtime has it, else the name of the only runtime.
+    pub(crate) fn default_store(&self) -> Option<&str> {
+        if self.runtimes.contains_key("") {
+            return Some("");
+        }
         if self.runtimes.len() != 1 {
             return None;
         }

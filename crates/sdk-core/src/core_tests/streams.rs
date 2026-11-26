@@ -787,9 +787,7 @@ async fn an_append_with_no_store_name_runs_on_the_only_runtime_and_replays_on_it
 #[case::no_runtime(0)]
 #[case::two_runtimes(2)]
 #[tokio::test]
-async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_runtime(
-    #[case] count: usize,
-) {
+async fn an_append_with_no_store_name_fails_its_task_with_no_runtime_to_pick(#[case] count: usize) {
     let store = store(&["s"]).await;
     let mut opts = StartOpts::new(&store);
     opts.fails = 1;
@@ -802,8 +800,8 @@ async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_r
     let workflow: Workflow = |_| vec![append_with_no_store_name(1, "s")];
     assert_eq!(run.drive(workflow).await.len(), 1);
     let message = format!(
-        "A Stream call with no Store name needs exactly one Stream runtime, and this Worker has \
-         {count}"
+        "A Stream call with no Store name needs a Stream runtime under the empty name or exactly \
+         one Stream runtime, and this Worker has {count}"
     );
     let failed = run.failed.lock().clone();
     assert_eq!(
@@ -815,6 +813,42 @@ async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_r
     );
     assert!(run.sent().is_empty());
     run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+/// Puts the runtime of the test's Store under the empty name, next to a runtime on another Store.
+fn the_store_under_the_empty_name(wc: &mut WorkerConfig) {
+    let runtime = wc.stream_runtimes.get(STORE).unwrap().clone();
+    let other = StreamRuntime::new(Arc::new(MemoryStore::default()), StoreLimits::default());
+    wc.stream_runtimes = StreamRuntimes::new([
+        (String::new(), runtime),
+        ("other".to_string(), Arc::new(other)),
+    ]);
+}
+
+#[tokio::test]
+async fn an_append_with_no_store_name_runs_on_the_runtime_under_the_empty_name() {
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    opts.configure = the_store_under_the_empty_name;
+    let run = start(history(Duration::from_secs(60)), opts);
+    let nameless: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append_with_no_store_name(1, "s")],
+        _ => vec![complete()],
+    };
+    let live = run.drive(nameless).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(store.records("s").len(), 1);
+    assert_eq!(markers(&run.sent()[0])[0].appends[0].store, "");
+    let writes = store.requests().len();
+    let mut opts = StartOpts::new(&store);
+    opts.replay = true;
+    opts.configure = the_store_under_the_empty_name;
+    let replay = start(run.history.lock().clone(), opts);
+    let (replayed, evicted) = drive_until_evicted(&replay.worker, nameless).await;
+    assert_eq!(evicted, Some(EvictionReason::LangRequested), "{replayed:?}");
+    assert_eq!(replayed, live);
+    replay.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(store.requests().len(), writes);
 }
 
 // The settings are public fields, so a config can change them after the check of its builder.
