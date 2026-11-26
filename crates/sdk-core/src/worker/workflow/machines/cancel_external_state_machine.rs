@@ -1,6 +1,7 @@
 use super::{
     EventInfo, NewMachineWithCommand, OnEventWrapper, StateMachine, TransitionResult,
-    WFMachinesAdapter, WFMachinesError, fsm, workflow_machines::MachineResponse,
+    WFMachinesAdapter, WFMachinesError, fsm,
+    workflow_machines::{MachineKey, MachineResponse},
 };
 use crate::worker::workflow::{fatal, machines::HistEventData, nondeterminism};
 use std::convert::TryFrom;
@@ -44,6 +45,7 @@ fsm! {
 #[derive(Default, Clone)]
 pub(super) struct SharedState {
     seq: u32,
+    child_waiting_for_cancel_request: Option<MachineKey>,
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -59,8 +61,15 @@ pub(super) fn new_external_cancel(
     workflow_execution: NamespacedWorkflowExecution,
     only_child: bool,
     reason: String,
+    child_waiting_for_cancel_request: Option<MachineKey>,
 ) -> NewMachineWithCommand {
-    let mut s = CancelExternalMachine::from_parts(Created {}.into(), SharedState { seq });
+    let mut s = CancelExternalMachine::from_parts(
+        Created {}.into(),
+        SharedState {
+            seq,
+            child_waiting_for_cancel_request,
+        },
+    );
     OnEventWrapper::on_event_mut(&mut s, CancelExternalMachineEvents::Schedule)
         .expect("Scheduling cancel external wf command doesn't fail");
     #[allow(deprecated)]
@@ -175,6 +184,11 @@ impl WFMachinesAdapter for CancelExternalMachine {
         _event_info: Option<EventInfo>,
     ) -> Result<Vec<MachineResponse>, WFMachinesError> {
         Ok(match my_command {
+            CancelExternalCommand::Requested
+                if let Some(child) = self.shared_state.child_waiting_for_cancel_request =>
+            {
+                vec![MachineResponse::ChildWorkflowCancelRequested(child)]
+            }
             CancelExternalCommand::Requested => {
                 vec![
                     ResolveRequestCancelExternalWorkflow {

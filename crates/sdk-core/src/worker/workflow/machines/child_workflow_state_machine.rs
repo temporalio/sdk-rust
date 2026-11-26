@@ -1,6 +1,7 @@
 use super::{
     EventInfo, MachineError, NewMachineWithCommand, OnEventWrapper, StateMachine, TransitionResult,
-    WFMachinesAdapter, WFMachinesError, fsm, workflow_machines::MachineResponse,
+    WFMachinesAdapter, WFMachinesError, fsm, process_machine_commands,
+    workflow_machines::MachineResponse,
 };
 use crate::{
     abstractions::dbg_panic,
@@ -66,6 +67,7 @@ fsm! {
     // while the child start is still in flight.
     StartEventRecorded --(Cancel(String), shared on_cancelled) --> StartEventRecorded;
     StartEventRecorded --(Cancel(String), shared on_cancelled) --> Cancelled;
+    StartEventRecorded --(CancelRequestAcknowledged, shared on_cancel_request_acknowledged) --> Cancelled;
     StartEventRecorded --(CommandRequestCancelExternalWorkflowExecution) --> StartEventRecorded;
 
     Started --(ChildWorkflowExecutionCompleted(Option<Payloads>),
@@ -84,6 +86,7 @@ fsm! {
     Started --(Cancel(String), shared on_cancelled) --> Started;
     // Abandon & try cancel modes may immediately move to cancelled
     Started --(Cancel(String), shared on_cancelled) --> Cancelled;
+    Started --(CancelRequestAcknowledged, on_cancel_request_acknowledged) --> Cancelled;
     Started --(CommandRequestCancelExternalWorkflowExecution) --> Started;
 
     // Ignore any spurious cancellations after resolution
@@ -152,6 +155,11 @@ fn completion_after_non_immediate_cancel_err() -> WFMachinesError {
 }
 
 impl Cancelled {
+    fn ignores_late_outcome(&self, state: &SharedState) -> bool {
+        // Cancellation can resolve the child in lang before its terminal event arrives.
+        !self.seen_cancelled_event || state.resolves_immediately_on_cancel()
+    }
+
     pub(super) fn on_child_workflow_execution_cancelled(
         self,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
@@ -175,7 +183,7 @@ impl Cancelled {
         state: &mut SharedState,
         _: Option<Payloads>,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.resolves_immediately_on_cancel() {
+        if !self.ignores_late_outcome(state) {
             return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
@@ -186,7 +194,7 @@ impl Cancelled {
         state: &mut SharedState,
         _: ChildWorkflowExecutionFailedEventAttributes,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.resolves_immediately_on_cancel() {
+        if !self.ignores_late_outcome(state) {
             return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
@@ -197,7 +205,7 @@ impl Cancelled {
         state: &mut SharedState,
         _: RetryState,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.resolves_immediately_on_cancel() {
+        if !self.ignores_late_outcome(state) {
             return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
@@ -207,7 +215,7 @@ impl Cancelled {
         self,
         state: &mut SharedState,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.resolves_immediately_on_cancel() {
+        if !self.ignores_late_outcome(state) {
             return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
@@ -289,6 +297,15 @@ impl StartCommandCreated {
 pub(super) struct StartEventRecorded {}
 
 impl StartEventRecorded {
+    pub(super) fn on_cancel_request_acknowledged(
+        self,
+        state: &mut SharedState,
+    ) -> ChildWorkflowMachineTransition<Cancelled> {
+        TransitionResult::commands([ChildWorkflowCommand::StartCancel(
+            state.cancellation_failure(),
+        )])
+    }
+
     pub(super) fn on_child_workflow_execution_started(
         self,
         state: &mut SharedState,
@@ -334,6 +351,12 @@ pub(super) struct StartFailed {}
 pub(super) struct Started {}
 
 impl Started {
+    pub(super) fn on_cancel_request_acknowledged(
+        self,
+    ) -> ChildWorkflowMachineTransition<Cancelled> {
+        TransitionResult::commands([ChildWorkflowCommand::Cancel])
+    }
+
     fn on_child_workflow_execution_completed(
         self,
         result: Option<Payloads>,
@@ -451,6 +474,22 @@ pub(super) struct SharedState {
 }
 
 impl SharedState {
+    fn cancellation_failure(&self) -> Failure {
+        Failure {
+            message: "Child Workflow execution cancelled".to_owned(),
+            cause: Some(Box::new(Failure {
+                failure_info: Some(FailureInfo::CanceledFailureInfo(
+                    failure::CanceledFailureInfo {
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            failure_info: failure_info_from_state(self, RetryState::NonRetryableFailure),
+            ..Default::default()
+        }
+    }
+
     fn resolves_immediately_on_cancel(&self) -> bool {
         matches!(
             self.cancel_type,
@@ -492,30 +531,32 @@ impl ChildWorkflowMachine {
     }
 
     fn resolve_cancelled_msg(&self) -> ResolveChildWorkflowExecution {
-        let failure = Failure {
-            message: "Child Workflow execution cancelled".to_owned(),
-            cause: Some(Box::new(Failure {
-                failure_info: Some(FailureInfo::CanceledFailureInfo(
-                    failure::CanceledFailureInfo {
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            })),
-            failure_info: failure_info_from_state(
-                &self.shared_state,
-                RetryState::NonRetryableFailure,
-            ),
-            ..Default::default()
-        };
         ResolveChildWorkflowExecution {
             seq: self.shared_state.lang_sequence_number,
             result: Some(ChildWorkflowResult {
                 status: Some(ChildWorkflowStatus::Cancelled(wfr::Cancellation {
-                    failure: Some(failure),
+                    failure: Some(self.shared_state.cancellation_failure()),
                 })),
             }),
         }
+    }
+
+    pub(super) fn waits_for_cancel_request(&self) -> bool {
+        self.shared_state.cancel_type == ChildWorkflowCancellationType::WaitCancellationRequested
+    }
+
+    pub(super) fn cancel_request_acknowledged(
+        &mut self,
+    ) -> Result<Vec<MachineResponse>, WFMachinesError> {
+        if !matches!(
+            self.state(),
+            ChildWorkflowMachineState::StartEventRecorded(_)
+                | ChildWorkflowMachineState::Started(_)
+        ) {
+            return Ok(vec![]);
+        }
+        let commands = self.on_event_mut(ChildWorkflowMachineEvents::CancelRequestAcknowledged)?;
+        process_machine_commands(self, commands, None)
     }
 
     pub(super) fn cancel(

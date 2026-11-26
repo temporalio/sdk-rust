@@ -48,6 +48,8 @@ relevant information.
   the workflow. A nondeterminism error that Core finds during replay no longer sends lang's
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
+* A Child Workflow with `WAIT_CANCELLATION_REQUESTED` now resolves as canceled when the server
+  acknowledges the cancellation request. Existing histories retain their recorded replay behavior.
 
 ## [0.12.0] - 2026-11-23
 

@@ -1,4 +1,5 @@
 mod activity_tasks;
+mod child_workflows;
 mod event_groups;
 mod local_activity_workflow_task;
 mod nexus_operations;
