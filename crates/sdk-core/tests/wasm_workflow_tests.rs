@@ -29,7 +29,12 @@ use temporalio_common::{
         },
     },
 };
-use temporalio_sdk::{PatchActivationCallback, WasmWorkflowComponent};
+use temporalio_sdk::{
+    PatchActivationCallback, WasmWorkflowComponent,
+    workflow_replayer::{
+        WorkflowReplayError, WorkflowReplayWorkerError, WorkflowReplayer, WorkflowReplayerOptions,
+    },
+};
 use tokio::process::Command;
 
 const WASM_COMPONENT_ID: &str = "hello-workflow-component";
@@ -38,6 +43,27 @@ const WASM_INTERCEPTOR_WORKFLOW_TYPE: &str = "InterceptorWorkflow";
 const WASM_PATCH_ACTIVATION_WORKFLOW_TYPE: &str = "PatchActivationWorkflow";
 const WASM_TASK_FAILURE_WORKFLOW_TYPE: &str = "WasmTaskFailureWorkflow";
 const WASM_PATCH_ID: &str = "wasm-patch-activation";
+
+#[tokio::test]
+async fn workflow_replayer_accepts_wasm_only_registration() {
+    let component_path = build_wasm_hello_component().await;
+    let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
+        .expect("sample WASM component should be loadable");
+    let options = WorkflowReplayerOptions::new()
+        .register_wasm_workflow(component)
+        .build();
+    WorkflowReplayer::new(options).expect("a WASM component should satisfy replay registration");
+}
+
+#[test]
+fn workflow_replayer_rejects_empty_registration() {
+    assert!(matches!(
+        WorkflowReplayer::new(WorkflowReplayerOptions::new().build()),
+        Err(WorkflowReplayError::Worker(
+            WorkflowReplayWorkerError::NoWorkflowsRegistered
+        ))
+    ));
+}
 
 #[tokio::test]
 async fn wasm_workflow_component_executes() {

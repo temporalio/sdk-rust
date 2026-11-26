@@ -355,7 +355,11 @@ impl WorkflowReplayer {
         #[cfg(feature = "experimental")]
         crate::plugins::apply_workflow_replayer_plugins(&mut options)
             .map_err(WorkflowReplayWorkerError::Plugin)?;
-        if options.workflows.is_empty() {
+        let workflows_registered = !options.workflows.is_empty();
+        #[cfg(feature = "wasm-workflows")]
+        let workflows_registered =
+            workflows_registered || !options.wasm_workflow_components.is_empty();
+        if !workflows_registered {
             return Err(WorkflowReplayWorkerError::NoWorkflowsRegistered.into());
         }
         Ok(Self { options })
