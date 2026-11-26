@@ -26,15 +26,19 @@ use temporalio_common::{
             ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task as act_task},
-            common::{extract_local_activity_marker_data, extract_local_activity_marker_details},
+            common::{
+                NamespacedWorkflowExecution, extract_local_activity_marker_data,
+                extract_local_activity_marker_details,
+            },
             workflow_activation::{
                 WorkflowActivation, WorkflowActivationJob, remove_from_cache::EvictionReason,
                 workflow_activation_job,
             },
             workflow_commands::{
                 ActivityCancellationType as ProtoActivityCancellationType,
-                CompleteWorkflowExecution, RequestCancelLocalActivity, ScheduleLocalActivity,
-                workflow_command::Variant,
+                CompleteWorkflowExecution, ModifyWorkflowProperties, RequestCancelLocalActivity,
+                ScheduleLocalActivity, SignalExternalWorkflowExecution,
+                signal_external_workflow_execution, workflow_command::Variant,
             },
             workflow_completion::{
                 self, WorkflowActivationCompletion, workflow_activation_completion,
@@ -42,7 +46,7 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{RecordMarkerCommandAttributes, command},
-            common::v1::{Payload, RetryPolicy},
+            common::v1::{Memo, Payload, RetryPolicy},
             enums::v1::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
@@ -2119,6 +2123,19 @@ fn record_completion(t: &mut TestHistoryBuilder, completion: &WorkflowTaskComple
             command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                 t.add_workflow_execution_completed();
             }
+            command::Attributes::SignalExternalWorkflowExecutionCommandAttributes(signal) => {
+                t.add_signal_wf(
+                    signal.signal_name,
+                    signal.execution.map(|e| e.workflow_id).unwrap_or_default(),
+                    "",
+                );
+            }
+            command::Attributes::ModifyWorkflowPropertiesCommandAttributes(props) => {
+                t.add(history::v1::WorkflowPropertiesModifiedEventAttributes {
+                    workflow_task_completed_event_id: wft_completed_id,
+                    upserted_memo: props.upserted_memo,
+                });
+            }
             unexpected => panic!("Unexpected command: {unexpected:?}"),
         }
     }
@@ -2713,6 +2730,278 @@ async fn legacy_query_before_forced_task_leaves_la_result_held() {
     run.shut_down().await;
 }
 
+/// After a timer, starts a local activity and signals another workflow, then once that signal is
+/// acknowledged records whether the local activity had already finished: a memo if not, a timer if
+/// so. It applies every job in an activation before making that check, so the decision depends on
+/// whether the acknowledgement and the result arrive in the same activation.
+#[derive(Default)]
+struct AckThenLocalActivityWf {
+    acked: bool,
+    la_done: bool,
+    decided_with_la_done: Option<bool>,
+}
+
+impl AckThenLocalActivityWf {
+    fn activate(&mut self, activation: &WorkflowActivation) -> WorkflowActivationCompletion {
+        let mut commands = vec![];
+        for job in &activation.jobs {
+            match job.variant.as_ref().unwrap() {
+                workflow_activation_job::Variant::InitializeWorkflow(_) => {
+                    commands.push(start_timer_cmd(1, Duration::from_secs(1)));
+                }
+                workflow_activation_job::Variant::FireTimer(_) => {
+                    commands.push(schedule_local_activity_cmd(
+                        1,
+                        "1",
+                        ProtoActivityCancellationType::TryCancel,
+                        Duration::from_secs(60),
+                    ));
+                    commands.push(
+                        SignalExternalWorkflowExecution {
+                            seq: 1,
+                            target: Some(
+                                signal_external_workflow_execution::Target::WorkflowExecution(
+                                    NamespacedWorkflowExecution {
+                                        namespace: "default".to_owned(),
+                                        workflow_id: "signal-target".to_owned(),
+                                        run_id: String::new(),
+                                    },
+                                ),
+                            ),
+                            signal_name: "wake".to_owned(),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                }
+                workflow_activation_job::Variant::ResolveSignalExternalWorkflow(_) => {
+                    self.acked = true;
+                }
+                workflow_activation_job::Variant::ResolveActivity(_) => self.la_done = true,
+                unexpected => panic!("Unexpected activation job: {unexpected:?}"),
+            }
+        }
+        if self.acked && self.decided_with_la_done.is_none() {
+            self.decided_with_la_done = Some(self.la_done);
+            commands.push(if self.la_done {
+                start_timer_cmd(2, Duration::from_secs(10))
+            } else {
+                ModifyWorkflowProperties {
+                    upserted_memo: Some(Memo {
+                        fields: HashMap::from([("progress".to_owned(), Payload::default())]),
+                    }),
+                }
+                .into()
+            });
+        }
+        WorkflowActivationCompletion::from_cmds(activation.run_id.clone(), commands)
+    }
+}
+
+/// A legacy query dispatched while a local activity result is held for the forced task can carry
+/// the acknowledgement of a signal the workflow sent. Preparing the query delivers that
+/// acknowledgement to workflow code before the held result, outside any workflow task, while
+/// replay delivers both in one activation. Reusing the run would let the next task commit what the
+/// workflow decided before seeing the result, which replay cannot reproduce.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn legacy_query_acknowledging_signal_with_held_la_result_replays_like_live() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_wfe_started_with_wft_timeout(Duration::from_secs(1));
+    history.add_workflow_task_scheduled_and_started();
+    let (tasks, next_tasks) = mpsc::unbounded_channel();
+    tasks.send(task_with_queries(&history, &[])).unwrap();
+    let (completion_tx, mut completions) = mpsc::unbounded_channel();
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .returning(move |completion, _| {
+            let _ = completion_tx.send(completion);
+            Ok(Default::default())
+        });
+    client
+        .expect_respond_legacy_query()
+        .returning(|_, _| Ok(Default::default()));
+    let mut mock = MocksHolder::from_wft_stream(client, UnboundedReceiverStream::new(next_tasks));
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+    let mut workflow = AckThenLocalActivityWf::default();
+
+    let activation = within("polling", core.poll_workflow_activation())
+        .await
+        .unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(workflow.activate(&activation))
+        .await
+        .unwrap();
+    record_completion(&mut history, &completions.recv().await.unwrap());
+    history.add_timer_fired(history.current_event_id(), "1".to_owned());
+    history.add_workflow_task_scheduled_and_started();
+    tasks.send(task_with_queries(&history, &["q"])).unwrap();
+    let activation = within("polling", core.poll_workflow_activation())
+        .await
+        .unwrap();
+    core.complete_workflow_activation(workflow.activate(&activation))
+        .await
+        .unwrap();
+    let query = within("polling", core.poll_workflow_activation())
+        .await
+        .unwrap();
+    assert_eq!(query_ids(&query), ["q"]);
+    // The local activity finishes while lang answers the attached query, so its result is held for
+    // the task the query completion forces.
+    let local_activity = within("polling", core.poll_activity_task()).await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: local_activity.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        query.run_id,
+        query_ok("q", "answer"),
+    ))
+    .await
+    .unwrap();
+    let completion = completions.recv().await.unwrap();
+    assert!(completion.force_create_new_workflow_task);
+    assert_eq!(
+        command_types(&completion),
+        [CommandType::SignalExternalWorkflowExecution]
+    );
+    record_completion(&mut history, &completion);
+    let initiated_id = history.current_event_id();
+
+    history.add_workflow_task_scheduled();
+    history.add_external_signal_completed(initiated_id);
+    let mut legacy_query = task_with_queries(&history, &[]);
+    legacy_query.query = Some(WorkflowQuery {
+        query_type: "query-type".to_owned(),
+        ..Default::default()
+    });
+    legacy_query.started_event_id = 0;
+    tasks.send(legacy_query).unwrap();
+    let activation = within("polling", core.poll_workflow_activation())
+        .await
+        .unwrap();
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveSignalExternalWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(workflow.activate(&activation))
+        .await
+        .unwrap();
+    assert_eq!(workflow.decided_with_la_done, Some(false));
+    let activation = within("polling", core.poll_workflow_activation())
+        .await
+        .unwrap();
+    assert_eq!(query_ids(&activation), [LEGACY_QUERY_ID]);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        query_ok(LEGACY_QUERY_ID, "answer"),
+    ))
+    .await
+    .unwrap();
+
+    history.add_workflow_task_started();
+    tasks.send(task_with_queries(&history, &[])).unwrap();
+    // Run until the task that records the local activity's marker completes, executing the local
+    // activity again if the held result was dropped.
+    let local_activities = async {
+        loop {
+            let task = core.poll_activity_task().await.unwrap();
+            core.complete_activity_task(ActivityTaskCompletion {
+                task_token: task.task_token,
+                result: Some(ActivityExecutionResult::ok(vec![1].into())),
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let workflow_tasks = async {
+        loop {
+            select! {
+                biased;
+                completion = completions.recv() => {
+                    let completion = completion.unwrap();
+                    record_completion(&mut history, &completion);
+                    if command_types(&completion).contains(&CommandType::RecordMarker) {
+                        return workflow.decided_with_la_done;
+                    }
+                    if completion.force_create_new_workflow_task {
+                        history.add_workflow_task_scheduled_and_started();
+                        tasks.send(task_with_queries(&history, &[])).unwrap();
+                    }
+                }
+                activation = core.poll_workflow_activation() => {
+                    let activation = activation.unwrap();
+                    let completion = if activation.eviction_reason().is_some() {
+                        workflow = AckThenLocalActivityWf::default();
+                        WorkflowActivationCompletion::empty(activation.run_id)
+                    } else {
+                        workflow.activate(&activation)
+                    };
+                    core.complete_workflow_activation(completion).await.unwrap();
+                }
+            }
+        }
+    };
+    let live_decision = within("running the forced task", async {
+        select! {
+            _ = local_activities => unreachable!(),
+            decision = workflow_tasks => decision,
+        }
+    })
+    .await;
+
+    core.request_workflow_eviction(&run_id);
+    let eviction = within("polling", core.poll_workflow_activation())
+        .await
+        .unwrap();
+    assert!(eviction.eviction_reason().is_some());
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    within("shutting down", core.drain_pollers_and_shutdown()).await;
+
+    let events = history.get_full_history_info().unwrap().into_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type() == EventType::MarkerRecorded)
+            .count(),
+        1
+    );
+    let replay = init_core_replay_preloaded(LIVE_RUN_WFID, [HistoryForReplay::from(history)]);
+    let mut workflow = AckThenLocalActivityWf::default();
+    loop {
+        let activation = match within("polling replay", replay.poll_workflow_activation()).await {
+            Ok(activation) => activation,
+            Err(PollError::ShutDown) => break,
+            Err(e) => panic!("Replay poll failed: {e:?}"),
+        };
+        let completion = if let Some(reason) = activation.eviction_reason() {
+            assert_ne!(
+                reason,
+                EvictionReason::Nondeterminism,
+                "Replay diverged from live execution: {activation:?}"
+            );
+            WorkflowActivationCompletion::empty(activation.run_id)
+        } else {
+            workflow.activate(&activation)
+        };
+        within(
+            "completing a replay activation",
+            replay.complete_workflow_activation(completion),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(workflow.decided_with_la_done, live_decision);
+}
+
 /// Evicting a run while it holds a local activity result for the next workflow task drops the
 /// result, so the local activity executes again, once, when the run is replayed. Local activities
 /// run at least once, so this is allowed, and Core logs a warning when it happens.
@@ -3005,46 +3294,51 @@ async fn legacy_query_must_not_execute_local_activity(
     mock.worker_cfg(|wc| wc.max_cached_workflows = usize::from(cached));
     let core = mock_worker(mock);
 
-    let activation = core.poll_workflow_activation().await.unwrap();
-    assert!(activation.is_replaying);
-    assert_matches!(
-        activation.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
-        }]
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-        activation.run_id,
-        schedule_activity_cmd(
-            1,
-            "task-queue",
-            "remote",
-            ProtoActivityCancellationType::TryCancel,
-            Duration::from_secs(60),
-            Duration::ZERO,
-        ),
-    ))
-    .await
-    .unwrap();
-    let activation = core.poll_workflow_activation().await.unwrap();
-    assert!(activation.is_replaying);
-    assert_matches!(
-        activation.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
-        }]
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-        activation.run_id,
-        schedule_local_activity_cmd(
-            2,
-            "local",
-            ProtoActivityCancellationType::TryCancel,
-            Duration::from_secs(60),
-        ),
-    ))
-    .await
-    .unwrap();
+    // Drives the workflow up to scheduling its local activity: a remote activity on start, then the
+    // local one once that resolves. The resolution is replayed only while preparing the query.
+    let run_until_local_activity_scheduled = async |resolution_replaying: bool| {
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert!(activation.is_replaying);
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            activation.run_id,
+            schedule_activity_cmd(
+                1,
+                "task-queue",
+                "remote",
+                ProtoActivityCancellationType::TryCancel,
+                Duration::from_secs(60),
+                Duration::ZERO,
+            ),
+        ))
+        .await
+        .unwrap();
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert_eq!(activation.is_replaying, resolution_replaying);
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            activation.run_id,
+            schedule_local_activity_cmd(
+                2,
+                "local",
+                ProtoActivityCancellationType::TryCancel,
+                Duration::from_secs(60),
+            ),
+        ))
+        .await
+        .unwrap();
+    };
+    run_until_local_activity_scheduled(true).await;
 
     // Dispatch must lose to query handling without relying on a timing window.
     let query_and_eviction = async {
@@ -3099,6 +3393,21 @@ async fn legacy_query_must_not_execute_local_activity(
             .unwrap();
         };
         let finish_workflow = async {
+            // Preparing the query ran workflow code on history no workflow task has committed, so
+            // the run is rebuilt from history before the workflow task is applied.
+            let activation = core.poll_workflow_activation().await.unwrap();
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
+                }]
+            );
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(
+                activation.run_id,
+            ))
+            .await
+            .unwrap();
+            run_until_local_activity_scheduled(false).await;
             let activation = core.poll_workflow_activation().await.unwrap();
             assert!(!activation.is_replaying);
             assert_matches!(

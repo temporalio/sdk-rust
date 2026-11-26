@@ -124,6 +124,12 @@ pub(crate) struct WorkflowMachines {
     /// Legacy queries cannot produce commands, so catching up on their history must not cause any
     /// side effects, like dispatching LA requests.
     preparing_legacy_query: bool,
+    /// Set when preparing a legacy query applied an event that would end replay for a real
+    /// workflow task: a non-command event other than `WorkflowTaskCompleted`, newer than the
+    /// update's `previous_wft_started_id`, in the history's final workflow task. The event is
+    /// already in history, but no workflow task records the activation boundary at which workflow
+    /// code reacts to it, so replay cannot reconstruct that boundary.
+    legacy_query_applied_new_events: bool,
     /// Rejection-only tasks can be discarded, so they must not release LAs waiting on replay.
     update_only_task: bool,
     /// Workflow identifier
@@ -307,6 +313,7 @@ impl WorkflowMachines {
             drive_me: DrivenWorkflow::default(),
             replaying,
             preparing_legacy_query: false,
+            legacy_query_applied_new_events: false,
             update_only_task: false,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
@@ -363,6 +370,7 @@ impl WorkflowMachines {
         }
         self.protocol_msgs = protocol_messages;
         self.preparing_legacy_query = preparing_legacy_query;
+        self.legacy_query_applied_new_events = false;
         self.update_only_task = false;
         self.new_history_from_server(update)?;
         Ok(())
@@ -507,6 +515,10 @@ impl WorkflowMachines {
         if self.failed_wft_started_ids.len() > MAX_FAILED_WFTS {
             self.failed_wft_started_ids.pop_first();
         }
+    }
+
+    pub(crate) fn legacy_query_applied_new_events(&self) -> bool {
+        self.legacy_query_applied_new_events
     }
 
     pub(crate) fn history_size_bytes(&self) -> u64 {
@@ -845,13 +857,14 @@ impl WorkflowMachines {
             // event, because that will typically show up as the first event in an incremental
             // history, and we want to ignore it and its associated commands since we "produced"
             // them.
-            if self.replaying
-                && !self.preparing_legacy_query
-                && has_final_event
+            let is_new_event = has_final_event
                 && eid > self.last_history_from_server.previous_wft_started_id
                 && event.event_type() != EventType::WorkflowTaskCompleted
-                && !event.is_command_event()
-            {
+                && !event.is_command_event();
+            if self.preparing_legacy_query && is_new_event {
+                self.legacy_query_applied_new_events = true;
+            }
+            if self.replaying && !self.preparing_legacy_query && is_new_event {
                 // Replay is finished
                 self.replaying = false;
             }

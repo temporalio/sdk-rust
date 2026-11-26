@@ -91,6 +91,11 @@ pub(super) struct ManagedRun {
     task_buffer: BufferedTasks,
     /// Is set if an eviction has been requested for this run
     trying_to_evict: Option<RequestEvictMsg>,
+    /// Set as soon as a normal (non-query) activation is issued to lang during the preparation of a
+    /// legacy query that applied new events, without waiting for lang to complete it. No workflow
+    /// task records that activation boundary, so replay cannot reconstruct it, and the next
+    /// workflow task must go to a run rebuilt from history. Stays set until this run is evicted.
+    legacy_query_ran_workflow_code: bool,
 
     /// We track if we have recorded useful debugging values onto a certain span yet, to overcome
     /// duplicating field values. Remove this once https://github.com/tokio-rs/tracing/issues/2334
@@ -120,6 +125,7 @@ impl ManagedRun {
             activation: None,
             task_buffer: Default::default(),
             trying_to_evict: None,
+            legacy_query_ran_workflow_code: false,
             recorded_span_ids: Default::default(),
             metrics,
             paginator: None,
@@ -179,6 +185,24 @@ impl ManagedRun {
     ) -> Result<Option<ActivationOrAuto>, RunUpdateErr> {
         if self.wft.is_some() {
             dbg_panic!("Trying to send a new WFT for a run which already has one!");
+        }
+        // Lang already handled work from a legacy query's preparation in activations that no
+        // workflow task recorded. Applying this task on top of them could commit commands from an
+        // activation boundary replay cannot reconstruct, so the task waits for a run rebuilt from
+        // history.
+        if self.legacy_query_ran_workflow_code && pwft.work.legacy_query.is_none() {
+            self.task_buffer.buffer(pwft);
+            if self.trying_to_evict.is_none() {
+                self.trying_to_evict = Some(RequestEvictMsg {
+                    run_id: self.run_id().to_string(),
+                    message: "Legacy query ran workflow code on history no workflow task has \
+                              committed"
+                        .to_string(),
+                    reason: EvictionReason::Unspecified,
+                    auto_reply_fail: None,
+                });
+            }
+            return Ok(None);
         }
         let start_time = Instant::now();
 
@@ -1215,6 +1239,12 @@ impl ManagedRun {
                 OutstandingActivation::Autocomplete
             }
         };
+        if matches!(act_type, OutstandingActivation::Normal)
+            && self.pending_work_is_legacy_query()
+            && self.wfm.machines.legacy_query_applied_new_events()
+        {
+            self.legacy_query_ran_workflow_code = true;
+        }
         if let Some(old_act) = self.activation {
             // This is a panic because we have screwed up core logic if this is violated. It must be
             // upheld.

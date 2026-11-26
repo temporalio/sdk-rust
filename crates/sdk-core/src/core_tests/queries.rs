@@ -22,6 +22,7 @@ use std::{
 };
 use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::protos::{
+    TaskToken,
     coresdk::{
         workflow_activation::{
             WorkflowActivationJob, remove_from_cache::EvictionReason, workflow_activation_job,
@@ -1111,35 +1112,36 @@ async fn queries_arent_lost_in_buffer_void(#[values(false, true)] buffered_becau
         vec![]
     };
 
+    let legacy_query = |query_type: &str| {
+        let mut pr = hist_to_poll_resp(&t, wfid.to_owned(), 1.into());
+        pr.query = Some(WorkflowQuery {
+            query_type: query_type.to_string(),
+            ..Default::default()
+        });
+        pr.started_event_id = 0;
+        pr
+    };
+    let (query_1, query_2) = (legacy_query("1"), legacy_query("2"));
+    let query_tokens = [&query_1, &query_2].map(|q| TaskToken::from(q.resp.task_token.clone()));
     tasks.extend([
         hist_to_poll_resp(&t, wfid.to_owned(), 1.into()),
-        {
-            let mut pr = hist_to_poll_resp(&t, wfid.to_owned(), 1.into());
-            pr.query = Some(WorkflowQuery {
-                query_type: "1".to_string(),
-                ..Default::default()
-            });
-            pr.started_event_id = 0;
-            pr
-        },
-        {
-            let mut pr = hist_to_poll_resp(&t, wfid.to_owned(), 1.into());
-            pr.query = Some(WorkflowQuery {
-                query_type: "2".to_string(),
-                ..Default::default()
-            });
-            pr.started_event_id = 0;
-            pr
-        },
+        query_1,
+        query_2,
         hist_to_poll_resp(&t, wfid.to_owned(), 2.into()),
     ]);
 
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .returning(|_, _| Ok(Default::default()));
-    mock.expect_respond_legacy_query()
-        .times(2)
-        .returning(|_, _| Ok(Default::default()));
+    // Each query task is answered successfully exactly once.
+    for token in query_tokens {
+        mock.expect_respond_legacy_query()
+            .withf(move |task_token, result| {
+                *task_token == token && matches!(result, LegacyQueryResult::Succeeded(_))
+            })
+            .times(1)
+            .returning(|_, _| Ok(Default::default()));
+    }
     let mut mock =
         MocksHolder::from_wft_stream(mock, stream::iter(tasks.into_iter().map(|r| r.resp)));
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
@@ -1165,16 +1167,57 @@ async fn queries_arent_lost_in_buffer_void(#[values(false, true)] buffered_becau
     }
 
     let task = core.poll_workflow_activation().await.unwrap();
+    let run_id = task.run_id.clone();
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
         .await
         .unwrap();
 
-    let task = core.poll_workflow_activation().await.unwrap();
+    // When the cache was full, a legacy query can create the run and initialize the workflow on
+    // history whose task has not completed. A real task is then applied to a rebuilt run: one
+    // eviction for that reason, then the initialization replayed. That may happen once after each
+    // query, and nowhere else.
+    let next_activation = async |rebuild_allowed: bool| {
+        let task = core.poll_workflow_activation().await.unwrap();
+        assert_eq!(task.run_id, run_id);
+        let rebuilding = matches!(
+            task.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(r)),
+            }] if r.message.starts_with("Legacy query ran workflow code")
+        );
+        if !rebuilding {
+            return task;
+        }
+        assert!(
+            buffered_because_cache && rebuild_allowed,
+            "Unexpected rebuild: {task:?}"
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+            .await
+            .unwrap();
+        let task = core.poll_workflow_activation().await.unwrap();
+        assert_eq!(task.run_id, run_id);
+        assert!(task.is_replaying);
+        assert_matches!(
+            task.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+            .await
+            .unwrap();
+        let task = core.poll_workflow_activation().await.unwrap();
+        assert_eq!(task.run_id, run_id);
+        task
+    };
+
+    let task = next_activation(false).await;
     assert_matches!(
         task.jobs.as_slice(),
         [WorkflowActivationJob {
             variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
-        }] => q.query_type == "1"
+        }] if q.query_type == "1"
     );
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
@@ -1183,12 +1226,12 @@ async fn queries_arent_lost_in_buffer_void(#[values(false, true)] buffered_becau
     .await
     .unwrap();
 
-    let task = core.poll_workflow_activation().await.unwrap();
+    let task = next_activation(true).await;
     assert_matches!(
         task.jobs.as_slice(),
         [WorkflowActivationJob {
             variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
-        }] => q.query_type == "2"
+        }] if q.query_type == "2"
     );
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
@@ -1197,7 +1240,7 @@ async fn queries_arent_lost_in_buffer_void(#[values(false, true)] buffered_becau
     .await
     .unwrap();
 
-    let task = core.poll_workflow_activation().await.unwrap();
+    let task = next_activation(true).await;
     assert_matches!(
         task.jobs.as_slice(),
         [WorkflowActivationJob {
