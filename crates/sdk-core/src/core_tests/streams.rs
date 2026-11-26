@@ -851,6 +851,18 @@ async fn an_append_with_no_store_name_runs_on_the_runtime_under_the_empty_name()
     assert_eq!(store.requests().len(), writes);
 }
 
+/// Starts a Worker, or a replay Worker, on `config`.
+fn start_worker(config: WorkerConfig, replay: bool) -> Result<(), String> {
+    let started = if replay {
+        let histories = stream::empty::<HistoryForReplay>();
+        init_replay_worker(ReplayWorkerInput::new(config, histories)).map(drop)
+    } else {
+        let client = Arc::new(mock_worker_client());
+        Worker::new(config, None, client, None, None, None).map(drop)
+    };
+    started.map_err(|error| error.to_string())
+}
+
 // The settings are public fields, so a config can change them after the check of its builder.
 #[rstest::rstest]
 #[case::worker(false)]
@@ -859,16 +871,39 @@ async fn an_append_with_no_store_name_runs_on_the_runtime_under_the_empty_name()
 async fn stream_settings_out_of_bounds_fail_the_start_of_a_worker(#[case] replay: bool) {
     let mut config = test_worker_cfg().build().unwrap();
     config.stream_runtimes.settings.try_deadline = Duration::ZERO;
-    let started = if replay {
-        let histories = stream::empty::<HistoryForReplay>();
-        init_replay_worker(ReplayWorkerInput::new(config, histories)).map(drop)
-    } else {
-        let client = Arc::new(mock_worker_client());
-        Worker::new(config, None, client, None, None, None).map(drop)
-    };
     assert_eq!(
-        started.map_err(|error| error.to_string()),
+        start_worker(config, replay),
         Err("The Stream setting `try_deadline` must be more than 0".to_string())
+    );
+}
+
+#[rstest::rstest]
+#[case::worker(false)]
+#[case::replay_worker(true)]
+#[tokio::test]
+async fn a_store_name_over_4096_bytes_fails_the_start_of_a_worker(#[case] replay: bool) {
+    let with_store = |name: &str| {
+        let mut config = test_worker_cfg().build().unwrap();
+        config.stream_runtimes = runtimes_of(&[STORE, name]);
+        config
+    };
+    assert_eq!(start_worker(with_store(&"x".repeat(4096)), replay), Ok(()));
+    assert_eq!(
+        start_worker(with_store(&"x".repeat(4097)), replay),
+        Err("The Store name of a Stream runtime has 4097 bytes, more than 4096".to_string())
+    );
+}
+
+#[test]
+fn a_store_name_over_4096_bytes_fails_the_build_of_a_worker_config() {
+    let build = |name: &str| {
+        let config = test_worker_cfg().stream_runtimes(runtimes_of(&[name]));
+        config.build().map(drop)
+    };
+    assert_eq!(build(&"x".repeat(4096)), Ok(()));
+    assert_eq!(
+        build(&"x".repeat(4097)),
+        Err("The Store name of a Stream runtime has 4097 bytes, more than 4096".to_string())
     );
 }
 

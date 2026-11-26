@@ -27,6 +27,10 @@ use temporalio_streams::StreamRuntime;
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender};
 use tracing::Span;
 
+/// A marker records the Store name of each call, so a longer name fails the Workflow Task, and a
+/// runtime with a longer name fails the start of its Worker.
+const MAX_STORE_NAME_BYTES: usize = 4096;
+
 /// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
 /// with the settings of its Stream calls. The runtime under the empty name is the default.
 #[derive(Clone, Debug, Default)]
@@ -63,6 +67,18 @@ impl StreamRuntimes {
 
     pub(crate) fn count(&self) -> usize {
         self.runtimes.len()
+    }
+
+    /// Checks the Store names and the settings.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let longest = self.runtimes.keys().map(String::len).max().unwrap_or(0);
+        if longest > MAX_STORE_NAME_BYTES {
+            return Err(format!(
+                "The Store name of a Stream runtime has {longest} bytes, more than \
+                 {MAX_STORE_NAME_BYTES}"
+            ));
+        }
+        self.settings.check()
     }
 }
 
@@ -229,6 +245,30 @@ pub(super) fn task_attempt(info: &WorkflowTaskInfo) -> WorkflowTaskAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_help::stream_store::MemoryStore;
+    use temporalio_streams::record::StoreLimits;
+
+    #[test]
+    fn the_check_refuses_a_store_name_over_4096_bytes() {
+        let check = |names: &[String]| {
+            let runtimes = StreamRuntimes::new(names.iter().map(|name| {
+                let store = Arc::new(MemoryStore::default());
+                let runtime = StreamRuntime::new(store, StoreLimits::default());
+                (name.clone(), Arc::new(runtime))
+            }));
+            runtimes.check()
+        };
+        let too_long = |bytes: usize| {
+            Err(format!(
+                "The Store name of a Stream runtime has {bytes} bytes, more than 4096"
+            ))
+        };
+        assert_eq!(check(&["x".repeat(4096), String::new()]), Ok(()));
+        // The bound is in bytes, as in a marker, so 2049 two-byte characters are over it.
+        assert_eq!(check(&["é".repeat(2049)]), too_long(4098));
+        let names = ["x".repeat(4097), "x".repeat(5000), "mem".to_string()];
+        assert_eq!(check(&names), too_long(5000));
+    }
 
     #[test]
     fn the_settings_check_refuses_each_value_out_of_its_bounds() {

@@ -289,7 +289,7 @@ pub struct WorkerConfig {
     /// a replay. If there is neither, the task fails. A replay compares the name that it picks
     /// with History. So a change of the runtime that it picks, such as a new runtime under the
     /// empty name or a renamed only runtime, makes the replay of a call with no Store name a
-    /// nondeterminism error.
+    /// nondeterminism error. A Store name of more than 4096 bytes fails the start of the Worker.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,
@@ -407,7 +407,7 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         {
             return Err("max_outstanding_* fields are mutually exclusive with `tuner`".to_string());
         }
-        config.stream_runtimes.settings.check()?;
+        config.stream_runtimes.check()?;
 
         match &config.versioning_strategy {
             WorkerVersioningStrategy::None { .. } => {}
@@ -753,9 +753,9 @@ impl Worker {
         worker_heartbeat_options: Option<WorkerHeartbeatOptions>,
         shared_namespace_worker: bool,
     ) -> Result<Worker, anyhow::Error> {
-        // The settings are public fields, so a config can change them after its builder checked
-        // them.
-        (config.stream_runtimes.settings.check()).map_err(anyhow::Error::msg)?;
+        // `stream_runtimes` and its settings are public fields, so a config can change them after
+        // its builder checked them.
+        (config.stream_runtimes.check()).map_err(anyhow::Error::msg)?;
         let (metrics, meter) = if let Some(wt) = worker_telemetry.as_ref() {
             (
                 MetricsContext::top_level_with_meter(

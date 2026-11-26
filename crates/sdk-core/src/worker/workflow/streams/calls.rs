@@ -2,7 +2,7 @@
 //! and the Worker's [`StreamManager`](super::StreamManager) runs the requests that they start.
 
 use super::{
-    StreamRuntimes, TaskState,
+    MAX_STORE_NAME_BYTES, StreamRuntimes, TaskState,
     manager::{Call, Op, Outcome, Request, StreamResolution},
     marker::append_job,
 };
@@ -30,9 +30,6 @@ use temporalio_streams::{
         sdk::{AppendRecordsRequest, StreamRef},
     },
 };
-
-/// A marker records the Store name of each call, so a longer name fails the Workflow Task.
-const MAX_STORE_NAME_BYTES: usize = 4096;
 
 /// One counter for the whole process, so a late result of an evicted run never matches a call of
 /// the run that replaces it.
