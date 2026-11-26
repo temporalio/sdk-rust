@@ -458,7 +458,8 @@ impl StreamCalls {
 
     /// Returns true if activation `activation` of the task has a Stream result to give. A result
     /// from History is held back while the index of the next Local Activity marker, `marker`, is at
-    /// or below the result's own index, so that the Local Activity result goes first.
+    /// or below the result's own index. So a Local Activity result of an earlier activation goes
+    /// first, and one with the same index goes in the same activation.
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
@@ -467,20 +468,21 @@ impl StreamCalls {
     }
 
     /// Returns the results for the activation at index `activation` of the task, as
-    /// [`Self::has_jobs`] decides them. The markers of the activation record each live result with
-    /// that index, and [`Self::take_marker`] and [`Self::take_read_marker`] return them.
+    /// [`Self::has_jobs`] decides them, each with the index that its marker has. The markers of the
+    /// activation record each live result with that index, and [`Self::take_marker`] and
+    /// [`Self::take_read_marker`] return them.
     pub(crate) fn take_jobs(
         &mut self,
         activation: u64,
         marker: Option<u64>,
-    ) -> Vec<workflow_activation_job::Variant> {
+    ) -> Vec<(u64, workflow_activation_job::Variant)> {
         let mut jobs = vec![];
         while let Some(key) = self.ready.keys().next().copied()
             && self.is_due(&key, activation, marker)
         {
             let ready = self.ready.remove(&key).expect("The key was just read");
             self.leave(key.1);
-            jobs.push(ready.job());
+            jobs.push((key.0, ready.job()));
         }
         self.released = None;
         if !self.task.is_open() {
@@ -492,7 +494,7 @@ impl StreamCalls {
             };
             self.done.remove(&call);
             self.leave(call);
-            jobs.push(job);
+            jobs.push((activation, job));
         }
         jobs
     }
@@ -789,10 +791,10 @@ impl StreamCalls {
         self.ready.keys().next().map(|(at, _)| *at)
     }
 
-    /// Returns the activation of the first result from History that Workflow code doesn't have.
-    pub(crate) fn first_result_activation(&self) -> Option<u64> {
-        let held = self.held.first_result().map(|(at, _)| at);
-        self.next_ready_activation().into_iter().chain(held).min()
+    /// Returns the activation of the first result from History whose call Workflow code hasn't
+    /// issued.
+    pub(crate) fn first_held_activation(&self) -> Option<u64> {
+        self.held.first_result().map(|(at, _)| at)
     }
 
     /// Releases the results from History to the next activation in the order of the first run,
@@ -1549,7 +1551,7 @@ mod tests {
     /// `read 3 of 2`, with the number of its Records.
     fn jobs(calls: &mut StreamCalls, activation: u64) -> Vec<String> {
         (calls.take_jobs(activation, None).into_iter())
-            .map(|job| match job {
+            .map(|(_, job)| match job {
                 Variant::ResolveStreamAppend(ResolveStreamAppend {
                     seq,
                     status: Some(resolve_stream_append::Status::Failed(failure)),
@@ -1864,7 +1866,9 @@ mod tests {
             &mut self,
             commands: &[Command],
         ) -> Result<(Vec<Variant>, Vec<PeekedMarker>), WFMachinesError> {
-            let jobs = self.calls.take_jobs(self.activation, None);
+            let jobs = (self.calls.take_jobs(self.activation, None).into_iter())
+                .map(|(_, job)| job)
+                .collect();
             let appends = self.calls.take_marker().map(PeekedMarker::Append);
             let reads = self.calls.take_read_marker().map(PeekedMarker::Read);
             self.activation += 1;

@@ -1,5 +1,5 @@
 use crate::{
-    PollError, PollWorkflowOptions, Worker, advance_fut,
+    PollError, PollWorkflowOptions, Worker, WorkflowErrorType, advance_fut,
     internal_flags::CoreInternalFlags,
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
@@ -20,6 +20,7 @@ use crate::{
 };
 use futures_util::{FutureExt, stream};
 use mockall::TimesRange;
+use parking_lot::Mutex;
 use rstest::{fixture, rstest};
 use siphasher::sip::SipHasher13;
 use std::{
@@ -45,7 +46,8 @@ use temporalio_common::{
             common::{VersioningIntent, extract_local_activity_marker_details},
             workflow_activation::{
                 FireTimer, InitializeWorkflow, ResolveActivity, UpdateRandomSeed,
-                WorkflowActivationJob, remove_from_cache::EvictionReason, workflow_activation_job,
+                WorkflowActivation, WorkflowActivationJob, remove_from_cache::EvictionReason,
+                workflow_activation_job,
             },
             workflow_commands::{
                 ActivityCancellationType, CancelTimer, CompleteWorkflowExecution,
@@ -1514,6 +1516,195 @@ async fn fail_wft_then_recover() {
     .await
     .unwrap();
     core.drain_pollers_and_shutdown().await;
+}
+
+/// Runs the tasks of `mh` with `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`,
+/// so nondeterminism fails the workflow rather than the task, and completes each activation with
+/// `lang` until the run is evicted. Returns the type of each command of each completion, with the
+/// message of its failure if any.
+async fn run_failing_workflow_on_nondeterminism(
+    mut mh: MockPollCfg,
+    mut lang: impl FnMut(&WorkflowActivation) -> WorkflowActivationCompletion,
+) -> Vec<Vec<(CommandType, Option<String>)>> {
+    let sent = Arc::new(Mutex::new(vec![]));
+    let kept = sent.clone();
+    mh.completion_mock_fn = Some(Box::new(move |c| {
+        let commands = c.commands.iter().map(|command| {
+            let failure = match &command.attributes {
+                Some(Attributes::FailWorkflowExecutionCommandAttributes(fail)) => {
+                    fail.failure.as_ref().map(|failure| failure.message.clone())
+                }
+                _ => None,
+            };
+            (command.command_type(), failure)
+        });
+        kept.lock().push(commands.collect::<Vec<_>>());
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    });
+    let core = mock_worker(mock);
+
+    loop {
+        let act = core.poll_workflow_activation().await.unwrap();
+        if act.is_only_eviction() {
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+                .await
+                .unwrap();
+            break;
+        }
+        core.complete_workflow_activation(lang(&act)).await.unwrap();
+    }
+    core.drain_pollers_and_shutdown().await;
+    sent.lock().clone()
+}
+
+/// Fails `act` with the nondeterminism error that lang found.
+fn langs_nondeterminism_failure(act: &WorkflowActivation) -> WorkflowActivationCompletion {
+    WorkflowActivationCompletion::fail(
+        act.run_id.clone(),
+        "changed".into(),
+        Some(WorkflowTaskFailedCause::NonDeterministicError),
+    )
+}
+
+/// Returns the completions that the server must get for lang's nondeterminism failure: one,
+/// with only that fail command.
+fn fails_with_langs_error() -> Vec<Vec<(CommandType, Option<String>)>> {
+    let fail = (
+        CommandType::FailWorkflowExecution,
+        Some("changed".to_string()),
+    );
+    vec![vec![fail]]
+}
+
+/// The first event in history after the task that lang fails.
+#[derive(Clone, Copy, Debug)]
+enum EventAfterTheFailure {
+    TimerStarted,
+    LocalActivityMarker,
+}
+
+// Lang's error is the cause, so the workflow fails once, with that error. The events that follow
+// must not fail the workflow again, activate lang again, or replace the cause.
+#[rstest]
+#[case::timer(EventAfterTheFailure::TimerStarted)]
+#[case::local_activity_marker(EventAfterTheFailure::LocalActivityMarker)]
+#[tokio::test]
+async fn a_nondeterminism_failure_fails_the_workflow_once_with_langs_error(
+    #[case] event: EventAfterTheFailure,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    if let EventAfterTheFailure::LocalActivityMarker = event {
+        t.add_local_activity_result_marker(1, "1", "done".into());
+    }
+    let started = t.add_timer_started("1".to_string());
+    t.add_timer_fired(started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    // All of history comes in one poll, so lang fails the first activation while replaying.
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    let sent = run_failing_workflow_on_nondeterminism(mh, langs_nondeterminism_failure).await;
+    assert_eq!(
+        sent,
+        fails_with_langs_error(),
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
+    );
+}
+
+// History already records the commands that a replayed task sent before lang failed it. Sending
+// them again would start a second timer with the same id.
+#[tokio::test]
+async fn a_nondeterminism_failure_in_a_later_activation_of_a_replayed_task_sends_one_command() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let started = t.add_timer_started("1".to_string());
+    t.add_local_activity_result_marker(1, "1", "done".into());
+    t.add_timer_fired(started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    // The local activity resolves from its marker, so lang gets a second activation in task 1.
+    let lang = |act: &WorkflowActivation| match &act.jobs[0].variant {
+        Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+            let commands = vec![
+                start_timer_cmd(1, Duration::from_secs(1)),
+                schedule_local_activity_cmd(
+                    1,
+                    "1",
+                    ActivityCancellationType::TryCancel,
+                    Duration::from_secs(60),
+                ),
+            ];
+            WorkflowActivationCompletion::from_cmds(act.run_id.clone(), commands)
+        }
+        _ => langs_nondeterminism_failure(act),
+    };
+    let sent = run_failing_workflow_on_nondeterminism(mh, lang).await;
+    assert_eq!(
+        sent,
+        fails_with_langs_error(),
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
+    );
+}
+
+// History has no event for the commands of a live task, so the server must get them with the
+// failure.
+#[tokio::test]
+async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its_commands() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    // A cancel of an activity that Core never sent resolves at once, in a second activation.
+    let lang = |act: &WorkflowActivation| match &act.jobs[0].variant {
+        Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+            let activity = ScheduleActivity {
+                seq: 2,
+                activity_id: "2".to_string(),
+                cancellation_type: ActivityCancellationType::TryCancel as i32,
+                ..default_act_sched()
+            };
+            let commands = vec![
+                start_timer_cmd(1, Duration::from_secs(1)),
+                activity.into(),
+                RequestCancelActivity { seq: 2 }.into(),
+            ];
+            WorkflowActivationCompletion::from_cmds(act.run_id.clone(), commands)
+        }
+        _ => langs_nondeterminism_failure(act),
+    };
+    let sent = run_failing_workflow_on_nondeterminism(mh, lang).await;
+    let timer = (CommandType::StartTimer, None);
+    let fail = (
+        CommandType::FailWorkflowExecution,
+        Some("changed".to_string()),
+    );
+    assert_eq!(
+        sent,
+        [vec![timer, fail]],
+        "Expected exactly one completion, containing the live task's StartTimer followed by a \
+         FailWorkflowExecution with lang's error"
+    );
 }
 
 #[tokio::test]

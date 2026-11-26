@@ -1654,8 +1654,8 @@ enum Nondeterminism {
     ReportedByLangWithNoStreamCall,
 }
 
-// The completion that fails the Workflow applies no next task while Records are unread, so it
-// waits for none. With no Records to wait for, it applies the next task, and Core finds the error.
+// A completion in which lang fails the Workflow applies no next task, so it waits for no Records.
+// When Core finds the error, it applies the next task, for which it reads the next part.
 #[rstest::rstest]
 #[case::found_by_core(Nondeterminism::FoundByCore)]
 #[case::reported_by_lang(Nondeterminism::ReportedByLang)]
@@ -1737,15 +1737,10 @@ async fn a_replay_fails_the_workflow_with_the_next_part_unread(
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{label}: the Workflow didn't fail"));
-        // After lang's failure, Core applies the next task unless Records are unread. It then
-        // finds the read marker or the timer that has no command, and fails the Workflow with
-        // that error in place of lang's, which has no message.
+        // After lang's failure, Core applies no next task, so the Workflow fails with lang's
+        // error, which has no message. Core's own error has one.
         let applied_next_task = !message.is_empty();
-        let applies_next_task = match nondeterminism {
-            Nondeterminism::FoundByCore => true,
-            Nondeterminism::ReportedByLang => bound == usize::MAX,
-            Nondeterminism::ReportedByLangWithNoStreamCall => true,
-        };
+        let applies_next_task = matches!(nondeterminism, Nondeterminism::FoundByCore);
         assert_eq!(applied_next_task, applies_next_task, "{label}: {message}");
     }
     let fails_the_workflow = vec![vec![CommandType::FailWorkflowExecution]];
