@@ -798,6 +798,88 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
     changed.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+/// Returns the type of each command of `completion`, with the message of its failure if any.
+fn with_failures(completion: &WorkflowTaskCompletion) -> Vec<(CommandType, Option<String>)> {
+    (completion.commands.iter())
+        .map(|command| {
+            let failure = match command.attributes.as_ref() {
+                Some(Attributes::FailWorkflowExecutionCommandAttributes(fail)) => {
+                    fail.failure.as_ref().map(|failure| failure.message.clone())
+                }
+                _ => None,
+            };
+            (command.command_type(), failure)
+        })
+        .collect()
+}
+
+// Lang's error is the cause, so the Workflow fails with it alone. The marker that follows in
+// History has an append that lang never sent, and it must not fail the Workflow a second time.
+#[tokio::test]
+async fn a_nondeterminism_failure_before_a_stream_marker_sends_one_fail_command() {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let completed = t.current_event_id();
+    let appends = vec![appended(1, "s", vec![7], 1)];
+    add_stream_marker(&mut t, completed, &StreamAppendMarkerData { appends });
+    t.add_workflow_task_scheduled_and_started();
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    opts.configure = Box::new(|wc| {
+        wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    });
+    let run = start(t, opts);
+    let activation = run.worker.poll_workflow_activation().await.unwrap();
+    let cause = WorkflowTaskFailedCause::NonDeterministicError;
+    let failed =
+        WorkflowActivationCompletion::fail(activation.run_id, "changed".into(), Some(cause));
+    run.worker
+        .complete_workflow_activation(failed)
+        .await
+        .unwrap();
+    assert_eq!(run.drive(|_| vec![]).await.len(), 0);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let sent: Vec<_> = run.sent().iter().map(with_failures).collect();
+    let expected = (
+        CommandType::FailWorkflowExecution,
+        Some("changed".to_string()),
+    );
+    assert_eq!(sent, [vec![expected]], "The commands of each completion");
+    assert_eq!(store.requests(), []);
+}
+
+// Core finds the error at the marker, so the Workflow fails with Core's error alone. Lang's
+// command that ends the Workflow came from the replayed task, and the server has that task.
+#[tokio::test]
+async fn a_stream_marker_with_no_call_fails_the_workflow_with_one_command() {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let completed = t.current_event_id();
+    let appends = vec![appended(1, "s", vec![7], 1)];
+    add_stream_marker(&mut t, completed, &StreamAppendMarkerData { appends });
+    t.add_workflow_task_scheduled_and_started();
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    opts.configure = Box::new(|wc| {
+        wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    });
+    let run = start(t, opts);
+    assert_eq!(run.drive(|_| vec![complete()]).await.len(), 1);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let sent: Vec<_> = run.sent().iter().map(with_failures).collect();
+    let [completion] = &sent[..] else {
+        panic!("One completion: {sent:?}");
+    };
+    let [(CommandType::FailWorkflowExecution, Some(message))] = &completion[..] else {
+        panic!("One fail command: {completion:?}");
+    };
+    let error = "History has a result of Stream append 1 that Workflow code never issued";
+    assert!(message.contains(error), "{message}");
+    assert_eq!(store.requests(), []);
+}
+
 #[tokio::test]
 async fn a_replayed_append_to_another_store_is_a_nondeterminism_error() {
     let store = store(&["s"]).await;
@@ -1273,41 +1355,65 @@ fn marker_sizes(completion: &WorkflowTaskCompletion) -> Vec<usize> {
 
 // The server refuses an event over 2 MB, so the data of one marker can have at most 1 MiB. Each
 // failed append has a Store message of 4 KiB, the most that a marker keeps, so about 247 results
-// fill one marker. Core can give the results in a few activations, so the case over the bound has
-// enough for several markers.
+// fill one marker. The results of `streams` appends all arrive while one activation is
+// outstanding, so the next activation gives them all and its marker records them all.
 #[rstest::rstest]
-#[case::under_the_bound(240, false)]
-#[case::over_the_bound(1200, true)]
+#[case::under_the_bound(200, false)]
+#[case::over_the_bound(300, true)]
 #[tokio::test]
 async fn a_stream_marker_over_1_mib_fails_its_task(#[case] streams: u32, #[case] over: bool) {
     const BOUND: usize = 1024 * 1024;
     let store = store(&[]).await;
     let refused = StreamError::invalid_argument("x".repeat(4096));
-    store.fail(Op::Append, refused, usize::MAX);
+    // Append 1 answers first, and the activation of its result stays outstanding while the others
+    // answer.
+    store.fail(Op::Append, refused, streams as usize + 1);
+    let held: Vec<String> = (2..=streams + 1).map(|seq| format!("s{seq}")).collect();
+    for id in &held {
+        store.hold_stream(id);
+    }
     let mut opts = StartOpts::new(&store);
     opts.fails = usize::from(over);
     let run = start(history(Duration::from_secs(60)), opts);
+    let worker = &run.worker;
+    let init = worker.poll_workflow_activation().await.unwrap();
+    let appends = (1..=streams + 1).map(|seq| append(seq, &format!("s{seq}")));
+    let completion =
+        WorkflowActivationCompletion::from_cmds(init.run_id.clone(), appends.collect());
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert!(resolves_append(&first, 1), "{first:?}");
+    // Each input reaches the run in the order that it was sent, and the Store sends an answer as
+    // soon as it fails the call.
+    for id in &held {
+        store.release_stream(id);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.failures_left(Op::Append) > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "The Store never answered each append"
+        );
+        tokio::task::yield_now().await;
+    }
+    let completion = WorkflowActivationCompletion::from_cmds(first.run_id.clone(), vec![]);
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
     let mut results = 0;
     let workflow = |activation: &WorkflowActivation| {
-        let mut commands = vec![];
-        for job in &activation.jobs {
-            match &job.variant {
-                Some(Job::InitializeWorkflow(_)) => {
-                    commands.extend((1..=streams).map(|seq| append(seq, &format!("s{seq}"))));
-                }
-                Some(Job::ResolveStreamAppend(_)) => results += 1,
-                _ => {}
-            }
-        }
-        if results == streams {
-            commands.push(complete());
-        }
-        commands
+        results += (activation.jobs.iter())
+            .filter(|job| matches!(job.variant, Some(Job::ResolveStreamAppend(_))))
+            .count();
+        vec![complete()]
     };
     let driven = tokio::time::timeout(Duration::from_secs(30), run.drive(workflow)).await;
     driven.expect("The run never ended");
     let failed = run.failed.lock().clone();
-    let sizes: Vec<usize> = run.sent().iter().flat_map(marker_sizes).collect();
     if over {
         let [(cause, message)] = &failed[..] else {
             panic!("One task fails: {failed:?}");
@@ -1320,15 +1426,19 @@ async fn a_stream_marker_over_1_mib_fails_its_task(#[case] streams: u32, #[case]
             .and_then(|rest| rest.strip_suffix(&format!(" bytes, more than {BOUND}")))
             .and_then(|size| size.parse::<usize>().ok());
         assert!(size.is_some_and(|size| size > BOUND), "{message}");
-        // The task that the marker failed sent no completion.
-        assert_eq!(sizes, Vec::<usize>::new());
+        // Workflow code never got the results, and the task that the marker failed sent no
+        // completion.
+        assert_eq!(results, 0);
+        assert_eq!(run.sent().len(), 0);
     } else {
         assert_eq!(failed, []);
-        assert_eq!(results, streams);
-        let entries: usize = (run.sent().iter().flat_map(markers))
+        assert_eq!(results, streams as usize);
+        let sent = run.sent();
+        let entries: Vec<usize> = (sent.iter().flat_map(markers))
             .map(|marker| marker.appends.len())
-            .sum();
-        assert_eq!(entries, streams as usize);
+            .collect();
+        assert_eq!(entries, [1, streams as usize]);
+        let sizes: Vec<usize> = sent.iter().flat_map(marker_sizes).collect();
         assert!(sizes.iter().all(|size| *size <= BOUND), "{sizes:?}");
     }
     run.worker.drain_pollers_and_shutdown_ref().await;
@@ -1434,11 +1544,42 @@ async fn a_forced_completion_with_an_open_append_keeps_its_task_apart_on_replay(
         })
         .collect();
     assert_eq!(recorded, [[(1, 0)], [(2, 1)]]);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(command_types(&sent[0]), [CommandType::RecordMarker]);
+    assert_eq!(markers(&sent[0]), [StreamAppendMarkerData::default()]);
     run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(run.replay(workflow).await, live);
+
     // The marker with no entry is the only command event of task 1. Without it, a replay with
     // chunking on takes task 1 for a heartbeat and joins it to task 2. The indexes of task 2 then
     // count from the activation of task 1, so append 2 at index 1 comes with append 1.
-    assert_eq!(run.replay(workflow).await, live);
+    let rebuilt = |first: &WorkflowTaskCompletion| {
+        let mut t = history(Duration::from_secs(1));
+        write(&mut t, first);
+        t.add_workflow_task_scheduled_and_started();
+        write(&mut t, &sent[1]);
+        t
+    };
+    let types = |t: &TestHistoryBuilder| -> Vec<EventType> {
+        let history = t.get_full_history_info().unwrap();
+        history.events().iter().map(|e| e.event_type()).collect()
+    };
+    assert_eq!(types(&rebuilt(&sent[0])), types(&run.history.lock()));
+    let mut no_marker = sent[0].clone();
+    no_marker.commands.clear();
+    let mut opts = StartOpts::new(&store);
+    opts.replay = true;
+    let joined = start(rebuilt(&no_marker), opts);
+    let (jobs, evicted) = drive_until_evicted(&joined.worker, workflow).await;
+    joined.worker.drain_pollers_and_shutdown_ref().await;
+    let results: Vec<Vec<String>> = (jobs.iter())
+        .map(|jobs| jobs.iter().map(summary).collect())
+        .collect();
+    assert_eq!(
+        results,
+        [vec!["InitializeWorkflow"], vec!["append 1", "append 2"]]
+    );
+    assert_eq!(evicted, Some(EvictionReason::LangRequested));
 }
 
 #[rstest::rstest]
@@ -2042,12 +2183,82 @@ async fn an_update_whose_append_has_its_result_in_its_task_replays_as_its_first_
     assert_eq!(store.requests().len(), writes);
 }
 
+// A Stream result and a Local Activity result that arrive while one activation is outstanding go
+// in the next activation with one index. The Stream result goes first, and a replay with chunking
+// on or off gives the same activations.
+#[tokio::test]
+async fn a_stream_result_goes_before_a_local_activity_result_of_its_activation() {
+    let store = store(&["a", "b"]).await;
+    store.hold_stream("b");
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let worker = &run.worker;
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![local_activity(1), append(1, "a"), append(2, "b")],
+        _ if activation.jobs.len() == 2 => vec![complete()],
+        _ => vec![],
+    };
+    let variants = |activation: &WorkflowActivation| -> Vec<Job> {
+        (activation.jobs.iter())
+            .filter_map(|job| job.variant.clone())
+            .collect()
+    };
+    let mut live = vec![];
+    let init = worker.poll_workflow_activation().await.unwrap();
+    live.push(variants(&init));
+    let completion = WorkflowActivationCompletion::from_cmds(init.run_id.clone(), workflow(&init));
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    let local = worker.poll_activity_task().await.unwrap();
+    // Append 1 answers at once. The Local Activity and the held append have no result yet.
+    let first = worker.poll_workflow_activation().await.unwrap();
+    live.push(variants(&first));
+    // Both results arrive while that activation is outstanding. Each input reaches the run in the
+    // order that it was sent, and the Store sends its answer as soon as it writes.
+    store.release_stream("b");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.records("b").is_empty() {
+        assert!(Instant::now() < deadline, "The Store never wrote append 2");
+        tokio::task::yield_now().await;
+    }
+    let result = ActivityTaskCompletion {
+        task_token: local.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    };
+    worker.complete_activity_task(result).await.unwrap();
+    let completion = WorkflowActivationCompletion::from_cmds(first.run_id.clone(), vec![]);
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    live.extend(run.drive(workflow).await);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+
+    let live = with_events(&live);
+    let expected = [
+        vec!["InitializeWorkflow".to_string()],
+        vec!["append 1".to_string()],
+        vec!["append 2".to_string(), "local 1".to_string()],
+    ];
+    assert_eq!(live, expected);
+    let sent = run.sent();
+    let indexes: Vec<Vec<u64>> = (markers(&sent[0]).iter())
+        .map(|marker| marker.appends.iter().map(|a| a.activation_index).collect())
+        .collect();
+    assert_eq!(indexes, [[1], [2]]);
+    for chunking in [true, false] {
+        let replayed = with_events(&run.replay_with(chunking, workflow).await);
+        assert_eq!(replayed, live, "Chunking {chunking}");
+    }
+}
+
 /// The kind of a call of a first run that [`replay_calls`] replays. In one activation the first
-/// run gave the results of Local Activities before those of appends.
+/// run gave the results of appends before those of Local Activities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
-    LocalActivity,
     Append,
+    LocalActivity,
 }
 
 /// A call of a first run whose task 2 gave its result. Its seq is its place in the list of calls.
@@ -2092,8 +2303,8 @@ async fn replay_calls(
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_completed();
     let completed = t.current_event_id();
-    // History has the results in the order that the first run gave them. In each activation the
-    // Local Activity markers come before the Stream marker.
+    // History has the activations of the first run in order. In each activation the Local Activity
+    // markers come before the Stream marker, as Core writes them.
     for seqs in first_run(calls) {
         let mut appends = vec![];
         for seq in seqs {
@@ -2183,7 +2394,7 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
             1 => (false, 0, vec![(append, 0, None), (local, 1, None)]),
             2 => (true, 1, vec![(append, 0, None), (local, 1, None)]),
             // Workflow code makes Local Activity 4 at the result of call 1, and the first run got
-            // its result with the one of append 2, after the one of append 3.
+            // its result after the one of append 2, in one activation after the one of append 3.
             3 => (
                 true,
                 1,
@@ -2192,6 +2403,19 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                     (append, 2, None),
                     (append, 1, None),
                     (local, 2, Some(1)),
+                ],
+            ),
+            // Workflow code makes append 4 at the result of call 1, and the first run got its
+            // result before the one of Local Activity 2, in one activation after the one of
+            // Local Activity 3.
+            4 => (
+                true,
+                1,
+                vec![
+                    (local, 0, None),
+                    (local, 2, None),
+                    (local, 1, None),
+                    (append, 2, Some(1)),
                 ],
             ),
             _ => {
@@ -2277,8 +2501,12 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                     assert_eq!(replays[2], first_run(&calls), "{case}");
                 }
                 // Append 2 waits for the result of Local Activity 4, which the first run gave
-                // with it.
+                // with it, and goes first.
                 if seed == 3 {
+                    assert_eq!(replays[2], [vec![1, 3], vec![2, 4]], "{case}");
+                }
+                // Local Activity 2 waits until Workflow code makes append 4, and goes after it.
+                if seed == 4 {
                     assert_eq!(replays[2], [vec![1, 3], vec![4, 2]], "{case}");
                 }
                 batched += usize::from(replays[0] != first_run(&all(local)));
