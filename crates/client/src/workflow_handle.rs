@@ -1,3 +1,5 @@
+#[cfg(feature = "experimental")]
+use crate::__internal::{capture_nexus_response_link, forward_nexus_request_links};
 use crate::{
     CancelWorkflowInput, DescribeWorkflowInput, DescribeWorkflowOutput,
     FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, HistoryEventFilterType,
@@ -813,6 +815,8 @@ where
                             header: options.header,
                             ..Default::default()
                         };
+                        #[cfg(feature = "experimental")]
+                        forward_nexus_request_links(&client, &mut request.links);
                         let target = request.workflow_execution.as_ref().map(|execution| {
                             StoreTarget::workflow(
                                 &request.namespace,
@@ -824,9 +828,11 @@ where
                         store_external_payloads(&mut request, &data_converter, &client.namespace(), target).await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
-                        WorkflowService::signal_workflow_execution(&mut client, request)
+                        let _response = WorkflowService::signal_workflow_execution(&mut client, request)
                             .await
                             .map_err(WorkflowInteractionError::from_status)?;
+                        #[cfg(feature = "experimental")]
+                        capture_nexus_response_link(&client, _response.into_inner().link);
                         Ok(())
                     })
                 }

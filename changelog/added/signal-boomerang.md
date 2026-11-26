@@ -1,0 +1,1 @@
+When a Nexus operation signals a workflow using its handler’s Temporal client, the receiving workflow’s history links to the Nexus call that triggered the signal. On servers that support signal backlinks, you can also follow the link from the caller’s history to the signal event.

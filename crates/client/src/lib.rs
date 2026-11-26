@@ -41,7 +41,52 @@ mod workflow_status;
 #[doc(hidden)]
 pub mod __internal {
     use crate::{Client, WorkflowClientTrait, WorkflowStartOptions, errors::WorkflowStartError};
+    use parking_lot::Mutex;
+    use std::{future::Future, sync::Arc};
     use temporalio_common::{HasWorkflowDefinition, protos::temporal::api::common::v1::Link};
+
+    pub(super) struct NexusLinks {
+        inbound: Vec<Link>,
+        outbound: Arc<Mutex<Vec<Link>>>,
+    }
+
+    pub async fn scope_nexus_links<T, F: Future<Output = T>>(
+        mut client: Client,
+        inbound: Vec<Link>,
+        outbound: Arc<Mutex<Vec<Link>>>,
+        handler: impl FnOnce(Client) -> F,
+    ) -> T {
+        let links = Arc::new(NexusLinks { inbound, outbound });
+        // Clones can send linked requests from spawned tasks without keeping the scope alive.
+        client.nexus_links = Arc::downgrade(&links);
+        let result = handler(client).await;
+        drop(links);
+        result
+    }
+
+    fn current_nexus_links(client: &impl crate::NamespacedClient) -> Option<Arc<NexusLinks>> {
+        client.__sdk_client()?.nexus_links.upgrade()
+    }
+
+    pub(crate) fn forward_nexus_request_links(
+        client: &impl crate::NamespacedClient,
+        request_links: &mut Vec<Link>,
+    ) {
+        if let Some(links) = current_nexus_links(client) {
+            request_links.extend(links.inbound.iter().cloned());
+        }
+    }
+
+    pub(crate) fn capture_nexus_response_link(
+        client: &impl crate::NamespacedClient,
+        response_link: Option<Link>,
+    ) {
+        if let Some(link) = response_link
+            && let Some(links) = current_nexus_links(client)
+        {
+            links.outbound.lock().push(link);
+        }
+    }
 
     pub async fn start_nexus_workflow<W>(
         client: &Client,
@@ -1115,6 +1160,8 @@ impl TemporalServiceClient {
 pub struct Client {
     connection: Connection,
     options: Arc<ClientOptions>,
+    #[cfg(feature = "experimental")]
+    nexus_links: std::sync::Weak<__internal::NexusLinks>,
 }
 
 impl Client {
@@ -1144,6 +1191,8 @@ impl Client {
         Ok(Client {
             connection,
             options: Arc::new(options),
+            #[cfg(feature = "experimental")]
+            nexus_links: std::sync::Weak::new(),
         })
     }
 
@@ -1418,6 +1467,11 @@ impl NamespacedClient for Client {
     fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
         &self.options.client_interceptors
     }
+
+    #[cfg(feature = "experimental")]
+    fn __sdk_client(&self) -> Option<&Client> {
+        Some(self)
+    }
 }
 
 /// Enum to help reference a namespace by either the namespace name or the namespace id
@@ -1620,6 +1674,12 @@ pub trait NamespacedClient {
     /// normally retain the default empty chain unless they deliberately provide the same plumbing.
     fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
         &[]
+    }
+
+    #[cfg(feature = "experimental")]
+    #[doc(hidden)]
+    fn __sdk_client(&self) -> Option<&Client> {
+        None
     }
 }
 
