@@ -24,8 +24,9 @@ use crate::workflow_registry::{
     WorkflowDefinitions, WorkflowExecutionFactory, WorkflowExecutionInput,
 };
 
+// A copy of `crates/workflow/wit`: the published package can only read files inside this crate.
 wasmtime::component::bindgen!({
-    path: "../workflow/wit",
+    path: "wit",
     world: "workflow-module",
 });
 
@@ -448,4 +449,27 @@ fn decode_proto<M: Message + prost::Name + Default>(bytes: Vec<u8>) -> M {
         let n = M::NAME;
         panic!("failed to decode {n} from WASM boundary bytes: {err}")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, fs, path::Path};
+
+    fn wit_files(dir: &str) -> BTreeMap<String, String> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+        fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "wit"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, fs::read_to_string(path).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn packaged_wit_matches_workflow_wit() {
+        assert_eq!(wit_files("wit"), wit_files("../workflow/wit"));
+    }
 }
