@@ -50,8 +50,8 @@ message StreamAppendMarkerData {
 message StreamAppendResult {
   uint32 seq = 1;
   string stream_id = 2;
-  // The name of the Store that the append used. For a ref with no Store name, it is the name of
-  // the Worker's only Stream runtime.
+  // The name of the Store that the append used. For a ref with no Store name, it is the empty
+  // name if the Worker has a Stream runtime under it, else the name of its only runtime.
   string store = 3;
   // The index of the activation, within its Workflow Task, in which Workflow code got the result.
   uint64 activation_index = 4;
@@ -87,8 +87,8 @@ message StreamReadMarkerData {
 message StreamReadResult {
   uint32 seq = 1;
   string stream_id = 2;
-  // The name of the Store that the read used. For a ref with no Store name, it is the name of the
-  // Worker's only Stream runtime.
+  // The name of the Store that the read used. For a ref with no Store name, it is the empty name
+  // if the Worker has a Stream runtime under it, else the name of its only runtime.
   string store = 3;
   // The index of the activation, within its Workflow Task, in which Workflow code got the result.
   uint64 activation_index = 4;

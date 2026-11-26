@@ -1796,7 +1796,7 @@ pub(crate) enum WFMachinesError {
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
     /// A Stream call that this Worker can't serve, on a Store with no runtime, with no Store name
-    /// and not exactly one runtime, or in an outage, or a Stream marker over its size bound. The
+    /// and no runtime to pick for it, or in an outage, or a Stream marker over its size bound. The
     /// Workflow Task fails with this message as-is. For an outage it starts with
     /// `StreamStoreUnavailable:`, and for a marker with `StreamMarkerTooLarge:`.
     #[error("{0}")]

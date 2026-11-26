@@ -2,8 +2,8 @@
 //! and the Worker's [`StreamManager`](super::StreamManager) runs the requests that they start.
 
 use super::{
-    DEFAULT_PAGE_BYTES, DEFAULT_PAGE_RECORDS, MarkerReads, StreamRuntimes, StreamSettings,
-    TaskState,
+    DEFAULT_PAGE_BYTES, DEFAULT_PAGE_RECORDS, MAX_STORE_NAME_BYTES, MarkerReads, StreamRuntimes,
+    StreamSettings, TaskState,
     manager::{Call, LastTry, Op, Outcome, ReadCall, Request, StreamResolution},
     marker::{PeekedMarker, append_job},
     read::{After, ReadDone, read_job},
@@ -39,9 +39,6 @@ use temporalio_streams::{
         sdk::{AppendRecordsRequest, ReadRecordsRequest, StreamRef},
     },
 };
-
-/// A marker records the Store name of each call, so a longer name fails the Workflow Task.
-const MAX_STORE_NAME_BYTES: usize = 4096;
 
 /// One counter for the whole process, so a late result of an evicted run never matches a call of
 /// the run that replaces it.
@@ -901,16 +898,17 @@ impl StreamCalls {
         self.requests.clear();
     }
 
-    /// Gives a ref with no Store name the Store of the Worker's only runtime. A replay does the
-    /// same, so it compares History with the Store that a live call uses.
+    /// Gives a ref with no Store name the Store of the Worker's runtime under the empty name, else
+    /// of its only runtime. A replay does the same, so it compares History with the Store that a
+    /// live call uses.
     fn resolve_store(&self, stream: &mut StreamRef) -> Result<(), WFMachinesError> {
         if !stream.store.is_empty() {
             return Ok(());
         }
-        let Some(store) = self.runtimes.only_store() else {
+        let Some(store) = self.runtimes.default_store() else {
             return Err(WFMachinesError::Stream(format!(
-                "A Stream call with no Store name needs exactly one Stream runtime, and this \
-                 Worker has {}",
+                "A Stream call with no Store name needs a Stream runtime under the empty name or \
+                 exactly one Stream runtime, and this Worker has {}",
                 self.runtimes.count()
             )));
         };
@@ -2842,8 +2840,8 @@ mod tests {
                 let mut calls = StreamCalls::new("n", "w", "r", runtimes(stores), phase);
                 calls.set_task(TaskState::Open(task_attempt(3)));
                 let error = format!(
-                    "A Stream call with no Store name needs exactly one Stream runtime, and this \
-                     Worker has {}",
+                    "A Stream call with no Store name needs a Stream runtime under the empty \
+                     name or exactly one Stream runtime, and this Worker has {}",
                     stores.len()
                 );
                 let result = calls.append(nameless(1));
@@ -2903,8 +2901,8 @@ mod tests {
                 let mut calls = StreamCalls::new("n", "w", "r", runtimes(stores), phase);
                 calls.set_task(TaskState::Open(task_attempt(3)));
                 let error = format!(
-                    "A Stream call with no Store name needs exactly one Stream runtime, and this \
-                     Worker has {}",
+                    "A Stream call with no Store name needs a Stream runtime under the empty \
+                     name or exactly one Stream runtime, and this Worker has {}",
                     stores.len()
                 );
                 let result = calls.read(nameless(1));
@@ -2949,6 +2947,118 @@ mod tests {
                      Stream `s` in Store `mem`";
         assert_eq!(
             other.peeked(marker(), vec![]),
+            Err(WFMachinesError::Nondeterminism(error.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_read_with_no_store_name_uses_the_runtime_under_the_empty_name() {
+        let nameless = |seq| {
+            let mut command = read(seq, "s", &[]);
+            command.stream.as_mut().unwrap().store.clear();
+            command
+        };
+        let with_default = |phase| {
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["", "mem"]), phase);
+            calls.set_task(TaskState::Open(task_attempt(3)));
+            calls
+        };
+        let running = |calls: &mut StreamCalls| -> Vec<(String, String)> {
+            (calls.take_requests().into_iter())
+                .map(|request| match request {
+                    Request::Run(Call {
+                        store,
+                        op: Op::Read(read),
+                        ..
+                    }) => (store, read.request.r#ref.unwrap().store),
+                    _ => panic!("Only the read runs"),
+                })
+                .collect()
+        };
+        let mut live = with_default(Phase::Live);
+        live.read(nameless(1)).unwrap();
+        assert_eq!(running(&mut live), [(String::new(), String::new())]);
+
+        let mut replaying = with_default(Phase::Replaying);
+        replaying.read(nameless(1)).unwrap();
+        replaying.go_live().unwrap();
+        assert_eq!(running(&mut replaying), [(String::new(), String::new())]);
+
+        let marker = |store: &str| {
+            let entry = StreamReadResult {
+                seq: 1,
+                stream_id: "s".to_string(),
+                store: store.to_string(),
+                activation_index: 0,
+                from_offset: vec![],
+                result: Some(stream_read_result::Result::Failure(refused("down"))),
+            };
+            PeekedMarker::Read(StreamReadMarkerData { reads: vec![entry] })
+        };
+        let mut replay = with_default(Phase::ReplayOnly);
+        replay.read(nameless(1)).unwrap();
+        replay.peeked(marker(""), vec![]).unwrap();
+        assert_eq!(jobs(&mut replay, 0), ["read 1: failed"]);
+        let mut recorded_in_mem = with_default(Phase::ReplayOnly);
+        recorded_in_mem.read(nameless(1)).unwrap();
+        let error = "Stream read 1 is for Stream `s` in Store ``, and History has it for Stream \
+                     `s` in Store `mem`";
+        assert_eq!(
+            recorded_in_mem.peeked(marker("mem"), vec![]),
+            Err(WFMachinesError::Nondeterminism(error.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_store_name_uses_the_runtime_under_the_empty_name() {
+        let nameless = |seq| {
+            let mut command = append(seq, "s");
+            command.stream.as_mut().unwrap().store.clear();
+            command
+        };
+        let with_default = |phase| {
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["", "mem"]), phase);
+            calls.set_task(TaskState::Open(task_attempt(3)));
+            calls
+        };
+        let running = |calls: &mut StreamCalls| -> Vec<(u32, String)> {
+            (calls.take_requests().into_iter())
+                .map(|request| match request {
+                    Request::Run(call) => (call.seq, call.store),
+                    Request::Stop(_) => panic!("Nothing stops"),
+                })
+                .collect()
+        };
+        let mut live = with_default(Phase::Live);
+        live.append(nameless(1)).unwrap();
+        live.append(append(2, "s")).unwrap();
+        assert_eq!(
+            running(&mut live),
+            [(1, String::new()), (2, "mem".to_string())]
+        );
+        finish(&mut live, 1, None);
+        assert_eq!(jobs(&mut live, 0), ["append 1"]);
+        assert_eq!(live.take_marker().unwrap().appends[0].store, "");
+
+        let mut replaying = with_default(Phase::Replaying);
+        replaying.append(nameless(1)).unwrap();
+        replaying.go_live().unwrap();
+        assert_eq!(running(&mut replaying), [(1, String::new())]);
+
+        let mut replay = with_default(Phase::ReplayOnly);
+        replay.append(nameless(1)).unwrap();
+        let PeekedMarker::Append(mut entry) = marker(0, 1, "s") else {
+            unreachable!()
+        };
+        entry.appends[0].store.clear();
+        replay.peeked(PeekedMarker::Append(entry), vec![]).unwrap();
+        assert_eq!(jobs(&mut replay, 0), ["append 1"]);
+        let mut recorded_in_mem = with_default(Phase::ReplayOnly);
+        recorded_in_mem.append(nameless(1)).unwrap();
+        let error = "Stream append 1 is for Stream `s` in Store ``, and History has it for Stream \
+                     `s` in Store `mem`";
+        assert_eq!(
+            recorded_in_mem.peeked(marker(0, 1, "s"), vec![]),
             Err(WFMachinesError::Nondeterminism(error.to_string()))
         );
     }
