@@ -1,11 +1,13 @@
 use crate::common::{CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities};
 use futures::FutureExt;
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    task::Poll,
+    time::{Duration, Instant},
 };
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
@@ -16,14 +18,19 @@ use temporalio_common::{
         temporal::api::{
             enums::v1::{EventType, WorkflowTaskFailedCause},
             failure::v1::Failure,
-            history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
+            history::v1::{
+                HistoryEvent,
+                history_event::Attributes::{
+                    WorkflowExecutionFailedEventAttributes, WorkflowTaskFailedEventAttributes,
+                },
+            },
         },
     },
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ChildWorkflowOptions, LocalActivityOptions, WorkflowContext, WorkflowResult,
-    workflows,
+    ActivityOptions, ChildWorkflowOptions, LocalActivityOptions, MemoValue, WorkflowContext,
+    WorkflowResult, runtime::WorkflowErrorType, workflows,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -609,6 +616,205 @@ async fn nondeterministic_future_detection_fails_wft() {
         has_detection_failure,
         "Expected a WorkflowTaskFailed event with nondeterminism detection message"
     );
+}
+
+/// What task 1 of [`ChangedBeforeReplayWf`] runs. In each, a timer gives task 2.
+#[derive(Clone, Copy, Debug)]
+enum FirstTask {
+    Timer,
+    TimerWithLocalActivity,
+    /// The changed code upserts a memo in place of the timer and completes, so Core finds the
+    /// nondeterminism.
+    TimerReplacedByMemoUpsert,
+}
+
+#[workflow]
+struct ChangedBeforeReplayWf {
+    first_task: FirstTask,
+    /// Set in each instance after the first, as a deploy of changed code would be.
+    changed: bool,
+}
+
+#[workflow_methods(factory_only)]
+impl ChangedBeforeReplayWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let (first_task, changed) = ctx.state(|wf| (wf.first_task, wf.changed));
+        // A future that wakes itself while the SDK polls it is a non-SDK wake, which the SDK
+        // reports as nondeterminism in that activation. Tokio's `yield_now` wakes after the poll.
+        let changed_code = async {
+            if changed {
+                let mut woke = false;
+                futures::future::poll_fn(|cx| {
+                    if woke {
+                        return Poll::Ready(());
+                    }
+                    woke = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
+            }
+        };
+        let echo = || {
+            ctx.execute_local_activity(
+                StdActivities::echo,
+                "hi".to_string(),
+                LocalActivityOptions::default(),
+            )
+        };
+        match first_task {
+            FirstTask::Timer => {
+                changed_code.await;
+                ctx.timer(Duration::from_secs(2)).await;
+            }
+            FirstTask::TimerWithLocalActivity => {
+                let after_echo = async {
+                    let echoed = echo().await;
+                    changed_code.await;
+                    echoed
+                };
+                let (_, echoed) = workflows::join!(ctx.timer(Duration::from_secs(2)), after_echo);
+                echoed?;
+            }
+            FirstTask::TimerReplacedByMemoUpsert if changed => {
+                ctx.upsert_memo([("deployed", Some(MemoValue::new(true)))])?;
+            }
+            FirstTask::TimerReplacedByMemoUpsert => {
+                ctx.timer(Duration::from_secs(2)).await;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns the type of each event of `events`, with the cause and the message of a failed task
+/// and the message of the workflow's failure.
+fn history_summary(events: &[HistoryEvent]) -> Vec<String> {
+    (events.iter())
+        .map(|event| match &event.attributes {
+            Some(WorkflowTaskFailedEventAttributes(failed)) => format!(
+                "WorkflowTaskFailed({:?}: {})",
+                failed.cause(),
+                failed.failure.as_ref().map_or("", |f| f.message.as_str())
+            ),
+            Some(WorkflowExecutionFailedEventAttributes(failed)) => format!(
+                "WorkflowExecutionFailed({})",
+                failed.failure.as_ref().map_or("", |f| f.message.as_str())
+            ),
+            _ => format!("{:?}", event.event_type()),
+        })
+        .collect()
+}
+
+/// Runs [`ChangedBeforeReplayWf`] on a worker with no workflow cache, so task 2 builds a second
+/// instance, which runs the changed code and replays task 1. Returns the summary of history once
+/// the workflow closes, or after 30 seconds.
+async fn run_changed_before_replay(name: &str, first_task: FirstTask) -> Vec<String> {
+    let mut starter = CoreWfStarter::new(name);
+    starter.sdk_config.max_cached_workflows = 0;
+    starter.sdk_config.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    starter.sdk_config.register_activities(StdActivities);
+    let instances = AtomicUsize::new(0);
+    starter
+        .sdk_config
+        .register_workflow_with_factory(move || ChangedBeforeReplayWf {
+            first_task,
+            changed: instances.fetch_add(1, Ordering::Relaxed) > 0,
+        })
+        .unwrap();
+    let mut worker = starter.worker().await;
+    worker.fetch_results = false;
+    let task_queue = starter.get_task_queue().to_owned();
+    worker
+        .submit_workflow(
+            ChangedBeforeReplayWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+    let core_worker = worker.core_worker();
+    let watcher = async {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let events = starter.get_history().await.events;
+            let closed = events.iter().any(|e| {
+                matches!(
+                    e.event_type(),
+                    EventType::WorkflowExecutionFailed | EventType::WorkflowExecutionCompleted
+                )
+            });
+            if closed || Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        core_worker.initiate_shutdown();
+    };
+    let runner = async { worker.run_until_done().await.unwrap() };
+    tokio::join!(watcher, runner);
+    history_summary(&starter.get_history().await.events)
+}
+
+/// Asserts that the workflow failed once, with a nondeterminism error whose message starts with
+/// `message`, and with no failed task.
+fn assert_fails_once_with(summary: &[String], message: &str) {
+    let failures: Vec<&String> = (summary.iter())
+        .filter(|event| event.contains("Failed("))
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "Expected exactly one failure event in history: {summary:#?}"
+    );
+    let expected = format!("WorkflowExecutionFailed({message}");
+    assert!(
+        failures[0].starts_with(&expected),
+        "Expected the only failure to be the workflow failing with `{message}`: {summary:#?}"
+    );
+    assert!(
+        !summary.iter().any(|event| event == "WorkflowTaskTimedOut"),
+        "Expected no workflow task to time out, which would mean the server refused a \
+         completion: {summary:#?}"
+    );
+}
+
+/// Asserts as [`assert_fails_once_with`] does, with the nondeterminism error that the SDK reported.
+fn assert_fails_once_with_langs_error(summary: &[String]) {
+    assert_fails_once_with(summary, "[TMPRL1100] Nondeterministic future detected");
+}
+
+// The replay fails its first activation, before the timer that task 1 started.
+#[tokio::test]
+async fn changed_code_before_a_replayed_timer_fails_the_workflow_with_langs_error() {
+    let name = "changed_code_before_a_replayed_timer_fails_the_workflow_with_langs_error";
+    let summary = run_changed_before_replay(name, FirstTask::Timer).await;
+    assert_fails_once_with_langs_error(&summary);
+}
+
+// The replay fails the activation with the local activity's result, after the one that started
+// the timer, so the timer must not start again.
+#[tokio::test]
+async fn changed_code_at_a_replayed_local_activity_result_starts_no_second_timer() {
+    let name = "changed_code_at_a_replayed_local_activity_result_starts_no_second_timer";
+    let summary = run_changed_before_replay(name, FirstTask::TimerWithLocalActivity).await;
+    assert_fails_once_with_langs_error(&summary);
+    let timers = summary.iter().filter(|event| *event == "TimerStarted");
+    assert_eq!(
+        timers.count(),
+        1,
+        "Expected the replayed timer not to be started a second time: {summary:#?}"
+    );
+}
+
+// Core finds that history has the timer where the changed code upserts a memo. The changed code's
+// completion of the workflow is not in history, and must not go out next to Core's failure.
+#[tokio::test]
+async fn changed_code_that_core_finds_fails_the_workflow_with_cores_error() {
+    let name = "changed_code_that_core_finds_fails_the_workflow_with_cores_error";
+    let summary = run_changed_before_replay(name, FirstTask::TimerReplacedByMemoUpsert).await;
+    assert_fails_once_with(&summary, "[TMPRL1100] Nondeterminism error");
 }
 
 #[workflow]
