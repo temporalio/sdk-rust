@@ -763,12 +763,20 @@ fn assert_fails_once_with(summary: &[String], message: &str) {
     let failures: Vec<&String> = (summary.iter())
         .filter(|event| event.contains("Failed("))
         .collect();
-    assert_eq!(failures.len(), 1, "{summary:#?}");
+    assert_eq!(
+        failures.len(),
+        1,
+        "Expected exactly one failure event in history: {summary:#?}"
+    );
     let expected = format!("WorkflowExecutionFailed({message}");
-    assert!(failures[0].starts_with(&expected), "{summary:#?}");
+    assert!(
+        failures[0].starts_with(&expected),
+        "Expected the only failure to be the workflow failing with `{message}`: {summary:#?}"
+    );
     assert!(
         !summary.iter().any(|event| event == "WorkflowTaskTimedOut"),
-        "{summary:#?}"
+        "Expected no workflow task to time out, which would mean the server refused a \
+         completion: {summary:#?}"
     );
 }
 
@@ -793,7 +801,11 @@ async fn changed_code_at_a_replayed_local_activity_result_starts_no_second_timer
     let summary = run_changed_before_replay(name, FirstTask::TimerWithLocalActivity).await;
     assert_fails_once_with_langs_error(&summary);
     let timers = summary.iter().filter(|event| *event == "TimerStarted");
-    assert_eq!(timers.count(), 1, "{summary:#?}");
+    assert_eq!(
+        timers.count(),
+        1,
+        "Expected the replayed timer not to be started a second time: {summary:#?}"
+    );
 }
 
 // Core finds that history has the timer where the changed code upserts a memo. The changed code's

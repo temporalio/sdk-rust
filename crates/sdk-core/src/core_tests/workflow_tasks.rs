@@ -1518,10 +1518,11 @@ async fn fail_wft_then_recover() {
     core.drain_pollers_and_shutdown().await;
 }
 
-/// Runs the tasks of `mh` with the Nondeterminism opt-in, and completes each activation with
+/// Runs the tasks of `mh` with `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`,
+/// so nondeterminism fails the workflow rather than the task, and completes each activation with
 /// `lang` until the run is evicted. Returns the type of each command of each completion, with the
 /// message of its failure if any.
-async fn run_with_nondeterminism_opt_in(
+async fn run_failing_workflow_on_nondeterminism(
     mut mh: MockPollCfg,
     mut lang: impl FnMut(&WorkflowActivation) -> WorkflowActivationCompletion,
 ) -> Vec<Vec<(CommandType, Option<String>)>> {
@@ -1612,11 +1613,11 @@ async fn a_nondeterminism_failure_fails_the_workflow_once_with_langs_error(
         [ResponseType::AllHistory],
         mock_worker_client(),
     );
-    let sent = run_with_nondeterminism_opt_in(mh, langs_nondeterminism_failure).await;
+    let sent = run_failing_workflow_on_nondeterminism(mh, langs_nondeterminism_failure).await;
     assert_eq!(
         sent,
         fails_with_langs_error(),
-        "The commands of each completion"
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
     );
 }
 
@@ -1653,11 +1654,11 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_replayed_task_sends
         }
         _ => langs_nondeterminism_failure(act),
     };
-    let sent = run_with_nondeterminism_opt_in(mh, lang).await;
+    let sent = run_failing_workflow_on_nondeterminism(mh, lang).await;
     assert_eq!(
         sent,
         fails_with_langs_error(),
-        "The commands of each completion"
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
     );
 }
 
@@ -1692,13 +1693,18 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its
         }
         _ => langs_nondeterminism_failure(act),
     };
-    let sent = run_with_nondeterminism_opt_in(mh, lang).await;
+    let sent = run_failing_workflow_on_nondeterminism(mh, lang).await;
     let timer = (CommandType::StartTimer, None);
     let fail = (
         CommandType::FailWorkflowExecution,
         Some("changed".to_string()),
     );
-    assert_eq!(sent, [vec![timer, fail]], "The commands of each completion");
+    assert_eq!(
+        sent,
+        [vec![timer, fail]],
+        "Expected exactly one completion, containing the live task's StartTimer followed by a \
+         FailWorkflowExecution with lang's error"
+    );
 }
 
 #[tokio::test]
