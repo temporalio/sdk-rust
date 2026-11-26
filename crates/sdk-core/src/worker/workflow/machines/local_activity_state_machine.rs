@@ -123,21 +123,26 @@ impl From<CompleteLocalActivityData> for ResolveDat {
         ResolveDat {
             result: match d.result {
                 Ok(res) => LocalActivityExecutionResult::Completed(Success { result: Some(res) }),
-                Err(fail) => {
+                Err(fail)
                     if matches!(fail.failure_info, Some(FailureInfo::CanceledFailureInfo(_)))
                         || matches!(
                             fail.cause.as_deref().and_then(|f| f.failure_info.as_ref()),
                             Some(FailureInfo::CanceledFailureInfo(_))
-                        )
-                    {
-                        LocalActivityExecutionResult::Cancelled(Cancellation {
-                            failure: Some(fail),
-                        })
-                    } else {
-                        LocalActivityExecutionResult::Failed(ActFail {
-                            failure: Some(fail),
-                            ..Default::default()
-                        })
+                        ) =>
+                {
+                    LocalActivityExecutionResult::Cancelled(Cancellation {
+                        failure: Some(fail),
+                    })
+                }
+                Err(fail) => {
+                    let timeout = fail.is_timeout();
+                    let failure = ActFail {
+                        failure: Some(fail),
+                        ..Default::default()
+                    };
+                    match timeout {
+                        Some(_) => LocalActivityExecutionResult::TimedOut(failure),
+                        None => LocalActivityExecutionResult::Failed(failure),
                     }
                 }
             },

@@ -89,6 +89,10 @@ relevant information.
   `failure_reason` with the reason of the Stream error, such as `stream_not_found`, or
   `stream_store_unavailable` for a try in an outage.
 
+### Fixed
+* Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
+  matching live execution.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

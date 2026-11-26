@@ -295,6 +295,7 @@ pub struct StartWorkflowOutput {
     pub workflow_id: String,
     /// The run ID returned by the service or a short-circuiting interceptor.
     pub run_id: String,
+    pub(crate) link: Option<temporalio_common::protos::temporal::api::common::v1::Link>,
 }
 
 impl StartWorkflowOutput {
@@ -302,6 +303,7 @@ impl StartWorkflowOutput {
         Self {
             workflow_id: workflow_id.into(),
             run_id: run_id.into(),
+            link: None,
         }
     }
 }
