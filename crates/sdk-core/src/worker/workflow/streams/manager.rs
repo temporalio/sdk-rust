@@ -300,7 +300,7 @@ async fn read_page(
     } = read;
     if check {
         request.wait = None;
-        let deadline = settings.read_check_deadline;
+        let deadline = settings.read_check_deadline();
         metrics.stream_read_executed();
         let read = runtime.read_records_with_more(request);
         let answer = match tokio::time::timeout(deadline, read).await {

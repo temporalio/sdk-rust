@@ -25,7 +25,9 @@ mod workflow_task_state_machine;
 mod transition_coverage;
 
 pub(crate) use temporalio_common::fsm_trait::MachineError;
-pub(crate) use workflow_machines::{MachinesWFTResponseContent, WorkflowMachines};
+pub(crate) use workflow_machines::{
+    HasActivationIndex, MachinesWFTResponseContent, WorkflowMachines,
+};
 
 use crate::{
     telemetry::VecDisplayer,
