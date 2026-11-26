@@ -107,6 +107,7 @@ fsm! {
     StartFailed --(Cancel(String)) --> StartFailed;
     TimedOut --(Cancel(String)) --> TimedOut;
     Completed --(Cancel(String)) --> Completed;
+    Terminated --(Cancel(String)) --> Terminated;
 }
 
 pub(super) struct ChildWorkflowExecutionStartedEvent {
@@ -1007,6 +1008,7 @@ mod test {
             StartFailed {}.into(),
             TimedOut {}.into(),
             Completed {}.into(),
+            Terminated {}.into(),
         ] {
             let mut s = ChildWorkflowMachine::from_parts(
                 state.clone(),

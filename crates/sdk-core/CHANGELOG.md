@@ -39,6 +39,7 @@ relevant information.
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
+* A cancellation request for an already terminated Child Workflow no longer fails the parent Workflow Task.
 
 ## [0.12.0] - 2026-11-23
 
