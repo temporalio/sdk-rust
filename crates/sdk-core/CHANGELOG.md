@@ -39,6 +39,8 @@ relevant information.
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
+* Canceling an external Workflow Signal whose delivery has already failed no longer fails the
+  sending Workflow Task.
 
 * With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, a workflow that lang fails
   for nondeterminism during replay now fails once, with lang's failure, and the completion has only

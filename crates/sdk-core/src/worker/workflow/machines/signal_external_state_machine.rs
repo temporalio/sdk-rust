@@ -49,6 +49,7 @@ fsm! {
     // Ignore any spurious cancellations after resolution
     Cancelled --(Cancel) --> Cancelled;
     Signaled --(Cancel) --> Signaled;
+    Failed --(Cancel) --> Failed;
 }
 
 #[derive(Default, Clone)]
@@ -295,5 +296,46 @@ impl SignalExternalMachine {
         // We are only ever in the cancelled state if cancelled before sent to server, there is no
         // after sent cancellation here.
         matches!(self.state(), SignalExternalMachineState::Cancelled(_))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{super::TemporalStateMachine, *};
+    use temporalio_common::protos::temporal::api::history::v1::{
+        HistoryEvent, SignalExternalWorkflowExecutionFailedEventAttributes,
+    };
+
+    #[test]
+    fn cancels_ignored_after_signal_failure() {
+        let mut machine = SignalExternalMachine::from_parts(
+            SignalExternalCommandRecorded {}.into(),
+            SharedState { seq: 1 },
+        );
+        let cause = SignalExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound;
+        let failure = SignalExternalWorkflowExecutionFailedEventAttributes {
+            cause: cause as i32,
+            initiated_event_id: 5,
+            workflow_task_completed_event_id: 4,
+            ..Default::default()
+        };
+        let responses = machine
+            .handle_event(HistEventData {
+                event: HistoryEvent {
+                    event_id: 6,
+                    event_type: EventType::SignalExternalWorkflowExecutionFailed as i32,
+                    attributes: Some(failure.into()),
+                    ..Default::default()
+                },
+                replaying: false,
+                current_task_is_last_in_history: true,
+            })
+            .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(machine.cancel().unwrap().is_empty());
+        assert!(matches!(
+            machine.state(),
+            SignalExternalMachineState::Failed(_)
+        ));
     }
 }
