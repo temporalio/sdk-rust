@@ -114,7 +114,7 @@ pub(crate) struct StreamCalls {
     done: BTreeSet<CallKey>,
     held: Held,
     /// Results from History whose calls Workflow code has issued, by the activation that gets them.
-    ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
+    ready: BTreeMap<(u64, CallKey), StreamAppendResult>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
     /// The live results of the current activation, which its marker records.
@@ -246,9 +246,9 @@ impl StreamCalls {
         while let Some(key) = self.ready.keys().next().copied()
             && self.is_due(&key, activation, marker)
         {
-            let job = self.ready.remove(&key).expect("The key was just read");
+            let entry = self.ready.remove(&key).expect("The key was just read");
             self.leave(key.1);
-            jobs.push(job);
+            jobs.push(append_job(&entry).into());
         }
         self.released = None;
         if !self.task.is_open() {
@@ -370,6 +370,11 @@ impl StreamCalls {
             .count()
     }
 
+    /// Returns the first result from History whose call Workflow code issued.
+    pub(crate) fn next_ready(&self) -> Option<&StreamAppendResult> {
+        self.ready.values().next()
+    }
+
     /// Returns the activation of the first result from History whose call Workflow code issued.
     pub(crate) fn next_ready_activation(&self) -> Option<u64> {
         self.ready.keys().next().map(|(at, _)| *at)
@@ -453,7 +458,7 @@ impl StreamCalls {
         }
         append.state = AppendState::Replayed;
         let at = (entry.activation_index, call);
-        self.ready.insert(at, append_job(&entry).into());
+        self.ready.insert(at, entry);
         Ok(())
     }
 
