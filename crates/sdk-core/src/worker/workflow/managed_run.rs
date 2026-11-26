@@ -570,7 +570,7 @@ impl ManagedRun {
     }
 
     /// Returns true for a completion that fails the Workflow while its replay has Stream Records
-    /// left to read. It's the last one of the run, so it applies no next task and reads none.
+    /// left to read. It's the last one of the run, so it waits for no page.
     fn fails_before_stream_records(&self, is_forced_failure: bool) -> bool {
         let paginator = self.paginator.as_ref();
         is_forced_failure && paginator.is_some_and(ReplayReader::has_unread_in)

@@ -171,10 +171,17 @@ async fn a_read_result_goes_before_a_local_activity_result_of_its_activation() {
     // The append answers at once. The Local Activity and the gated read have no result yet.
     let first = worker.poll_workflow_activation().await.unwrap();
     live.push(jobs_of(&first));
-    // Both results arrive while that activation is outstanding. Each input reaches the run in the
+    // Both results must arrive before that activation completes. Each input reaches the run in the
     // order that it was sent, and the Store sends its answer as soon as the read passes the gate.
-    store.let_go(0..store.requests().len());
     let deadline = Instant::now() + Duration::from_secs(30);
+    while store.reads().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "The read never reached the Store"
+        );
+        tokio::task::yield_now().await;
+    }
+    store.let_go(0..store.requests().len());
     while store.reads_let_go() == 0 {
         assert!(Instant::now() < deadline, "The read never passed the gate");
         tokio::task::yield_now().await;
