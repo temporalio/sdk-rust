@@ -15,6 +15,7 @@ const BRIDGE_CRATE: &str = "temporalio-sdk-core-c-bridge";
 const PROTOS_CRATE: &str = "temporalio-protos";
 const RELEASE_TOOL_CRATE: &str = "changelog-release-notes";
 const AWS_S3_DRIVER_CRATE: &str = "temporalio-aws-s3driver";
+const AWS_LAMBDA_CRATE: &str = "temporalio-sdk-aws-lambda";
 const STREAMS_CRATE: &str = "temporalio-streams";
 
 fn workspace_root() -> PathBuf {
@@ -133,6 +134,8 @@ fn main() -> Result<(), String> {
         RELEASE_TOOL_CRATE.into(),
         "--exclude".into(),
         AWS_S3_DRIVER_CRATE.into(),
+        "--exclude".into(),
+        AWS_LAMBDA_CRATE.into(),
         "--exclude".into(),
         STREAMS_CRATE.into(),
     ];

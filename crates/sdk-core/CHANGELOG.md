@@ -76,6 +76,10 @@ relevant information.
   queries. A replay whose Store lost the Records fails with the new
   `WorkflowErrorType::StreamReplay`.
 
+### Fixed
+* Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
+  matching live execution.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
