@@ -681,6 +681,12 @@ impl WorkflowMachines {
         }
     }
 
+    /// Lets Core fail the workflow in an update-only task. The fail command accepts no update, but
+    /// the server takes it and aborts the update.
+    pub(crate) fn allow_forced_failure_in_update_only_task(&mut self) {
+        self.update_only_task = false;
+    }
+
     /// Apply the language SDK's workflow commands and prepare the resulting commands for the server.
     pub(crate) fn iterate_machines(&mut self, results: Vec<WFCommand>) -> Result<()> {
         debug!(in_cmds = %results.display(), "wf bridge iteration fetch");

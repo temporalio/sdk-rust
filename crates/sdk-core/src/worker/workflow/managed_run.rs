@@ -679,6 +679,7 @@ impl ManagedRun {
             )
         {
             warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            self.wfm.machines.allow_forced_failure_in_update_only_task();
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -896,6 +897,14 @@ impl ManagedRun {
                         resp_chan: completion.resp_chan,
                     }))
                 }
+            }
+            // A nondeterminism error here would make `failed_completion` force the failure again,
+            // and hit the same error, until the stack overflows. So the task fails instead.
+            Err(e @ WFMachinesError::Nondeterminism(_)) if completion.is_forced_failure => {
+                Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(format!("Could not fail the workflow: {e}")),
+                    complete_resp_chan: completion.resp_chan,
+                })
             }
             Err(e) => Err(RunUpdateErr {
                 source: e,

@@ -54,7 +54,10 @@ relevant information.
   lang gets only the eviction after it, even when a Local Activity result is still pending.
   Previously, lang got one more activation, and the completion could have a nondeterminism error
   from Core in place of lang's failure, or a Local Activity marker and a second
-  `FailWorkflowExecution` command after the first.
+  `FailWorkflowExecution` command after the first. A nondeterminism error in a workflow task that
+  only delivers an Update to a cached workflow also fails the workflow once, and the server aborts
+  the Update. Previously, Core rejected that `FailWorkflowExecution` command, because it accepts no
+  Update, and tried again until the worker process aborted with a stack overflow.
 
 ## [0.12.0] - 2026-11-23
 
