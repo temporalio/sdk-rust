@@ -1094,6 +1094,54 @@ fn a_store_name_over_4096_bytes_fails_the_build_of_a_worker_config() {
     );
 }
 
+/// Returns a runtime under the test's Store name, one under `other` and one under the empty name.
+/// If `shared`, the runtime under the empty name is the one of the test's Store.
+fn runtimes_with_a_default(shared: bool) -> StreamRuntimes {
+    let runtime = || {
+        let store = Arc::new(MemoryStore::default());
+        Arc::new(StreamRuntime::new(store, StoreLimits::default()))
+    };
+    let mem = runtime();
+    let default = if shared { mem.clone() } else { runtime() };
+    StreamRuntimes::new([
+        (STORE.to_string(), mem),
+        ("other".to_string(), runtime()),
+        (String::new(), default),
+    ])
+}
+
+const ONE_RUNTIME_UNDER_TWO_NAMES: &str = "The Stream runtime for Store `mem` is also registered \
+                                           under the empty name. Register each runtime under one \
+                                           name.";
+
+// `stream_runtimes` is a public field, so a config can change it after the check of its builder.
+#[rstest::rstest]
+#[case::worker(false)]
+#[case::replay_worker(true)]
+#[tokio::test]
+async fn one_runtime_under_two_names_fails_the_start_of_a_worker(#[case] replay: bool) {
+    let with_runtimes = |shared: bool| {
+        let mut config = test_worker_cfg().build().unwrap();
+        config.stream_runtimes = runtimes_with_a_default(shared);
+        config
+    };
+    assert_eq!(start_worker(with_runtimes(false), replay), Ok(()));
+    assert_eq!(
+        start_worker(with_runtimes(true), replay),
+        Err(ONE_RUNTIME_UNDER_TWO_NAMES.to_string())
+    );
+}
+
+#[test]
+fn one_runtime_under_two_names_fails_the_build_of_a_worker_config() {
+    let build = |shared: bool| {
+        let config = test_worker_cfg().stream_runtimes(runtimes_with_a_default(shared));
+        config.build().map(drop)
+    };
+    assert_eq!(build(false), Ok(()));
+    assert_eq!(build(true), Err(ONE_RUNTIME_UNDER_TWO_NAMES.to_string()));
+}
+
 /// The state of a call when Workflow code sends its last command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AtTheEnd {
