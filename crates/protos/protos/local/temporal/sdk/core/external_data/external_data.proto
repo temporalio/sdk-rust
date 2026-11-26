@@ -76,9 +76,10 @@ message StreamFailure {
 }
 
 // The data of a `core_stream_read` marker. Core records one in each activation in which Workflow
-// code got the page of a read, and one with no entry by the rule of `StreamAppendMarkerData`. The
-// marker keeps the offsets, the count and a digest of each page, never its Records. A replay reads
-// the Records from the Store again. Its JSON has `bytes` fields in lower-case hex, as for appends.
+// code got the page of a read. An empty marker keeps a task with an open read and no open append
+// apart from the next task when chunking is on. The marker keeps the offsets, the count and a
+// digest of each page, never its Records. A replay reads the Records from the Store again. Its
+// JSON has `bytes` fields in lower-case hex, as for appends.
 message StreamReadMarkerData {
   repeated StreamReadResult reads = 1;
 }
