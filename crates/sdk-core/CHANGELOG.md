@@ -53,6 +53,10 @@ relevant information.
   with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
   message starts with `StreamStoreUnavailable:`.
 
+### Fixed
+* Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
+  matching live execution.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
