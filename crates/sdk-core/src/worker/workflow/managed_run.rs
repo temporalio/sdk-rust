@@ -525,8 +525,8 @@ impl ManagedRun {
 
             // Verify we can actually apply the next workflow task, which will happen as part of
             // applying the completion to machines. If we can't, return early indicating we need
-            // to fetch a page.
-            if !self.wfm.ready_to_apply_next_wft() {
+            // to fetch a page. A forced failure applies no next task, so it never waits for one.
+            if !is_forced_failure && !self.wfm.ready_to_apply_next_wft() {
                 return if let Some(paginator) = self.paginator.take() {
                     debug!("Need to fetch a history page before next WFT can be applied");
                     self.completion_waiting_on_page_fetch = Some(rac);
@@ -693,7 +693,7 @@ impl ManagedRun {
                     true,
                 )
                 .unwrap_or_else(|e| {
-                    dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
+                    dbg_panic!("A forced failure must not wait for a history page: {e:?}");
                     None
                 });
         }

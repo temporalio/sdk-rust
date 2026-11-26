@@ -59,6 +59,11 @@ relevant information.
   the Update. Previously, Core rejected that `FailWorkflowExecution` command, because it accepts no
   Update, and tried again until the worker process aborted with a stack overflow.
 
+* With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, lang's completion of an
+  activation that fails for nondeterminism returns in a workflow task that reads a history newer
+  than itself, such as a sticky task that timed out while it waited for a cache slot. Previously,
+  it waited for a history page that Core never fetched.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
