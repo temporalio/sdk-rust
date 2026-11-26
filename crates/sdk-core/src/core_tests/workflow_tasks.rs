@@ -27,6 +27,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
+    ops::RangeInclusive,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -65,7 +66,7 @@ use temporalio_common::{
             enums::v1::{CommandType, EventType, RetryState, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
-                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes,
+                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes, History,
                 TimerFiredEventAttributes, WorkflowPropertiesModifiedExternallyEventAttributes,
                 history_event,
             },
@@ -2010,6 +2011,232 @@ async fn a_nondeterminism_failure_in_an_update_only_task_fails_the_workflow_once
         activations.len(),
         expected_activations,
         "Expected lang to get no activation after the one it failed: {activations:?}"
+    );
+}
+
+/// Where the nondeterminism is, in a history whose second page ends inside a task.
+#[derive(Clone, Copy, Debug)]
+enum NondeterminismAtTheLastPage {
+    /// Lang fails the activation of the last task that the second page completes.
+    Lang,
+    /// Lang's command in the activation before that task differs from it, which Core finds.
+    Core,
+}
+
+/// The events of `t` with an id in `ids`, as a page of `GetWorkflowExecutionHistory`.
+fn history_page(
+    t: &TestHistoryBuilder,
+    ids: RangeInclusive<i64>,
+    next_page_token: Vec<u8>,
+) -> GetWorkflowExecutionHistoryResponse {
+    let events = t.get_full_history_info().unwrap().into_events();
+    GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: (events.into_iter())
+                .filter(|event| ids.contains(&event.event_id))
+                .collect(),
+        }),
+        next_page_token,
+        ..Default::default()
+    }
+}
+
+/// Mocks that poll `task`, and fetch the page of `pages` with the requested page token. The
+/// counter counts the fetches.
+fn paged_history_mocks(
+    wf_id: &str,
+    t: TestHistoryBuilder,
+    task: ResponseType,
+    pages: Vec<(Vec<u8>, GetWorkflowExecutionHistoryResponse)>,
+) -> (MockPollCfg, Arc<AtomicUsize>) {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counted = fetches.clone();
+    let mut client = mock_worker_client();
+    client
+        .expect_get_workflow_execution_history()
+        .returning(move |_, _, token| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let (_, page) = (pages.iter())
+                .find(|(page_token, _)| *page_token == token)
+                .unwrap_or_else(|| panic!("Unexpected page token {token:?}"));
+            Ok(page.clone())
+        });
+    let mh = MockPollCfg::from_resp_batches(wf_id, t, [task], client);
+    (mh, fetches)
+}
+
+/// Runs a workflow that starts timer `n` in activation `n`, until `found_by` makes activation
+/// `failing_activation` nondeterministic. Checks that lang's completion returns, that the workflow
+/// fails once with the error found, and that lang gets no activation after it. Returns the value
+/// of `fetches` when lang got the failing activation.
+async fn fail_a_timer_loop_once(
+    mh: MockPollCfg,
+    found_by: NondeterminismAtTheLastPage,
+    failing_activation: usize,
+    fetches: &AtomicUsize,
+) -> usize {
+    let events = mh.hists[0]
+        .hist
+        .get_full_history_info()
+        .unwrap()
+        .into_events();
+    let timer_id = failing_activation.to_string();
+    let timer_started = (events.iter())
+        .find(|event| {
+            matches!(&event.attributes,
+                Some(history_event::Attributes::TimerStartedEventAttributes(timer))
+                    if timer.timer_id == timer_id)
+        })
+        .expect("Expected history to start the timer of the failing activation")
+        .event_id;
+    let mut activations = 0;
+    let mut fetches_at_the_failure = 0;
+    let lang = |act: &WorkflowActivation| {
+        activations += 1;
+        if activations < failing_activation {
+            let seq = activations as u32;
+            return WorkflowActivationCompletion::from_cmd(
+                act.run_id.clone(),
+                start_timer_cmd(seq, Duration::from_secs(1)),
+            );
+        }
+        fetches_at_the_failure = fetches.load(Ordering::SeqCst);
+        match found_by {
+            NondeterminismAtTheLastPage::Lang => langs_nondeterminism_failure(act),
+            NondeterminismAtTheLastPage::Core => {
+                let activity = ScheduleActivity {
+                    seq: 1,
+                    activity_id: "1".to_string(),
+                    ..default_act_sched()
+                };
+                WorkflowActivationCompletion::from_cmd(act.run_id.clone(), activity.into())
+            }
+        }
+    };
+    let run = run_failing_workflow_on_nondeterminism(mh, lang);
+    let sent = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("Expected the run to end within 10 seconds");
+    let expected_error = match found_by {
+        NondeterminismAtTheLastPage::Lang => "changed".to_string(),
+        NondeterminismAtTheLastPage::Core => format!(
+            "[TMPRL1100] Nondeterminism error: Activity machine does not handle this event: \
+             HistoryEvent(id: {timer_started}, TimerStarted)"
+        ),
+    };
+    let fail = (CommandType::FailWorkflowExecution, Some(expected_error));
+    assert_eq!(
+        sent,
+        vec![vec![fail]],
+        "Expected one completion, containing only a FailWorkflowExecution with the error found"
+    );
+    assert_eq!(
+        activations, failing_activation,
+        "Expected lang to get no activation after the failure"
+    );
+    fetches_at_the_failure
+}
+
+// The poll brings the first page of a long history and the paginator fetches the rest by page
+// token. The second page ends inside task 3, so the failure in task 2 would come before the last
+// page if the paginator stopped there. It loads every page first, since only the current task
+// follows the previous started event. The workflow fails once and lang's completion returns.
+#[rstest]
+#[case::lang(NondeterminismAtTheLastPage::Lang, 2)]
+#[case::core(NondeterminismAtTheLastPage::Core, 1)]
+#[tokio::test]
+async fn a_nondeterminism_failure_in_a_paged_history_sends_one_command(
+    #[case] found_by: NondeterminismAtTheLastPage,
+    #[case] failing_activation: usize,
+) {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    for timer_id in ["1", "2", "3"] {
+        let started = t.add_timer_started(timer_id.to_string());
+        t.add_timer_fired(started, timer_id.to_string());
+        if timer_id == "3" {
+            t.add_workflow_task_scheduled_and_started();
+        } else {
+            t.add_full_wf_task();
+        }
+    }
+    let mut task = hist_to_poll_resp(&t, wf_id, ResponseType::AllHistory).resp;
+    assert_eq!(
+        (task.previous_started_event_id, task.started_event_id),
+        (13, 18)
+    );
+    // A page holds whole batches. A timer fires in the batch of the next task's scheduled event.
+    task.history = history_page(&t, 1..=7, vec![]).history;
+    task.next_page_token = vec![1];
+    let pages = vec![
+        (vec![1], history_page(&t, 8..=12, vec![2])),
+        (vec![2], history_page(&t, 13..=18, vec![])),
+    ];
+    let (mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(task), pages);
+    let fetches_at_the_failure =
+        fail_a_timer_loop_once(mh, found_by, failing_activation, &fetches).await;
+    assert_eq!(
+        fetches_at_the_failure, 2,
+        "Expected the paginator to fetch both remaining pages before the failing activation"
+    );
+}
+
+// A sticky task comes for a run that is no longer cached, so Core fetches history from the start.
+// By then the task timed out and another worker completed the next two tasks, so the history goes
+// past the task's own started event. Two tasks then follow the previous started event, and the
+// paginator stops after the second page, which ends inside the last task. A forced failure at the
+// last task of that page must not wait for the next one. The server refuses the completion of a
+// timed out task, which doesn't change what Core sends.
+#[rstest]
+#[case::lang(NondeterminismAtTheLastPage::Lang, 5)]
+#[case::core(NondeterminismAtTheLastPage::Core, 4)]
+#[tokio::test]
+async fn a_nondeterminism_failure_before_the_next_page_of_a_timed_out_task_sends_one_command(
+    #[case] found_by: NondeterminismAtTheLastPage,
+    #[case] failing_activation: usize,
+) {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    for timer_id in ["1", "2"] {
+        let started = t.add_timer_started(timer_id.to_string());
+        t.add_timer_fired(started, timer_id.to_string());
+        t.add_full_wf_task();
+    }
+    let started = t.add_timer_started("3".to_string());
+    t.add_timer_fired(started, "3".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let sticky_task = hist_to_poll_resp(&t, wf_id, ResponseType::OneTask(4)).resp;
+    assert_eq!(
+        (
+            sticky_task.previous_started_event_id,
+            sticky_task.started_event_id
+        ),
+        (13, 18)
+    );
+    // That task times out, and another worker completes the next attempt and one more task.
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    let started = t.add_timer_started("4".to_string());
+    t.add_timer_fired(started, "4".to_string());
+    t.add_full_wf_task();
+    let started = t.add_timer_started("5".to_string());
+    t.add_timer_fired(started, "5".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let pages = vec![
+        (vec![], history_page(&t, 1..=23, vec![1])),
+        (vec![1], history_page(&t, 24..=28, vec![2])),
+        (vec![2], history_page(&t, 29..=31, vec![])),
+    ];
+    let (mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
+    let fetches_at_the_failure =
+        fail_a_timer_loop_once(mh, found_by, failing_activation, &fetches).await;
+    assert_eq!(
+        fetches_at_the_failure, 2,
+        "Expected the paginator to fetch the first two of three pages before the failing activation"
     );
 }
 
