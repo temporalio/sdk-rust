@@ -42,19 +42,10 @@ relevant information.
   own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
   append of client code against them with `StoreLimits::validate_append`.
 * [lang-internal] Workflow code can append to a Stream with the experimental `AppendToStream`
-  command, on a Store in `WorkerConfig::stream_runtimes`. Each append writes with the Producer and
-  the attempt of its Workflow Task. Its result comes back in a `ResolveStreamAppend` job. Each
-  activation that gives results records them in a `core_stream_append` marker, with the index of
-  the activation, which a replay counts as for a Local Activity result. So a replay doesn't make a
-  Store call. In one activation the Stream results go before the Local Activity results. A
-  completion that leaves an append with no result, and has no such marker, records one with no
-  entry, so that a replay with chunking on keeps its task apart from the next one.
-  Core drops a call that has no result when the Workflow's last command arrives, as it drops a
-  Local Activity. If a call is waiting to try again at the task's heartbeat, because a try failed
-  with `StoreUnavailable` or got no answer within `try_deadline`, the task fails, and its failure
-  message starts with `StreamStoreUnavailable:`. The data of one marker can have at most 1 MiB.
-  An activation whose marker has more fails its task with a message that starts with
-  `StreamMarkerTooLarge:`.
+  command, on a Store in `WorkerConfig::stream_runtimes`. Core calls the Store, gives the result in
+  a `ResolveStreamAppend` job, and records it in a `core_stream_append` marker, so a replay makes
+  no Store call. A task fails with `StreamStoreUnavailable:` if the Store is still unavailable at
+  the task's heartbeat, and with `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
