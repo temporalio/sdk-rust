@@ -40,7 +40,7 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
+        enums::v1::{CommandType, VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
@@ -808,8 +808,12 @@ impl ManagedRun {
                 self.wfm.feed_history_from_new_page(update)?;
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
-            // or are otherwise broken.
-            if !completion.activation_was_eviction && !self.am_broken {
+            // or are otherwise broken. After a forced failure, lang sent none of the commands the
+            // next task's history records, so applying it would fail the workflow again.
+            if !completion.activation_was_eviction
+                && !self.am_broken
+                && !completion.is_forced_failure
+            {
                 self.wfm.apply_next_task_if_ready()?;
             }
             let mut new_local_acts = self.wfm.drain_queued_local_activities();
@@ -1281,10 +1285,19 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                (
-                    machines_wft_response.commands().collect(),
-                    machines_wft_response.messages(),
-                )
+                let mut commands: Vec<_> = machines_wft_response.commands().collect();
+                // The server already has the replayed task that lang's queued commands came from,
+                // so sending them again would repeat or contradict its history. Core pushes the
+                // forced FailWorkflow after anything lang queued.
+                if data.is_forced_failure
+                    && machines_wft_response.replaying
+                    && let Some(fail_ix) = commands
+                        .iter()
+                        .rposition(|c| c.command_type() == CommandType::FailWorkflowExecution)
+                {
+                    commands = vec![commands.swap_remove(fail_ix)];
+                }
+                (commands, machines_wft_response.messages())
             };
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);

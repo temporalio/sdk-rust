@@ -46,6 +46,15 @@ relevant information.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
+* With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, a workflow that lang fails
+  for nondeterminism during replay now fails once, with lang's failure, and the completion has only
+  that `FailWorkflowExecution` command. Previously, the next event in history could replace that
+  failure with a nondeterminism error from Core, or add a second terminal command after it, which
+  the server refused, so the workflow task timed out and later attempts failed it without failing
+  the workflow. A nondeterminism error that Core finds during replay no longer sends lang's
+  commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
+  command.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
