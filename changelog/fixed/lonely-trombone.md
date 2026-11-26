@@ -1,0 +1,1 @@
+With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, a nondeterminism error during replay now fails the workflow once, with that error. Before, the workflow could fail with another error, or stay open after the server refused the completion.
