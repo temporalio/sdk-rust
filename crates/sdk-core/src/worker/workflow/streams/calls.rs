@@ -2949,6 +2949,64 @@ mod tests {
     }
 
     #[test]
+    fn a_read_with_no_store_name_uses_the_runtime_under_the_empty_name() {
+        let nameless = |seq| {
+            let mut command = read(seq, "s", &[]);
+            command.stream.as_mut().unwrap().store.clear();
+            command
+        };
+        let with_default = |phase| {
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["", "mem"]), phase);
+            calls.set_task(TaskState::Open(task_attempt(3)));
+            calls
+        };
+        let running = |calls: &mut StreamCalls| -> Vec<(String, String)> {
+            (calls.take_requests().into_iter())
+                .map(|request| match request {
+                    Request::Run(Call {
+                        store,
+                        op: Op::Read(read),
+                        ..
+                    }) => (store, read.request.r#ref.unwrap().store),
+                    _ => panic!("Only the read runs"),
+                })
+                .collect()
+        };
+        let mut live = with_default(Phase::Live);
+        live.read(nameless(1)).unwrap();
+        assert_eq!(running(&mut live), [(String::new(), String::new())]);
+
+        let mut replaying = with_default(Phase::Replaying);
+        replaying.read(nameless(1)).unwrap();
+        replaying.go_live().unwrap();
+        assert_eq!(running(&mut replaying), [(String::new(), String::new())]);
+
+        let marker = |store: &str| {
+            let entry = StreamReadResult {
+                seq: 1,
+                stream_id: "s".to_string(),
+                store: store.to_string(),
+                activation_index: 0,
+                from_offset: vec![],
+                result: Some(stream_read_result::Result::Failure(refused("down"))),
+            };
+            PeekedMarker::Read(StreamReadMarkerData { reads: vec![entry] })
+        };
+        let mut replay = with_default(Phase::ReplayOnly);
+        replay.read(nameless(1)).unwrap();
+        replay.peeked(marker(""), vec![]).unwrap();
+        assert_eq!(jobs(&mut replay, 0), ["read 1: failed"]);
+        let mut recorded_in_mem = with_default(Phase::ReplayOnly);
+        recorded_in_mem.read(nameless(1)).unwrap();
+        let error = "Stream read 1 is for Stream `s` in Store ``, and History has it for Stream \
+                     `s` in Store `mem`";
+        assert_eq!(
+            recorded_in_mem.peeked(marker("mem"), vec![]),
+            Err(WFMachinesError::Nondeterminism(error.to_string()))
+        );
+    }
+
+    #[test]
     fn a_call_with_no_store_name_uses_the_runtime_under_the_empty_name() {
         let nameless = |seq| {
             let mut command = append(seq, "s");

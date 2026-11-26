@@ -3036,3 +3036,38 @@ async fn a_read_with_no_store_name_reads_the_only_store_and_replays_from_it() {
     assert_eq!(stores, [STORE]);
     assert_eq!(run.replay(workflow).await, live);
 }
+
+#[tokio::test]
+async fn a_read_with_no_store_name_reads_the_store_under_the_empty_name_and_replays_from_it() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let mut opts = StartOpts::new(&store);
+    opts.configure = Box::new(the_store_under_the_empty_name);
+    let run = start(history(Duration::from_secs(60)), opts);
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        match &activation.jobs[0].variant {
+            Some(Job::InitializeWorkflow(_)) => {
+                let mut nameless = read(1, "s", &[], Duration::ZERO);
+                nameless.stream.as_mut().unwrap().store.clear();
+                vec![nameless.into()]
+            }
+            _ => vec![complete()],
+        }
+    };
+    let live = run.drive(workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(records_of(&live), store.records("s"));
+    let stores: Vec<String> = (run.sent().iter())
+        .flat_map(read_markers)
+        .flat_map(|marker| marker.reads.into_iter().map(|entry| entry.store))
+        .collect();
+    assert_eq!(stores, [""]);
+    let mut opts = StartOpts::new(&store);
+    opts.replay = true;
+    opts.configure = Box::new(the_store_under_the_empty_name);
+    let replay = start(run.history.lock().clone(), opts);
+    let (replayed, evicted) = drive_until_evicted(&replay.worker, workflow).await;
+    assert_eq!(evicted, Some(EvictionReason::LangRequested), "{replayed:?}");
+    assert_eq!(replayed, live);
+    replay.worker.drain_pollers_and_shutdown_ref().await;
+}
