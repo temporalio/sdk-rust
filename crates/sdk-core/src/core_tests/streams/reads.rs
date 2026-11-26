@@ -2822,8 +2822,8 @@ async fn the_read_limit_counts_from_the_end_of_the_replay() {
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-// The replays of a Worker read their Records from the Stores for at most `replay_read_runs` runs
-// at a time, which bounds the Records that the Worker holds for them.
+// The replays of a Worker read their Records from the Stores for at most `REPLAY_READ_RUNS` runs
+// at a time, which bounds the Records that the Worker holds for them. The test sets other bounds.
 #[rstest::rstest]
 #[case::one_run_at_a_time(1)]
 #[case::two_runs_at_a_time(2)]

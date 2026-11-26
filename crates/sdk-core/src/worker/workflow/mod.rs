@@ -210,7 +210,7 @@ impl Workflows {
                 .worker_config
                 .stream_runtimes
                 .settings
-                .replay_read_runs,
+                .replay_read_runs(),
         );
         let locals_stream = if let Some(la_notify_rx) = la_notify_rx {
             // LA manager notifications go first so that one is never processed after an input lang

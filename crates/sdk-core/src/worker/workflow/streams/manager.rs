@@ -275,7 +275,7 @@ async fn read_page(
     } = read;
     if check {
         request.wait = None;
-        let deadline = settings.read_check_deadline;
+        let deadline = settings.read_check_deadline();
         return match tokio::time::timeout(deadline, runtime.read_records_with_more(request)).await {
             Ok(answer) => answer,
             Err(_) => Err(StreamError::store_unavailable(format!(

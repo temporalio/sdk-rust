@@ -640,7 +640,7 @@ impl StreamCalls {
     fn budget_holds(&self, read: &Read) -> bool {
         matches!(read.state, ReadState::Waiting)
             && !read.checked
-            && self.task_read_results >= self.runtimes.settings.max_task_read_results
+            && self.task_read_results >= self.runtimes.settings.max_task_read_results()
     }
 
     /// Stops each live read that Core knows no result for in the next task, before the task
