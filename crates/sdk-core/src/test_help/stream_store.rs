@@ -100,6 +100,15 @@ impl MemoryStore {
         self.state.lock().failures.insert(op, (error, times));
     }
 
+    /// Returns the number of calls of `op` that [`Self::fail`] still fails.
+    pub fn failures_left(&self, op: Op) -> usize {
+        self.state
+            .lock()
+            .failures
+            .get(&op)
+            .map_or(0, |(_, times)| *times)
+    }
+
     /// Makes the next `times` calls of `op` write, and then fail with `StoreUnavailable`.
     pub fn lose_answers(&self, op: Op, times: usize) {
         self.state.lock().lost_answers.insert(op, times);
