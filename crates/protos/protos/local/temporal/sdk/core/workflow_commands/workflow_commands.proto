@@ -501,6 +501,9 @@ message AppendToStream {
 // Worker with no runtime for the Store of a marker can't replay, and fails the task, or gives the
 // error as the answer of a legacy query.
 //
+// A `stream` with no Store name is on the Store of the Worker's only Stream runtime, as for an
+// append.
+//
 // A replay compares the `seq`, the `stream` and the `from_offset` of the command with History, and
 // not the `max_records`, the `max_bytes` or the `wait`. It accepts a marker with no entry after any
 // task. After a replay Core doesn't know which Streams have Records after the pages of History, so
