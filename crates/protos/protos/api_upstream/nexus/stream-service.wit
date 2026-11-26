@@ -254,7 +254,8 @@ interface stream-service {
     ) -> append-records-response;
 
     // Workflow code and a client read the same way, with a page read or its poll iterator.
-    /// @nexus.doc "Read one page of Records. The poll iterator reads them all."
+    /// @nexus.doc
+    ///   "Read one page of Records. The poll iterator keeps reading after a page with no Record."
     /// @nexus.operation "read-records"
     read: func(
       from-offset: option<list<u8>>,
