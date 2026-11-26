@@ -140,6 +140,77 @@ fn records_of(jobs: &[Vec<Job>]) -> Vec<StreamRecord> {
         .collect()
 }
 
+// A read result and a Local Activity result that arrive while one activation is outstanding go in
+// the next activation with one index. The read result goes first, as an append result does, and a
+// replay with chunking on or off gives the same activations.
+#[tokio::test]
+async fn a_read_result_goes_before_a_local_activity_result_of_its_activation() {
+    let store = store(&["a", "s"]).await;
+    fill(&store, "s", 1).await;
+    store.gate_reads(true);
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let worker = &run.worker;
+    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![
+            local_activity(1),
+            append(1, "a"),
+            read(1, "s", &[], Duration::ZERO).into(),
+        ],
+        _ if activation.jobs.len() == 2 => vec![complete()],
+        _ => vec![],
+    };
+    let mut live = vec![];
+    let init = worker.poll_workflow_activation().await.unwrap();
+    live.push(jobs_of(&init));
+    let completion = WorkflowActivationCompletion::from_cmds(init.run_id.clone(), workflow(&init));
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    let local = worker.poll_activity_task().await.unwrap();
+    // The append answers at once. The Local Activity and the gated read have no result yet.
+    let first = worker.poll_workflow_activation().await.unwrap();
+    live.push(jobs_of(&first));
+    // Both results arrive while that activation is outstanding. Each input reaches the run in the
+    // order that it was sent, and the Store sends its answer as soon as the read passes the gate.
+    store.let_go(0..store.requests().len());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.reads_let_go() == 0 {
+        assert!(Instant::now() < deadline, "The read never passed the gate");
+        tokio::task::yield_now().await;
+    }
+    let result = ActivityTaskCompletion {
+        task_token: local.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    };
+    worker.complete_activity_task(result).await.unwrap();
+    let completion = WorkflowActivationCompletion::from_cmds(first.run_id.clone(), vec![]);
+    worker
+        .complete_workflow_activation(completion)
+        .await
+        .unwrap();
+    live.extend(run.drive(workflow).await);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    store.gate_reads(false);
+
+    let live = with_events(&live);
+    assert_eq!(live[..2], [vec!["InitializeWorkflow"], vec!["append 1"]]);
+    let [read, local] = &live[2][..] else {
+        panic!("{live:?}");
+    };
+    assert!(read.starts_with("read 1 1 "), "{live:?}");
+    assert_eq!(local, "local 1");
+    let sent = run.sent();
+    let indexes: Vec<u64> = (read_markers(&sent[0]).iter())
+        .flat_map(|marker| marker.reads.iter().map(|read| read.activation_index))
+        .collect();
+    assert_eq!(indexes, [2]);
+    for chunking in [true, false] {
+        let replayed = with_events(&run.replay_with(chunking, workflow).await);
+        assert_eq!(replayed, live, "Chunking {chunking}");
+    }
+}
+
 /// What keeps a read from an answer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NoAnswer {
