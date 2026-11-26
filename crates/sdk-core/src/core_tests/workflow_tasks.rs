@@ -4,8 +4,8 @@ use crate::{
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
-        CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt,
-        WorkerTestHelpers,
+        CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, PollWFTRespExt,
+        ResponseType, WorkerExt, WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
         build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
         gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
@@ -1910,6 +1910,88 @@ async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_co
                 ResolveActivity { seq: 1, .. }
             )),
         }]
+    );
+}
+
+/// Who finds the nondeterminism in an update-only task.
+#[derive(Clone, Copy, Debug)]
+enum UpdateOnlyNondeterminism {
+    /// Lang fails the activation, as the Rust SDK does with `[TMPRL1100]`.
+    Lang,
+    /// Lang sends a command without accepting the update, which Core rejects.
+    Core,
+}
+
+/// The state of the run when the update-only task comes.
+#[derive(Clone, Copy, Debug)]
+enum RunAtTheUpdate {
+    /// The worker completed task 1 and kept the run.
+    Cached,
+    /// The task brings all of history, as a poll that is not sticky does. The update then comes
+    /// with the workflow's initialization, so the activation is not update-only.
+    Cold,
+}
+
+// A live task that only delivers an update has no new events but its own scheduled and started
+// events. The forced fail command is not an update response, so it must not trip Core's check
+// for commands in an update-only activation. The workflow fails once.
+#[rstest]
+#[case::lang_cached(UpdateOnlyNondeterminism::Lang, RunAtTheUpdate::Cached)]
+#[case::core_cached(UpdateOnlyNondeterminism::Core, RunAtTheUpdate::Cached)]
+#[case::lang_cold(UpdateOnlyNondeterminism::Lang, RunAtTheUpdate::Cold)]
+#[tokio::test]
+async fn a_nondeterminism_failure_in_an_update_only_task_fails_the_workflow_once(
+    #[case] found_by: UpdateOnlyNondeterminism,
+    #[case] run_at_the_update: RunAtTheUpdate,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    let mut update_task = hist_to_poll_resp(&t, "fake_wf_id", ResponseType::AllHistory).resp;
+    update_task.add_update_request("upd1", 5);
+    let tasks = match run_at_the_update {
+        RunAtTheUpdate::Cached => vec![
+            hist_to_poll_resp(&t, "fake_wf_id", ResponseType::ToTaskNum(1)).resp,
+            update_task,
+        ],
+        RunAtTheUpdate::Cold => vec![update_task],
+    };
+    let mh = MockPollCfg::from_resp_batches("fake_wf_id", t, tasks, mock_worker_client());
+    let activations = RefCell::new(vec![]);
+    let lang = |act: &WorkflowActivation| {
+        activations.borrow_mut().push(act.jobs.clone());
+        let has_update = act.jobs.iter().any(|job| {
+            matches!(
+                job.variant,
+                Some(workflow_activation_job::Variant::DoUpdate(_))
+            )
+        });
+        match found_by {
+            _ if !has_update => WorkflowActivationCompletion::empty(act.run_id.clone()),
+            UpdateOnlyNondeterminism::Lang => langs_nondeterminism_failure(act),
+            UpdateOnlyNondeterminism::Core => WorkflowActivationCompletion::from_cmds(
+                act.run_id.clone(),
+                vec![start_timer_cmd(1, Duration::from_secs(1))],
+            ),
+        }
+    };
+    let run = run_failing_workflow_on_nondeterminism(mh, lang);
+    let sent = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("Expected the run to end within 10 seconds");
+    let fails: Vec<_> = (sent.iter().flatten())
+        .filter(|(command, _)| *command == CommandType::FailWorkflowExecution)
+        .collect();
+    assert_eq!(
+        fails.len(),
+        1,
+        "Expected one FailWorkflowExecution. Completions: {sent:?}"
+    );
+    assert_matches!(
+        sent.last().map(Vec::as_slice),
+        Some([(CommandType::FailWorkflowExecution, Some(_))]),
+        "Expected the last completion to only fail the workflow. Completions: {sent:?}"
     );
 }
 

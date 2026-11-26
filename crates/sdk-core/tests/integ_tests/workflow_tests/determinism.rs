@@ -1,4 +1,7 @@
-use crate::common::{CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities};
+use crate::common::{
+    CoreWfStarter, TestWorker, WorkflowHandleExt, activity_functions::StdActivities,
+    integ_sdk_config,
+};
 use futures::FutureExt;
 use std::{
     collections::HashSet,
@@ -9,7 +12,7 @@ use std::{
     task::Poll,
     time::{Duration, Instant},
 };
-use temporalio_client::WorkflowStartOptions;
+use temporalio_client::{WorkflowExecuteUpdateOptions, WorkflowStartOptions};
 use temporalio_common::{
     UntypedActivity, UntypedWorkflow,
     data_converters::RawValue,
@@ -863,6 +866,179 @@ async fn changed_code_that_core_finds_fails_the_workflow_with_cores_error() {
     let name = "changed_code_that_core_finds_fails_the_workflow_with_cores_error";
     let summary = run_changed_before_replay(name, FirstTask::TimerReplacedByMemoUpsert).await;
     assert_fails_once_with(&summary, "[TMPRL1100] Nondeterminism error");
+}
+
+#[workflow]
+#[derive(Default)]
+struct NonSdkFutureInUpdateWf {
+    done: bool,
+}
+
+#[workflow_methods]
+impl NonSdkFutureInUpdateWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|wf| wf.done).await?;
+        Ok(())
+    }
+
+    #[update]
+    async fn finish(
+        ctx: &mut WorkflowContext<Self>,
+        _: (),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // A future that wakes itself while the SDK polls it, as in `ChangedBeforeReplayWf`.
+        let mut woke = false;
+        futures::future::poll_fn(|cx| {
+            if woke {
+                return Poll::Ready(());
+            }
+            woke = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+        ctx.state_mut(|wf| wf.done = true);
+        Ok(())
+    }
+}
+
+/// Set in the process that [`a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once`]
+/// starts, to the task queue of the workflow.
+const UPDATE_WORKER_TASK_QUEUE: &str = "UPDATE_WORKER_TASK_QUEUE";
+
+/// Returns a starter for [`NonSdkFutureInUpdateWf`] that fails workflows on nondeterminism and
+/// keeps one run in the cache, so an update to a cached run gets a task with only the update.
+fn non_sdk_future_in_update_starter(name: &str) -> CoreWfStarter {
+    let mut starter = CoreWfStarter::new(name);
+    if let Ok(task_queue) = std::env::var(UPDATE_WORKER_TASK_QUEUE) {
+        starter.sdk_config = integ_sdk_config(&task_queue);
+    }
+    starter.sdk_config.max_cached_workflows = 1;
+    starter.sdk_config.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    starter
+        .sdk_config
+        .register_workflow::<NonSdkFutureInUpdateWf>()
+        .unwrap();
+    starter
+}
+
+/// Runs `worker` until `done` holds for the history of the starter's workflow, or for `limit`.
+async fn run_until_history(
+    starter: &CoreWfStarter,
+    worker: &mut TestWorker,
+    limit: Duration,
+    done: impl Fn(&[HistoryEvent]) -> bool,
+) {
+    worker.fetch_results = false;
+    let core_worker = worker.core_worker();
+    let watcher = async {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline && !done(&starter.get_history().await.events) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        core_worker.initiate_shutdown();
+    };
+    let runner = async { worker.run_until_done().await.unwrap() };
+    tokio::join!(watcher, runner);
+}
+
+fn closed(events: &[HistoryEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e.event_type(),
+            EventType::WorkflowExecutionFailed | EventType::WorkflowExecutionCompleted
+        )
+    })
+}
+
+// The worker has the run in its cache, so the update comes in a task with only the update. The
+// SDK fails that task, so the workflow must fail once with the SDK's error, and the worker must
+// keep running. That worker is a second process, so the test sees what is left if it ends.
+#[tokio::test]
+async fn a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once() {
+    let name = "a_non_sdk_future_in_an_update_of_a_cached_run_fails_the_workflow_once";
+    let mut starter = non_sdk_future_in_update_starter(name);
+    let mut worker = starter.worker().await;
+    if std::env::var(UPDATE_WORKER_TASK_QUEUE).is_ok() {
+        worker.fetch_results = false;
+        let core_worker = worker.core_worker();
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            core_worker.initiate_shutdown();
+        };
+        let runner = async { worker.run_until_done().await.unwrap() };
+        tokio::join!(stop, runner);
+        return;
+    }
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let test_name = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            test_name.as_str(),
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UPDATE_WORKER_TASK_QUEUE, &task_queue)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child = tokio::task::spawn_blocking(move || child.wait_with_output());
+    let mut options = WorkflowStartOptions::new(task_queue.clone(), task_queue).build();
+    options.task_timeout = Some(Duration::from_secs(2));
+    let handle = worker
+        .submit_workflow(NonSdkFutureInUpdateWf::run, (), options)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let events = starter.get_history().await.events;
+        if events
+            .iter()
+            .any(|e| e.event_type() == EventType::WorkflowTaskCompleted)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let update = tokio::time::timeout(
+        Duration::from_secs(15),
+        handle.execute_update(
+            NonSdkFutureInUpdateWf::finish,
+            (),
+            WorkflowExecuteUpdateOptions::default(),
+        ),
+    )
+    .await;
+    let child = child.await.unwrap().unwrap();
+    let child_stderr = String::from_utf8_lossy(&child.stderr);
+    let child_end: Vec<&str> = (child_stderr.lines())
+        .filter(|line| line.contains("overflowed") || line.contains("fatal runtime error"))
+        .collect();
+    let after_the_worker = history_summary(&starter.get_history().await.events);
+    println!("update result: {update:?}");
+    println!("worker exit: {:?}, its end: {child_end:?}", child.status);
+    println!("history after the worker: {after_the_worker:#?}");
+
+    // A new worker with the same code, as a restart would be.
+    run_until_history(&starter, &mut worker, Duration::from_secs(15), closed).await;
+    let after_the_restart = history_summary(&starter.get_history().await.events);
+    let description = handle.describe(Default::default()).await.unwrap();
+    let raw = &description.raw_description;
+    let status = raw.workflow_execution_info.as_ref().map(|i| i.status());
+    let pending_attempt = raw.pending_workflow_task.as_ref().map(|t| t.attempt);
+    println!("history after the restart: {after_the_restart:#?}");
+    println!("status: {status:?}, pending workflow task attempt: {pending_attempt:?}");
+
+    assert!(
+        child.status.success(),
+        "Expected the worker to keep running. Exit: {:?}, end: {child_end:?}",
+        child.status
+    );
+    assert_fails_once_with_langs_error(&after_the_restart);
 }
 
 #[workflow]
