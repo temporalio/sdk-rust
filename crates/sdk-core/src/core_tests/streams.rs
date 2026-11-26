@@ -973,9 +973,7 @@ async fn an_append_with_no_store_name_runs_on_the_only_runtime_and_replays_on_it
 #[case::no_runtime(0)]
 #[case::two_runtimes(2)]
 #[tokio::test]
-async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_runtime(
-    #[case] count: usize,
-) {
+async fn an_append_with_no_store_name_fails_its_task_with_no_runtime_to_pick(#[case] count: usize) {
     let store = store(&["s"]).await;
     let mut opts = StartOpts::new(&store);
     opts.fails = 1;
@@ -989,8 +987,8 @@ async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_r
     let workflow: Workflow = |_| vec![append_with_no_store_name(1, "s")];
     assert_eq!(run.drive(workflow).await.len(), 1);
     let message = format!(
-        "A Stream call with no Store name needs exactly one Stream runtime, and this Worker has \
-         {count}"
+        "A Stream call with no Store name needs a Stream runtime under the empty name or exactly \
+         one Stream runtime, and this Worker has {count}"
     );
     let failed = run.failed.lock().clone();
     assert_eq!(
@@ -1004,6 +1002,54 @@ async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_r
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+/// Puts the runtime of the test's Store under the empty name, next to a runtime on another Store.
+fn the_store_under_the_empty_name(wc: &mut WorkerConfig) {
+    let runtime = wc.stream_runtimes.get(STORE).unwrap().clone();
+    let other = StreamRuntime::new(Arc::new(MemoryStore::default()), StoreLimits::default());
+    wc.stream_runtimes = StreamRuntimes::new([
+        (String::new(), runtime),
+        ("other".to_string(), Arc::new(other)),
+    ]);
+}
+
+#[tokio::test]
+async fn an_append_with_no_store_name_runs_on_the_runtime_under_the_empty_name() {
+    let store = store(&["s"]).await;
+    let mut opts = StartOpts::new(&store);
+    opts.configure = Box::new(the_store_under_the_empty_name);
+    let run = start(history(Duration::from_secs(60)), opts);
+    let nameless: Workflow = |activation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![append_with_no_store_name(1, "s")],
+        _ => vec![complete()],
+    };
+    let live = run.drive(nameless).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(store.records("s").len(), 1);
+    assert_eq!(markers(&run.sent()[0])[0].appends[0].store, "");
+    let writes = store.requests().len();
+    let mut opts = StartOpts::new(&store);
+    opts.replay = true;
+    opts.configure = Box::new(the_store_under_the_empty_name);
+    let replay = start(run.history.lock().clone(), opts);
+    let (replayed, evicted) = drive_until_evicted(&replay.worker, nameless).await;
+    assert_eq!(evicted, Some(EvictionReason::LangRequested), "{replayed:?}");
+    assert_eq!(replayed, live);
+    replay.worker.drain_pollers_and_shutdown_ref().await;
+    assert_eq!(store.requests().len(), writes);
+}
+
+/// Starts a Worker, or a replay Worker, on `config`.
+fn start_worker(config: WorkerConfig, replay: bool) -> Result<(), String> {
+    let started = if replay {
+        let histories = stream::empty::<HistoryForReplay>();
+        init_replay_worker(ReplayWorkerInput::new(config, histories)).map(drop)
+    } else {
+        let client = Arc::new(mock_worker_client());
+        Worker::new(config, None, client, None, None, None).map(drop)
+    };
+    started.map_err(|error| error.to_string())
+}
+
 // The settings are public fields, so a config can change them after the check of its builder.
 #[rstest::rstest]
 #[case::worker(false)]
@@ -1012,16 +1058,39 @@ async fn an_append_with_no_store_name_fails_its_task_unless_the_worker_has_one_r
 async fn stream_settings_out_of_bounds_fail_the_start_of_a_worker(#[case] replay: bool) {
     let mut config = test_worker_cfg().build().unwrap();
     config.stream_runtimes.settings.try_deadline = Duration::ZERO;
-    let started = if replay {
-        let histories = stream::empty::<HistoryForReplay>();
-        init_replay_worker(ReplayWorkerInput::new(config, histories)).map(drop)
-    } else {
-        let client = Arc::new(mock_worker_client());
-        Worker::new(config, None, client, None, None, None).map(drop)
-    };
     assert_eq!(
-        started.map_err(|error| error.to_string()),
+        start_worker(config, replay),
         Err("The Stream setting `try_deadline` must be more than 0".to_string())
+    );
+}
+
+#[rstest::rstest]
+#[case::worker(false)]
+#[case::replay_worker(true)]
+#[tokio::test]
+async fn a_store_name_over_4096_bytes_fails_the_start_of_a_worker(#[case] replay: bool) {
+    let with_store = |name: &str| {
+        let mut config = test_worker_cfg().build().unwrap();
+        config.stream_runtimes = runtimes_of(&[STORE, name]);
+        config
+    };
+    assert_eq!(start_worker(with_store(&"x".repeat(4096)), replay), Ok(()));
+    assert_eq!(
+        start_worker(with_store(&"x".repeat(4097)), replay),
+        Err("The Store name of a Stream runtime has 4097 bytes, more than 4096".to_string())
+    );
+}
+
+#[test]
+fn a_store_name_over_4096_bytes_fails_the_build_of_a_worker_config() {
+    let build = |name: &str| {
+        let config = test_worker_cfg().stream_runtimes(runtimes_of(&[name]));
+        config.build().map(drop)
+    };
+    assert_eq!(build(&"x".repeat(4096)), Ok(()));
+    assert_eq!(
+        build(&"x".repeat(4097)),
+        Err("The Store name of a Stream runtime has 4097 bytes, more than 4096".to_string())
     );
 }
 
