@@ -39,6 +39,8 @@ relevant information.
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
+* Canceling an external Workflow Signal whose delivery has already failed no longer fails the
+  sending Workflow Task.
 
 ## [0.12.0] - 2026-11-23
 
