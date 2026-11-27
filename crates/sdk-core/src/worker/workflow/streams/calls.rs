@@ -704,7 +704,11 @@ mod tests {
         workflow_activation::{ResolveStreamAppend, resolve_stream_append},
     };
     use temporalio_streams::{AnyError, StreamRuntime, record::StoreLimits};
-    use tokio::runtime::Handle;
+    use tokio::{
+        runtime::Handle,
+        sync::mpsc,
+        time::{Duration, timeout},
+    };
     use workflow_activation_job::Variant;
 
     const SEEDS: u64 = 400;
@@ -1739,90 +1743,77 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_call_with_no_runtime_fails_the_task() {
-        let stores = ["a", "b", "c"];
-        let mut with_no_runtime = 0;
-        for seed in 0..SEEDS {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let served: Vec<(&str, Arc<MemoryStore>)> = (stores.into_iter())
-                .filter(|_| rng.random_bool(0.5))
-                .map(|store| (store, Arc::new(MemoryStore::default())))
-                .collect();
-            let phase = [Phase::Live, Phase::Replaying, Phase::ReplayOnly][rng.random_range(0..3)];
-            if served.is_empty() && phase != Phase::ReplayOnly {
-                with_no_runtime += 1;
-            }
-            let runtimes = StreamRuntimes::new(served.iter().map(|(name, store)| {
-                let runtime = StreamRuntime::new(store.clone(), StoreLimits::default());
-                (name.to_string(), Arc::new(runtime))
-            }));
-            let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), phase);
+    #[test]
+    fn a_named_append_needs_its_runtime_when_it_goes_live() {
+        let without_runtimes = |phase| {
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes(&[]), phase);
             calls.set_task(TaskState::Open(task_attempt(3)));
-            let mut appends = 0;
-            let (mut unserved, mut store_of) = (BTreeMap::new(), HashMap::new());
-            for index in 0..rng.random_range(1..=6) {
-                let store = stores[rng.random_range(0..3)];
-                let stream = StreamRef {
-                    id: format!("s{index}"),
-                    store: store.to_string(),
-                };
-                store_of.insert(stream.id.clone(), store);
-                appends += 1;
-                let command = AppendToStream {
-                    seq: appends,
-                    stream: Some(stream),
-                    bodies: vec![Payload::default()],
-                };
-                let result = calls.append(command);
-                let error = WFMachinesError::Stream(format!(
-                    "This Worker has no Stream runtime for the Store `{store}`"
-                ));
-                let is_served = served.iter().any(|(name, _)| *name == store);
-                if phase == Phase::Live && !is_served {
-                    // The command fails the task, so the run records nothing of the call.
-                    assert_eq!(result, Err(error), "seed {seed}");
-                    assert!(!calls.appends.contains_key(&appends), "seed {seed}");
-                    break;
-                }
-                assert_eq!(result, Ok(()), "seed {seed}");
-                if !is_served {
-                    unserved.insert(appends, error);
-                }
-            }
-            calls.marker_recorded().unwrap();
-            let mut sent = calls.take_requests();
-            let at_go_live = calls.go_live();
-            sent.extend(calls.take_requests());
-            // No call on a Store with no runtime reaches a Store.
-            let streams: Vec<&str> = (sent.iter())
-                .map(|request| match request {
-                    Request::Run(call) => call.store.as_str(),
-                    Request::Stop(_) => panic!("seed {seed}"),
-                })
-                .collect();
-            assert!(
-                (streams.iter()).all(|store| served.iter().any(|(name, _)| name == store)),
-                "seed {seed}"
-            );
-            // A replay fails the task when it goes live with an unserved call, which a replay
-            // Worker never does.
-            let expected = match (phase, unserved.into_values().next()) {
-                (Phase::Replaying, Some(error)) => Err(error),
-                _ => Ok(()),
-            };
-            assert_eq!(at_go_live, expected, "seed {seed}");
-            // Each Store gets only the calls whose ref has its name.
-            let manager = StreamManager::new(runtimes, Handle::current(), |_, _| {});
-            manager.dispatch("r", sent);
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            for (name, store) in &served {
-                for StoreRequest::Append(append, _) in store.requests() {
-                    let id = append.stream_id;
-                    assert_eq!(store_of[&id], *name, "seed {seed}: Stream {id}");
-                }
-            }
+            calls
+        };
+        let missing = "This Worker has no Stream runtime for the Store `mem`";
+        let mut live = without_runtimes(Phase::Live);
+        assert_eq!(
+            live.append(append(1, "s")),
+            Err(WFMachinesError::Stream(missing.into()))
+        );
+        assert!(live.appends.is_empty());
+        assert!(live.take_requests().is_empty());
+
+        let mut replaying = without_runtimes(Phase::Replaying);
+        replaying.append(append(1, "s")).unwrap();
+        let mut second = append(2, "t");
+        second.stream.as_mut().unwrap().store = "other".into();
+        replaying.append(second).unwrap();
+        assert_eq!(
+            replaying.go_live(),
+            Err(WFMachinesError::Stream(missing.into()))
+        );
+        assert!(replaying.take_requests().is_empty());
+
+        let mut replay = without_runtimes(Phase::ReplayOnly);
+        replay.append(append(1, "s")).unwrap();
+        replay.peeked(marker(0, 1, "s")).unwrap();
+        assert_eq!(jobs(&mut replay, 0), ["append 1"]);
+        replay.marker_recorded().unwrap();
+        replay.append(append(2, "t")).unwrap();
+        replay.go_live().unwrap();
+        assert!(replay.take_requests().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_append_reaches_its_store() {
+        let stores = [
+            ("mem", Arc::new(MemoryStore::default())),
+            ("other", Arc::new(MemoryStore::default())),
+        ];
+        let runtimes = StreamRuntimes::new(stores.iter().map(|(name, store)| {
+            let runtime = StreamRuntime::new(store.clone(), StoreLimits::default());
+            (name.to_string(), Arc::new(runtime))
+        }));
+        let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), Phase::Live);
+        calls.set_task(TaskState::Open(task_attempt(3)));
+        calls.append(append(1, "first")).unwrap();
+        let mut second = append(2, "second");
+        second.stream.as_mut().unwrap().store = "other".into();
+        calls.append(second).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let manager = StreamManager::new(runtimes, Handle::current(), move |_, _| {
+            tx.send(()).unwrap();
+        });
+        manager.dispatch("r", calls.take_requests());
+        for _ in 0..2 {
+            timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
         }
-        assert!(with_no_runtime > 0, "No seed had a Worker with no runtime");
+        for ((_, store), stream) in stores.iter().zip(["first", "second"]) {
+            let requests = store.requests();
+            let [StoreRequest::Append(request, _)] = &requests[..] else {
+                panic!("expected one append for {stream}, got {requests:?}");
+            };
+            assert_eq!(request.stream_id, stream);
+        }
     }
 }
