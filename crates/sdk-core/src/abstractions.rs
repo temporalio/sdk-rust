@@ -33,9 +33,7 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     /// we add user-defined cache sizing, that logic will need to live with the supplier and
     /// there will need to be some associated refactoring.
     max_permits: Option<usize>,
-    /// Holds `max_permits` permits. A caller takes one before it asks the supplier for a slot, so
-    /// concurrent callers can't all pass the limit before any of them counts its slot. A caller
-    /// keeps its permit while the supplier blocks.
+    /// Count reservations while callers wait for their supplier to return a slot.
     max_permits_sem: Option<Arc<Semaphore>>,
     metrics_ctx: MetricsContext,
     slot_metric_version: Arc<AtomicU64>,
@@ -410,8 +408,7 @@ pub(crate) struct OwnedMeteredSemPermit<SK: SlotKind> {
     use_fn: Box<dyn Fn(&UseCtx<SK>) + Send + Sync>,
     #[allow(clippy::type_complexity)] // not really tho, bud
     release_fn: Box<dyn Fn(&mut ReleaseCtx<SK>) + Send + Sync>,
-    /// Dropped after `release_fn` returns the slot and lowers the extant count, so a caller woken
-    /// by the limit sees both.
+    /// Wake the next caller after `release_fn` returns the slot and updates its count.
     _max_permits_permit: Option<OwnedSemaphorePermit>,
 }
 impl<SK: SlotKind> Drop for OwnedMeteredSemPermit<SK> {
@@ -680,7 +677,6 @@ pub(crate) mod tests {
         acquire_fut.await;
     }
 
-    /// Yields before it reserves, so a second caller can run while the first is in the supplier.
     struct YieldingSlotSupplier(FixedSizeSlotSupplier<WorkflowSlotKind>);
 
     #[async_trait::async_trait]
@@ -721,7 +717,6 @@ pub(crate) mod tests {
         let first = dealer.acquire_owned();
         let second = dealer.acquire_owned();
         futures_util::pin_mut!(first, second);
-        // Both callers start before either one has its slot from the supplier
         assert!(first.as_mut().now_or_never().is_none());
         assert!(second.as_mut().now_or_never().is_none());
         let permit = first.await;
@@ -753,7 +748,6 @@ pub(crate) mod tests {
                 "eager permit was handed out over the limit"
             );
         }
-        // The dropped acquire gives its place back
         let _permit = dealer.try_acquire_owned().unwrap();
     }
 

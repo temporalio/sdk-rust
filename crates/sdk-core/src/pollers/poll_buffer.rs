@@ -405,7 +405,7 @@ where
                             _ = shutdown_clone.cancelled() => break,
                         }
                     }
-                    // Shutdown first in both, so a slot freed as shutdown starts can't start a poll
+                    // Prefer shutdown when a slot or permission to poll becomes ready at the same time.
                     let permit = tokio::select! {
                         biased;
                         _ = shutdown_clone.cancelled() => break,
@@ -1465,7 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn slot_freed_with_shutdown_does_not_start_a_poll() {
-        // Without the bias, both selects skip shutdown about one time in four.
+        // Repeat because an unbiased select can choose shutdown by chance.
         for _ in 0..100 {
             let mut mock_client = mock_manual_worker_client();
             let call_count = Arc::new(AtomicUsize::new(0));
@@ -1502,7 +1502,6 @@ mod tests {
                 })),
             );
 
-            // The first task holds the only slot, so the poller waits for one.
             let (_, permit) = pb.poll().await.unwrap().unwrap();
             shutdown_token.cancel();
             drop(permit);
