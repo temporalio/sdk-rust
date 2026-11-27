@@ -111,7 +111,6 @@ use temporalio_common::{
     worker::WorkerTaskTypes,
 };
 use tokio::sync::{mpsc::unbounded_channel, watch};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::Subscriber;
 use uuid::Uuid;
@@ -936,11 +935,22 @@ impl Worker {
                             let stream = if !client.is_mock() {
                                 // Some replay tests combine a mock client with real pollers,
                                 // and they don't need to use the external stream
-                                stream::select(
-                                    stream,
-                                    UnboundedReceiverStream::new(external_wft_rx),
-                                )
-                                .left_stream()
+                                let eager_stream = stream::unfold(
+                                    (external_wft_rx, shutdown_token.clone()),
+                                    |(mut rx, shutdown)| async move {
+                                        let next = tokio::select! {
+                                            biased;
+                                            _ = shutdown.cancelled() => {
+                                                // Accepted eager tasks still need a completion.
+                                                rx.close();
+                                                rx.recv().await
+                                            }
+                                            task = rx.recv() => task,
+                                        };
+                                        next.map(|task| (task, (rx, shutdown)))
+                                    },
+                                );
+                                stream::select(stream, eager_stream).left_stream()
                             } else {
                                 stream.right_stream()
                             };
@@ -1028,13 +1038,15 @@ impl Worker {
                         });
                         let wfs = wft_stream.map(|stream| {
                             let wft_semaphore = wft_slots.clone();
-                            let wfs = stream.then(move |s| {
-                                let wft_semaphore = wft_semaphore.clone();
-                                async move {
-                                    let permit = wft_semaphore.acquire_owned().await;
-                                    s.map(|s| (s, permit))
-                                }
-                            });
+                            let wfs = stream
+                                .take_until(shutdown_token.clone().cancelled_owned())
+                                .then(move |s| {
+                                    let wft_semaphore = wft_semaphore.clone();
+                                    async move {
+                                        let permit = wft_semaphore.acquire_owned().await;
+                                        s.map(|s| (s, permit))
+                                    }
+                                });
                             wfs.right_stream()
                         });
                         (

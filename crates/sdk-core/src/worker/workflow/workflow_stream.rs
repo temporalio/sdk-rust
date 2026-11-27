@@ -35,6 +35,7 @@ pub(super) struct WFStream {
 
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
+    poller_drained: bool,
 
     metrics: MetricsContext,
 }
@@ -95,6 +96,7 @@ impl WFStream {
                 basics.metrics.clone(),
             ),
             shutdown_token: basics.shutdown_token,
+            poller_drained: false,
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
@@ -196,6 +198,7 @@ impl WFStream {
                     }
                     WFStreamInput::PollerDead => {
                         debug!("WFT poller died, beginning shutdown");
+                        state.poller_drained = true;
                         state.shutdown_token.cancel();
                         None
                     }
@@ -605,7 +608,7 @@ impl WFStream {
     }
 
     fn shutdown_done(&self) -> bool {
-        if self.shutdown_token.is_cancelled() {
+        if self.poller_drained {
             if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
                 // Don't exit if there are outstanding fetch requests
                 return false;

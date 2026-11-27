@@ -901,7 +901,7 @@ impl PersistentPollErrorWarningState {
 mod tests {
     use super::*;
     use crate::{
-        abstractions::tests::fixed_size_permit_dealer,
+        abstractions::tests::fixed_size_permit_dealer, pollers::StickyTaskPoller,
         worker::client::mocks::mock_manual_worker_client,
     };
     use futures_util::FutureExt;
@@ -909,6 +909,45 @@ mod tests {
     use std::{future::pending, time::Duration};
     use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
+
+    #[tokio::test]
+    async fn closed_sticky_poller_still_delivers_normal_tasks() {
+        let mut client = mock_manual_worker_client();
+        client.expect_poll_workflow_task().returning(|_, _| {
+            async {
+                Ok(PollWorkflowTaskQueueResponse {
+                    task_token: vec![1],
+                    ..Default::default()
+                })
+            }
+            .boxed()
+        });
+        let client = Arc::new(client);
+        let make_buffer = |sticky| {
+            LongPollBuffer::new_workflow_task(
+                client.clone(),
+                "task-queue".to_owned(),
+                sticky,
+                PollerBehavior::SimpleMaximum(1),
+                fixed_size_permit_dealer(1),
+                CancellationToken::new(),
+                None::<fn(usize)>,
+                WorkflowTaskOptions {
+                    wft_poller_shared: None,
+                },
+                PollerHeartbeatState::default(),
+                Arc::new(NamespaceCapabilities::default()),
+            )
+        };
+
+        let sticky = make_buffer(Some("sticky".to_owned()));
+        sticky.notify_shutdown();
+        assert!(sticky.poll().await.is_none());
+        let poller = StickyTaskPoller::new(make_buffer(None), Some(sticky));
+        let (task, _permit) = poller.poll().await.unwrap().unwrap();
+        assert_eq!(task.task_token, [1]);
+        poller.shutdown().await;
+    }
 
     #[tokio::test]
     async fn only_polls_once_with_1_poller() {

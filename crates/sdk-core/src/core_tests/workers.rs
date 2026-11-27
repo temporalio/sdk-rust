@@ -5,8 +5,8 @@ use crate::{
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
-        test_worker_cfg,
+        WorkerTestHelpers, build_fake_worker, build_mock_pollers, hist_to_poll_resp, mock_worker,
+        start_timer_cmd, test_worker_cfg,
     },
     worker::{
         self, PollerBehavior,
@@ -1751,4 +1751,69 @@ async fn nexus_shutdown_does_not_hang_when_completion_is_malformed() {
         worker.shutdown().await;
         worker.finalize_shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_in_flight_workflow_poll() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    let task = hist_to_poll_resp(&history, "test-workflow", ResponseType::AllHistory).resp;
+    let poll_started = Arc::new(Notify::new());
+    let poll_released = Arc::new(Notify::new());
+    let mut client = mock_manual_worker_client();
+    client.expect_describe_namespace().returning(|| {
+        async {
+            Ok(DescribeNamespaceResponse {
+                namespace_info: Some(NamespaceInfo {
+                    capabilities: Some(Capabilities {
+                        worker_poll_complete_on_shutdown: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+        .boxed()
+    });
+    client.expect_poll_workflow_task().times(1).returning({
+        let started = poll_started.clone();
+        let released = poll_released.clone();
+        move |_, _| {
+            let task = task.clone();
+            let released = released.clone();
+            started.notify_one();
+            async move {
+                released.notified().await;
+                Ok(task)
+            }
+            .boxed()
+        }
+    });
+    client
+        .expect_complete_workflow_task()
+        .returning(|_, _| async { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed());
+    let mut config = test_worker_cfg().build().unwrap();
+    config.max_cached_workflows = 0;
+    config.task_types = WorkerTaskTypes::workflow_only();
+    let worker = worker::Worker::new_test(config, client);
+    worker.validate().await.unwrap();
+
+    let (activation, ()) = tokio::join!(worker.poll_workflow_activation(), async {
+        poll_started.notified().await;
+        worker.initiate_shutdown();
+        // Wait for the shutdown wakeup before releasing the server response.
+        worker.cached_workflows().await;
+        poll_released.notify_one();
+    });
+    let activation = activation.expect("the server returned a task from an in-flight poll");
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![CompleteWorkflowExecution::default().into()],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
 }

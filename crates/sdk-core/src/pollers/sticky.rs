@@ -56,8 +56,9 @@ where
     async fn poll(&self) -> Option<super::Result<(T, OwnedMeteredSemPermit<SK>)>> {
         if let Some(sq) = self.sticky_poller.as_ref() {
             tokio::select! {
-                r = self.normal_poller.poll() => r,
-                r = sq.poll() => r,
+                Some(r) = self.normal_poller.poll() => Some(r),
+                Some(r) = sq.poll() => Some(r),
+                else => None,
             }
         } else {
             self.normal_poller.poll().await
