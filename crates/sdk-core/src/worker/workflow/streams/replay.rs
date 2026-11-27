@@ -1004,7 +1004,7 @@ mod tests {
                 &given,
                 StreamSettings::default(),
                 StoreLimits::UNBOUNDED,
-                    |page| match format {
+                |page| match format {
                     Some(f) => page.digest = f.hash(std::slice::from_ref(&given)),
                     None => page.digest[0] = 2,
                 },
