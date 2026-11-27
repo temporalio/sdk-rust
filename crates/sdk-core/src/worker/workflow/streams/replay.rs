@@ -4,7 +4,7 @@
 
 use super::{
     StreamRuntimes,
-    digest::digest,
+    digest::DigestFormat,
     manager::{cut, is_outage, next_wait, retry_waits},
     marker::{is_read_marker, peeked_read_marker},
 };
@@ -344,10 +344,16 @@ impl ReplayReader {
         let gone = |why: String| {
             ReplayError::Gone(cut(format!("The Store doesn't have {}: {why}", range())))
         };
+        let format = DigestFormat::from_marker(&entry.digest).ok_or_else(|| {
+            ReplayError::Unavailable(cut(format!(
+                "This Worker doesn't know the digest format for {}",
+                range()
+            )))
+        })?;
         let settings = self.runtimes.settings;
         let recorded = usize::try_from(entry.record_bytes).unwrap_or(usize::MAX);
         let mut records: Vec<StreamRecord> = vec![];
-        let mut bytes = 0;
+        let mut bytes = 0_usize;
         let mut cursor = entry.after_offset.clone();
         let mut waits = retry_waits(&settings);
         while (records.len() as u64) < count {
@@ -387,7 +393,18 @@ impl ReplayReader {
                         .records
                         .iter()
                         .map(|record| field_len(record.encoded_len()));
-                    bytes += page_bytes.sum::<usize>();
+                    bytes = bytes.saturating_add(page_bytes.sum::<usize>());
+                    // Old Workers could deliver one oversized Record. Its original marker is
+                    // the only reason to allow more than the Workflow budget on replay.
+                    let limit = match format {
+                        DigestFormat::Legacy => recorded.max(super::MAX_TASK_RECORD_BYTES),
+                        DigestFormat::V1 => super::MAX_TASK_RECORD_BYTES,
+                    };
+                    if bytes > limit {
+                        return Err(gone(
+                            "its Records exceed the Workflow read byte limit".to_string(),
+                        ));
+                    }
                     records.extend(page.records);
                     cursor = page.last_offset;
                     continue;
@@ -419,7 +436,7 @@ impl ReplayReader {
             let wait = next_wait(&mut waits);
             tokio::time::sleep(wait.min(left)).await;
         }
-        if digest(&records) != entry.digest {
+        if format.hash(&records) != entry.digest {
             return Err(gone("it has other Records".to_string()));
         }
         Ok(records)
@@ -555,7 +572,7 @@ mod tests {
             ..Default::default()
         };
         if !given.is_empty() {
-            page.digest = digest(given);
+            page.digest = super::super::digest::digest(given);
             let size = |record: &StreamRecord| field_len(record.encoded_len());
             page.record_bytes = given.iter().map(size).sum::<usize>() as u64;
         }
@@ -933,13 +950,33 @@ mod tests {
         fault: impl FnMut(&mut StdRng, &StoreRead) -> Option<Fault> + Send + 'static,
     ) -> (StreamRecord, MarkerReads) {
         let given = record(&[1], 0, size);
+        let result = replay_record(
+            &given,
+            settings,
+            StoreLimits::default(),
+            |page| {
+                page.record_bytes -= less;
+            },
+            fault,
+        )
+        .await;
+        (given, result)
+    }
+
+    async fn replay_record(
+        given: &StreamRecord,
+        settings: StreamSettings,
+        limits: StoreLimits,
+        edit: impl FnOnce(&mut StreamReadPage),
+        fault: impl FnMut(&mut StdRng, &StoreRead) -> Option<Fault> + Send + 'static,
+    ) -> MarkerReads {
         let stream = StreamRef {
             id: "s".to_string(),
             store: "mem".to_string(),
         };
-        let mut entry = page_entry(1, &[], std::slice::from_ref(&given));
+        let mut entry = page_entry(1, &[], std::slice::from_ref(given));
         if let Some(stream_read_result::Result::Page(page)) = &mut entry.result {
-            page.record_bytes -= less;
+            edit(page);
         }
         let data = StreamReadMarkerData {
             reads: vec![with_stream(entry, &stream)],
@@ -951,12 +988,40 @@ mod tests {
             record: Some(given.clone()),
         };
         let model = ModelStore::new(Model::new(0, vec![entry], fault));
-        let runtime = StreamRuntime::new(Arc::new(model), StoreLimits::default());
+        let runtime = StreamRuntime::new(Arc::new(model), limits);
         let mut runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
         runtimes.settings = settings;
         let mut reader = ReplayReader::new(runtimes);
         reader.queue([event].iter());
-        (given, reader.read_next().await.take(1))
+        reader.read_next().await.take(1)
+    }
+
+    #[tokio::test]
+    async fn an_oversized_legacy_record_replays_and_unknown_formats_fail_the_task() {
+        let given = record(&[1], 0, super::super::MAX_TASK_RECORD_BYTES + 1);
+        for format in [Some(DigestFormat::Legacy), Some(DigestFormat::V1), None] {
+            let results = replay_record(
+                &given,
+                StreamSettings::default(),
+                StoreLimits::UNBOUNDED,
+                    |page| match format {
+                    Some(f) => page.digest = f.hash(std::slice::from_ref(&given)),
+                    None => page.digest[0] = 2,
+                },
+                |_, _| None,
+            )
+            .await;
+            match (format, results.as_slice()) {
+                (Some(DigestFormat::Legacy), [Some(Ok(records))]) => {
+                    assert_eq!(records, std::slice::from_ref(&given))
+                }
+                (Some(DigestFormat::V1), [Some(Err(ReplayError::Gone(_)))]) => {}
+                (None, [Some(Err(ReplayError::Unavailable(message)))]) => {
+                    assert!(message.contains("digest format"))
+                }
+                _ => panic!("unexpected replay result"),
+            }
+        }
     }
 
     // A Record over the Record size of the runtime leaves its entry unknown, since a runtime with
@@ -991,5 +1056,66 @@ mod tests {
         };
         let (given, result) = replay_one_record(0, 10, settings, fault).await;
         assert_eq!(result, vec![Some(Ok(vec![given]))]);
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_changed_optional_producer_timestamp() {
+        let mut original = record(&[1], 0, 10);
+        original.producer = Some(temporalio_streams::proto::Producer {
+            kind: Some(temporalio_streams::proto::producer::Kind::Workflow(
+                temporalio_streams::proto::WorkflowProducer {
+                    namespace: "n".to_string(),
+                    workflow_id: "w".to_string(),
+                    run_id: "r".to_string(),
+                    attempt: Some(temporalio_streams::proto::WorkflowTaskAttempt {
+                        started_event_id: 3,
+                        attempt: 1,
+                        started_time: None,
+                    }),
+                },
+            )),
+        });
+        let mut changed = original.clone();
+        if let Some(temporalio_streams::proto::producer::Kind::Workflow(workflow)) =
+            changed.producer.as_mut().unwrap().kind.as_mut()
+        {
+            workflow.attempt.as_mut().unwrap().started_time =
+                Some(prost_types::Timestamp::default());
+        }
+        assert_ne!(original, changed);
+        for record in [&original, &changed] {
+            let request = temporalio_streams::proto::AppendRecordsRequest {
+                stream_id: "s".to_string(),
+                producer: record.producer.clone(),
+                records: vec![temporalio_streams::proto::AppendRecord {
+                    body: record.body.clone(),
+                }],
+            };
+            StoreLimits::default().validate_append(&request).unwrap();
+        }
+        let stream = StreamRef {
+            id: "s".to_string(),
+            store: "mem".to_string(),
+        };
+        let entry = page_entry(1, &[], &[original]);
+        let data = StreamReadMarkerData {
+            reads: vec![with_stream(entry, &stream)],
+        };
+        let event = marker_event(1, &data);
+        let entry = Entry {
+            offset: vec![1],
+            at: Duration::ZERO,
+            record: Some(changed),
+        };
+        let model = ModelStore::new(Model::new(0, vec![entry], |_, _| None));
+        let runtime = StreamRuntime::new(Arc::new(model), StoreLimits::default());
+        let runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
+        let mut reader = ReplayReader::new(runtimes);
+        reader.queue([event].iter());
+        let result = reader.read_next().await.take(1);
+        assert!(
+            matches!(result.as_slice(), [Some(Err(ReplayError::Gone(_)))]),
+            "Replay accepted a changed Producer: {result:?}"
+        );
     }
 }

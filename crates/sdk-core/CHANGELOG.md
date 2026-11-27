@@ -48,13 +48,16 @@ relevant information.
   records it in a `core_stream_append` marker, so a replay makes no Store call. A task fails with
   `StreamStoreUnavailable:` if the Store is still unavailable at the task's heartbeat, and with
   `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
-* [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. Each
-  read gives one page of the Store in a `ResolveStreamRead` job, and waits for a Record at most to
-  the read limit of its task, the new `StreamSettings::read_time`. A `core_stream_read` marker
-  records each page with a digest of its Records, and a replay reads the Records from the Store
-  again. A replay whose Store lost them fails with the new `WorkflowErrorType::StreamReplay`.
+* [lang-internal] `ReadStream` returns one Store page in a `ResolveStreamRead` job.
+  `StreamSettings::read_time` bounds the wait in one Workflow Task. Read markers store offsets,
+  the Record count and a digest. Replay reads those Records again and verifies the digest.
 
 ### Fixed
+* A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.
+  New read markers preserve the Producer's optional timestamps and signed values during replay.
+  Workers can still replay the original marker format, including previously delivered oversized
+  Records. Older Workers cannot interpret the new digest format.
+* Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

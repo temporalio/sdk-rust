@@ -249,7 +249,24 @@ async fn run(
             let stream = (read.request.r#ref.clone()).expect("A read has the ref of its command");
             let from_offset = read.request.from_offset.clone();
             let page = read_page(runtime, read, settings).await;
-            let page = page.map_err(|error| recorded(&error));
+            let page = page
+                .and_then(|page| {
+                    // The Store runtime returns one Record even if it exceeds the request's soft
+                    // byte limit. A Record over the Workflow limit cannot fit in any future task.
+                    if super::read::record_bytes(&page.response.records)
+                        > super::MAX_TASK_RECORD_BYTES
+                    {
+                        return Err(ReadError::new(
+                            AnyReason::Unsupported,
+                            format!(
+                                "A Stream Record exceeds the {}-byte Workflow Task limit",
+                                super::MAX_TASK_RECORD_BYTES
+                            ),
+                        ));
+                    }
+                    Ok(page)
+                })
+                .map_err(|error| recorded(&error));
             Outcome::Read(ReadDone::new(&stream, seq, from_offset, page))
         }
     }
