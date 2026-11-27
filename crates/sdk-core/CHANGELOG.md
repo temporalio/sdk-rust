@@ -37,6 +37,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* Worker shutdown drains all Activity and Nexus poll responses before ending task delivery.
+
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

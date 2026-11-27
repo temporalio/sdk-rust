@@ -899,13 +899,122 @@ mod tests {
     use super::*;
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
+        pollers::{BoxedPoller, TaskPollerStream, ValidatableTask},
+        telemetry::metrics::MetricsContext,
         worker::client::mocks::mock_manual_worker_client,
     };
-    use futures_util::FutureExt;
+    use futures_util::{FutureExt, pin_mut};
     use rstest::rstest;
-    use std::{future::pending, time::Duration};
-    use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
-    use tokio::{select, sync::Notify};
+    use std::{collections::VecDeque, future::pending, time::Duration};
+    use temporalio_common::protos::temporal::api::{
+        namespace::v1::namespace_info::Capabilities,
+        nexus::v1::{Request, StartOperationRequest, request},
+    };
+    use tokio::{
+        select,
+        sync::{Notify, oneshot},
+    };
+
+    async fn assert_graceful_polls_drain<T>(task: T)
+    where
+        T: TaskPollerResult + ValidatableTask + Clone,
+        T::SlotKind: Debug + Send + Sync,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let shutdown = CancellationToken::new();
+            let capabilities = Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                worker_poll_complete_on_shutdown: true,
+                ..Default::default()
+            }));
+            let permits = fixed_size_permit_dealer::<T::SlotKind>(2);
+            let mut issued = permits.get_extant_count_rcv();
+            let (empty_tx, empty_rx) = oneshot::channel();
+            let (task_tx, task_rx) = oneshot::channel();
+            let responses = parking_lot::Mutex::new(VecDeque::from([empty_rx, task_rx]));
+            let (started_tx, mut started_rx) = unbounded_channel();
+            let admissions = AtomicUsize::new(0);
+            let buffer = LongPollBuffer::new(
+                move |_, _| {
+                    let response = responses.lock().pop_front().expect("only two polls");
+                    started_tx.send(()).unwrap();
+                    async move { Ok(response.await.unwrap()) }
+                },
+                permits,
+                shutdown.clone(),
+                PollScaler::new(
+                    PollerBehavior::SimpleMaximum(2),
+                    None::<fn(usize)>,
+                    shutdown.clone(),
+                    PollerHeartbeatState::default(),
+                    capabilities.clone(),
+                ),
+                Some(move || {
+                    let admitted = admissions.fetch_add(1, Ordering::Relaxed) < 2;
+                    async move {
+                        if !admitted {
+                            pending::<()>().await;
+                        }
+                    }
+                }),
+                None::<fn(&T)>,
+                capabilities,
+            );
+            let poller: BoxedPoller<_> = Box::new(buffer);
+            let stream = TaskPollerStream::new(poller, MetricsContext::no_op(), |_| {}, shutdown.clone())
+                .into_stream();
+            pin_mut!(stream);
+            let received = {
+                let next = stream.next();
+                pin_mut!(next);
+                tokio::select! {
+                    _ = async {
+                        started_rx.recv().await.unwrap();
+                        started_rx.recv().await.unwrap();
+                    } => {},
+                    result = &mut next => panic!("poll completed before shutdown: {result:?}"),
+                }
+                shutdown.cancel();
+                empty_tx.send(T::default()).unwrap();
+                tokio::select! {
+                    biased;
+                    result = &mut next => panic!("poll completed before the second response: {result:?}"),
+                    _ = issued.wait_for(|count| *count == 1) => {},
+                }
+                task_tx.send(task.clone()).unwrap();
+                next.await.unwrap().unwrap()
+            };
+            assert_eq!(received.resp, task);
+            drop(received);
+            assert!(stream.next().await.is_none());
+            assert_eq!(*issued.borrow(), 0);
+        })
+        .await
+        .expect("polls drain after shutdown");
+    }
+
+    #[tokio::test]
+    async fn activity_polls_drain_after_empty_shutdown_response() {
+        assert_graceful_polls_drain(PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            ..Default::default()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nexus_polls_drain_after_empty_shutdown_response() {
+        assert_graceful_polls_drain(PollNexusTaskQueueResponse {
+            task_token: vec![1],
+            request: Some(Request {
+                variant: Some(request::Variant::StartOperation(
+                    StartOperationRequest::default(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn only_polls_once_with_1_poller() {

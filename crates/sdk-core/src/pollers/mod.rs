@@ -159,15 +159,11 @@ where
                         return match state.poller.poll().await {
                             Some(Ok((task, permit))) => {
                                 if task == Default::default() {
-                                    if state.poller_was_shutdown {
-                                        // Server sent an empty response after we initiated
-                                        // shutdown — this is the graceful shutdown signal.
-                                        return None;
+                                    if !state.poller_was_shutdown {
+                                        debug!("Poll {} task timeout", T::task_name());
+                                        (state.metrics_no_task)(&state.metrics);
                                     }
-                                    // We get the default proto in the event that the long poll
-                                    // times out.
-                                    debug!("Poll {} task timeout", T::task_name());
-                                    (state.metrics_no_task)(&state.metrics);
+                                    // Other polls can still return tasks during shutdown.
                                     continue;
                                 }
 
@@ -297,17 +293,18 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    /// Verify that empty responses after shutdown are not treated as poll timeout and retried
-    /// indefinitely
     #[tokio::test]
-    async fn empty_response_after_shutdown_terminates_stream() {
+    async fn empty_responses_after_shutdown_drain_stream() {
         let poll_count = Arc::new(AtomicUsize::new(0));
         let poll_count_clone = poll_count.clone();
 
         let mut mock_poller = mock_poller();
         mock_poller.expect_poll().returning(move || {
-            poll_count_clone.fetch_add(1, Ordering::SeqCst);
-            Some(Ok(PollActivityTaskQueueResponse::default()))
+            if poll_count_clone.fetch_add(1, Ordering::SeqCst) < 2 {
+                Some(Ok(PollActivityTaskQueueResponse::default()))
+            } else {
+                None
+            }
         });
 
         let sem = Arc::new(fixed_size_permit_dealer::<ActivitySlotKind>(10));
@@ -329,14 +326,10 @@ mod tests {
         );
         assert!(
             result.unwrap().is_none(),
-            "Stream should return None (terminated) on empty response after shutdown"
+            "Stream should end after the poller drains"
         );
 
-        let total = poll_count.load(Ordering::SeqCst);
-        assert!(
-            total < 5,
-            "Expected stream to terminate quickly, but poller was called {total} times"
-        );
+        assert_eq!(poll_count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
