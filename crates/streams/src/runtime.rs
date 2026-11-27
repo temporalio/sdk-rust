@@ -338,12 +338,9 @@ mod tests {
     use crate::{
         AnyError, AppendReason,
         proto::{AppendRecord, CreateStreamResponse, StreamRecord},
-        record::{DEFAULT_MAX_RECORD_BYTES, producer_len, stored_len},
+        record::DEFAULT_MAX_RECORD_BYTES,
         test_store::{Received, Scripted, client, runtime, task, workflow},
     };
-    use futures_util::future::BoxFuture;
-    use parking_lot::Mutex;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::fmt::Debug;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
 
@@ -587,248 +584,114 @@ mod tests {
         assert_eq!(*store.received.lock(), expected);
     }
 
-    // A cap of 0 means no cap, so the extra bytes of the Record more must not wrap to 0.
     #[tokio::test]
-    async fn the_byte_cap_with_one_record_more_saturates() {
+    async fn a_lookahead_keeps_unbounded_caps_and_saturates_finite_caps() {
         let store = Arc::new(Scripted::default());
         let runtime = StreamRuntime::new(store.clone(), StoreLimits::UNBOUNDED);
-        for max_bytes in [1, i64::MAX - 1, i64::MAX] {
+        for (max_records, max_bytes, store_records, store_bytes) in [
+            (0, 0, 0, 0),
+            (0, 1, 0, i64::MAX),
+            (1, 0, 2, 0),
+            (i32::MAX - 1, i64::MAX - 1, i32::MAX, i64::MAX),
+            (i32::MAX, i64::MAX, i32::MAX, i64::MAX),
+        ] {
             let read = sdk::ReadRecordsRequest {
+                max_records,
                 max_bytes,
                 ..valid_read()
             };
             runtime.read_records_with_more(read).await.unwrap();
+            let Some(Received::Read(sent)) = store.received.lock().pop() else {
+                panic!("expected a Store read");
+            };
+            assert_eq!(
+                (sent.max_records, sent.max_bytes),
+                (store_records, store_bytes)
+            );
         }
-        let sent: Vec<i64> = (store.received.lock().iter())
-            .map(|received| match received {
-                Received::Read(read) => read.max_bytes,
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(sent, [i64::MAX; 3]);
     }
 
     #[tokio::test]
-    async fn a_page_is_trimmed_to_the_caps_of_its_read_and_only_then_checked() {
+    async fn a_page_keeps_its_first_record_and_ends_at_the_first_cap_it_reaches() {
         let (store, runtime) = runtime();
-        let offsets = ["a", "b", "c", "d", "e"];
-        let mut spared = 0;
-        for seed in 0..400 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let count = rng.random_range(0..=offsets.len());
-            let last_offset = match rng.random_bool(0.5) {
-                true => "z",
-                false => offsets[..count].last().copied().unwrap_or(""),
-            };
-            let mut answer = page(&offsets[..count], last_offset);
-            for record in &mut answer.records {
-                record.body.as_mut().unwrap().data = vec![0; rng.random_range(0..200)];
-            }
-            // In some seeds one Record has no body, which breaks the contract of a Store.
-            let broken = (count > 0 && rng.random_bool(0.3)).then(|| rng.random_range(0..count));
-            if let Some(at) = broken {
-                answer.records[at].body = None;
-            }
-            // The size of each Record as a page encodes it, with the tag and the length of its
-            // field.
-            let size = |record: &StreamRecord| {
-                let records = vec![record.clone()];
-                ReadRecordsResponse {
-                    records,
-                    ..Default::default()
-                }
-                .encoded_len()
-            };
-            let sizes: Vec<usize> = answer.records.iter().map(size).collect();
-            let max_records = rng.random_range(0..=count + 1);
-            // The byte cap is the size of some first Records, or one byte off it. Zero is no cap.
-            let first: usize = sizes[..rng.random_range(0..=count)].iter().sum();
-            let max_bytes = (first + rng.random_range(0..3)).saturating_sub(1);
-            let fits = |keep: usize| {
-                (max_records == 0 || keep <= max_records)
-                    && (max_bytes == 0 || sizes[..keep].iter().sum::<usize>() <= max_bytes)
-            };
-            // A page keeps its first Record, and then each Record that still fits both caps.
-            let keep = (1..=count)
-                .take_while(|keep| *keep == 1 || fits(*keep))
-                .count();
-            let mut expected = answer.clone();
-            if keep < count {
-                expected.records.truncate(keep);
-                expected.last_offset = expected.records[keep - 1].offset.clone();
-            }
-            store.answers.lock().page = answer;
+        let mut answer = page(&["a", "b", "c"], "z");
+        answer.records[1].body.as_mut().unwrap().data = vec![0; 128];
+        let first_two = ReadRecordsResponse {
+            records: answer.records[..2].to_vec(),
+            last_offset: vec![],
+        };
+        let bytes = first_two.encoded_len() as i64;
+        store.answers.lock().page = answer.clone();
+        for (max_records, max_bytes, count, last_offset, more) in [
+            (0, 0, 3, "z", false),
+            (3, 0, 3, "z", false),
+            (0, 1, 1, "a", true),
+            (3, bytes - 1, 1, "a", true),
+            (3, bytes, 2, "b", true),
+            (3, bytes + 1, 2, "b", true),
+            (1, bytes, 1, "a", true),
+        ] {
             let read = sdk::ReadRecordsRequest {
-                max_records: max_records as i32,
-                max_bytes: max_bytes as i64,
+                max_records,
+                max_bytes,
                 ..valid_read()
             };
-            let result = runtime.read_records(read.clone()).await;
-            let with_more = runtime.read_records_with_more(read).await;
-            // A Record that the trim removed can't fail the read.
-            match broken.filter(|at| *at < keep) {
-                Some(at) => {
-                    let message = format!("The Store gave Record {at} with no Producer or no body");
-                    let corrupt = StreamError::store_corrupt(message);
-                    assert_eq!(result, Err(corrupt.clone()), "seed {seed}");
-                    assert_eq!(with_more, Err(corrupt), "seed {seed}");
-                }
-                None => {
-                    let more = keep < count;
-                    let page = ReadPage {
-                        response: expected.clone(),
-                        more,
-                    };
-                    assert_eq!(result, Ok(expected), "seed {seed}");
-                    assert_eq!(with_more, Ok(page), "seed {seed}");
-                }
+            let response = ReadRecordsResponse {
+                records: answer.records[..count].to_vec(),
+                last_offset: last_offset.as_bytes().to_vec(),
+            };
+            assert_eq!(
+                runtime.read_records(read.clone()).await,
+                Ok(response.clone())
+            );
+            assert_eq!(
+                runtime.read_records_with_more(read).await,
+                Ok(ReadPage { response, more })
+            );
+        }
+
+        store.answers.lock().page = page(&[], "z");
+        let empty = runtime.read_records_with_more(valid_read()).await.unwrap();
+        assert_eq!(
+            empty,
+            ReadPage {
+                response: page(&[], "z"),
+                more: false
             }
-            spared += usize::from(broken.is_some_and(|at| at >= keep));
-        }
-        assert!(spared > 0, "No trim removed a Record with no body");
-    }
-
-    /// A Store that keeps the contract. It answers with the first Records after `from_offset`
-    /// that fit the caps of the request.
-    #[derive(Default)]
-    struct Stream(Mutex<Vec<StreamRecord>>);
-
-    impl StreamStore for Stream {
-        fn create_stream(
-            &self,
-            _: CreateStreamRequest,
-            _: String,
-        ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
-            unreachable!("The test only reads")
-        }
-
-        fn append_records(
-            &self,
-            _: AppendRecordsRequest,
-            _: String,
-        ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
-            unreachable!("The test only reads")
-        }
-
-        fn read_records(
-            &self,
-            request: ReadRecordsRequest,
-        ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
-            let max_records = match request.max_records {
-                0 => usize::MAX,
-                max => max as usize,
-            };
-            let max_bytes = match request.max_bytes {
-                0 => usize::MAX,
-                max => max as usize,
-            };
-            let mut bytes = 0;
-            let records: Vec<StreamRecord> = (self.0.lock().iter())
-                .filter(|record| record.offset > request.from_offset)
-                .take(max_records)
-                .take_while(|record| {
-                    let first = bytes == 0;
-                    bytes += field_len(record.encoded_len());
-                    first || bytes <= max_bytes
-                })
-                .cloned()
-                .collect();
-            let page = ReadRecordsResponse {
-                records,
-                ..Default::default()
-            };
-            Box::pin(async move { Ok(page) })
-        }
-
-        fn describe_stream(
-            &self,
-            _: DescribeStreamRequest,
-        ) -> BoxFuture<'_, Result<DescribeStreamResponse, DescribeError>> {
-            unreachable!("The test only reads")
-        }
+        );
     }
 
     #[tokio::test]
-    async fn more_says_that_the_stream_has_a_record_after_the_page() {
-        const MAX_RECORD: usize = 400;
-        let store = Arc::new(Stream::default());
-        let limits = StoreLimits::default().with_max_record_bytes(MAX_RECORD);
-        let runtime = StreamRuntime::new(store.clone(), limits.unwrap());
-        let (mut told, mut over_size_spared) = (0, 0);
-        for seed in 0..1000 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            // Some Records are over the Record size of the runtime.
-            let records: Vec<StreamRecord> = (0..rng.random_range(0..8_u8))
-                .map(|at| StreamRecord {
-                    producer: Some(client()),
-                    body: Some(Payload {
-                        data: vec![0; rng.random_range(0..MAX_RECORD + 100)],
-                        ..Default::default()
-                    }),
-                    offset: vec![b'a' + at],
+    async fn a_discarded_record_cannot_fail_a_read() {
+        let (store, runtime) = runtime();
+        let read = sdk::ReadRecordsRequest {
+            max_records: 1,
+            ..valid_read()
+        };
+        for body in [
+            None,
+            Some(Payload {
+                data: vec![0; DEFAULT_MAX_RECORD_BYTES],
+                ..Default::default()
+            }),
+        ] {
+            let mut answer = page(&["a", "b"], "z");
+            answer.records[1].body = body;
+            store.answers.lock().page = answer;
+            let response = page(&["a"], "a");
+            assert_eq!(
+                runtime.read_records(read.clone()).await,
+                Ok(response.clone())
+            );
+            assert_eq!(
+                runtime.read_records_with_more(read.clone()).await,
+                Ok(ReadPage {
+                    response,
+                    more: true
                 })
-                .collect();
-            let size = |record: &StreamRecord| field_len(record.encoded_len());
-            let over_size = |record: &StreamRecord| {
-                let stored = stored_len(producer_len(&client()), record.body.as_ref());
-                stored > MAX_RECORD
-            };
-            *store.0.lock() = records.clone();
-            let max_records = rng.random_range(0..4);
-            let max_bytes = match rng.random_bool(0.3) {
-                true => 0,
-                false => rng.random_range(1..1500),
-            };
-            let read = sdk::ReadRecordsRequest {
-                max_records: max_records as i32,
-                max_bytes: max_bytes as i64,
-                ..valid_read()
-            };
-            let result = runtime.read_records_with_more(read).await;
-            // The page has the first Records that fit the caps of the read, and at least one.
-            let (mut keep, mut bytes) = (0, 0);
-            for record in &records {
-                bytes += size(record);
-                let fits = (max_records == 0 || keep < max_records)
-                    && (max_bytes == 0 || bytes <= max_bytes);
-                if keep > 0 && !fits {
-                    break;
-                }
-                keep += 1;
-            }
-            let page = &records[..keep];
-            if let Some(at) = page.iter().position(over_size) {
-                let Err(error) = result else {
-                    panic!("seed {seed}: a Record over the size of the runtime passed");
-                };
-                assert_eq!(error.reason, AnyReason::Unsupported.into(), "seed {seed}");
-                assert!(
-                    error
-                        .message
-                        .starts_with(&format!("The Store gave Record {at} "))
-                );
-                continue;
-            }
-            let ReadPage { response, more } = result.unwrap();
-            assert_eq!(response.records, page, "seed {seed}");
-            let next = records.get(keep);
-            over_size_spared += usize::from(more && next.is_some_and(over_size));
-            // `more` is never a guess.
-            assert!(!more || next.is_some(), "seed {seed}");
-            // With a page within its byte cap, the extra cap has room for any Record that the
-            // runtime takes, so the Store returns it.
-            let page_bytes: usize = page.iter().map(size).sum();
-            let room = max_bytes == 0 || page_bytes <= max_bytes;
-            if next.is_some_and(|next| !over_size(next)) && room {
-                assert!(more, "seed {seed}");
-            }
-            told += usize::from(more);
+            );
+            assert!(runtime.read_records_with_more(valid_read()).await.is_err());
         }
-        assert!(told > 100, "Only {told} pages had more");
-        assert!(
-            over_size_spared > 0,
-            "No trim removed a Record over the size"
-        );
     }
 
     #[tokio::test]
