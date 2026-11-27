@@ -37,17 +37,9 @@ relevant information.
 ## Unreleased
 
 ### Added
-* [lang-internal] Added the experimental `temporalio-streams` crate. Its `StreamRuntime` checks each
-  Stream call and its answer for a `StreamStore`, which a lang SDK implements for a Store in its
-  own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
-  append of client code against them with `StoreLimits::validate_append`.
-* [lang-internal] Workflow code can append to a Stream with the experimental `AppendToStream`
-  command, on a Store in `WorkerConfig::stream_runtimes`. A ref with no Store name uses the Store
-  under the empty name there, else the only Store. A Worker with one runtime under two names
-  fails to start. Core calls the Store, gives the result in a `ResolveStreamAppend` job, and
-  records it in a `core_stream_append` marker, so a replay makes no Store call. A task fails with
-  `StreamStoreUnavailable:` if the Store is still unavailable at the task's heartbeat, and with
-  `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
+* [lang-internal] `AppendToStream` dispatches through a Store in `WorkerConfig::stream_runtimes`.
+  Core records the result in a `core_stream_append` marker for replay.
+  An outage at the task heartbeat fails the Workflow Task with `StreamStoreUnavailable:`.
 * [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
   a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
 
