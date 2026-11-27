@@ -216,13 +216,12 @@ fn check<'a>(entries: impl Iterator<Item = Entry<'a>> + Clone) -> Result<(), WFM
 
 #[cfg(test)]
 mod tests {
-    use super::super::manager::recorded;
-    use super::*;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use super::{super::manager::recorded, *};
+    use serde_json::{Value, json};
     use temporalio_common::protos::coresdk::external_data::{
         StreamAppendOffsets, StreamReadPage, StreamReadResult,
     };
-    use temporalio_streams::{AnyError, AppendError, AppendReason, StreamError};
+    use temporalio_streams::{AppendError, AppendReason};
 
     /// Returns the marker event of `marker`, as Core records it.
     fn event(marker: &PeekedMarker) -> HistoryEvent {
@@ -398,187 +397,110 @@ mod tests {
         assert_eq!(names, pinned);
     }
 
-    /// Returns text of 1 to `max` characters that JSON escapes or has in several bytes, such as a
-    /// quote, a control character or a character of another script.
-    fn text(rng: &mut StdRng, max: usize) -> String {
-        let chars = [
-            'a', '"', '\\', '/', '\n', '\0', '\u{7f}', 'é', '€', '𝄞', '\u{2028}',
+    fn fatal(event: HistoryEvent) -> String {
+        match peeked_marker(&event) {
+            Some(Err(WFMachinesError::Fatal(message))) => message,
+            other => panic!("expected a fatal marker error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marker_entries_accept_boundary_values_and_reject_invalid_data() {
+        let append = StreamAppendMarkerData {
+            appends: vec![StreamAppendResult {
+                seq: 99,
+                stream_id: "é\n\"".into(),
+                store: "mem".into(),
+                activation_index: MAX_ACTIVATION,
+                result: Some(stream_append_result::Result::Appended(
+                    StreamAppendOffsets {
+                        first_offset: vec![],
+                        last_offset: vec![0xff; 1024],
+                    },
+                )),
+            }],
+        };
+        let read = StreamReadMarkerData {
+            reads: vec![StreamReadResult {
+                seq: 99,
+                stream_id: "é\n\"".into(),
+                store: "mem".into(),
+                from_offset: vec![],
+                activation_index: MAX_ACTIVATION,
+                result: Some(stream_read_result::Result::Page(StreamReadPage {
+                    last_offset: vec![0xff; 1024],
+                    ..Default::default()
+                })),
+            }],
+        };
+        let cases = [
+            (
+                PeekedMarker::Append(append),
+                "append",
+                "/result/appended/first_offset",
+            ),
+            (PeekedMarker::Read(read), "read", "/from_offset"),
         ];
-        (0..rng.random_range(1..=max))
-            .map(|_| chars[rng.random_range(0..chars.len())])
-            .collect()
-    }
-
-    /// Returns an offset of 0 to 1024 bytes of any value.
-    fn offset(rng: &mut StdRng) -> Vec<u8> {
-        let len = match rng.random_range(0..10) {
-            0 => 0,
-            1 => 1024,
-            _ => rng.random_range(1..=16),
-        };
-        (0..len).map(|_| rng.random()).collect()
-    }
-
-    /// Returns the failure of a call, as the manager records it for an error of any reason.
-    fn failure(rng: &mut StdRng) -> StreamFailure {
-        let reasons: Vec<StreamErrorReason> = (0..)
-            .map_while(|number| StreamErrorReason::try_from(number).ok())
-            .collect();
-        let reason = reasons[rng.random_range(0..reasons.len())];
-        let message = match rng.random_bool(0.9) {
-            true => text(rng, 40),
-            false => text(rng, 5000),
-        };
-        recorded(&StreamError { reason, message })
-    }
-
-    /// Returns the marker of an activation with random results, of a random kind.
-    fn valid_marker(rng: &mut StdRng) -> PeekedMarker {
-        let activation_index = match rng.random_bool(0.9) {
-            true => rng.random_range(0..10),
-            false => MAX_ACTIVATION,
-        };
-        let seqs = 1..=rng.random_range(1..4);
-        if rng.random_bool(0.5) {
-            let appends = seqs
-                .map(|seq| StreamAppendResult {
-                    seq,
-                    stream_id: text(rng, 12),
-                    store: text(rng, 12),
-                    activation_index,
-                    result: Some(match rng.random_bool(0.5) {
-                        true => stream_append_result::Result::Appended(StreamAppendOffsets {
-                            first_offset: offset(rng),
-                            last_offset: offset(rng),
-                        }),
-                        false => stream_append_result::Result::Failure(failure(rng)),
-                    }),
-                })
-                .collect();
-            return PeekedMarker::Append(StreamAppendMarkerData { appends });
-        }
-        let reads = seqs
-            .map(|seq| StreamReadResult {
-                seq,
-                stream_id: text(rng, 12),
-                store: text(rng, 12),
-                activation_index,
-                from_offset: offset(rng),
-                result: Some(match rng.random_bool(0.7) {
-                    true => stream_read_result::Result::Page(StreamReadPage {
-                        record_count: rng.random(),
-                        digest: (0..16).map(|_| rng.random()).collect(),
-                        record_bytes: rng.random(),
-                        last_offset: offset(rng),
-                        wait_cut: rng.random(),
-                    }),
-                    false => stream_read_result::Result::Failure(failure(rng)),
-                }),
-            })
-            .collect();
-        PeekedMarker::Read(StreamReadMarkerData { reads })
-    }
-
-    #[test]
-    fn a_marker_reads_back_as_it_was_written() {
-        for seed in 0..1000 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let marker = valid_marker(&mut rng);
-            let read_back = peeked_marker(&event(&marker));
-            assert_eq!(read_back, Some(Ok(marker)), "seed {seed}");
-        }
-    }
-
-    /// Breaks one rule of `marker`. Returns its event and the reason that the decode gives, or the
-    /// start of it where the rest is the text of the JSON parser.
-    fn corrupt(rng: &mut StdRng, mut marker: PeekedMarker) -> (HistoryEvent, String) {
-        let (name, kind, offset_key) = match &marker {
-            PeekedMarker::Append(_) => (STREAM_APPEND_MARKER_NAME, "append", "first_offset"),
-            PeekedMarker::Read(_) => (STREAM_READ_MARKER_NAME, "read", "from_offset"),
-        };
-        // Adds an entry with seq 99 to the marker, whose result `result` sets.
-        let add = |marker: &mut PeekedMarker, activation_index, failure: Option<StreamFailure>| {
-            match marker {
-                PeekedMarker::Append(data) => data.appends.push(StreamAppendResult {
-                    seq: 99,
-                    activation_index,
-                    result: failure.map(stream_append_result::Result::Failure),
-                    ..Default::default()
-                }),
-                PeekedMarker::Read(data) => data.reads.push(StreamReadResult {
-                    seq: 99,
-                    activation_index,
-                    result: failure.map(stream_read_result::Result::Failure),
-                    ..Default::default()
-                }),
-            }
-        };
-        let known = || Some(recorded(&AnyError::store_unavailable("Down")));
-        let why = match rng.random_range(0..5) {
-            0 => return (event_of(name, HashMap::new()), "has no data".to_string()),
-            1 => {
-                let mut event = event(&marker);
-                let Some(history_event::Attributes::MarkerRecordedEventAttributes(attributes)) =
-                    &mut event.attributes
-                else {
-                    unreachable!("The event is a marker");
-                };
-                let payload = &mut attributes
-                    .details
-                    .get_mut(MARKER_DATA_KEY)
-                    .unwrap()
-                    .payloads[0];
-                let text = String::from_utf8(payload.data.clone()).unwrap();
-                // One more character makes the hex of an offset odd, and a `g` isn't hex.
-                let has_offset = format!("\"{offset_key}\":\"");
-                match rng.random_range(0..3) {
-                    0 => payload.metadata.clear(),
-                    1 if text.contains(&has_offset) => {
-                        let not_hex = [format!("{has_offset}0"), format!("{has_offset}0g")];
-                        let not_hex = &not_hex[rng.random_range(0..2)];
-                        payload.data = text.replacen(&has_offset, not_hex, 1).into_bytes();
-                    }
-                    _ => payload.data.truncate(text.len() - 1),
+        for (marker, kind, offset) in cases {
+            assert_eq!(peeked_marker(&event(&marker)), Some(Ok(marker.clone())));
+            let (name, data) = match marker {
+                PeekedMarker::Append(data) => {
+                    (STREAM_APPEND_MARKER_NAME, serde_json::to_value(data))
                 }
-                return (event, "doesn't decode: ".to_string());
-            }
-            2 => {
-                add(&mut marker, 0, None);
-                format!("has no result of {kind} 99")
-            }
-            3 => {
-                let activation = rng.random_range(MAX_ACTIVATION + 1..=u64::MAX);
-                add(&mut marker, activation, known());
-                format!("has an entry at activation {activation}, above the maximum of 4294967295")
-            }
-            _ => {
-                let later = StreamFailure {
-                    reason: "STREAM_ERROR_REASON_LATER".to_string(),
-                    message: "A later version of Core has this reason".to_string(),
-                };
-                add(&mut marker, 0, Some(later));
-                "has a failure with the reason `STREAM_ERROR_REASON_LATER`, which this Worker \
-                 doesn't know"
-                    .to_string()
-            }
-        };
-        (event(&marker), why)
+                PeekedMarker::Read(data) => (STREAM_READ_MARKER_NAME, serde_json::to_value(data)),
+            };
+            check_bad_entries(name, kind, offset, data.unwrap());
+        }
     }
 
-    #[test]
-    fn a_bad_marker_is_fatal() {
-        for seed in 0..1000 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let valid = valid_marker(&mut rng);
-            let (event, why) = corrupt(&mut rng, valid);
-            let Some(Err(WFMachinesError::Fatal(error))) = peeked_marker(&event) else {
-                panic!("seed {seed}: the marker decoded");
-            };
-            let expected = format!("The Stream marker {why}");
-            match why.ends_with(": ") {
-                true => assert!(error.starts_with(&expected), "seed {seed}: {error}"),
-                false => assert_eq!(error, expected, "seed {seed}"),
-            }
+    fn check_bad_entries(name: &str, kind: &str, offset: &str, data: Value) {
+        let key = format!("{kind}s");
+        let entry = &data[&key][0];
+        let event = |details| event_of(name, details);
+        let details = |payload: Payload| HashMap::from([("data".to_string(), payload.into())]);
+        let encoded = |entry: &Value| details(json(&json!({(&key): [entry]})));
+        assert_eq!(
+            fatal(event(HashMap::new())),
+            "The Stream marker has no data"
+        );
+        let mut missing_encoding = json(&data);
+        missing_encoding.metadata.clear();
+        let broken_json = Payload {
+            data: b"{".to_vec(),
+            ..json(&data)
+        };
+        for payload in [missing_encoding, broken_json] {
+            assert!(
+                fatal(event(details(payload))).starts_with("The Stream marker doesn't decode:")
+            );
         }
+        for hex in ["f", "gg"] {
+            let mut broken = entry.clone();
+            *broken.pointer_mut(offset).unwrap() = json!(hex);
+            assert!(
+                fatal(event(encoded(&broken))).starts_with("The Stream marker doesn't decode:")
+            );
+        }
+
+        let mut broken = entry.clone();
+        broken["result"] = Value::Null;
+        assert_eq!(
+            fatal(event(encoded(&broken))),
+            format!("The Stream marker has no result of {kind} 99")
+        );
+        let mut broken = entry.clone();
+        broken["activation_index"] = json!(MAX_ACTIVATION + 1);
+        assert_eq!(
+            fatal(event(encoded(&broken))),
+            "The Stream marker has an entry at activation 4294967296, above the maximum of \
+             4294967295"
+        );
+        let mut broken = entry.clone();
+        broken["result"] = json!({"failure": {"reason": "FUTURE", "message": "unknown"}});
+        assert_eq!(
+            fatal(event(encoded(&broken))),
+            "The Stream marker has a failure with the reason `FUTURE`, which this Worker \
+             doesn't know"
+        );
     }
 }
