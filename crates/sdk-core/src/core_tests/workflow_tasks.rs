@@ -3574,10 +3574,9 @@ async fn fetching_error_evicts_wf() {
     );
 }
 
-/// This test verifies that if we fail to fetch a page during a completion, that we don't get stuck
-/// in the complete waiting for the completion to finish.
+#[rstest]
 #[tokio::test]
-async fn ensure_fetching_fail_during_complete_sends_task_failure() {
+async fn fetch_failure_during_completion_evicts_the_run(#[values(false, true)] legacy_query: bool) {
     let wfid = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
@@ -3585,20 +3584,18 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
     t.add_we_signaled("sig1", vec![]);
     t.add_full_wf_task(); // started 7
 
-    // Need a command event after here so the paginator will know it has two complete WFTs and
-    // processing can begin before needing to fetch again
+    // The command lets the Worker start replay before the next fetch.
     t.add_by_type(EventType::TimerStarted);
     t.add_full_wf_task(); // started 11
     t.add_workflow_execution_completed();
 
     let mut first_poll = hist_to_poll_resp(&t, wfid, ResponseType::OneTask(4)).resp;
-    // History is partial so fetch will happen. We have to lie here and make up a previous started
-    // which really makes no sense, otherwise the paginator eagerly fetches and will fail before we
-    // ever start anything -- which is good -- but this test wants to make sure a fetching failure
-    // during a completion is handled correctly. That may no longer actually be a thing that can
-    // happen.
+    // Use an earlier task boundary so replay starts before the failing fetch.
     first_poll.previous_started_event_id = 0;
     first_poll.started_event_id = 11;
+    if legacy_query {
+        first_poll.query = Some(Default::default());
+    }
 
     let mut next_page: GetWorkflowExecutionHistoryResponse =
         t.get_full_history_info().unwrap().into();
@@ -3607,23 +3604,17 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
 
     let mut mock = mock_worker_client();
     mock.expect_get_workflow_execution_history()
-        .returning(move |_, _, _| {
-            error!("Called fetch!");
-            Ok(next_page.clone())
-        })
+        .returning(move |_, _, _| Ok(next_page.clone()))
         .times(1);
     mock.expect_get_workflow_execution_history()
-        .returning(move |_, _, _| {
-            error!("Called fetch second time!");
-            Err(tonic::Status::not_found("Ahh broken"))
-        })
+        .returning(move |_, _, _| Err(tonic::Status::not_found("history page unavailable")))
         .times(1);
     mock.expect_fail_workflow_task()
         .returning(|task, _, _| {
             assert_eq!(task.resource_id, "workflow:fake_wf_id");
             Ok(Default::default())
         })
-        .times(1);
+        .times(usize::from(!legacy_query));
 
     let mut mock = single_hist_mock_sg(wfid, t, [ResponseType::Raw(first_poll)], mock, true);
     mock.make_wft_stream_interminable();
@@ -3635,8 +3626,10 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .await
         .unwrap();
 
-    // Expect to see eviction b/c of history fetching error here.
-    let wf_task = core.poll_workflow_activation().await.unwrap();
+    let wf_task = tokio::time::timeout(Duration::from_secs(3), core.poll_workflow_activation())
+        .await
+        .expect("failed page fetch must evict the run")
+        .unwrap();
     assert_matches!(
         wf_task.jobs.as_slice(),
         [WorkflowActivationJob {

@@ -37,6 +37,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* A Worker evicts a run when replay fails during a retryable legacy query. The server can retry
+  the query on a fresh replay.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

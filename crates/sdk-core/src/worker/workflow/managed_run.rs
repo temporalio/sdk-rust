@@ -646,10 +646,27 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let rur = if is_no_report_query_fail {
+        let kind = if !self.pending_work_is_legacy_query() {
+            WftFailureKind::Task
+        } else if is_no_report_query_fail {
+            WftFailureKind::RetryableLegacyQuery
+        } else {
+            WftFailureKind::LegacyQuery
+        };
+
+        let retry_query_on_this_run = is_no_report_query_fail
+            && !self.am_broken
+            && reason != EvictionReason::PaginationOrHistoryFetch;
+        let rur = if retry_query_on_this_run {
             None
         } else {
-            // Blow up any cached data associated with the workflow
+            if is_no_report_query_fail {
+                // A failed replay cannot answer this query. The server may retry it after eviction.
+                self.am_broken = true;
+                if let Some(wft) = &mut self.wft {
+                    wft.pending_queries.clear();
+                }
+            }
             self.request_eviction(RequestEvictMsg {
                 run_id: self.run_id().to_string(),
                 message,
@@ -657,14 +674,6 @@ impl ManagedRun {
                 auto_reply_fail: None,
             })
             .into_run_update_resp()
-        };
-
-        let kind = if !self.pending_work_is_legacy_query() {
-            WftFailureKind::Task
-        } else if is_no_report_query_fail {
-            WftFailureKind::RetryableLegacyQuery
-        } else {
-            WftFailureKind::LegacyQuery
         };
 
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
