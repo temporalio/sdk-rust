@@ -262,19 +262,18 @@ mod tests {
             }
         }
         for attempts in [workflows, locals, activities, standalones] {
-            let taken: Vec<(Order, [u8; ATTEMPT_KEY_LEN])> = attempts
+            let mut taken: Vec<_> = attempts
                 .iter()
                 .filter(|(_, producer)| validate_producer(Some(producer)).is_ok())
                 .map(|(order, producer)| (*order, key(producer)))
                 .collect();
-            for (order, key) in &taken {
-                for (other_order, other_key) in &taken {
-                    assert_eq!(
-                        key.cmp(other_key),
-                        order.cmp(other_order),
-                        "{order:?} and {other_order:?}"
-                    );
-                }
+            taken.sort_unstable_by_key(|(order, _)| *order);
+            for ((order, key), (next_order, next_key)) in taken.iter().zip(taken.iter().skip(1)) {
+                assert_eq!(
+                    key.cmp(next_key),
+                    order.cmp(next_order),
+                    "{order:?} and {next_order:?}"
+                );
             }
         }
     }
