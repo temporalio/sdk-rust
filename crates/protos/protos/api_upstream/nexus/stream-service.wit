@@ -203,9 +203,9 @@ interface stream-service {
     // To read only new Records, a caller gets last-offset from a describe and reads after it.
     /// @nexus.doc "Read after this offset. Empty means from the beginning."
     from-offset: option<list<u8>>,
-    /// @nexus.doc "The maximum number of Records in one page. Zero uses the Store default."
+    /// @nexus.doc "The maximum Records per page. Zero uses the configured default."
     max-records: option<s32>,
-    /// @nexus.doc "The maximum bytes of Records in a page. A larger Record is returned alone."
+    /// @nexus.doc "The page byte target. One larger Record can be returned unless an SDK hard limit rejects it."
     max-bytes: option<s64>,
     /// @nexus.doc "How long to wait for a new Record. Unset returns immediately."
     wait: option<duration>,

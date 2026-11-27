@@ -63,7 +63,9 @@ message ReadRecordsRequest {
   // (-- api-linter: core::0140::prepositions=disabled
   //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
   bytes from_offset = 2;
+  // Zero uses the configured default.
   int32 max_records = 3;
+  // One Record can exceed this target unless an SDK hard limit rejects it.
   int64 max_bytes = 4;
   google.protobuf.Duration wait = 5;
 }
