@@ -3071,3 +3071,71 @@ async fn a_read_with_no_store_name_reads_the_store_under_the_empty_name_and_repl
     assert_eq!(replayed, live);
     replay.worker.drain_pollers_and_shutdown_ref().await;
 }
+
+#[rstest::rstest]
+#[tokio::test]
+async fn workflow_reads_respect_the_hard_record_byte_limit(#[values(0, 1)] over: usize) {
+    let store = store(&["s"]).await;
+    let limit = 16 * 1024 * 1024;
+    // At this size the payload lengths use four-byte varints. Measure the framing with
+    // the same Producer and offset width the Store will return.
+    let sample = StreamRecord {
+        offset: vec![0; 8],
+        producer: client(),
+        body: Some(Payload {
+            data: vec![0; limit],
+            ..Default::default()
+        }),
+    };
+    let overhead = field_len(sample.encoded_len()) - limit;
+    drop(sample);
+    append_sized(&store, "s", limit + over - overhead).await;
+    let stored = store.records("s");
+    assert_eq!(field_len(stored[0].encoded_len()), limit + over);
+    let configure = || {
+        let mut opts = StartOpts::new(&store);
+        let store = store.clone();
+        opts.configure = Box::new(move |wc| {
+            let runtime = StreamRuntime::new(store, StoreLimits::UNBOUNDED);
+            wc.stream_runtimes = StreamRuntimes::new([(STORE.to_string(), Arc::new(runtime))]);
+        });
+        opts
+    };
+    let workflow = |activation: &WorkflowActivation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![read(1, "s", &[], Duration::ZERO).into()],
+        _ => vec![complete()],
+    };
+    let run = start(history(Duration::from_secs(60)), configure());
+    let jobs = run.drive(workflow).await;
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let results: Vec<_> = jobs
+        .iter()
+        .flatten()
+        .filter_map(|job| match job {
+            Job::ResolveStreamRead(read) => read.status.as_ref(),
+            _ => None,
+        })
+        .collect();
+    match (over, results.as_slice()) {
+        (0, [resolve_stream_read::Status::Page(page)]) => assert_eq!(page.records, stored),
+        (1, [resolve_stream_read::Status::Failed(error)]) => {
+            assert!(error.message.contains("16777216-byte Workflow Task limit"));
+            assert!(format!("{:?}", error.failure_info).contains("stream_unsupported"));
+        }
+        _ => panic!("the task must deliver exactly one read result"),
+    }
+    let mut opts = configure();
+    opts.replay = true;
+    let replay = start(run.history.lock().clone(), opts);
+    let replay_jobs = replay.drive(workflow).await;
+    replay.worker.drain_pollers_and_shutdown_ref().await;
+    let replay_results: Vec<_> = replay_jobs
+        .iter()
+        .flatten()
+        .filter_map(|job| match job {
+            Job::ResolveStreamRead(read) => read.status.as_ref(),
+            _ => None,
+        })
+        .collect();
+    assert!(replay_results == results, "replay changed the read result");
+}

@@ -63,8 +63,25 @@ relevant information.
   the `ActivityTaskScheduled` event of an activity that a workflow scheduled. The server has no API
   field for it, so Core reads it from the task token. It's 0 for a local activity, for a standalone
   activity, and for a token that Core can't read.
+* [lang-internal] `AppendToStream` dispatches through a Store in `WorkerConfig::stream_runtimes`.
+  Core records the result in a `core_stream_append` marker for replay.
+  An outage at the task heartbeat fails the Workflow Task with `StreamStoreUnavailable:`.
+* [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
+  a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
+* [lang-internal] `ReadStream` returns one Store page in a `ResolveStreamRead` job.
+  `StreamSettings::read_time` bounds the wait in one Workflow Task. Read markers store offsets,
+  the Record count and a digest. Replay reads those Records again and verifies the digest.
+* [lang-internal] Stream metrics record Store calls by `stream_store` and failures by
+  `failure_reason`. Live append and read counters exclude replay. Replay Store reads have
+  separate `stream_replay_read_total`, `stream_replay_read_execution_failed`,
+  `stream_replay_read_records` and `stream_replay_read_execution_latency` instruments.
 
 ### Fixed
+* A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.
+  New read markers preserve the Producer's optional timestamps and signed values during replay.
+  Workers can still replay the original marker format, including previously delivered oversized
+  Records. Older Workers cannot interpret the new digest format.
+* Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

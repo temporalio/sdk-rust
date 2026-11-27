@@ -273,7 +273,24 @@ async fn run(
             if let Ok(page) = &page {
                 metrics.stream_read_records(page.response.records.len() as u64);
             }
-            let page = page.map_err(|error| recorded(&error));
+            let page = page
+                .and_then(|page| {
+                    // The Store runtime returns one Record even if it exceeds the request's soft
+                    // byte limit. A Record over the Workflow limit cannot fit in any future task.
+                    if super::read::record_bytes(&page.response.records)
+                        > super::MAX_TASK_RECORD_BYTES
+                    {
+                        return Err(ReadError::new(
+                            AnyReason::Unsupported,
+                            format!(
+                                "A Stream Record exceeds the {}-byte Workflow Task limit",
+                                super::MAX_TASK_RECORD_BYTES
+                            ),
+                        ));
+                    }
+                    Ok(page)
+                })
+                .map_err(|error| recorded(&error));
             Outcome::Read(ReadDone::new(&stream, seq, from_offset, page))
         }
     }
@@ -463,7 +480,7 @@ impl Note {
 }
 
 /// Returns `metrics` with the reason of `error`, such as `stream_not_found`, as `failure_reason`.
-fn failed<R: Copy + Into<StreamErrorReason>>(
+pub(super) fn failed<R: Copy + Into<StreamErrorReason>>(
     metrics: &MetricsContext,
     error: &StreamError<R>,
 ) -> MetricsContext {
@@ -536,12 +553,14 @@ pub(super) fn cut(text: String) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::{
-        read::After,
-        test_store::{Entry, Fault, Model, ModelStore, client},
+pub(super) mod tests {
+    use super::{
+        super::{
+            read::After,
+            test_store::{Entry, Fault, Model, ModelStore, client},
+        },
+        *,
     };
-    use super::*;
     use crate::{
         telemetry::metrics::{MetricsCallBuffer, stream_store},
         test_help::stream_store::{MemoryStore, Op as StoreOp},
@@ -698,7 +717,7 @@ mod tests {
 
     /// The name of an instrument of the metrics buffer.
     #[derive(Clone, Debug)]
-    struct Instrument(String);
+    pub(in crate::worker::workflow::streams) struct Instrument(String);
 
     impl BufferInstrumentRef for Instrument {}
 
@@ -708,7 +727,9 @@ mod tests {
 
     /// Returns the sum of each Stream counter and the sample count of each Stream histogram in
     /// `buffer`, by the name of the metric and its `failure_reason`.
-    fn totals(buffer: &MetricsCallBuffer<Instrument>) -> HashMap<(String, String), u64> {
+    pub(in crate::worker::workflow::streams) fn totals(
+        buffer: &MetricsCallBuffer<Instrument>,
+    ) -> HashMap<(String, String), u64> {
         let mut totals = HashMap::new();
         for event in buffer.retrieve() {
             match event {
@@ -774,15 +795,21 @@ mod tests {
         })
     }
 
+    pub(in crate::worker::workflow::streams) fn metric_buffer()
+    -> (Arc<MetricsCallBuffer<Instrument>>, MetricsContext) {
+        let buffer = Arc::new(MetricsCallBuffer::<Instrument>::new(1000));
+        let meter: Arc<dyn CoreMeter> = buffer.clone();
+        let telemetry = telemetry_init(TelemetryOptions::builder().metrics(meter).build()).unwrap();
+        let metrics = MetricsContext::top_level("n".to_string(), "q".to_string(), &telemetry);
+        (buffer, metrics)
+    }
+
     // Each try of a call counts for its Store when it starts, and a check is one try. Only a try
     // of an append has a latency, and a failed try has the token of its reason.
     #[tokio::test(start_paused = true)]
     async fn the_metrics_count_each_try_of_a_call() {
         let (store, manager, mut results) = manager().await;
-        let buffer = Arc::new(MetricsCallBuffer::<Instrument>::new(1000));
-        let meter: Arc<dyn CoreMeter> = buffer.clone();
-        let telemetry = telemetry_init(TelemetryOptions::builder().metrics(meter).build()).unwrap();
-        let metrics = MetricsContext::top_level("n".to_string(), "q".to_string(), &telemetry);
+        let (buffer, metrics) = metric_buffer();
         let of_store = |store: &str| metrics.with_new_attrs([stream_store(store.to_string())]);
         let down = || AnyError::store_unavailable("The Store is down");
         let missing = StreamRef {
