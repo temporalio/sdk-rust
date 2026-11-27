@@ -455,8 +455,8 @@ message AppendToStream {
 // blocking read resumes on a later task. An idle Stream alone does not request another task.
 // A nonblocking read can return an empty page in the current task, even after the read deadline.
 //
-// Each task delivers at most 256 results and 16 MiB of encoded Records. Deferred pages and reads
-// that exceed the result count request the next task. A single Record over 16 MiB gives a failed
+// Each task delivers at most 16 MiB of encoded Records. After 256 read results, new reads wait
+// for the next task. Reads already running can finish. A single Record over 16 MiB gives a failed
 // job with stream_unsupported. A Store outage or an unanswered check fails the Workflow Task with
 // StreamStoreUnavailable. Lang must accept results it no longer awaits. The terminal Workflow
 // command drops unresolved reads.

@@ -74,9 +74,8 @@ const REPLAY_RETRY_BOUND: Duration = Duration::from_secs(3);
 /// The maximum number of read entries whose Records a replay reads at the same time.
 const REPLAY_CONCURRENCY: usize = 8;
 
-/// The maximum number of runs of the Worker whose replay reads Records at the same time. A run
-/// reads a part of at most 16 MiB of recorded Records at a time, or one marker over that, so the
-/// replay reads of a Worker hold about 64 MiB.
+/// Limit simultaneous replay reads across runs. Each part uses recorded byte counts. A legacy
+/// marker may exceed the part size and must be read on its own.
 const REPLAY_READ_RUNS: usize = 4;
 
 /// The share of the time to a deadline that a read uses. The rest leaves room for the answer of a
