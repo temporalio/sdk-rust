@@ -51,6 +51,11 @@ relevant information.
 * [lang-internal] `ReadStream` returns one Store page in a `ResolveStreamRead` job.
   `StreamSettings::read_time` bounds the wait in one Workflow Task. Read markers store offsets,
   the Record count and a digest. Replay reads those Records again and verifies the digest.
+* [lang-internal] `AppendToStream` dispatches through a Store in `WorkerConfig::stream_runtimes`.
+  Core records the result in a `core_stream_append` marker for replay.
+  An outage at the task heartbeat fails the Workflow Task with `StreamStoreUnavailable:`.
+* [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
+  a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
 
 ### Fixed
 * A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.

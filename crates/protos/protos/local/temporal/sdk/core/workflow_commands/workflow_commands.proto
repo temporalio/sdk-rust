@@ -424,23 +424,16 @@ message RequestCancelNexusOperation {
     uint32 seq = 1;
 }
 
-// Appends Records to a Stream as the Workflow's Producer. Core calls the Store while the Workflow
-// Task is open, keeps the task open as it does for a Local Activity, and sends the result in a
-// `ResolveStreamAppend` job.
+// Appends Records as the Workflow Producer and returns ResolveStreamAppend. A retry of a task
+// whose append has no result in History can write the batch again. Core sends appends to each
+// Stream in command order.
 //
-// * An append is at-least-once. If History has no result for it, a later attempt of the Workflow
-//   Task writes the batch again.
-// * No command cancels an append. Lang must accept the result of an append that nothing awaits,
-//   and Core drops an append that has no result at the Workflow's last command.
-// * The appends of one Stream go to the Store one at a time, in the order of their commands.
-// * A `stream` with no Store name is on the Store of the Worker's Stream runtime under the empty
-//   name, else of its only Stream runtime, also in a replay. If the Worker has neither, the
-//   Workflow Task fails.
-// * A bad `seq` or `stream`, or a Store that the Worker has no runtime for, fails the Workflow
-//   Task. So does a Store that is still unavailable at the task's heartbeat, with a failure
-//   message that starts with `StreamStoreUnavailable:`.
-// * An empty batch, or one over the limits of its Store, gives lang a `failed` job.
-// * A replay compares the `seq` and the `stream` of the command with History, not the `bodies`.
+// An empty Store name selects the runtime under the empty name, or the only runtime if there
+// is no such entry. Invalid seq or Stream references, missing runtimes and a Store outage at
+// the task heartbeat fail the Workflow Task. Invalid batches return a failed job.
+//
+// Lang must accept results for appends it no longer awaits. The terminal Workflow command drops
+// unresolved appends. Replay matches seq and Stream and uses the result in History.
 message AppendToStream {
     // Lang's incremental sequence number for appends, starting at 1.
     uint32 seq = 1;
