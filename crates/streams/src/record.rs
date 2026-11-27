@@ -79,11 +79,9 @@ impl StoreLimits {
         })
     }
 
-    /// Checks the Stream id, the Producer and the Records of an append, and its sizes against these
-    /// limits, with no Store call. The runtime checks each append with it before the Store gets the
-    /// append. A lang bridge calls it for an append of client code, which reaches its Store through
-    /// no runtime with these limits. It computes the stored size of each Record without encoding
-    /// it, since a batch can be megabytes long.
+    /// Validate the Stream id, Producer, Records and batch limits without a Store call.
+    /// SDKs can use this check for client appends that bypass [`StreamRuntime`](crate::StreamRuntime).
+    /// The size calculation does not allocate an encoded copy of the batch.
     pub fn validate_append(&self, request: &AppendRecordsRequest) -> Result<(), AppendError> {
         validate_stream_id(&request.stream_id)?;
         let producer = validate_producer(request.producer.as_ref())?;

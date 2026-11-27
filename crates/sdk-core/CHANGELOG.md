@@ -37,10 +37,8 @@ relevant information.
 ## Unreleased
 
 ### Added
-* [lang-internal] Added the experimental `temporalio-streams` crate. Its `StreamRuntime` checks each
-  Stream call and its answer for a `StreamStore`, which a lang SDK implements for a Store in its
-  own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
-  append of client code against them with `StoreLimits::validate_append`.
+* [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
+  a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
