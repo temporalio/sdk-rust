@@ -50,25 +50,11 @@ relevant information.
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
 
-* With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, the completion of the
-  activation that lang fails for nondeterminism carries the `FailWorkflowExecution` command, and
-  lang gets only the eviction after it, even when a Local Activity result is still pending.
-  Previously, lang got one more activation, and the completion could have a nondeterminism error
-  from Core in place of lang's failure, or a Local Activity marker and a second
-  `FailWorkflowExecution` command after the first. A nondeterminism error in a workflow task that
-  only delivers an Update to a cached workflow also fails the workflow once, and the server aborts
-  the Update. Previously, Core rejected that `FailWorkflowExecution` command, because it accepts no
-  Update, and tried again until the worker process aborted with a stack overflow.
-
-* With `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`, lang's completion of an
-  activation that fails for nondeterminism returns in a workflow task that reads a history newer
-  than itself, such as a sticky task that timed out while it waited for a cache slot. Previously,
-  it waited for a history page that Core never fetched.
-
-* A workflow task that reads a history newer than itself, such as a sticky task that timed out
-  while it waited for a cache slot, gives lang every task of that history. Previously, when the
-  last whole task of the history pages that Core had fetched had no commands, Core could lose that
-  task and fail the workflow task with "History is out of order".
+* A forced Workflow failure returns the original nondeterminism error once, including when a
+  Local Activity result is pending or the task only delivers an Update. The server aborts the
+  outstanding Update.
+* A stale sticky task replays every completed task in newer paginated History. A forced failure
+  completes without waiting for another History page.
 
 ## [0.12.0] - 2026-11-23
 
