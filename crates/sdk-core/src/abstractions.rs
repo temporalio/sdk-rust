@@ -92,6 +92,8 @@ where
         context_data: Arc<PermitDealerContextData>,
         meter: Option<TemporalMeter>,
     ) -> Self {
+        // A cache size can exceed the number of reservations Tokio can represent.
+        let max_permits = max_permits.map(|max| max.min(Semaphore::MAX_PERMITS));
         let supplier_kind_label = supplier.slot_supplier_kind();
         let slot_supplier_kind = SlotSupplierKind::from_label(supplier_kind_label.as_ref());
         Self {

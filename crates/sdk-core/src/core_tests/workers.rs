@@ -517,11 +517,12 @@ async fn worker_can_shutdown_after_never_polling_ok(#[values(true, false)] poll_
 }
 
 #[rstest::rstest]
-#[case::ok(true, true)]
-#[case::best_effort(true, false)]
-#[case::not_sticky(false, true)]
+#[case::ok(1, true)]
+#[case::best_effort(1, false)]
+#[case::not_sticky(0, true)]
+#[case::large_cache(usize::MAX, true)]
 #[tokio::test]
-async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool) {
+async fn worker_shutdown_api(#[case] cache_size: usize, #[case] api_success: bool) {
     // Manually need to create MockWorkerClient because we want to specify
     // the expected number of calls for shutdown_worker.
     // This will no longer be needed if
@@ -553,7 +554,7 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
     let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
     mh.enforce_correct_number_of_polls = false;
     let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|w| w.max_cached_workflows = if use_cache { 1 } else { 0 });
+    mock.worker_cfg(|w| w.max_cached_workflows = cache_size);
     let worker = mock_worker(mock);
 
     let res = worker.poll_workflow_activation().await.unwrap();

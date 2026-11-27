@@ -51,6 +51,7 @@ relevant information.
 
 * When shutdown and a freed task slot are both ready, the Worker stops polling.
   Sticky polls, normal polls and eager starts share the Workflow cache slot limit.
+  A large limit no longer requires the Worker to reserve storage for every possible cache entry.
 
 ## [0.12.0] - 2026-11-23
 
