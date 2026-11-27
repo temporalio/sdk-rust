@@ -48,6 +48,8 @@ relevant information.
   records it in a `core_stream_append` marker, so a replay makes no Store call. A task fails with
   `StreamStoreUnavailable:` if the Store is still unavailable at the task's heartbeat, and with
   `StreamMarkerTooLarge:` if a marker has more than 1 MiB.
+* [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
+  a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
 
 ### Fixed
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,

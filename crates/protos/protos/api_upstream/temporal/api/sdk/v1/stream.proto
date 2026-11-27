@@ -9,9 +9,8 @@ option java_outer_classname = "StreamProto";
 option ruby_package = "Temporalio::Api::Sdk::V1";
 option csharp_namespace = "Temporalio.Api.Sdk.V1";
 
-// The Stream messages of an SDK, which the Stream WIT refers to. The SDK or SDK Core picks the
-// Store of a call by its `StreamRef`, and calls that Store with the request of the same name in
-// `temporal.api.streamservice.v1`, which has only the Stream id.
+// The SDK selects a Store from `StreamRef`. Store requests in `temporal.api.streamservice.v1`
+// contain only the Stream id.
 
 import "google/protobuf/duration.proto";
 
@@ -19,23 +18,17 @@ import "temporal/api/enums/v1/stream.proto";
 import "temporal/api/stream/v1/message.proto";
 
 // Experimental. Might change in the future.
-// A reference to one Stream, which code passes to other code as data. Callers treat the `id` as
-// opaque. An id is never used for a second Stream while the Store remembers the first one, so a
-// create for an expired Stream fails. A Store can forget an expired Stream after a time of its
-// choice, and a create for its id succeeds after that. Every SDK encodes a ref in a Payload with
-// this message, so a ref that one SDK writes decodes in another.
+// Callers treat `id` as opaque. A Store can reuse an expired id only after it forgets the Stream.
+// SDKs encode references with this message so that other SDKs can decode them.
 message StreamRef {
   string id = 1;
-  // The name under which the client and Worker config registered the Store of this Stream. An
-  // SDK uses it to send a call on this ref to the right Store. When it's empty, the SDK picks
-  // the Store from its config. Only an SDK sets and reads this field. A Store and the server
-  // never get it, because their requests have only the Stream id.
+  // The registered Store name. Empty selects the configured default.
+  // This field is local to the SDK. Store and server requests omit it.
   string store = 2;
 }
 
 // Experimental. Might change in the future.
-// The SDK form of `temporal.api.streamservice.v1.CreateStreamRequest`, with the ref of the Stream
-// in place of its id. The other fields mean the same.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
 // (-- api-linter: core::0133=disabled
 //     aip.dev/not-precedent: The request identifies a Stream by its ref. --)
 message CreateStreamRequest {
@@ -45,18 +38,16 @@ message CreateStreamRequest {
 }
 
 // Experimental. Might change in the future.
-// The Stream that the create made or found.
+// The reference includes the Store selected by the SDK.
 message CreateStreamResponse {
-  // The ref of the Stream. The caller can pass it to other code as data. The SDK builds it from
-  // the request and the Store that it picked.
+  // The SDK fills the Store name so that another caller can route the reference.
   StreamRef ref = 1;
   // False when `USE_EXISTING` returned a Stream that already existed.
   bool created = 2;
 }
 
 // Experimental. Might change in the future.
-// The SDK form of `temporal.api.streamservice.v1.AppendRecordsRequest`, with the ref of the Stream
-// in place of its id. The other fields mean the same.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
 message AppendRecordsRequest {
   // Required.
   StreamRef ref = 1;
@@ -65,8 +56,7 @@ message AppendRecordsRequest {
 }
 
 // Experimental. Might change in the future.
-// The SDK form of `temporal.api.streamservice.v1.ReadRecordsRequest`, with the ref of the Stream
-// in place of its id. The other fields mean the same.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
 message ReadRecordsRequest {
   // Required.
   StreamRef ref = 1;
@@ -79,8 +69,7 @@ message ReadRecordsRequest {
 }
 
 // Experimental. Might change in the future.
-// The SDK form of `temporal.api.streamservice.v1.DescribeStreamRequest`, with the ref of the
-// Stream in place of its id.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
 message DescribeStreamRequest {
   // Required.
   StreamRef ref = 1;
