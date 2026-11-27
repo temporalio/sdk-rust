@@ -60,6 +60,9 @@ struct Instruments {
     stream_read_total: Counter,
     stream_read_execution_failed: Counter,
     stream_read_records: Counter,
+    stream_replay_read_total: Counter,
+    stream_replay_read_execution_failed: Counter,
+    stream_replay_read_records: Counter,
     stream_replay_read_exec_latency: HistogramDuration,
     nexus_poll_no_task: Counter,
     nexus_task_schedule_to_start_latency: HistogramDuration,
@@ -300,6 +303,18 @@ impl MetricsContext {
 
     pub(crate) fn stream_read_records(&self, count: u64) {
         self.instruments.stream_read_records.adds(count);
+    }
+
+    pub(crate) fn stream_replay_read_executed(&self) {
+        self.instruments.stream_replay_read_total.adds(1);
+    }
+
+    pub(crate) fn stream_replay_read_execution_failed(&self) {
+        self.instruments.stream_replay_read_execution_failed.adds(1);
+    }
+
+    pub(crate) fn stream_replay_read_records(&self, count: u64) {
+        self.instruments.stream_replay_read_records.adds(count);
     }
 
     pub(crate) fn stream_replay_read_exec_latency(&self, dur: Duration) {
@@ -560,6 +575,21 @@ impl Instruments {
                 description: "Count of Records that Stores gave to Stream reads".into(),
                 unit: "".into(),
             }),
+            stream_replay_read_total: meter.counter(MetricParameters {
+                name: "stream_replay_read_total".into(),
+                description: "Count of the requests that Stream replay reads sent to a Store".into(),
+                unit: "".into(),
+            }),
+            stream_replay_read_execution_failed: meter.counter(MetricParameters {
+                name: "stream_replay_read_execution_failed".into(),
+                description: "Count of Stream replay read tries that failed".into(),
+                unit: "".into(),
+            }),
+            stream_replay_read_records: meter.counter(MetricParameters {
+                name: "stream_replay_read_records".into(),
+                description: "Count of Records that Stores gave to Stream replay reads".into(),
+                unit: "".into(),
+            }),
             stream_replay_read_exec_latency: meter.histogram_duration(MetricParameters {
                 name: "stream_replay_read_execution_latency".into(),
                 unit: "duration".into(),
@@ -699,6 +729,12 @@ impl Instruments {
         self.stream_read_execution_failed
             .update_attributes(new_attributes.clone());
         self.stream_read_records
+            .update_attributes(new_attributes.clone());
+        self.stream_replay_read_total
+            .update_attributes(new_attributes.clone());
+        self.stream_replay_read_execution_failed
+            .update_attributes(new_attributes.clone());
+        self.stream_replay_read_records
             .update_attributes(new_attributes.clone());
         self.stream_replay_read_exec_latency
             .update_attributes(new_attributes.clone());
@@ -1373,7 +1409,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 42;
+        let num_metrics = 45;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],

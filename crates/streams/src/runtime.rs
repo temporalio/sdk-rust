@@ -11,16 +11,12 @@ use crate::{
 use prost::Message;
 use std::{fmt, sync::Arc};
 
-/// Wraps a [`StreamStore`] and checks each call. It takes the request of an SDK, with the ref of a
-/// Stream, and calls the Store with only the Stream id of the ref. It validates the request before
-/// the Store gets it, and the response before the caller gets it. The [`StreamStore`] docs describe
-/// the contract that it checks. It has no timeout of its own, so a Store that never responds blocks
-/// the call.
+/// Adapts SDK requests to [`StreamStore`]. The Store receives the Stream id from the ref.
+/// The runtime validates requests and individual responses against the Store contract and
+/// the caller's [`StoreLimits`]. Set a deadline at the call site if needed.
 ///
-/// The runtime refuses a batch over its [`StoreLimits`], and fails a read that gives a Record over
-/// their Record size. The limits are the caller's. An SDK builds the runtime of each Store with
-/// the limits of its Stream config, and a Store that runs a runtime around itself builds it with
-/// [`StoreLimits::UNBOUNDED`].
+/// An SDK uses the limits from its Stream config. A Store can wrap itself in a runtime with
+/// [`StoreLimits::UNBOUNDED`] to validate requests independently of the caller's config.
 pub struct StreamRuntime {
     store: Arc<dyn StreamStore>,
     limits: StoreLimits,
@@ -40,11 +36,8 @@ impl StreamRuntime {
         Self { store, limits }
     }
 
-    /// Creates a Stream. If a Stream already has the id, the create fails, or it returns
-    /// `created` false with the `UseExisting` policy. Every try of one create passes the same
-    /// `request_id`, so a retry after a lost response returns `created` true. The response has the
-    /// ref of the request, since the Store gets only its id. The runtime doesn't know the name of
-    /// its Store, so a ref with no Store name has none in the response either.
+    /// Create a Stream under the Store's [conflict and retry rules](StreamStore::create_stream).
+    /// The response contains the caller's original ref, including its Store name.
     pub async fn create_stream(
         &self,
         request: sdk::CreateStreamRequest,
@@ -124,11 +117,9 @@ impl StreamRuntime {
         Ok(page.response)
     }
 
-    /// Reads one page as [`Self::read_records`] does, and tells whether the Stream has more
-    /// Records after it. The Store gets caps that take one Record more than the page holds, which
-    /// the runtime trims. So [`ReadPage::more`] is true only when the Store returned a Record after
-    /// the page. The extra Record costs one Record of each page, so only a caller that acts on
-    /// `more` uses this.
+    /// Read a page and check for a Record beyond its limits. The runtime asks the Store for
+    /// one extra Record. [`ReadPage::more`] is true only if the runtime trimmed a Record.
+    /// Use [`Self::read_records`] when the caller does not need this information.
     pub async fn read_records_with_more(
         &self,
         request: sdk::ReadRecordsRequest,

@@ -1,8 +1,6 @@
 // Experimental. Might change in the future.
-// The Stream service as a System Nexus service. Each record maps to a message under
-// ../temporal/api (sdk/v1/stream.proto, stream/v1, streamservice/v1 and the Stream enums in
-// enums/v1). Each SDK copies this file and generates its Workflow API and its client from it with
-// nexgen (`--targets workflow,client --system-nexus`).
+// SDKs generate their Workflow and client APIs with
+// `nexgen --targets workflow,client --system-nexus`.
 package temporal:nexus@1.0.0;
 
 world system {
@@ -22,9 +20,7 @@ interface stream-service {
   /// @nexus.type-parameter
   type body-t = placeholder;
 
-  // Every `list<u8>` offset in this file is the opaque position of a Record in one Stream (proto
-  // `bytes`). A caller doesn't parse an offset. It passes one back to a read, or compares two
-  // offsets of the same Stream, which compare bytewise in the order of their Records.
+  // Offsets are opaque. Unsigned byte order matches Record order within one Stream.
   // TODO: use `type stream-offset = list<u8>` once nexgen reads a named `list<u8>` as `bytes`.
 
   /// @nexus.proto "google.protobuf.Timestamp"
@@ -37,7 +33,7 @@ interface stream-service {
   /// @nexus.proto "temporal.api.sdk.v1.StreamRef"
   /// @nexus.generic "body-t"
   record stream-ref {
-    /// @nexus.doc "The Stream id, 1 to 4096 bytes."
+    /// @nexus.doc "The Stream id. It must not be empty."
     id: string,
     /// @nexus.doc "The registered name of the Store. If empty, the SDK picks a Store."
     store: option<string>,
@@ -78,7 +74,7 @@ interface stream-service {
     workflow-id: string,
     /// @nexus.doc "The id of this run, not the first run id of its chain."
     run-id: string,
-    // The Workflow Task attempt that makes the write.
+    // The SDK fills this from the Workflow Task.
     attempt: option<workflow-task-attempt>,
   }
 
@@ -121,8 +117,7 @@ interface stream-service {
     id: string,
   }
 
-  // Each kind is a separate case, so it has only its own ids. Two Producers are the same when
-  // they have the same case and the same ids. The attempt isn't part of that.
+  // The kind and ids identify a Producer. The attempt does not.
   /// @nexus.doc "The kind of a Producer, with its ids and its attempt."
   /// @nexus.proto "temporal.api.stream.v1.Producer.kind"
   variant producer-kind {
@@ -133,7 +128,7 @@ interface stream-service {
     client(client-producer),
   }
 
-  /// @nexus.doc "The writer of a batch. A later attempt supersedes an earlier one."
+  /// @nexus.doc "The writer of a batch. Attempts compare only within the same Producer."
   /// @nexus.proto "temporal.api.stream.v1.Producer"
   record producer {
     // A newer writer can use a kind that this SDK doesn't know. A read then gives no kind.
@@ -149,8 +144,7 @@ interface stream-service {
     body: body-t,
   }
 
-  // Offsets are unique and ordered within one Stream, but they have gaps, so they don't count
-  // Records. A read returns only Records.
+  // Offset gaps cannot be used to count Records.
   /// @nexus.doc "One Record of a Stream, as a read returns it."
   /// @nexus.proto "temporal.api.stream.v1.StreamRecord"
   record stream-record {
@@ -181,15 +175,13 @@ interface stream-service {
     stream-id-conflict-policy-use-existing,
   }
 
-  /// @nexus.doc "Append one batch. The Store writes a batch that arrives again only once."
+  /// @nexus.doc "Append one batch. Retries are deduplicated within the Store resend window."
   /// @nexus.proto "temporal.api.sdk.v1.AppendRecordsRequest"
   record append-records-request {
     ref: stream-ref,
     records: list<append-record>,
-    // Workflow code never passes a Producer. Its helper returns the Producer of the run, and the
-    // SDK sets the Workflow Task attempt. A client or an Activity can pass its own Producer.
-    // Without one, the client helper returns the default. That helper gets the client of the
-    // Stream, so each client object is a separate Producer.
+    // The Workflow source prevents user code from overriding its Producer.
+    // Clients and Activities can select a Producer or use the context default.
     /// @nexus.doc "The Producer of the batch. Defaults to the Producer of the calling context."
     /// @nexus.source targets="workflow" python="workflow_producer()"
     ///   typescript="workflowProducer()" dotnet="StreamWorkflowContext.Producer()"
@@ -211,18 +203,18 @@ interface stream-service {
     // To read only new Records, a caller gets last-offset from a describe and reads after it.
     /// @nexus.doc "Read after this offset. Empty means from the beginning."
     from-offset: option<list<u8>>,
-    /// @nexus.doc "The maximum number of Records in one page."
+    /// @nexus.doc "The maximum number of Records in one page. Zero uses the Store default."
     max-records: option<s32>,
     /// @nexus.doc "The maximum bytes of Records in a page. A larger Record is returned alone."
     max-bytes: option<s64>,
-    /// @nexus.doc "How long the read waits for a new Record before an empty page."
+    /// @nexus.doc "How long to wait for a new Record. Unset returns immediately."
     wait: option<duration>,
   }
 
   /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsResponse"
   record read-records-response {
     records: list<stream-record>,
-    /// @nexus.doc "Where the next read goes on. It is never before the last Record in this page."
+    /// @nexus.doc "The next read starts here. If empty, use the last Record or request offset."
     last-offset: option<list<u8>>,
   }
 
@@ -237,8 +229,7 @@ interface stream-service {
     last-offset: option<list<u8>>,
   }
 
-  // A stream object is immutable, because its methods return offsets as values. Only the response
-  // of a create sets `created`, so a stream built from a ref has none.
+  // Only a create result can report whether the Stream was created.
   /// @nexus.doc "One Stream. Build it from a stream-ref, or get it from a create."
   // TODO: implement @nexus.flatten-in-api param="ref".
   resource %stream {
@@ -253,7 +244,6 @@ interface stream-service {
       producer: option<producer>,
     ) -> append-records-response;
 
-    // Workflow code and a client read the same way, with a page read or its poll iterator.
     /// @nexus.doc
     ///   "Read one page of Records. The poll iterator keeps reading after a page with no Record."
     /// @nexus.operation "read-records"
@@ -269,7 +259,6 @@ interface stream-service {
     describe: func() -> describe-stream-response;
   }
 
-  // With use-existing, created is false when the Stream existed.
   /// @nexus.proto "temporal.api.sdk.v1.CreateStreamResponse"
   type create-stream-result = own<%stream>;
 
@@ -282,8 +271,7 @@ interface stream-service {
   /// @nexus.api-omit
   append-records: func(request: append-records-request) -> append-records-response;
 
-  // A WIT stream can't cross a Nexus call, so a read is a request and a response. The SDK's support
-  // helper builds the next request from a page for the poll iterator.
+  // A WIT stream cannot cross a Nexus call, so the iterator requests one page at a time.
   /// @nexus.doc "A long poll. It fails with NOT_FOUND for a Stream that was never created."
   /// @nexus.operation name="ReadRecords"
   /// @nexus.poll python="next_read_request" items="records" python-resume="resume_read_request"

@@ -9,13 +9,8 @@ option java_outer_classname = "RequestResponseProto";
 option ruby_package = "Temporalio::Api::StreamService::V1";
 option csharp_namespace = "Temporalio.Api.StreamService.V1";
 
-// The messages of the Stream service. An SDK Store (Redis or memory) and the server answer the
-// same four operations with them. A field that is only read by the server says so. A request has
-// only the id of its Stream, and an SDK builds it from the request of the same name in
-// `temporal.api.sdk.v1`, which has a `StreamRef`.
-//
-// The request id of a call is in its envelope, as for every Nexus operation. An SDK that calls a
-// Store with no envelope passes the request id next to the request.
+// Store requests omit the SDK Store name because routing is complete.
+// Nexus envelopes contain the request id. Direct Store calls pass it beside the request.
 
 import "google/protobuf/duration.proto";
 
@@ -23,15 +18,12 @@ import "temporal/api/enums/v1/stream.proto";
 import "temporal/api/stream/v1/message.proto";
 
 // Experimental. Might change in the future.
-// Creates a Stream. If the Stream already exists, the result depends on `id_conflict_policy`.
-// `FAIL` fails with `ALREADY_EXISTS`, and `USE_EXISTING` succeeds with `created` false. A retry of
-// the create that made the Stream, with the same request id, returns `created` true. The Store
-// remembers the request id of that create, so a retry after a lost response doesn't fail with
-// `ALREADY_EXISTS`. Either policy fails with `EXPIRED` for an expired Stream.
+// `FAIL` returns `ALREADY_EXISTS` for an existing Stream. `USE_EXISTING` returns `created` false.
+// A retry with the original create request id returns `created` true, even with `FAIL`.
+// Either policy returns `EXPIRED` while the Store remembers an expired Stream.
 //
-// A create has no Retention. Retention is a setting of the Store, as it's a setting of the
-// namespace for Workflows. It's the only lifetime setting of a Stream. It starts at the create,
-// and each append starts it again. When it passes, the Stream is expired.
+// Retention is a Store setting. It starts at create and restarts when an append writes a new batch.
+// Reads and resends keep the existing expiry.
 // (-- api-linter: core::0133=disabled
 //     aip.dev/not-precedent: The request identifies a Stream by its id. --)
 message CreateStreamRequest {
@@ -42,20 +34,15 @@ message CreateStreamRequest {
 }
 
 // Experimental. Might change in the future.
-// The result of a create.
 message CreateStreamResponse {
     // False when `USE_EXISTING` found a Stream that already existed.
     bool created = 1;
 }
 
 // Experimental. Might change in the future.
-// Appends one batch of Records as one Producer. If the same batch arrives again, with the same
-// Producer, attempt and request id, the Store writes it only once while it remembers the id, and it
-// returns the offsets of the first write. A caller that got no response sends the batch again with
-// the same request id. A Store remembers the request ids of the most recent batches of each
-// Producer of the Stream. How many it remembers is a setting of the Store, so a try that arrives
-// after more batches than that is written again. When the request id is empty, a retry is written
-// again.
+// Retries must use the same Producer, attempt, request id and batch. A remembered request id
+// returns the original offsets without writing again. The Store sets its resend window per
+// Producer. An empty or forgotten request id permits a second write.
 message AppendRecordsRequest {
     // Required.
     string stream_id = 1;
@@ -73,8 +60,7 @@ message AppendRecordsResponse {
 }
 
 // Experimental. Might change in the future.
-// Reads one page of Records after an offset. When no Record is left, the read waits for a new
-// one, so a reader long-polls.
+// Reads after an offset. When no Record is available, `wait` controls how long the read waits.
 message ReadRecordsRequest {
     // Required.
     string stream_id = 1;
@@ -84,12 +70,12 @@ message ReadRecordsRequest {
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
     bytes from_offset = 2;
-    // The maximum number of Records in one page. Zero means no limit.
+    // The maximum number of Records in one page. Zero uses the Store default.
     int32 max_records = 3;
     // The maximum total size of the Records in one page, in bytes. A caller sets it so that a
     // page fits a limit of its own, such as the size of a History marker. A Record larger than
-    // this is still returned, alone in its page, so a read always makes progress. Zero means no
-    // limit.
+    // this is still returned, alone in its page, so a read always makes progress. Zero uses the
+    // Store default.
     int64 max_bytes = 4;
     // How long the read waits for a new Record before it returns an empty page. When it's unset,
     // the read returns immediately.
@@ -97,7 +83,6 @@ message ReadRecordsRequest {
 }
 
 // Experimental. Might change in the future.
-// One page of a read.
 message ReadRecordsResponse {
     repeated temporal.api.stream.v1.StreamRecord records = 1;
     // The last position that the read covered. The next read passes it as `from_offset`. A Store
@@ -109,15 +94,13 @@ message ReadRecordsResponse {
 }
 
 // Experimental. Might change in the future.
-// Gets the newest offset of a Stream.
 message DescribeStreamRequest {
     // Required.
     string stream_id = 1;
 }
 
 // Experimental. Might change in the future.
-// The state of a Stream. It doesn't include Retention, which is a setting of the Store and not
-// of one Stream.
+// Retention is a Store setting and is not returned here.
 message DescribeStreamResponse {
     // The offset of the newest Record, or an offset after it that skips no Record. A read from it
     // returns only the Records that come later. It's empty when the Stream has no Record.

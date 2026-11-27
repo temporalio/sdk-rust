@@ -1,9 +1,5 @@
-//! The keys that a Store keeps for a Producer and for its attempts.
-//!
-//! [`producer_key`] identifies a Producer, so two keys are equal exactly when their Producers are
-//! the same. [`attempt_key`] turns the attempt that made a write into a fixed-size key whose byte
-//! order is the order of the attempts, so a Store can compare two attempts of the same Producer
-//! with a plain byte comparison. The attempt keys of different Producers aren't comparable.
+//! Persistent keys for Producer identity and attempt ordering. Compare attempt keys only
+//! within one Producer.
 
 use crate::proto::{
     ClientProducer, LocalActivityProducer, Producer, StandaloneActivityProducer,

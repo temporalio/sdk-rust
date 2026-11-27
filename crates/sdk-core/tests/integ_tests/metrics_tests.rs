@@ -1312,6 +1312,8 @@ async fn stream_metrics() {
         ("read_total", &of_run, 2),
         ("read_execution_failed", &not_found, 1),
         ("read_records", &of_run, 2),
+        ("replay_read_total", &of_worker, 1),
+        ("replay_read_records", &of_worker, 2),
         ("replay_read_execution_latency_count", &of_worker, 1),
     ];
     for (name, attributes, value) in expected {
