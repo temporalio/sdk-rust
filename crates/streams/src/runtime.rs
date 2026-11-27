@@ -584,25 +584,31 @@ mod tests {
         assert_eq!(*store.received.lock(), expected);
     }
 
-    // A cap of 0 means no cap, so the extra bytes of the Record more must not wrap to 0.
     #[tokio::test]
-    async fn the_byte_cap_with_one_record_more_saturates() {
+    async fn a_lookahead_keeps_unbounded_caps_and_saturates_finite_caps() {
         let store = Arc::new(Scripted::default());
         let runtime = StreamRuntime::new(store.clone(), StoreLimits::UNBOUNDED);
-        for max_bytes in [1, i64::MAX - 1, i64::MAX] {
+        for (max_records, max_bytes, store_records, store_bytes) in [
+            (0, 0, 0, 0),
+            (0, 1, 0, i64::MAX),
+            (1, 0, 2, 0),
+            (i32::MAX - 1, i64::MAX - 1, i32::MAX, i64::MAX),
+            (i32::MAX, i64::MAX, i32::MAX, i64::MAX),
+        ] {
             let read = sdk::ReadRecordsRequest {
+                max_records,
                 max_bytes,
                 ..valid_read()
             };
             runtime.read_records_with_more(read).await.unwrap();
+            let Some(Received::Read(sent)) = store.received.lock().pop() else {
+                panic!("expected a Store read");
+            };
+            assert_eq!(
+                (sent.max_records, sent.max_bytes),
+                (store_records, store_bytes)
+            );
         }
-        let sent: Vec<i64> = (store.received.lock().iter())
-            .map(|received| match received {
-                Received::Read(read) => read.max_bytes,
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(sent, [i64::MAX; 3]);
     }
 
     #[tokio::test]
