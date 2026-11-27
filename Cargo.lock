@@ -4788,7 +4788,6 @@ dependencies = [
  "parking_lot",
  "prost",
  "prost-wkt-types",
- "rand 0.10.3",
  "temporalio-common",
  "tokio",
 ]
