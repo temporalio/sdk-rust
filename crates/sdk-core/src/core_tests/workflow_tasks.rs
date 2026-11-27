@@ -2311,6 +2311,83 @@ async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang
 }
 
 #[tokio::test]
+async fn a_timeout_on_the_next_page_does_not_change_workflow_history_length() {
+    let wf_id = "wf";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("1".to_string());
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let sticky = hist_to_poll_resp(&t, wf_id, ResponseType::OneTask(2)).resp;
+    assert_eq!(
+        (sticky.previous_started_event_id, sticky.started_event_id),
+        (3, 8)
+    );
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("2".to_string());
+    t.add_timer_fired(timer, "2".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("3".to_string());
+    t.add_timer_fired(timer, "3".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let pages = vec![
+        (vec![], history_page(&t, 1..=16, vec![1])),
+        (vec![1], history_page(&t, 17..=24, vec![])),
+    ];
+    let (mut mh, _) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky), pages);
+    mh.expect_fail_wft_matcher = Box::new(|_, _, _| false);
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+    let mut lengths = vec![];
+    let run = async {
+        loop {
+            let act = core.poll_workflow_activation().await.unwrap();
+            let mut commands = vec![];
+            let mut done = false;
+            for job in &act.jobs {
+                match job.variant.as_ref().unwrap() {
+                    workflow_activation_job::Variant::InitializeWorkflow(_) => {
+                        commands.push(start_timer_cmd(1, Duration::from_secs(1)));
+                    }
+                    workflow_activation_job::Variant::FireTimer(timer) => {
+                        lengths.push((timer.seq, act.history_length));
+                        if timer.seq == 3 {
+                            commands.push(CompleteWorkflowExecution::default().into());
+                            done = true;
+                        } else {
+                            commands.push(start_timer_cmd(timer.seq + 1, Duration::from_secs(1)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                act.run_id, commands,
+            ))
+            .await
+            .unwrap();
+            if done {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap();
+    core.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        lengths,
+        [(1, 11), (2, 19), (3, 24)],
+        "a historical timed-out task must not set the Workflow's observed History length"
+    );
+}
+
+#[tokio::test]
 async fn default_wft_fail_cause_is_worker_unhandled() {
     let t = canned_histories::single_timer("1");
     let mut mh = MockPollCfg::from_resp_batches(

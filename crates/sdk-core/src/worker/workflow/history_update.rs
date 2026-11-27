@@ -871,9 +871,9 @@ fn find_end_index_of_next_wft_seq_chunked(
                 // The slice ends with a task. Either it holds the last task of history, or
                 // `from_events` found this end from the events that it split off.
                 return NextWFTSeqEndIndex::Complete(ix);
-            } else if !saw_command_or_started {
-                // Don't have enough events to look ahead of the WorkflowTaskStarted. Need to fetch
-                // more.
+            } else {
+                // A timeout or failure on the next page can invalidate this start, even
+                // when an earlier event produced a command.
                 continue;
             }
             if saw_command_or_started {
@@ -939,6 +939,83 @@ mod tests {
         let seq = update.take_next_wft_sequence(from_id).unwrap_events();
         assert_eq!(seq, seq_peeked);
         seq
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn timeout_at_page_boundary_is_not_an_activation(
+        #[values(false, true)] chunking_disabled: bool,
+    ) {
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        let timer = t.add_timer_started("1".to_string());
+        t.add_timer_fired(timer, "1".to_string());
+        t.add_workflow_task_scheduled_and_started();
+        t.add_workflow_task_timed_out();
+        t.add_full_wf_task();
+        let timer = t.add_timer_started("2".to_string());
+        t.add_timer_fired(timer, "2".to_string());
+        t.add_workflow_task_scheduled_and_started();
+        t.add_workflow_task_timed_out();
+        t.add_full_wf_task();
+        let timer = t.add_timer_started("3".to_string());
+        t.add_timer_fired(timer, "3".to_string());
+        t.add_workflow_task_scheduled_and_started();
+        let events = t.get_full_history_info().unwrap().into_events();
+        assert_eq!(events[15].event_type(), EventType::WorkflowTaskStarted);
+        assert_eq!(events[16].event_type(), EventType::WorkflowTaskTimedOut);
+        let mut whole = HistoryUpdate::from_events(events.clone(), 3, 8, true, chunking_disabled).0;
+        let mut expected = vec![];
+        let mut from = 0;
+        while let NextWFT::WFT(seq, _) = whole.take_next_wft_sequence(from) {
+            from = seq.last().unwrap().event_id;
+            expected.push(from);
+        }
+        let pages = vec![events[..16].to_vec(), events[16..].to_vec()];
+        let mut pages = pages.into_iter().peekable();
+        let mut client = mock_worker_client();
+        client
+            .expect_get_workflow_execution_history()
+            .returning(move |_, _, _| {
+                let events = pages.next().unwrap();
+                Ok(GetWorkflowExecutionHistoryResponse {
+                    history: Some(History { events }),
+                    next_page_token: if pages.peek().is_some() {
+                        vec![1]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                })
+            });
+        let mut paginator = HistoryPaginator::new(
+            History::default(),
+            3,
+            8,
+            "wf".into(),
+            "run".into(),
+            NextPageToken::FetchFromStart,
+            Arc::new(client),
+        );
+        paginator.chunking_disabled = chunking_disabled;
+        let mut actual = vec![];
+        let mut from = 0;
+        loop {
+            let mut update = paginator.extract_next_update().await.unwrap();
+            let final_update = update.has_last_wft;
+            while let NextWFT::WFT(seq, _) = update.take_next_wft_sequence(from) {
+                from = seq.last().unwrap().event_id;
+                actual.push(from);
+            }
+            if final_update {
+                break;
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "pagination must not replay a timed-out task"
+        );
     }
 
     #[test]
