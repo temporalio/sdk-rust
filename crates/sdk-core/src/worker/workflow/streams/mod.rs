@@ -532,24 +532,28 @@ mod tests {
         *,
     };
     use crate::{
+        abstractions::tests::fixed_size_permit_dealer,
         replay::TestHistoryBuilder,
         test_help::{ResponseType, hist_to_poll_resp, stream_store::MemoryStore},
         worker::{
             client::mocks::mock_worker_client,
             workflow::{
-                NextPageReq,
+                PermittedWFT,
                 history_update::HistoryPaginator,
-                wft_extraction::{HistfetchRC, WFTExtractor},
+                wft_extraction::{HistfetchRC, WFTExtractor, WFTExtractorOutput},
             },
         },
     };
-    use futures_util::{StreamExt, stream};
+    use futures_util::{FutureExt, StreamExt, stream};
     use temporalio_common::protos::{
         constants::STREAM_READ_MARKER_NAME,
-        coresdk::external_data::{
-            StreamReadMarkerData, StreamReadPage, StreamReadResult, stream_read_result,
+        coresdk::{
+            WorkflowSlotInfo,
+            external_data::{
+                StreamReadMarkerData, StreamReadPage, StreamReadResult, stream_read_result,
+            },
         },
-        temporal::api::history::v1::{HistoryEvent, MarkerRecordedEventAttributes, history_event},
+        temporal::api::history::v1::MarkerRecordedEventAttributes,
     };
     use temporalio_streams::record::StoreLimits;
     use tokio::sync::{
@@ -628,16 +632,20 @@ mod tests {
         assert!(limit.expires(generation));
     }
 
+    #[rstest::rstest]
+    #[case::drop_extractor(false)]
+    #[case::store_panic(true)]
     #[tokio::test(start_paused = true)]
-    async fn dropping_extractor_cancels_a_replay_store_read() {
+    async fn outstanding_replay_read_at_shutdown(#[case] store_panics: bool) {
         let started = Arc::new(Notify::new());
         let notify = started.clone();
         let store = Arc::new(ModelStore::new(Model::new(0, vec![], move |_, _| {
             notify.notify_one();
+            assert!(!store_panics, "test Store panic");
             Some(Fault::Silent)
         })));
         let runtime = Arc::new(StreamRuntime::new(store.clone(), StoreLimits::default()));
-        let mut reader = ReplayReader::new(
+        let reader = ReplayReader::new(
             StreamRuntimes::new([("mem".to_string(), runtime)]),
             MetricsContext::no_op(),
         );
@@ -654,34 +662,39 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let event = HistoryEvent {
-            event_id: 5,
-            attributes: Some(history_event::Attributes::MarkerRecordedEventAttributes(
-                MarkerRecordedEventAttributes {
-                    marker_name: STREAM_READ_MARKER_NAME.to_string(),
-                    details: marker_details(&data).unwrap(),
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        };
-        reader.queue(std::iter::once(&event));
         let mut history = TestHistoryBuilder::default();
         history.add_wfe_started_with_wft_timeout(Duration::from_secs(10));
+        history.add_full_wf_task();
+        history.add(MarkerRecordedEventAttributes {
+            marker_name: STREAM_READ_MARKER_NAME.to_string(),
+            details: marker_details(&data).unwrap(),
+            ..Default::default()
+        });
         history.add_workflow_task_scheduled_and_started();
         let poll = hist_to_poll_resp(&history, "workflow", ResponseType::AllHistory).resp;
         let client = Arc::new(mock_worker_client());
-        let (mut paginator, _) =
+        let (mut paginator, work) =
             HistoryPaginator::from_poll(poll.try_into().unwrap(), client.clone())
                 .await
                 .unwrap();
         paginator.stream_reader = Some(reader);
-        let request = StreamRecordsReq::NextPart(
-            Box::new(NextPageReq {
+        let token = work.task_token.clone();
+        let permit =
+            fixed_size_permit_dealer(1)
+                .acquire_owned()
+                .await
+                .into_used(WorkflowSlotInfo {
+                    workflow_type: work.workflow_type.clone(),
+                    is_sticky: false,
+                });
+        let rc = Arc::new(HistfetchRC {});
+        let request = StreamRecordsReq::NewRun(
+            Box::new(PermittedWFT {
                 paginator,
-                span: Span::none(),
+                work,
+                permit,
             }),
-            Arc::new(HistfetchRC {}),
+            rc.clone(),
         );
         let mut extractor = Box::pin(WFTExtractor::build(
             client,
@@ -691,14 +704,29 @@ mod tests {
             stream::iter([request]),
             1,
         ));
-        tokio::select! {
-            _ = started.notified() => {}
-            _ = extractor.next() => panic!("The Store read must still be pending"),
+        assert!(extractor.next().now_or_never().is_none());
+        started.notified().await;
+        if store_panics {
+            // Shutdown can run before the extractor delivers the Store panic.
+            assert!(
+                Arc::strong_count(&rc) > 1,
+                "Shutdown lost the pending fetch"
+            );
+            let Some(Ok(WFTExtractorOutput::FailedFetch {
+                auto_reply_fail: Some(info),
+                ..
+            })) = extractor.next().await
+            else {
+                panic!("Expected a failure of the replaying task");
+            };
+            assert_eq!(info.task_token, token);
+            assert_eq!(Arc::strong_count(&rc), 1);
+        } else {
+            assert_eq!(store.model.lock().reading.0, 1);
+            drop(extractor);
+            tokio::task::yield_now().await;
+            assert_eq!(store.model.lock().reading.0, 0);
         }
-        assert_eq!(store.model.lock().reading.0, 1);
-        drop(extractor);
-        tokio::task::yield_now().await;
-        assert_eq!(store.model.lock().reading.0, 0);
     }
 
     #[test]

@@ -172,9 +172,11 @@ impl WFTExtractor {
         let handle = Handle::current();
         let records = records_stream
             .map(move |request| {
-                let (run_id, auto_reply_fail) = request.failure_context();
+                let (run_id, auto_reply_fail, rc) = request.failure_context();
                 let read = AbortOnDropHandle::new(handle.spawn(request.read()));
                 read.map(move |output| {
+                    // Shutdown must wait for delivery of a failed read even if the Store panics.
+                    let _guard = rc;
                     Ok(
                         output.unwrap_or_else(|error| WFTExtractorOutput::FailedFetch {
                             run_id,
