@@ -79,6 +79,17 @@ impl StreamRuntime {
         request: sdk::AppendRecordsRequest,
         request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
+        self.append_records_with_start(request, request_id, || {})
+            .await
+    }
+
+    /// Calls `on_start` after validation, immediately before the Store receives the request.
+    pub async fn append_records_with_start(
+        &self,
+        request: sdk::AppendRecordsRequest,
+        request_id: String,
+        on_start: impl FnOnce(),
+    ) -> Result<AppendRecordsResponse, AppendError> {
         let sdk::AppendRecordsRequest {
             r#ref,
             producer,
@@ -90,6 +101,7 @@ impl StreamRuntime {
             records,
         };
         self.limits.validate_append(&request)?;
+        on_start();
         let appended = self.store.append_records(request, request_id).await?;
         for offset in [&appended.first_offset, &appended.last_offset] {
             if offset.is_empty() {
@@ -118,7 +130,9 @@ impl StreamRuntime {
         &self,
         request: sdk::ReadRecordsRequest,
     ) -> Result<ReadRecordsResponse, ReadError> {
-        let page = self.read(request, false).await?;
+        let page = self
+            .read_records_observed(request, false, || {}, |_| {})
+            .await?;
         Ok(page.response)
     }
 
@@ -129,13 +143,18 @@ impl StreamRuntime {
         &self,
         request: sdk::ReadRecordsRequest,
     ) -> Result<ReadPage, ReadError> {
-        self.read(request, true).await
+        self.read_records_observed(request, true, || {}, |_| {})
+            .await
     }
 
-    async fn read(
+    /// With `one_more`, requests a lookahead Record as in [`Self::read_records_with_more`].
+    /// Reports dispatch after validation and the Store's Record count before trimming the page.
+    pub async fn read_records_observed(
         &self,
         request: sdk::ReadRecordsRequest,
         one_more: bool,
+        on_start: impl FnOnce(),
+        on_records: impl FnOnce(usize),
     ) -> Result<ReadPage, ReadError> {
         let sdk::ReadRecordsRequest {
             r#ref,
@@ -196,7 +215,9 @@ impl StreamRuntime {
             },
             false => request,
         };
+        on_start();
         let page = self.store.read_records(request).await?;
+        on_records(page.records.len());
         fit_page(page, &from_offset, max_records, max_bytes, max_record_bytes)
     }
 

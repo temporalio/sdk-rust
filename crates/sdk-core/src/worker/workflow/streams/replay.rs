@@ -209,13 +209,11 @@ pub(crate) struct ReplayReader {
     unread: VecDeque<UnreadMarker>,
     #[debug(skip)]
     metrics: MetricsContext,
-    /// The metrics of each Store that the reader read, by its name.
     #[debug(skip)]
     store_metrics: HashMap<String, MetricsContext>,
 }
 
 impl ReplayReader {
-    /// Creates a reader with the Stream runtimes and the metrics of a Worker.
     pub(crate) fn new(runtimes: StreamRuntimes, metrics: MetricsContext) -> Self {
         Self {
             runtimes,
@@ -400,14 +398,17 @@ impl ReplayReader {
                 max_bytes: i64::try_from(recorded.saturating_sub(bytes)).unwrap_or(i64::MAX),
                 ..Default::default()
             };
-            let asked = Instant::now();
-            let mut started = false;
+            let mut started = None;
             let answer = {
-                let read = async {
-                    started = true;
-                    metrics.stream_replay_read_executed();
-                    runtime.read_records(request).await
-                };
+                let read = runtime.read_records_observed(
+                    request,
+                    false,
+                    || {
+                        started = Some(Instant::now());
+                        metrics.stream_replay_read_executed();
+                    },
+                    |count| metrics.stream_replay_read_records(count as u64),
+                );
                 let read = tokio::time::timeout(settings.try_deadline, read);
                 // Poll the shared deadline first so an expired deadline never starts a try.
                 match future::select(pin!(deadline.passed()), pin!(read)).await {
@@ -418,11 +419,11 @@ impl ReplayReader {
             let answer = match answer {
                 Err(first_error) => {
                     let bound = settings.replay_retry_bound();
-                    if started {
+                    if let Some(started) = started {
                         let error = temporalio_streams::ReadError::store_unavailable(&first_error);
                         super::manager::failed(metrics, &error)
                             .stream_replay_read_execution_failed();
-                        metrics.stream_replay_read_exec_latency(asked.elapsed());
+                        metrics.stream_replay_read_exec_latency(started.elapsed());
                     }
                     return Err(ReplayError::Unavailable(cut(format!(
                         "The Store is unavailable, so the replay can't read {} within {bound:?} \
@@ -432,19 +433,21 @@ impl ReplayReader {
                 }
                 Ok(answer) => answer,
             };
-            metrics.stream_replay_read_exec_latency(asked.elapsed());
             let answer = answer.unwrap_or_else(|_| {
                 Err(StreamError::store_unavailable(format!(
                     "The Store gave no answer in {:?}",
                     settings.try_deadline
                 )))
             });
-            if let Err(error) = &answer {
-                super::manager::failed(metrics, error).stream_replay_read_execution_failed();
+            if let Some(started) = started {
+                metrics.stream_replay_read_exec_latency(started.elapsed());
+                if let Err(error) = &answer {
+                    super::manager::failed(metrics, error).stream_replay_read_execution_failed();
+                }
             }
             let error = match answer {
                 Ok(page) => {
-                    metrics.stream_replay_read_records(page.records.len() as u64);
+                    let page = page.response;
                     waits = retry_waits(&settings);
                     // An answer with no Records that moves the cursor passed entries that aren't
                     // Records, so it doesn't mean that Records are missing.
