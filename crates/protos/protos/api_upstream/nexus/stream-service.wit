@@ -20,7 +20,7 @@ interface stream-service {
   /// @nexus.type-parameter
   type body-t = placeholder;
 
-  // Offsets are opaque. Unsigned byte order matches Record order within one Stream.
+  // Offsets are opaque and at most 1,024 bytes. Within a Stream they sort as unsigned bytes.
   // TODO: use `type stream-offset = list<u8>` once nexgen reads a named `list<u8>` as `bytes`.
 
   /// @nexus.proto "google.protobuf.Timestamp"
@@ -35,7 +35,7 @@ interface stream-service {
   record stream-ref {
     /// @nexus.doc "The Stream id. It must not be empty."
     id: string,
-    /// @nexus.doc "The registered name of the Store. If empty, the SDK picks a Store."
+    /// @nexus.doc "If empty, the SDK uses its Store selector or the only registered Store."
     store: option<string>,
   }
 
@@ -150,6 +150,7 @@ interface stream-service {
   record stream-record {
     /// @nexus.doc "The value."
     body: body-t,
+    // Saved SDK payloads can omit the Producer.
     producer: option<producer>,
     /// @nexus.doc "The position of this Record in the Stream. Offsets are ordered, with gaps."
     offset: list<u8>,
@@ -192,6 +193,7 @@ interface stream-service {
 
   /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsResponse"
   record append-records-response {
+    // Saved append results can omit offsets.
     first-offset: option<list<u8>>,
     last-offset: option<list<u8>>,
   }
@@ -205,7 +207,7 @@ interface stream-service {
     from-offset: option<list<u8>>,
     /// @nexus.doc "The maximum Records per page. Zero uses the configured default."
     max-records: option<s32>,
-    /// @nexus.doc "The page byte target. One larger Record can be returned unless an SDK hard limit rejects it."
+    /// @nexus.doc "Page byte target. A larger Record can exceed it within SDK hard limits."
     max-bytes: option<s64>,
     /// @nexus.doc "How long to wait for a new Record. Unset returns immediately."
     wait: option<duration>,
