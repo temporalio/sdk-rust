@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package temporal.api.streamservice.v1;
+
+option go_package = "go.temporal.io/api/streamservice/v1;streamservice";
+option java_package = "io.temporal.api.streamservice.v1";
+option java_multiple_files = true;
+option java_outer_classname = "RequestResponseProto";
+option ruby_package = "Temporalio::Api::StreamService::V1";
+option csharp_namespace = "Temporalio.Api.StreamService.V1";
+
+// Store requests omit the SDK Store name because routing is complete.
+// Nexus envelopes contain the request id. Direct Store calls pass it beside the request.
+// All offsets, including read cursors, are at most 1,024 bytes.
+
+import "google/protobuf/duration.proto";
+
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/stream/v1/message.proto";
+
+// Experimental. Might change in the future.
+// `FAIL` returns `ALREADY_EXISTS` for an existing Stream. `USE_EXISTING` returns `created` false.
+// A retry with the original create request id returns `created` true, even with `FAIL`.
+// Either policy returns `EXPIRED` while the Store remembers an expired Stream.
+//
+// Retention is a Store setting. It starts at create and restarts when an append writes a new batch.
+// Reads and resends keep the existing expiry.
+// (-- api-linter: core::0133=disabled
+//     aip.dev/not-precedent: The request identifies a Stream by its id. --)
+message CreateStreamRequest {
+    // Required. The id of the Stream to create. It must not be empty.
+    string stream_id = 1;
+    // What the create does if the Stream already exists. Unspecified means `FAIL`.
+    temporal.api.enums.v1.StreamIdConflictPolicy id_conflict_policy = 2;
+}
+
+// Experimental. Might change in the future.
+message CreateStreamResponse {
+    // False when `USE_EXISTING` found a Stream that already existed.
+    bool created = 1;
+}
+
+// Experimental. Might change in the future.
+// Retries must use the same Producer, attempt, request id and batch. A remembered request id
+// returns the original offsets without writing again. The Store sets its resend window per
+// Producer. An empty or forgotten request id permits a second write.
+message AppendRecordsRequest {
+    // Required.
+    string stream_id = 1;
+    // Required. The Producer that writes the batch.
+    temporal.api.stream.v1.Producer producer = 2;
+    // Required. A batch has at least one Record.
+    repeated temporal.api.stream.v1.AppendRecord records = 3;
+}
+
+// Experimental. Might change in the future.
+// The offsets of the first and the last Record of the batch.
+message AppendRecordsResponse {
+    // Required and nonempty.
+    bytes first_offset = 1;
+    // Required and nonempty.
+    bytes last_offset = 2;
+}
+
+// Experimental. Might change in the future.
+// Reads after an offset. When no Record is available, `wait` controls how long the read waits.
+message ReadRecordsRequest {
+    // Required.
+    string stream_id = 1;
+    // The read returns the Records after this offset. Empty means from the beginning. An offset
+    // past the newest one fails with `OFFSET_TOO_HIGH`. To read only new Records, a caller gets
+    // `last_offset` from a describe and reads after it.
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
+    bytes from_offset = 2;
+    // The maximum number of Records in one page. Zero uses the Store default.
+    int32 max_records = 3;
+    // The target size of a page in bytes. A larger Record is returned alone so the read can
+    // advance. Zero uses the Store default.
+    int64 max_bytes = 4;
+    // How long the read waits for a new Record before it returns an empty page. When it's unset,
+    // the read returns immediately.
+    google.protobuf.Duration wait = 5;
+}
+
+// Experimental. Might change in the future.
+message ReadRecordsResponse {
+    repeated temporal.api.stream.v1.StreamRecord records = 1;
+    // The last position that the read covered. The next read passes it as `from_offset`. A Store
+    // doesn't have to set it. If it's empty, that position is the offset of the last Record in
+    // this page, or the `from_offset` of the request for an empty page. A Store can set a later
+    // offset that skips only entries of its own that aren't Records, so the next read doesn't
+    // scan them again.
+    bytes last_offset = 2;
+}
+
+// Experimental. Might change in the future.
+message DescribeStreamRequest {
+    // Required.
+    string stream_id = 1;
+}
+
+// Experimental. Might change in the future.
+// Retention is a Store setting and is not returned here.
+message DescribeStreamResponse {
+    // The offset of the newest Record, or an offset after it that skips no Record. A read from it
+    // returns only the Records that come later. It's empty when the Stream has no Record.
+    bytes last_offset = 1;
+}

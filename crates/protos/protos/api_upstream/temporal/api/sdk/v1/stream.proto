@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package temporal.api.sdk.v1;
+
+option go_package = "go.temporal.io/api/sdk/v1;sdk";
+option java_package = "io.temporal.api.sdk.v1";
+option java_multiple_files = true;
+option java_outer_classname = "StreamProto";
+option ruby_package = "Temporalio::Api::Sdk::V1";
+option csharp_namespace = "Temporalio.Api.Sdk.V1";
+
+// The SDK selects a Store from `StreamRef`. Store requests in `temporal.api.streamservice.v1`
+// contain only the Stream id.
+
+import "google/protobuf/duration.proto";
+
+import "temporal/api/enums/v1/stream.proto";
+import "temporal/api/stream/v1/message.proto";
+
+// Experimental. Might change in the future.
+// Callers treat `id` as opaque. A Store can reuse an expired id only after it forgets the Stream.
+// SDKs encode references with this message so that other SDKs can decode them.
+message StreamRef {
+  string id = 1;
+  // When empty, the SDK uses its Store selector or the only registered Store.
+  // This field is local to the SDK. Store and server requests omit it.
+  string store = 2;
+}
+
+// Experimental. Might change in the future.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
+// (-- api-linter: core::0133=disabled
+//     aip.dev/not-precedent: The request identifies a Stream by its ref. --)
+message CreateStreamRequest {
+  // Required. The Stream to create. Its `id` must not be empty.
+  StreamRef stream_ref = 1;
+  temporal.api.enums.v1.StreamIdConflictPolicy id_conflict_policy = 2;
+}
+
+// Experimental. Might change in the future.
+// The reference includes the Store selected by the SDK.
+message CreateStreamResponse {
+  // The SDK fills the Store name so that another caller can route the reference.
+  StreamRef ref = 1;
+  // False when `USE_EXISTING` returned a Stream that already existed.
+  bool created = 2;
+}
+
+// Experimental. Might change in the future.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
+message AppendRecordsRequest {
+  // Required.
+  StreamRef ref = 1;
+  temporal.api.stream.v1.Producer producer = 2;
+  repeated temporal.api.stream.v1.AppendRecord records = 3;
+}
+
+// Experimental. Might change in the future.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
+message ReadRecordsRequest {
+  // Required.
+  StreamRef ref = 1;
+  // (-- api-linter: core::0140::prepositions=disabled
+  //     aip.dev/not-precedent: "from" marks the start of a range of offsets. --)
+  bytes from_offset = 2;
+  // Zero uses the configured default.
+  int32 max_records = 3;
+  // One Record can exceed this target unless an SDK hard limit rejects it.
+  int64 max_bytes = 4;
+  google.protobuf.Duration wait = 5;
+}
+
+// Experimental. Might change in the future.
+// Uses the Store request contract, with a `StreamRef` for SDK routing.
+message DescribeStreamRequest {
+  // Required.
+  StreamRef ref = 1;
+}

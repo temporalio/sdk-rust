@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package temporal.api.stream.v1;
+
+option go_package = "go.temporal.io/api/stream/v1;stream";
+option java_package = "io.temporal.api.stream.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Stream::V1";
+option csharp_namespace = "Temporalio.Api.Stream.V1";
+
+import "google/protobuf/timestamp.proto";
+
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/stream.proto";
+
+// Experimental. Might change in the future.
+// Attempts of one Producer compare by `started_event_id`, then `attempt`, then `started_time`.
+// Attempts from different runs have no order, including reset and Continue-As-New runs.
+message WorkflowTaskAttempt {
+    // Required.
+    int64 started_event_id = 1;
+    // Required. Starts at 1 for each task, so this number alone cannot order writes in a run.
+    int32 attempt = 2;
+    // Distinguishes tasks when the server reuses a started event id after a speculative task.
+    // Empty when the server did not send a started time.
+    google.protobuf.Timestamp started_time = 3;
+}
+
+// Experimental. Might change in the future.
+// Attempts of one Producer compare by `task`, then `attempt`.
+// A later Workflow Task therefore has a later attempt. Attempts from different runs have no order.
+message LocalActivityAttempt {
+    // Required. The Workflow Task attempt that dispatched the Local Activity.
+    WorkflowTaskAttempt task = 1;
+    // Required. The Local Activity's own attempt number within that Workflow Task, starting at 1.
+    int32 attempt = 2;
+}
+
+// Experimental. Might change in the future.
+// One attempt of an Activity. Two attempts compare by `attempt_scheduled_time`, then `attempt`.
+message ActivityAttempt {
+    // Required. A reset restarts the attempt number, so this time orders attempts across a reset.
+    google.protobuf.Timestamp attempt_scheduled_time = 1;
+    // Required. The attempt number, starting at 1.
+    int32 attempt = 2;
+}
+
+// Experimental. Might change in the future.
+// Workflow writes share one Producer per run. Local Activity writes use `LocalActivityProducer`.
+message WorkflowProducer {
+    // Required.
+    string namespace = 1;
+    // Required.
+    string workflow_id = 2;
+    // Required. This run id separates the Producer from other runs in the chain.
+    string run_id = 3;
+    // Workflow code leaves this empty so that the SDK can set the actual Workflow Task attempt.
+    WorkflowTaskAttempt attempt = 4;
+}
+
+// Experimental. Might change in the future.
+// The Producer of one Local Activity of a Workflow run.
+message LocalActivityProducer {
+    // Required. The namespace of the Workflow that made the call.
+    string namespace = 1;
+    // Required.
+    string workflow_id = 2;
+    // Required.
+    string run_id = 3;
+    // Required. Local Activities have no scheduled event, so this id must be unique in the run.
+    // The SDK assigns an id unless the caller supplies one.
+    string activity_id = 4;
+    // Required.
+    LocalActivityAttempt attempt = 5;
+}
+
+// Experimental. Might change in the future.
+// The Producer of one Activity that a Workflow scheduled.
+message WorkflowActivityProducer {
+    // Required. The namespace of the Workflow that scheduled the Activity.
+    string namespace = 1;
+    // Required.
+    string workflow_id = 2;
+    // Required.
+    string run_id = 3;
+    // Required.
+    string activity_id = 4;
+    // Distinguishes calls when a run reuses an Activity id after an Activity completes.
+    // Zero when the SDK does not have the `ActivityTaskScheduled` event id.
+    int64 scheduled_event_id = 5;
+    // Required.
+    ActivityAttempt attempt = 6;
+}
+
+// Experimental. Might change in the future.
+// Standalone Activity attempts use the same order as Workflow Activity attempts.
+message StandaloneActivityProducer {
+    // Required.
+    string namespace = 1;
+    // Required.
+    string activity_id = 2;
+    // Required. The run id of the Activity itself.
+    string run_id = 3;
+    // Required.
+    ActivityAttempt attempt = 4;
+}
+
+// Experimental. Might change in the future.
+// Clients have no attempt, so their writes cannot be fenced or superseded by a later attempt.
+message ClientProducer {
+    // Required.
+    string namespace = 1;
+    // Required. The SDK generates an id per client object unless the caller supplies one.
+    string id = 2;
+}
+
+// Experimental. Might change in the future.
+// The kind and ids identify a Producer. The attempt does not.
+// With fencing enabled, a write fails with `FENCED` after a later attempt of that Producer writes.
+// Records retain their Producer and attempt so that readers can apply their own retry policy.
+// Attempts of different Producers have no order. A reset run cannot fence its base run.
+message Producer {
+    // The kind of the Producer. Required on a write. A reader can get a kind that it doesn't
+    // know, since kinds can be added.
+    oneof kind {
+        WorkflowProducer workflow = 1;
+        LocalActivityProducer local_activity = 2;
+        WorkflowActivityProducer workflow_activity = 3;
+        StandaloneActivityProducer standalone_activity = 4;
+        ClientProducer client = 5;
+    }
+}
+
+// Experimental. Might change in the future.
+// The Store adds the batch Producer and assigns an offset.
+message AppendRecord {
+    // Required.
+    temporal.api.common.v1.Payload body = 1;
+}
+
+// Experimental. Might change in the future.
+message StreamRecord {
+    // Stores must return the Producer that appended this Record.
+    Producer producer = 1;
+    temporal.api.common.v1.Payload body = 2;
+    // Required. Record offsets are 1 to 1,024 bytes and unique within a Stream. Unsigned byte order
+    // matches Record order. Offsets can have gaps and do not identify the Stream.
+    bytes offset = 3;
+}
+
+// Experimental. Might change in the future.
+// Returned in gRPC status details or Nexus application failure details.
+message StreamErrorDetails {
+    temporal.api.enums.v1.StreamErrorReason reason = 1;
+}

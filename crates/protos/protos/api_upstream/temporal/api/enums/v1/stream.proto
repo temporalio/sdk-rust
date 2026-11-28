@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package temporal.api.enums.v1;
+
+option go_package = "go.temporal.io/api/enums/v1;enums";
+option java_package = "io.temporal.api.enums.v1";
+option java_multiple_files = true;
+option java_outer_classname = "StreamProto";
+option ruby_package = "Temporalio::Api::Enums::V1";
+option csharp_namespace = "Temporalio.Api.Enums.V1";
+
+// Experimental. Might change in the future.
+// The conflict policy for an existing Stream. Unspecified means `FAIL`.
+enum StreamIdConflictPolicy {
+    STREAM_ID_CONFLICT_POLICY_UNSPECIFIED = 0;
+    // The create fails with `ALREADY_EXISTS`.
+    STREAM_ID_CONFLICT_POLICY_FAIL = 1;
+    // The create returns the existing Stream without changing its expiry.
+    STREAM_ID_CONFLICT_POLICY_USE_EXISTING = 2;
+}
+
+// Experimental. Might change in the future.
+// Several reasons share a gRPC status code. Callers must check the reason to distinguish them.
+enum StreamErrorReason {
+    STREAM_ERROR_REASON_UNSPECIFIED = 0;
+    // The Stream was never created (`NOT_FOUND`).
+    STREAM_ERROR_REASON_NOT_FOUND = 1;
+    // Retention has passed since create or the last append of a new batch (`NOT_FOUND`).
+    STREAM_ERROR_REASON_EXPIRED = 2;
+    // A later attempt of this Producer has written, and fencing is enabled (`FAILED_PRECONDITION`).
+    STREAM_ERROR_REASON_FENCED = 3;
+    // The Stream has a newer format than this caller knows (`FAILED_PRECONDITION`).
+    STREAM_ERROR_REASON_FORMAT_TOO_NEW = 4;
+    // The offset is past the newest one, for example after a failover lost the newest Records. A
+    // read from it works again once the Stream has Records up to that offset (`OUT_OF_RANGE`).
+    STREAM_ERROR_REASON_OFFSET_TOO_HIGH = 5;
+    // A Record or a batch is larger than the Store allows (`INVALID_ARGUMENT`).
+    STREAM_ERROR_REASON_TOO_LARGE = 6;
+    // The request is malformed (`INVALID_ARGUMENT`).
+    STREAM_ERROR_REASON_INVALID_ARGUMENT = 7;
+    // The Store failed or did not respond. A retry can succeed (`UNAVAILABLE`).
+    STREAM_ERROR_REASON_STORE_UNAVAILABLE = 8;
+    // The Store doesn't support something that the call needs (`UNIMPLEMENTED`).
+    STREAM_ERROR_REASON_UNSUPPORTED = 9;
+    // A create with the `FAIL` policy found that the Stream already exists (`ALREADY_EXISTS`).
+    STREAM_ERROR_REASON_ALREADY_EXISTS = 10;
+    // Stored data is invalid. Retrying cannot repair it (`DATA_LOSS`).
+    STREAM_ERROR_REASON_STORE_CORRUPT = 11;
+}
