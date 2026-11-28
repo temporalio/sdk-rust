@@ -215,7 +215,8 @@ impl WFStream {
                         .map(WorkflowStreamAction::Activation),
                 );
 
-                if state.shutdown_done() {
+                // A failed fetch can need a reply even when no run remains cached.
+                if actions.is_empty() && state.shutdown_done() {
                     info!("Workflow shutdown is done");
                     return Err(PollError::ShutDown);
                 }

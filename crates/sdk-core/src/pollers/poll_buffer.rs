@@ -405,7 +405,7 @@ where
                             _ = shutdown_clone.cancelled() => break,
                         }
                     }
-                    // Prefer shutdown when a slot or permission to poll becomes ready at the same time.
+                    // A freed slot must not start another poll after shutdown.
                     let permit = tokio::select! {
                         biased;
                         _ = shutdown_clone.cancelled() => break,

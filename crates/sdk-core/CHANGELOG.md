@@ -49,9 +49,9 @@ relevant information.
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
 
-* When shutdown and a freed task slot are both ready, the Worker stops polling.
-  Sticky polls, normal polls and eager starts share the Workflow cache slot limit.
-  A large limit no longer requires the Worker to reserve storage for every possible cache entry.
+* Workflow slot reservations share the cache limit, including waits for a custom slot supplier.
+* Shutdown drains accepted tasks and History fetches after Workflow polling has started.
+* Workers can use large cache limits without allocating entries up front.
 
 ## [0.12.0] - 2026-11-23
 

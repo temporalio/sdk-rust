@@ -33,7 +33,7 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     /// we add user-defined cache sizing, that logic will need to live with the supplier and
     /// there will need to be some associated refactoring.
     max_permits: Option<usize>,
-    /// Count reservations while callers wait for their supplier to return a slot.
+    /// A pending supplier reservation must count against the shared limit.
     max_permits_sem: Option<Arc<Semaphore>>,
     metrics_ctx: MetricsContext,
     slot_metric_version: Arc<AtomicU64>,
