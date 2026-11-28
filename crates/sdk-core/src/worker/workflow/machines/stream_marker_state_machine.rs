@@ -49,7 +49,6 @@ impl From<CommandSent> for Recorded {
     }
 }
 
-/// Creates the marker command that records `data`, with its machine.
 pub(super) fn stream_marker(data: &PeekedMarker) -> Result<NewMachineWithCommand, WFMachinesError> {
     let (marker_name, details) = match data {
         PeekedMarker::Append(data) => (STREAM_APPEND_MARKER_NAME, marker_details(data)?),

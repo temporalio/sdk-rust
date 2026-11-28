@@ -68,8 +68,8 @@ message LocalActivityProducer {
     string workflow_id = 2;
     // Required.
     string run_id = 3;
-    // Required. Local Activities have no scheduled event, so this id distinguishes calls in a run.
-    // The SDK assigns an id from its counter unless the user sets one. Do not reuse it within a run.
+    // Required. Local Activities have no scheduled event, so this id must be unique in the run.
+    // The SDK assigns an id unless the caller supplies one.
     string activity_id = 4;
     // Required.
     LocalActivityAttempt attempt = 5;
@@ -141,10 +141,11 @@ message AppendRecord {
 
 // Experimental. Might change in the future.
 message StreamRecord {
+    // Stores must return the Producer that appended this Record.
     Producer producer = 1;
     temporal.api.common.v1.Payload body = 2;
-    // Required and nonempty. Offsets are unique within a Stream. Unsigned byte order matches
-    // Record order. Gaps cannot be used to count Records. Offsets do not identify their Stream.
+    // Required. Record offsets are 1 to 1,024 bytes and unique within a Stream. Unsigned byte order
+    // matches Record order. Offsets can have gaps and do not identify the Stream.
     bytes offset = 3;
 }
 

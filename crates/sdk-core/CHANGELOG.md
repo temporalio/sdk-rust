@@ -45,7 +45,7 @@ relevant information.
 * [lang-internal] `ReadStream` returns one Store page in a `ResolveStreamRead` job.
   `StreamSettings::read_time` bounds the wait in one Workflow Task. Read markers store offsets,
   the Record count and a digest. Replay reads those Records again and verifies the digest.
-* [lang-internal] Stream metrics record Store calls by `stream_store` and failures by
+* Stream metrics record Store calls by `stream_store` and failures by
   `failure_reason`. Live append and read counters exclude replay. Replay Store reads have
   separate `stream_replay_read_total`, `stream_replay_read_execution_failed`,
   `stream_replay_read_records` and `stream_replay_read_execution_latency` instruments.
@@ -59,6 +59,7 @@ relevant information.
   Workers can still replay the original marker format, including previously delivered oversized
   Records. Older Workers cannot interpret the new digest format.
 * Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
+* Workflow queries retain task results when replay needs another History page.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

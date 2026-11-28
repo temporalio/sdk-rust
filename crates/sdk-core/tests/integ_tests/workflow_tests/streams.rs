@@ -316,15 +316,22 @@ async fn a_read_with_a_memo_upsert_in_the_first_task_gets_its_page() {
                     };
                     vec![memo.into(), read(1, &[])]
                 }
-                _ if seen
-                    .last()
-                    .unwrap()
-                    .iter()
-                    .any(|job| job.starts_with("read 1")) =>
-                {
-                    vec![complete()]
+                _ => {
+                    let result = activation.jobs.iter().find_map(|job| match &job.variant {
+                        Some(Job::ResolveStreamRead(result)) => Some(result),
+                        _ => None,
+                    });
+                    if let Some(result) = result {
+                        assert_eq!(result.seq, 1);
+                        let Some(resolve_stream_read::Status::Page(page)) = &result.status else {
+                            panic!("The read failed. {result:?}");
+                        };
+                        assert_eq!(page.records.as_slice(), &store.records("s")[..1]);
+                        vec![complete()]
+                    } else {
+                        vec![]
+                    }
                 }
-                _ => vec![],
             };
             let ends = matches!(commands[..], [Command::CompleteWorkflowExecution(_)]);
             let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
@@ -494,13 +501,22 @@ async fn a_drain_that_crosses_the_read_limit_ends_in_its_task_on_the_server() {
     let core = starter.get_core_worker().await;
     starter.start_wf().await;
     let mut seen = vec![];
+    let mut page_sizes = vec![];
     let drive = async {
         loop {
             let activation = core.poll_workflow_activation().await.unwrap();
             let run_id = activation.run_id.clone();
             let jobs = jobs_of(&activation);
-            if jobs.iter().any(|job| job.starts_with("read 2 of")) {
-                tokio::time::sleep(Duration::from_millis(600)).await;
+            for job in &activation.jobs {
+                if let Some(Job::ResolveStreamRead(result)) = &job.variant {
+                    let Some(resolve_stream_read::Status::Page(page)) = &result.status else {
+                        panic!("The read failed. {result:?}");
+                    };
+                    page_sizes.push(page.records.len());
+                    if result.seq == 2 {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                    }
+                }
             }
             seen.push(jobs);
             // The Workflow completes at the page with no Record in place of the timer.
@@ -528,6 +544,7 @@ async fn a_drain_that_crosses_the_read_limit_ends_in_its_task_on_the_server() {
         store.reads().len()
     );
     assert!(finished, "{label}");
+    assert_eq!(page_sizes, [1, 1, 0], "{label}");
     assert_eq!(
         count_of(&history, EventType::WorkflowTaskCompleted),
         1,

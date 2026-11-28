@@ -134,6 +134,29 @@ impl WFStream {
                                 ));
                                 None // completions can return more than one activation
                             }
+                            LocalInputs::FetchedPageCompletion {
+                                mut paginator,
+                                update: FetchedPage::History(update),
+                            } if ReplayReads::needed_by(&update) => {
+                                // The machines can peek a marker as soon as they receive its page.
+                                ReplayReader::add_to(
+                                    &mut paginator,
+                                    &state.worker_config,
+                                    &state.metrics,
+                                );
+                                let req = NextPageReq {
+                                    paginator,
+                                    span: Span::current(),
+                                };
+                                state.stream_records_reads.push_back(
+                                    StreamRecordsReq::HistoryPage(
+                                        Box::new(req),
+                                        update,
+                                        state.history_fetch_refcounter.clone(),
+                                    ),
+                                );
+                                None
+                            }
                             LocalInputs::FetchedPageCompletion { paginator, update } => {
                                 activations.extend(state.process_completion(
                                     NewOrFetchedComplete::Fetched(update, Box::new(paginator)),
@@ -721,7 +744,6 @@ pub(super) enum LocalInputs {
     PostActivation(Box<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
-    /// The read limit of the run's task came, at the timer of that task.
     ReadLimit(String, u64),
     /// A queued cancel was handed to lang, so the run may be ready to evict
     #[from(ignore)]

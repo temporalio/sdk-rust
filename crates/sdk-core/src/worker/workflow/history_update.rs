@@ -79,9 +79,22 @@ impl HistoryUpdate {
         self.events.as_slice()
     }
 
-    /// Returns true if the WFT sequence after the one that ends at the index `end` of the events
-    /// ends at or after the first read marker with no Records yet. The machines peek that sequence
-    /// when they take the one before it, and give its read markers their Records.
+    pub(super) fn prepend_unapplied(&mut self, previous: &mut Self) {
+        if previous.get_events().is_empty() {
+            return;
+        }
+        let mut events: Vec<_> = previous.events.by_ref().collect();
+        events.extend(self.events.by_ref());
+        self.events = events.into_iter();
+        if let Some(mut reads) = previous.stream_reads.take() {
+            if let Some(next) = self.stream_reads.take() {
+                reads.extend(next);
+            }
+            self.stream_reads = Some(reads);
+        }
+    }
+
+    // The machines peek the next task's markers, so its Records must be available too.
     fn peeks_unread_stream_records(&self, end: usize) -> bool {
         let unread = self.stream_reads.as_ref().and_then(ReplayReads::unread);
         let (Some(unread), Some(taken)) = (unread, self.get_events().get(end)) else {
@@ -693,8 +706,10 @@ impl HistoryUpdate {
             self.has_last_wft || self.ends_at_known_boundary(),
             self.chunking_disabled,
         );
-        if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
-            && !self.has_last_wft
+        // Results for the last started task can be in the next physical History page.
+        if !self.has_last_wft
+            && (matches!(next_wft_ix, NextWFTSeqEndIndex::Incomplete(_))
+                || next_wft_ix.index() + 1 == self.get_events().len())
         {
             return false;
         }
@@ -2034,8 +2049,6 @@ mod tests {
         assert_eq!(seq.len(), 3);
     }
 
-    /// Returns a read marker of the completion `completed`, with a read whose Records aren't in
-    /// History.
     fn read_marker(completed: i64) -> MarkerRecordedEventAttributes {
         let page = StreamReadPage {
             record_count: 1,

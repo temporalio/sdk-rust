@@ -22,15 +22,18 @@ use crate::{
     WorkerConfig,
     telemetry::metrics::{MetricsContext, stream_store},
     worker::workflow::{
-        LocalResolution, LocalResolutionMsg, RunBasics, WFT_HEARTBEAT_TIMEOUT_FRACTION,
-        WorkflowTaskInfo,
+        LocalResolution, LocalResolutionMsg, RunBasics, WFMachinesError,
+        WFT_HEARTBEAT_TIMEOUT_FRACTION, WorkflowTaskInfo,
         workflow_stream::{LocalInput, LocalInputs},
     },
 };
 use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use temporalio_common::protos::temporal::api::stream::v1::WorkflowTaskAttempt;
@@ -85,6 +88,9 @@ const READ_WAIT_SHARE: f32 = 0.9;
 /// A marker records the Store name of each call, so a longer name fails the Workflow Task, and a
 /// runtime with a longer name fails the start of its Worker.
 const MAX_STORE_NAME_BYTES: usize = 4096;
+
+// A queued timeout must not expire a task in a replacement instance of the same run.
+static READ_LIMIT_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// The Stream runtimes of a Worker, identified by the name of the Store that each one serves,
 /// with the settings of its Stream calls. The runtime under the empty name is the default.
@@ -252,7 +258,6 @@ impl StreamSettings {
         Ok(())
     }
 
-    /// Returns [`MAX_TASK_RECORD_BYTES`], or the bound that a test set.
     pub(crate) fn max_task_record_bytes(&self) -> usize {
         #[cfg(test)]
         let max = self.max_task_record_bytes;
@@ -261,7 +266,6 @@ impl StreamSettings {
         max
     }
 
-    /// Returns [`MAX_REPLAY_PART_BYTES`], or the bound that a test set for the Records of a task.
     pub(crate) fn max_replay_part_bytes(&self) -> usize {
         #[cfg(test)]
         let max = self.max_task_record_bytes;
@@ -270,7 +274,6 @@ impl StreamSettings {
         max
     }
 
-    /// Returns [`READ_CHECK_DEADLINE`], or the bound that a test set.
     pub(crate) fn read_check_deadline(&self) -> Duration {
         #[cfg(test)]
         let deadline = self.read_check_deadline;
@@ -279,7 +282,6 @@ impl StreamSettings {
         deadline
     }
 
-    /// Returns [`MAX_TASK_READ_RESULTS`], or the bound that a test set.
     pub(crate) fn max_task_read_results(&self) -> usize {
         #[cfg(test)]
         let max = self.max_task_read_results;
@@ -288,7 +290,6 @@ impl StreamSettings {
         max
     }
 
-    /// Returns [`REPLAY_RETRY_BOUND`], or the bound that a test set.
     pub(crate) fn replay_retry_bound(&self) -> Duration {
         #[cfg(test)]
         let bound = self.replay_retry_bound;
@@ -297,7 +298,6 @@ impl StreamSettings {
         bound
     }
 
-    /// Returns [`REPLAY_CONCURRENCY`], or the bound that a test set.
     pub(crate) fn replay_concurrency(&self) -> usize {
         #[cfg(test)]
         let max = self.replay_concurrency;
@@ -306,7 +306,6 @@ impl StreamSettings {
         max
     }
 
-    /// Returns [`REPLAY_READ_RUNS`], or the bound that a test set.
     pub(crate) fn replay_read_runs(&self) -> usize {
         #[cfg(test)]
         let max = self.replay_read_runs;
@@ -368,12 +367,11 @@ impl Streams {
     }
 }
 
-/// The Stream manager of a Worker for one run, with the id and the metrics of that run.
+/// The Stream manager of a Worker for one run, with the id of that run.
 pub(super) struct RunStreams {
     streams: Arc<Streams>,
     run_id: String,
     metrics: MetricsContext,
-    /// The metrics of each Store that the run called, by its name.
     store_metrics: HashMap<String, MetricsContext>,
 }
 
@@ -424,6 +422,10 @@ impl RunStreams {
         self.streams.manager.outage(&self.run_id)
     }
 
+    pub(super) fn check_read_tasks(&self) -> Result<(), WFMachinesError> {
+        self.streams.manager.check_read_tasks(&self.run_id)
+    }
+
     /// Sends the read limit of the task in hand to the run when the limit comes, once per task. It
     /// must be called on the thread of the runs.
     pub(super) fn read_limit_at(&self, limit: &mut ReadLimit) {
@@ -432,6 +434,7 @@ impl RunStreams {
         };
         let (abort, registration) = AbortHandle::new_pair();
         limit.timer = Some(abort);
+        limit.generation = READ_LIMIT_IDS.fetch_add(1, Ordering::Relaxed);
         let (run_id, generation) = (self.run_id.clone(), limit.generation);
         let local_tx = self.streams.local_tx.clone();
         let span = Span::current();
@@ -466,7 +469,6 @@ impl RunStreams {
 pub(super) struct ReadLimit {
     /// `None` until the run knows the Workflow Task timeout.
     at: Option<Instant>,
-    /// Counts the tasks, so that the timer of an earlier task ends nothing.
     generation: u64,
     timer: Option<AbortHandle>,
     /// True once the limit came. A read that goes on after it doesn't start the timer again.
@@ -485,30 +487,32 @@ impl ReadLimit {
             .get_or_insert_with(|| (Instant::now() + time).min(start + latest));
     }
 
-    /// Returns the time that the task has left to its limit.
     pub(super) fn left(&self) -> Duration {
         (self.at).map_or(Duration::ZERO, |at| {
             at.saturating_duration_since(Instant::now())
         })
     }
 
-    /// Clears the limit for the next task, and stops its timer.
     pub(super) fn reset(&mut self) {
         if let Some(timer) = self.timer.take() {
             timer.abort();
         }
         self.at = None;
-        self.generation += 1;
         self.passed = false;
     }
 
-    /// Returns true for the timer of the task in hand.
     pub(super) fn expires(&mut self, generation: u64) -> bool {
         if generation != self.generation || self.timer.take().is_none() {
             return false;
         }
         self.passed = true;
         true
+    }
+}
+
+impl Drop for ReadLimit {
+    fn drop(&mut self) {
+        self.reset();
     }
 }
 
@@ -523,9 +527,179 @@ pub(super) fn task_attempt(info: &WorkflowTaskInfo) -> WorkflowTaskAttempt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_help::stream_store::MemoryStore;
+    use super::{
+        test_store::{Fault, Model, ModelStore},
+        *,
+    };
+    use crate::{
+        replay::TestHistoryBuilder,
+        test_help::{ResponseType, hist_to_poll_resp, stream_store::MemoryStore},
+        worker::{
+            client::mocks::mock_worker_client,
+            workflow::{
+                NextPageReq,
+                history_update::HistoryPaginator,
+                wft_extraction::{HistfetchRC, WFTExtractor},
+            },
+        },
+    };
+    use futures_util::{StreamExt, stream};
+    use temporalio_common::protos::{
+        constants::STREAM_READ_MARKER_NAME,
+        coresdk::external_data::{
+            StreamReadMarkerData, StreamReadPage, StreamReadResult, stream_read_result,
+        },
+        temporal::api::history::v1::{HistoryEvent, MarkerRecordedEventAttributes, history_event},
+    };
     use temporalio_streams::record::StoreLimits;
+    use tokio::sync::{
+        Notify,
+        mpsc::{UnboundedReceiver, unbounded_channel},
+    };
+
+    fn timer_run() -> (RunStreams, UnboundedReceiver<LocalInput>) {
+        let (local_tx, local_rx) = unbounded_channel();
+        let streams = Arc::new(Streams {
+            manager: StreamManager::new(StreamRuntimes::default(), Handle::current(), |_, _| {}),
+            local_tx,
+        });
+        (
+            RunStreams {
+                streams,
+                run_id: "run".to_string(),
+                metrics: MetricsContext::no_op(),
+                store_metrics: HashMap::new(),
+            },
+            local_rx,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_read_limit_cancels_its_timer() {
+        let (run, mut inputs) = timer_run();
+        let mut limit = ReadLimit {
+            at: Some((tokio::time::Instant::now() + Duration::from_secs(1)).into_std()),
+            generation: 0,
+            timer: None,
+            passed: false,
+        };
+        run.read_limit_at(&mut limit);
+        tokio::task::yield_now().await;
+        drop(limit);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(inputs.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_read_limit_does_not_expire_a_replacement_run() {
+        let (old_run, mut inputs) = timer_run();
+        let mut old_limit = ReadLimit {
+            at: Some(tokio::time::Instant::now().into_std()),
+            generation: 0,
+            timer: None,
+            passed: false,
+        };
+        old_run.read_limit_at(&mut old_limit);
+        let queued = inputs.recv().await.unwrap();
+        let replacement = RunStreams {
+            streams: old_run.streams.clone(),
+            run_id: old_run.run_id.clone(),
+            metrics: old_run.metrics.clone(),
+            store_metrics: HashMap::new(),
+        };
+        drop(old_limit);
+        drop(old_run);
+        let mut limit = ReadLimit {
+            at: Some((tokio::time::Instant::now() + Duration::from_secs(1)).into_std()),
+            generation: 0,
+            timer: None,
+            passed: false,
+        };
+        replacement.read_limit_at(&mut limit);
+        let LocalInputs::ReadLimit(run_id, generation) = queued.input else {
+            panic!("Expected a read limit");
+        };
+        assert_eq!(run_id, replacement.run_id);
+        assert!(!limit.expires(generation));
+        let LocalInputs::ReadLimit(_, generation) = inputs.recv().await.unwrap().input else {
+            panic!("Expected the replacement read limit");
+        };
+        assert!(limit.expires(generation));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_extractor_cancels_a_replay_store_read() {
+        let started = Arc::new(Notify::new());
+        let notify = started.clone();
+        let store = Arc::new(ModelStore::new(Model::new(0, vec![], move |_, _| {
+            notify.notify_one();
+            Some(Fault::Silent)
+        })));
+        let runtime = Arc::new(StreamRuntime::new(store.clone(), StoreLimits::default()));
+        let mut reader = ReplayReader::new(
+            StreamRuntimes::new([("mem".to_string(), runtime)]),
+            MetricsContext::no_op(),
+        );
+        let data = StreamReadMarkerData {
+            reads: vec![StreamReadResult {
+                stream_id: "stream".to_string(),
+                store: "mem".to_string(),
+                result: Some(stream_read_result::Result::Page(StreamReadPage {
+                    record_count: 1,
+                    digest: vec![1; 16],
+                    record_bytes: 32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+        };
+        let event = HistoryEvent {
+            event_id: 5,
+            attributes: Some(history_event::Attributes::MarkerRecordedEventAttributes(
+                MarkerRecordedEventAttributes {
+                    marker_name: STREAM_READ_MARKER_NAME.to_string(),
+                    details: marker_details(&data).unwrap(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        reader.queue(std::iter::once(&event));
+        let mut history = TestHistoryBuilder::default();
+        history.add_wfe_started_with_wft_timeout(Duration::from_secs(10));
+        history.add_workflow_task_scheduled_and_started();
+        let poll = hist_to_poll_resp(&history, "workflow", ResponseType::AllHistory).resp;
+        let client = Arc::new(mock_worker_client());
+        let (mut paginator, _) =
+            HistoryPaginator::from_poll(poll.try_into().unwrap(), client.clone())
+                .await
+                .unwrap();
+        paginator.stream_reader = Some(reader);
+        let request = StreamRecordsReq::NextPart(
+            Box::new(NextPageReq {
+                paginator,
+                span: Span::none(),
+            }),
+            Arc::new(HistfetchRC {}),
+        );
+        let mut extractor = Box::pin(WFTExtractor::build(
+            client,
+            1,
+            stream::pending(),
+            stream::pending(),
+            stream::iter([request]),
+            1,
+        ));
+        tokio::select! {
+            _ = started.notified() => {}
+            _ = extractor.next() => panic!("The Store read must still be pending"),
+        }
+        assert_eq!(store.model.lock().reading.0, 1);
+        drop(extractor);
+        tokio::task::yield_now().await;
+        assert_eq!(store.model.lock().reading.0, 0);
+    }
 
     #[test]
     fn the_check_refuses_a_store_name_over_4096_bytes() {

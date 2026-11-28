@@ -22,13 +22,12 @@ pub(crate) struct Answers {
     pub(crate) described: DescribeStreamResponse,
 }
 
-/// A request that the Store got, with the request id of a create or an append.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Received {
-    Create(CreateStreamRequest, String),
-    Append(AppendRecordsRequest, String),
+    Create,
+    Append,
     Read(ReadRecordsRequest),
-    Describe(DescribeStreamRequest),
+    Describe,
 }
 
 #[derive(Default)]
@@ -40,23 +39,19 @@ pub(crate) struct Scripted {
 impl StreamStore for Scripted {
     fn create_stream(
         &self,
-        request: CreateStreamRequest,
-        request_id: String,
+        _request: CreateStreamRequest,
+        _request_id: String,
     ) -> BoxFuture<'_, Result<CreateStreamResponse, CreateError>> {
-        self.received
-            .lock()
-            .push(Received::Create(request, request_id));
+        self.received.lock().push(Received::Create);
         Box::pin(async move { Ok(self.answers.lock().created) })
     }
 
     fn append_records(
         &self,
-        request: AppendRecordsRequest,
-        request_id: String,
+        _request: AppendRecordsRequest,
+        _request_id: String,
     ) -> BoxFuture<'_, Result<AppendRecordsResponse, AppendError>> {
-        self.received
-            .lock()
-            .push(Received::Append(request, request_id));
+        self.received.lock().push(Received::Append);
         Box::pin(async move { Ok(self.answers.lock().appended.clone()) })
     }
 
@@ -70,9 +65,9 @@ impl StreamStore for Scripted {
 
     fn describe_stream(
         &self,
-        request: DescribeStreamRequest,
+        _request: DescribeStreamRequest,
     ) -> BoxFuture<'_, Result<DescribeStreamResponse, DescribeError>> {
-        self.received.lock().push(Received::Describe(request));
+        self.received.lock().push(Received::Describe);
         Box::pin(async move { Ok(self.answers.lock().described.clone()) })
     }
 }

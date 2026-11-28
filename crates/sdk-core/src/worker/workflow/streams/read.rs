@@ -1,5 +1,3 @@
-//! The result of a read of Workflow code, as the entry of its marker and the Records of its page.
-
 use super::{digest::digest, manager::failure_of};
 use prost::Message;
 use temporalio_common::protos::coresdk::{
@@ -12,7 +10,6 @@ use temporalio_streams::{
     record::field_len,
 };
 
-/// What a read result says about the Records after its page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum After {
     /// The Store returned Records after the page.
@@ -23,7 +20,6 @@ pub(crate) enum After {
     AsBefore,
 }
 
-/// The live result of a read.
 #[derive(Debug)]
 pub(crate) struct ReadDone {
     /// The marker entry, with an activation index of 0 until an activation takes it.
@@ -35,8 +31,6 @@ pub(crate) struct ReadDone {
 }
 
 impl ReadDone {
-    /// Converts the answer to read `seq` of `stream` into its result. The entry of a page gets the
-    /// digest of its Records.
     pub(crate) fn new(
         stream: &StreamRef,
         seq: u32,
@@ -62,9 +56,7 @@ impl ReadDone {
         }
     }
 
-    /// Returns the result of read `seq` of `stream`, which waited, at the read limit of its task.
-    /// It's a page with no Record that ends at `from_offset`, so the next read from there skips no
-    /// Record.
+    // Keep the cursor unchanged so the next read skips no Records.
     pub(crate) fn cut(stream: &StreamRef, seq: u32, from_offset: Vec<u8>) -> Self {
         let last_offset = from_offset.clone();
         let mut done = Self::page(
@@ -79,20 +71,17 @@ impl ReadDone {
         done
     }
 
-    /// Marks the page as one whose wait the read time of the task ended.
     pub(crate) fn set_wait_cut(&mut self) {
         if let Some(stream_read_result::Result::Page(page)) = &mut self.entry.result {
             page.wait_cut = true;
         }
     }
 
-    /// Returns true if the result is a page with no Record.
     pub(crate) fn is_empty_page(&self) -> bool {
         matches!(&self.entry.result,
             Some(stream_read_result::Result::Page(page)) if page.record_count == 0)
     }
 
-    /// Returns the failure of the read, if it failed.
     pub(crate) fn failure(&self) -> Option<&StreamFailure> {
         match &self.entry.result {
             Some(stream_read_result::Result::Failure(failure)) => Some(failure),
@@ -147,16 +136,14 @@ impl ReadDone {
     }
 }
 
-/// Returns the size of `records` as the page of a read encodes them, which is the measure of the
-/// `max_bytes` of a read.
+// Include each field's framing bytes to match the Store page budget.
 pub(crate) fn record_bytes(records: &[StreamRecord]) -> usize {
     (records.iter())
         .map(|record| field_len(record.encoded_len()))
         .sum()
 }
 
-/// Returns the job that gives Workflow code the result of a read in a marker, with the Records of
-/// its page. A live run and a replay both build the job from the entry.
+// Live execution and replay must give Workflow code the same result fields.
 pub(crate) fn read_job(entry: &StreamReadResult, records: Vec<StreamRecord>) -> ResolveStreamRead {
     let status = entry.result.as_ref().map(|result| match result {
         stream_read_result::Result::Page(page) => resolve_stream_read::Status::Page(StreamPage {

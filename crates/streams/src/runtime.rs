@@ -59,6 +59,11 @@ impl StreamRuntime {
             id_conflict_policy: policy,
         };
         let created = self.store.create_stream(request, request_id).await?.created;
+        if !created && policy != StreamIdConflictPolicy::UseExisting as i32 {
+            return Err(StreamError::store_corrupt(
+                "The Store returned an existing Stream without the UseExisting policy",
+            ));
+        }
         Ok(sdk::CreateStreamResponse {
             r#ref: Some(stream_ref),
             created,
@@ -74,6 +79,17 @@ impl StreamRuntime {
         request: sdk::AppendRecordsRequest,
         request_id: String,
     ) -> Result<AppendRecordsResponse, AppendError> {
+        self.append_records_with_start(request, request_id, || {})
+            .await
+    }
+
+    /// Calls `on_start` after validation, immediately before the Store receives the request.
+    pub async fn append_records_with_start(
+        &self,
+        request: sdk::AppendRecordsRequest,
+        request_id: String,
+        on_start: impl FnOnce(),
+    ) -> Result<AppendRecordsResponse, AppendError> {
         let sdk::AppendRecordsRequest {
             r#ref,
             producer,
@@ -85,6 +101,7 @@ impl StreamRuntime {
             records,
         };
         self.limits.validate_append(&request)?;
+        on_start();
         let appended = self.store.append_records(request, request_id).await?;
         for offset in [&appended.first_offset, &appended.last_offset] {
             if offset.is_empty() {
@@ -113,7 +130,9 @@ impl StreamRuntime {
         &self,
         request: sdk::ReadRecordsRequest,
     ) -> Result<ReadRecordsResponse, ReadError> {
-        let page = self.read(request, false).await?;
+        let page = self
+            .read_records_observed(request, false, || {}, |_| {})
+            .await?;
         Ok(page.response)
     }
 
@@ -124,13 +143,18 @@ impl StreamRuntime {
         &self,
         request: sdk::ReadRecordsRequest,
     ) -> Result<ReadPage, ReadError> {
-        self.read(request, true).await
+        self.read_records_observed(request, true, || {}, |_| {})
+            .await
     }
 
-    async fn read(
+    /// With `one_more`, requests a lookahead Record as in [`Self::read_records_with_more`].
+    /// Reports dispatch after validation and the Store's Record count before trimming the page.
+    pub async fn read_records_observed(
         &self,
         request: sdk::ReadRecordsRequest,
         one_more: bool,
+        on_start: impl FnOnce(),
+        on_records: impl FnOnce(usize),
     ) -> Result<ReadPage, ReadError> {
         let sdk::ReadRecordsRequest {
             r#ref,
@@ -160,8 +184,15 @@ impl StreamRuntime {
         if request.max_bytes < 0 {
             return Err(StreamError::invalid_argument("max_bytes must be 0 or more"));
         }
-        if (request.wait.as_ref()).is_some_and(|wait| wait.seconds < 0 || wait.nanos < 0) {
-            return Err(StreamError::invalid_argument("wait must be 0 or more"));
+        if let Some(wait) = request.wait {
+            if wait.seconds < 0 || wait.nanos < 0 {
+                return Err(StreamError::invalid_argument("wait must be 0 or more"));
+            }
+            if wait.seconds > 315_576_000_000 || wait.nanos >= 1_000_000_000 {
+                return Err(StreamError::invalid_argument(
+                    "wait exceeds the protobuf Duration range",
+                ));
+            }
         }
         let max_records = match request.max_records {
             0 => usize::MAX,
@@ -175,13 +206,18 @@ impl StreamRuntime {
         let max_record_bytes = self.limits.max_record_bytes;
         let request = match one_more {
             true => ReadRecordsRequest {
-                max_records: one_more_record(request.max_records),
+                max_records: match request.max_records {
+                    0 => 0,
+                    max => max.saturating_add(1),
+                },
                 max_bytes: one_more_record_bytes(request.max_bytes, max_record_bytes),
                 ..request
             },
             false => request,
         };
+        on_start();
         let page = self.store.read_records(request).await?;
+        on_records(page.records.len());
         fit_page(page, &from_offset, max_records, max_bytes, max_record_bytes)
     }
 
@@ -205,8 +241,6 @@ impl StreamRuntime {
     }
 }
 
-/// Returns the Stream id of a ref, which is all that a Store gets of it. A request with no ref has
-/// an empty id, which the id check refuses.
 fn stream_id(stream_ref: Option<sdk::StreamRef>) -> String {
     stream_ref
         .map(|stream_ref| stream_ref.id)
@@ -223,17 +257,8 @@ pub struct ReadPage {
     pub more: bool,
 }
 
-/// Returns the `max_records` that the Store gets for a read with `max_records`.
-fn one_more_record(max_records: i32) -> i32 {
-    match max_records {
-        0 => 0,
-        max => max.saturating_add(1),
-    }
-}
-
-/// Returns the `max_bytes` that the Store gets for a read with `max_bytes`. It adds the largest
-/// Record that the runtime takes, as a page encodes it with its offset. The sum saturates, since 0
-/// would mean no cap.
+// The extra budget lets a full page include one more Record.
+// Saturation avoids zero, which would remove the Store's limit.
 fn one_more_record_bytes(max_bytes: i64, max_record_bytes: usize) -> i64 {
     if max_bytes == 0 {
         return 0;
@@ -503,97 +528,81 @@ mod tests {
                 read(|r| r.wait = seconds(-1)).await,
                 invalid("wait must be 0 or more"),
             ),
+            (
+                read(|r| {
+                    r.wait = Some(prost_types::Duration {
+                        seconds: 0,
+                        nanos: 1_000_000_000,
+                    })
+                })
+                .await,
+                invalid("wait exceeds the protobuf Duration range"),
+            ),
+            (
+                read(|r| r.wait = seconds(315_576_000_001)).await,
+                invalid("wait exceeds the protobuf Duration range"),
+            ),
             (describe(|r| r.r#ref = None).await, no_id()),
         ];
         for (result, error) in cases {
             assert_eq!(result, Err(error));
         }
+        assert!(store.received.lock().is_empty());
+
+        let longest_wait = sdk::ReadRecordsRequest {
+            wait: Some(prost_types::Duration {
+                seconds: 315_576_000_000,
+                nanos: 999_999_999,
+            }),
+            ..valid_read()
+        };
+        runtime.read_records(longest_wait).await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_create_answers_with_the_ref_of_its_request() {
-        // The Store gets only the id, so the `store` of the ref comes from the request.
+    async fn only_use_existing_can_return_an_existing_stream() {
         let (store, runtime) = runtime();
-        for created in [true, false] {
+        for (policy, created, valid) in [
+            (StreamIdConflictPolicy::Unspecified, true, true),
+            (StreamIdConflictPolicy::Unspecified, false, false),
+            (StreamIdConflictPolicy::Fail, true, true),
+            (StreamIdConflictPolicy::Fail, false, false),
+            (StreamIdConflictPolicy::UseExisting, true, true),
+            (StreamIdConflictPolicy::UseExisting, false, true),
+        ] {
             store.answers.lock().created = CreateStreamResponse { created };
-            let answer = sdk::CreateStreamResponse {
-                r#ref: stream_ref("s", "x"),
-                created,
+            let request = sdk::CreateStreamRequest {
+                id_conflict_policy: policy.into(),
+                ..valid_create()
             };
-            let response = runtime.create_stream(valid_create(), "r".to_string());
-            assert_eq!(response.await, Ok(answer));
+            let result = runtime.create_stream(request, "r".into()).await;
+            if valid {
+                assert_eq!(
+                    result.unwrap(),
+                    sdk::CreateStreamResponse {
+                        r#ref: stream_ref("s", "x"),
+                        created,
+                    }
+                );
+            } else {
+                assert_eq!(result.unwrap_err().reason, AnyReason::StoreCorrupt.into());
+            }
         }
     }
 
     #[tokio::test]
-    async fn the_store_gets_each_request_with_only_the_stream_id_of_its_ref() {
-        let (store, runtime) = runtime();
-        store.answers.lock().appended = AppendRecordsResponse {
-            first_offset: b"a".to_vec(),
-            last_offset: b"a".to_vec(),
-        };
-        let (create, append) = (valid_create(), valid_append());
-        let read = sdk::ReadRecordsRequest {
-            from_offset: b"a".to_vec(),
-            max_records: 3,
-            max_bytes: 7,
-            wait: seconds(2),
-            ..valid_read()
-        };
-        let created = runtime.create_stream(create.clone(), "c".to_string());
-        created.await.unwrap();
-        let appended = runtime.append_records(append.clone(), "a".to_string());
-        appended.await.unwrap();
-        runtime.read_records(read.clone()).await.unwrap();
-        runtime.read_records_with_more(read.clone()).await.unwrap();
-        runtime.describe_stream(valid_describe()).await.unwrap();
-        let id = || "s".to_string();
-        let expected = [
-            Received::Create(
-                CreateStreamRequest {
-                    stream_id: id(),
-                    id_conflict_policy: create.id_conflict_policy,
-                },
-                "c".to_string(),
-            ),
-            Received::Append(
-                AppendRecordsRequest {
-                    stream_id: id(),
-                    producer: append.producer,
-                    records: append.records,
-                },
-                "a".to_string(),
-            ),
-            Received::Read(ReadRecordsRequest {
-                stream_id: id(),
-                from_offset: read.from_offset.clone(),
-                max_records: 3,
-                max_bytes: 7,
-                wait: read.wait,
-            }),
-            // These caps take one Record more, of at most 1572864 bytes and its offset.
-            Received::Read(ReadRecordsRequest {
-                stream_id: id(),
-                from_offset: read.from_offset,
-                max_records: 4,
-                max_bytes: 7 + 1573895,
-                wait: read.wait,
-            }),
-            Received::Describe(DescribeStreamRequest { stream_id: id() }),
-        ];
-        assert_eq!(*store.received.lock(), expected);
-    }
-
-    #[tokio::test]
-    async fn a_lookahead_keeps_unbounded_caps_and_saturates_finite_caps() {
+    async fn a_lookahead_adds_one_record_without_overflowing_the_caps() {
         let store = Arc::new(Scripted::default());
         let runtime = StreamRuntime::new(store.clone(), StoreLimits::UNBOUNDED);
-        for (max_records, max_bytes, store_records, store_bytes) in [
-            (0, 0, 0, 0),
-            (0, 1, 0, i64::MAX),
-            (1, 0, 2, 0),
-            (i32::MAX - 1, i64::MAX - 1, i32::MAX, i64::MAX),
-            (i32::MAX, i64::MAX, i32::MAX, i64::MAX),
+        let bounded = StreamRuntime::new(store.clone(), StoreLimits::default());
+        for (runtime, max_records, max_bytes, store_records, store_bytes) in [
+            // The lookahead must fit the largest Record, including its offset.
+            (&bounded, 3, 7, 4, 7 + 1_573_895),
+            (&runtime, 0, 0, 0, 0),
+            (&runtime, 0, 1, 0, i64::MAX),
+            (&runtime, 1, 0, 2, 0),
+            (&runtime, i32::MAX - 1, i64::MAX - 1, i32::MAX, i64::MAX),
+            (&runtime, i32::MAX, i64::MAX, i32::MAX, i64::MAX),
         ] {
             let read = sdk::ReadRecordsRequest {
                 max_records,

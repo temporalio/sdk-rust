@@ -1,10 +1,13 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
 use super::{StreamRuntimes, StreamSettings, read::ReadDone};
-use crate::telemetry::metrics::{FailureReason, MetricsContext, failure_reason};
+use crate::{
+    telemetry::metrics::{FailureReason, MetricsContext, failure_reason},
+    worker::workflow::WFMachinesError,
+};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
-use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 use temporalio_common::protos::{
     coresdk::external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
     temporal::api::{
@@ -15,7 +18,7 @@ use temporalio_common::protos::{
 use temporalio_streams::{
     AnyReason, AppendError, ReadError, ReadPage, StreamError, StreamRuntime,
     proto::{
-        StreamErrorReason,
+        AppendRecordsResponse, StreamErrorReason,
         sdk::{AppendRecordsRequest, ReadRecordsRequest},
     },
 };
@@ -59,7 +62,6 @@ pub(crate) enum Op {
     Read(ReadCall),
 }
 
-/// A read to run.
 #[derive(Debug)]
 pub(crate) struct ReadCall {
     /// The request of each try, with the `from_offset` and the page size of the read.
@@ -75,7 +77,6 @@ pub(crate) struct ReadCall {
 /// if a read has one at the read limit, at the completion or at the heartbeat.
 pub(crate) type LastTry = Arc<Mutex<Option<StreamFailure>>>;
 
-/// The result of a call, sent to its run.
 #[derive(Debug)]
 pub(crate) struct StreamResolution {
     pub(crate) call_id: u64,
@@ -94,7 +95,10 @@ type Sink = Arc<dyn Fn(String, StreamResolution) + Send + Sync>;
 /// The running calls, keyed by run id and call id.
 type Tasks = Arc<Mutex<HashMap<String, HashMap<u64, Task>>>>;
 
+const TASK_ENDED: &str = "StreamStoreUnavailable: A Stream Store task ended without a result";
+
 struct Task {
+    is_read: bool,
     abort: AbortHandle,
     /// The failure of the last try, while the call waits to try again.
     outage: Option<String>,
@@ -125,7 +129,6 @@ impl StreamManager {
         }
     }
 
-    /// Starts and stops calls of the run `run_id`. `metrics` gives the metrics of a Store.
     pub(crate) fn dispatch(
         &self,
         run_id: &str,
@@ -139,12 +142,14 @@ impl StreamManager {
             match request {
                 Request::Run(call) => {
                     let call_id = call.call_id;
+                    let is_read = matches!(call.op, Op::Read(_));
                     let metrics = metrics(&call.store);
                     let abort = self.spawn(run_id, call, metrics);
                     let run = tasks.entry(run_id.to_string()).or_default();
                     run.insert(
                         call_id,
                         Task {
+                            is_read,
                             abort,
                             outage: None,
                         },
@@ -178,10 +183,26 @@ impl StreamManager {
     pub(crate) fn outage(&self, run_id: &str) -> Option<String> {
         let tasks = self.tasks.lock();
         let run = tasks.get(run_id)?;
+        // A finished task still in the map never delivered a result or received a cancellation.
         run.iter()
-            .filter_map(|(call_id, task)| Some((*call_id, task.outage.as_ref()?)))
+            .filter(|(_, task)| task.outage.is_some() || task.abort.is_finished())
             .min_by_key(|(call_id, _)| *call_id)
-            .map(|(_, outage)| outage.clone())
+            .map(|(_, task)| {
+                task.outage
+                    .clone()
+                    .unwrap_or_else(|| TASK_ENDED.to_string())
+            })
+    }
+
+    pub(super) fn check_read_tasks(&self, run_id: &str) -> Result<(), WFMachinesError> {
+        // A read that ended without delivering a result must not become an empty page at cutoff.
+        if self.tasks.lock().get(run_id).is_some_and(|run| {
+            run.values()
+                .any(|task| task.is_read && task.abort.is_finished())
+        }) {
+            return Err(WFMachinesError::Stream(TASK_ENDED.to_string()));
+        }
+        Ok(())
     }
 
     fn spawn(&self, run_id: &str, call: Call, metrics: MetricsContext) -> AbortHandle {
@@ -233,10 +254,6 @@ impl Drop for StreamManager {
     }
 }
 
-/// Runs the call `seq` on `runtime`, and returns its outcome. The metrics count each try when it
-/// starts, as those of a Local Activity count each attempt, and a check is one try. They time a
-/// try of an append once it ends, so a try that is stopped has only its count, and a read has no
-/// latency.
 async fn run(
     runtime: &StreamRuntime,
     seq: u32,
@@ -247,17 +264,7 @@ async fn run(
 ) -> Outcome {
     match op {
         Op::Append(request, request_id) => {
-            let send = || {
-                metrics.stream_append_executed();
-                runtime.append_records(request.clone(), request_id.clone())
-            };
-            let tried = |took: Duration, error: Option<&AppendError>| {
-                metrics.stream_append_exec_latency(took);
-                if let Some(error) = error {
-                    failed(metrics, error).stream_append_execution_failed();
-                }
-            };
-            let answer = tries(settings, note, send, tried).await;
+            let answer = append(runtime, request, request_id, settings, note, metrics).await;
             Outcome::Append(match answer {
                 Ok(appended) => stream_append_result::Result::Appended(StreamAppendOffsets {
                     first_offset: appended.first_offset,
@@ -270,9 +277,6 @@ async fn run(
             let stream = (read.request.r#ref.clone()).expect("A read has the ref of its command");
             let from_offset = read.request.from_offset.clone();
             let page = read_page(runtime, read, settings, metrics).await;
-            if let Ok(page) = &page {
-                metrics.stream_read_records(page.response.records.len() as u64);
-            }
             let page = page
                 .and_then(|page| {
                     // The Store runtime returns one Record even if it exceeds the request's soft
@@ -296,13 +300,8 @@ async fn run(
     }
 }
 
-/// Reads the page of Records after the `from_offset` of `read`. A page is one answer of the Store,
-/// which waits up to the read's wait for the first Record. An answer with no Record before the
-/// wait is up makes the read ask again from its `last_offset`, at most once per
-/// [`MIN_ASK_AGAIN`]. A try that fails with `StoreUnavailable`, or gets no answer by its deadline,
-/// is the last try of the read, and the read asks again after a backoff. A check is one try with
-/// no wait, which returns its outage. The run fails the task of a read whose last try failed, so a
-/// read notes no outage in the manager.
+// Back off after early empty pages to avoid repeated Store calls while no Records are available.
+// The run checks the last failure when the task ends, so read outages stay with the call.
 async fn read_page(
     runtime: &StreamRuntime,
     read: ReadCall,
@@ -318,18 +317,7 @@ async fn read_page(
     if check {
         request.wait = None;
         let deadline = settings.read_check_deadline();
-        metrics.stream_read_executed();
-        let read = runtime.read_records_with_more(request);
-        let answer = match tokio::time::timeout(deadline, read).await {
-            Ok(answer) => answer,
-            Err(_) => Err(StreamError::store_unavailable(format!(
-                "The Store gave no answer in {deadline:?}"
-            ))),
-        };
-        if let Err(error) = &answer {
-            failed(metrics, error).stream_read_execution_failed();
-        }
-        return answer;
+        return read_attempt(runtime, request, deadline, metrics).await;
     }
     // A time past the end of the clock never ends the wait.
     let wait_until = Instant::now().checked_add(wait);
@@ -344,19 +332,7 @@ async fn read_page(
         // The Store can take the whole wait to answer, so the deadline of the try adds it.
         let deadline = settings.try_deadline.saturating_add(wait);
         let asked = Instant::now();
-        metrics.stream_read_executed();
-        let read = runtime.read_records_with_more(request.clone());
-        let answer = match tokio::time::timeout(deadline, read).await {
-            Ok(Err(error)) if !is_outage(&error) => {
-                failed(metrics, &error).stream_read_execution_failed();
-                *last_try.lock() = None;
-                return Err(error);
-            }
-            Ok(answer) => answer,
-            Err(_) => Err(StreamError::store_unavailable(format!(
-                "The Store gave no answer in {deadline:?}"
-            ))),
-        };
+        let answer = read_attempt(runtime, request.clone(), deadline, metrics).await;
         match answer {
             Ok(page) => {
                 *last_try.lock() = None;
@@ -375,8 +351,11 @@ async fn read_page(
                 request.from_offset = page.response.last_offset;
                 waits = retry_waits(&settings);
             }
+            Err(error) if !is_outage(&error) => {
+                *last_try.lock() = None;
+                return Err(error);
+            }
             Err(error) => {
-                failed(metrics, &error).stream_read_execution_failed();
                 *last_try.lock() = Some(recorded(&error));
                 tokio::time::sleep(next_wait(&mut waits)).await;
             }
@@ -384,39 +363,75 @@ async fn read_page(
     }
 }
 
-/// Sends the request again while the Store is in an outage. The loop has no time limit of its own,
-/// because the run fails its Workflow Task if, at the task's heartbeat, a call has had no answer
-/// since a try that failed. A resend is safe, because a Store doesn't write a batch whose request
-/// id it still remembers.
-/// `tried` gets the duration of each try, and its error if it failed.
-async fn tries<T, R, F>(
+async fn read_attempt(
+    runtime: &StreamRuntime,
+    request: ReadRecordsRequest,
+    deadline: Duration,
+    metrics: &MetricsContext,
+) -> Result<ReadPage, ReadError> {
+    let mut started = false;
+    let read = runtime.read_records_observed(
+        request,
+        true,
+        || {
+            started = true;
+            metrics.stream_read_executed();
+        },
+        |count| metrics.stream_read_records(count as u64),
+    );
+    let answer = tokio::time::timeout(deadline, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(StreamError::store_unavailable(format!(
+                "The Store gave no answer in {deadline:?}"
+            )))
+        });
+    if started && let Err(error) = &answer {
+        failed(metrics, error).stream_read_execution_failed();
+    }
+    answer
+}
+
+// Resending with the original request id lets the Store return the first write's result.
+async fn append(
+    runtime: &StreamRuntime,
+    request: AppendRecordsRequest,
+    request_id: String,
     settings: StreamSettings,
     note: &Note,
-    mut send: impl FnMut() -> F,
-    tried: impl Fn(Duration, Option<&StreamError<R>>),
-) -> Result<T, StreamError<R>>
-where
-    R: Copy + From<AnyReason> + Into<StreamErrorReason>,
-    F: Future<Output = Result<T, StreamError<R>>>,
-{
+    metrics: &MetricsContext,
+) -> Result<AppendRecordsResponse, AppendError> {
     let mut waits = retry_waits(&settings);
     loop {
-        let started = Instant::now();
-        let error = match tokio::time::timeout(settings.try_deadline, send()).await {
-            Ok(Err(error)) if is_outage(&error) => error,
-            Ok(answer) => {
-                tried(started.elapsed(), answer.as_ref().err());
+        let mut started = None;
+        let send = runtime.append_records_with_start(request.clone(), request_id.clone(), || {
+            started = Some(Instant::now());
+            metrics.stream_append_executed();
+        });
+        let answer = tokio::time::timeout(settings.try_deadline, send)
+            .await
+            .unwrap_or_else(|_| {
+                Err(StreamError::store_unavailable(format!(
+                    "The Store gave no answer in {:?}",
+                    settings.try_deadline
+                )))
+            });
+        if let Some(started) = started {
+            metrics.stream_append_exec_latency(started.elapsed());
+            if let Err(error) = &answer {
+                failed(metrics, error).stream_append_execution_failed();
+            }
+        }
+        match &answer {
+            Err(error) if is_outage(error) => {
+                note.set(Some(error));
+                tokio::time::sleep(next_wait(&mut waits)).await;
+            }
+            _ => {
                 note.set(None);
                 return answer;
             }
-            Err(_) => StreamError::store_unavailable(format!(
-                "The Store gave no answer in {:?}",
-                settings.try_deadline
-            )),
-        };
-        tried(started.elapsed(), Some(&error));
-        note.set(Some(&error));
-        tokio::time::sleep(next_wait(&mut waits)).await;
+        }
     }
 }
 
@@ -479,7 +494,6 @@ impl Note {
     }
 }
 
-/// Returns `metrics` with the reason of `error`, such as `stream_not_found`, as `failure_reason`.
 pub(super) fn failed<R: Copy + Into<StreamErrorReason>>(
     metrics: &MetricsContext,
     error: &StreamError<R>,
@@ -705,7 +719,6 @@ pub(super) mod tests {
         assert_eq!(store.requests().len(), after);
     }
 
-    /// The labels of an attribute set of the metrics buffer.
     #[derive(Debug)]
     struct Labels(HashMap<String, String>);
 
@@ -715,7 +728,6 @@ pub(super) mod tests {
         }
     }
 
-    /// The name of an instrument of the metrics buffer.
     #[derive(Clone, Debug)]
     pub(in crate::worker::workflow::streams) struct Instrument(String);
 
@@ -804,8 +816,35 @@ pub(super) mod tests {
         (buffer, metrics)
     }
 
-    // Each try of a call counts for its Store when it starts, and a check is one try. Only a try
-    // of an append has a latency, and a failed try has the token of its reason.
+    #[tokio::test]
+    async fn an_invalid_batch_produces_no_store_metrics() {
+        let (store, manager, mut results) = manager().await;
+        let (buffer, metrics) = metric_buffer();
+        let mut invalid = append(1);
+        let Request::Run(Call {
+            op: Op::Append(request, _),
+            ..
+        }) = &mut invalid
+        else {
+            unreachable!();
+        };
+        request.records.clear();
+        manager.dispatch("r", vec![invalid], |store| {
+            metrics.with_new_attrs([stream_store(store.to_string())])
+        });
+        let (_, resolution) = results.recv().await.unwrap();
+        let Outcome::Append(stream_append_result::Result::Failure(error)) = resolution.outcome
+        else {
+            panic!("The empty batch should fail");
+        };
+        assert_eq!(
+            error.reason,
+            StreamErrorReason::InvalidArgument.as_str_name()
+        );
+        assert!(store.requests().is_empty());
+        assert!(totals(&buffer).is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_metrics_count_each_try_of_a_call() {
         let (store, manager, mut results) = manager().await;
@@ -816,10 +855,27 @@ pub(super) mod tests {
             id: "missing".to_string(),
             ..stream()
         };
-        // The first try of the append and of the read meet an outage, and so does the first check.
+        let mut batch = append(1);
+        let Request::Run(Call {
+            op: Op::Append(append, _),
+            ..
+        }) = &mut batch
+        else {
+            unreachable!();
+        };
+        append.records.push(append.records[0].clone());
+        let mut first = read(2, stream(), false);
+        let Request::Run(Call {
+            op: Op::Read(read_call),
+            ..
+        }) = &mut first
+        else {
+            unreachable!();
+        };
+        read_call.request.max_records = 1;
         let calls = [
-            (Some(StoreOp::Append), append(1)),
-            (Some(StoreOp::Read), read(2, stream(), false)),
+            (Some(StoreOp::Append), batch),
+            (Some(StoreOp::Read), first),
             (Some(StoreOp::Read), read(3, stream(), true)),
             (None, read(4, missing, true)),
         ];
@@ -828,7 +884,13 @@ pub(super) mod tests {
                 store.fail(op, down(), 1);
             }
             manager.dispatch("r", vec![call], of_store);
-            results.recv().await.unwrap();
+            let (_, resolution) = results.recv().await.unwrap();
+            if resolution.seq == 2 {
+                let Outcome::Read(page) = resolution.outcome else {
+                    panic!("Expected the limited read");
+                };
+                assert_eq!(page.records.len(), 1);
+            }
         }
         let expected = [
             ("stream_append_total", "", 2),
@@ -845,7 +907,7 @@ pub(super) mod tests {
                 2,
             ),
             ("stream_read_execution_failed", "stream_not_found", 1),
-            ("stream_read_records", "", 1),
+            ("stream_read_records", "", 2),
         ];
         let expected = (expected.into_iter())
             .map(|(name, reason, value)| ((name.to_string(), reason.to_string()), value))

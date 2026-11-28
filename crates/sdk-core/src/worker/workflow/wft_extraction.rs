@@ -15,6 +15,7 @@ use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
 use std::{future, sync::Arc};
 use temporalio_common::protos::coresdk::WorkflowSlotInfo;
 use tokio::runtime::Handle;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -166,14 +167,22 @@ impl WFTExtractor {
             |_: &mut ()| PollNext::Right,
         )
         .buffer_unordered(max_fetch_concurrency);
-        // In a separate stage, a Store that gives no answer keeps no poll out of the fetch stage.
-        // Each read runs on the Worker's runtime, so no Store code holds the thread of the runs.
-        // The bound on the runs that read at once bounds the Records that the Worker holds.
+        // A slow Store must not block History fetches or the thread that runs Workflows.
+        // Limit concurrent replay reads to bound the Records held in memory.
         let handle = Handle::current();
         let records = records_stream
             .map(move |request| {
-                let read = handle.spawn(request.read());
-                read.map(|output| output.map_err(|e| tonic::Status::internal(e.to_string())))
+                let (run_id, auto_reply_fail) = request.failure_context();
+                let read = AbortOnDropHandle::new(handle.spawn(request.read()));
+                read.map(move |output| {
+                    Ok(
+                        output.unwrap_or_else(|error| WFTExtractorOutput::FailedFetch {
+                            run_id,
+                            auto_reply_fail,
+                            err: tonic::Status::internal(error.to_string()),
+                        }),
+                    )
+                })
             })
             .buffer_unordered(replay_read_runs);
         stream::select(fetched, records)

@@ -33,7 +33,10 @@ use temporalio_common::{
                 self as activity_result, ActivityExecutionResult, activity_execution_result,
             },
             nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
-            workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+            workflow_activation::{
+                WorkflowActivationJob,
+                workflow_activation_job::{self, Variant as Job},
+            },
             workflow_commands::{
                 AppendToStream, CancelWorkflowExecution, CompleteWorkflowExecution,
                 ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
@@ -1208,7 +1211,6 @@ async fn activity_metrics() {
 // of a Local Activity. It times each try of an append and of a replay's Store read.
 #[tokio::test]
 async fn stream_metrics() {
-    use workflow_activation_job::Variant as Job;
     let namespace = integ_namespace();
     let (telemopts, addr, _aborter) = prom_metrics(None);
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
@@ -1316,13 +1318,21 @@ async fn stream_metrics() {
         ("replay_read_records", &of_worker, 2),
         ("replay_read_execution_latency_count", &of_worker, 1),
     ];
-    for (name, attributes, value) in expected {
-        let line = format!("temporal_stream_{name}{{{attributes}}} {value}");
-        assert!(
-            body.contains(&line),
-            "`{line}` isn't in the metrics:\n{body}"
-        );
-    }
+    let mut expected: Vec<String> = expected
+        .into_iter()
+        .map(|(name, attributes, value)| format!("temporal_stream_{name}{{{attributes}}} {value}"))
+        .collect();
+    let mut actual: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("temporal_stream_"))
+        .filter(|line| {
+            let metric = line.split('{').next().unwrap();
+            !metric.ends_with("_bucket") && !metric.ends_with("_sum")
+        })
+        .collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "{body}");
     core.drain_pollers_and_shutdown_ref().await;
 }
 
