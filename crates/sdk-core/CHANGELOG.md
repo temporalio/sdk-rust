@@ -37,8 +37,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
-* Local Activities now report a schedule-to-close timeout while waiting for a slot or between
-  retry attempts. A retry that is still queued at the deadline cannot start.
+* Local Activities report schedule-to-close timeouts before dispatch and during local backoff.
+  Expired queued attempts do not start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

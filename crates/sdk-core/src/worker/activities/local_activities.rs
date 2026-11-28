@@ -231,8 +231,6 @@ struct LocalActivityInfo {
     queued_for_dispatch: bool,
     /// Tasks for the current backoff until the next retry, if any.
     backing_off_task: Option<JoinHandle<()>>,
-    /// Tasks / info about timeouts associated with this LA. May be empty for very brief periods
-    /// while the LA id has been generated, but it has not yet been scheduled.
     timeout_bag: Option<TimeoutBag>,
     /// True once the first workflow task this LA started in has elapsed
     first_wft_has_ended: bool,
@@ -343,7 +341,8 @@ impl LocalActivityManager {
         let mut immediate_resolutions = vec![];
         for req in reqs {
             match req {
-                LocalActRequest::New(act) => {
+                LocalActRequest::New(mut act) => {
+                    act.schedule_cmd.attempt = act.schedule_cmd.attempt.max(1);
                     debug!(local_activity=?act, "Queuing local activity");
                     let id = ExecutingLAId {
                         run_id: act.workflow_exec_info.run_id.clone(),
@@ -364,7 +363,7 @@ impl LocalActivityManager {
                                 Ok(timeout_bag) => {
                                     ve.insert(LocalActivityInfo {
                                         task_token: tt.clone(),
-                                        attempt: act.schedule_cmd.attempt.max(1),
+                                        attempt: act.schedule_cmd.attempt,
                                         queued_for_dispatch: true,
                                         backing_off_task: None,
                                         timeout_bag: Some(timeout_bag),
@@ -374,7 +373,7 @@ impl LocalActivityManager {
                                     self.act_req_tx
                                         .send(PendingAttempt {
                                             token: tt,
-                                            attempt: act.schedule_cmd.attempt.max(1),
+                                            attempt: act.schedule_cmd.attempt,
                                             activity: act,
                                         })
                                         .expect(
@@ -1759,6 +1758,21 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn already_expired_local_activity_reports_first_attempt() {
+        let lam = LocalActivityManager::test(1);
+        let mut activity = retrying_activity(Duration::from_secs(1), Duration::from_secs(5));
+        activity.schedule_cmd.attempt = 0;
+        activity.schedule_cmd.original_schedule_time = Some(SystemTime::UNIX_EPOCH);
+        let resolutions = lam.enqueue([activity.into()]);
+        assert_matches!(
+            resolutions.as_slice(),
+            [LocalActivityResolution { result, attempt: 1, .. }]
+                if result.get_timeout_type() == Some(TimeoutType::ScheduleToClose)
+        );
+        assert!(lam.next_pending().now_or_never().is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queued_retry_cannot_use_a_replacement_activity_with_the_same_id() {
         let lam = LocalActivityManager::test(1);
@@ -1784,7 +1798,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::during_backoff(10)]
-    #[case::retry_and_deadline_ready(5)]
+    #[case::dispatch_before_timeout_delivery(5)]
     #[tokio::test(start_paused = true)]
     async fn schedule_to_close_expires_during_local_backoff(#[case] retry_seconds: u64) {
         let lam = LocalActivityManager::test(1);
@@ -1797,6 +1811,16 @@ mod tests {
             LocalActivityExecutionResult::Failed(Default::default()),
         );
         assert_matches!(retry, LACompleteAction::WillBeRetried(None));
+        if retry_seconds == deadline.as_secs() {
+            // Force dispatch to win the race against delivery of the timeout notification.
+            let data = lam.dat.lock();
+            let info = data.la_info.values().next().unwrap();
+            info.timeout_bag
+                .as_ref()
+                .unwrap()
+                .sched_to_close_handle
+                .abort();
+        }
         yield_now().await;
         tokio::time::advance(deadline).await;
         yield_now().await;
