@@ -49,6 +49,7 @@ pub use worker::{
     TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig,
     WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
     WorkflowErrorType, WorkflowSlotKind,
+    streams::{StreamRuntimes, StreamSettings},
 };
 
 use crate::{

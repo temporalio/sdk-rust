@@ -12,6 +12,8 @@ pub use test_utils::*;
 #[cfg(any(feature = "test-utilities", test))]
 mod integ_helpers;
 #[cfg(any(feature = "test-utilities", test))]
+pub mod stream_store;
+#[cfg(any(feature = "test-utilities", test))]
 mod test_utils;
 #[cfg(test)]
 mod unit_helpers;

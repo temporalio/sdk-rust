@@ -999,7 +999,8 @@ impl RunStoreTargets {
             | workflow_command::Variant::UpsertWorkflowSearchAttributes(_)
             | workflow_command::Variant::ModifyWorkflowProperties(_)
             | workflow_command::Variant::UpdateResponse(_)
-            | workflow_command::Variant::RequestCancelNexusOperation(_) => self.current(),
+            | workflow_command::Variant::RequestCancelNexusOperation(_)
+            | workflow_command::Variant::AppendToStream(_) => self.current(),
         })
     }
 }

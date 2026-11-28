@@ -41,6 +41,7 @@ pub(crate) use activities::{
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+pub(crate) use workflow::streams::{self, StreamRuntimes};
 
 use crate::{
     ActivityHeartbeat,
@@ -282,6 +283,24 @@ pub struct WorkerConfig {
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
 
+    /// Stream runtimes and retry settings for this Worker. A live call with no Store name uses
+    /// the runtime registered under `""`, or the only runtime. An unresolved Store fails the task.
+    ///
+    /// Replay uses the recorded Store for a ref with no Store name and makes no append call.
+    /// An explicit Store name must match History.
+    ///
+    /// Give each Store one name so its appends share one queue. Reusing a runtime under two names
+    /// or a Store name over 4096 bytes prevents Worker startup.
+    /// Core can't detect different runtimes backed by the same Store.
+    ///
+    /// Experimental.
+    #[builder(default)]
+    pub stream_runtimes: StreamRuntimes,
+
+    /// True on a replay Worker, which doesn't make live Stream calls.
+    #[builder(skip)]
+    pub(crate) replays_only: bool,
+
     /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
     /// oversized payloads are still warned about, and the server still rejects them. When unset, an
     /// oversized completion is proactively failed as a WFT/activity rather than sent.
@@ -391,6 +410,7 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         {
             return Err("max_outstanding_* fields are mutually exclusive with `tuner`".to_string());
         }
+        config.stream_runtimes.check()?;
 
         match &config.versioning_strategy {
             WorkerVersioningStrategy::None { .. } => {}
@@ -736,6 +756,9 @@ impl Worker {
         worker_heartbeat_options: Option<WorkerHeartbeatOptions>,
         shared_namespace_worker: bool,
     ) -> Result<Worker, anyhow::Error> {
+        // `stream_runtimes` and its settings are public fields, so a config can change them after
+        // its builder checked them.
+        (config.stream_runtimes.check()).map_err(anyhow::Error::msg)?;
         let (metrics, meter) = if let Some(wt) = worker_telemetry.as_ref() {
             (
                 MetricsContext::top_level_with_meter(

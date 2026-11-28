@@ -4734,6 +4734,7 @@ dependencies = [
  "temporalio-macros",
  "temporalio-sdk",
  "temporalio-sdk-aws-lambda",
+ "temporalio-streams",
  "temporalio-workflow",
  "thiserror 2.0.21",
  "tokio",

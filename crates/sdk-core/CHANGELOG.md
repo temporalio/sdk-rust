@@ -37,6 +37,9 @@ relevant information.
 ## Unreleased
 
 ### Added
+* [lang-internal] `AppendToStream` dispatches through a Store in `WorkerConfig::stream_runtimes`.
+  Core records the result in a `core_stream_append` marker for replay.
+  An outage at the task heartbeat fails the Workflow Task with `StreamStoreUnavailable:`.
 * [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
   a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
 

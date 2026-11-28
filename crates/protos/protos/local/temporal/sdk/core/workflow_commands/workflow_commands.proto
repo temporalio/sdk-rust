@@ -16,6 +16,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
+import "temporal/api/sdk/v1/stream.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
@@ -55,6 +56,7 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        AppendToStream append_to_stream = 23;
     }
 }
 
@@ -419,4 +421,21 @@ message ScheduleNexusOperation {
 message RequestCancelNexusOperation {
     // Lang's incremental sequence number as passed to `ScheduleNexusOperation`
     uint32 seq = 1;
+}
+
+// Appends Records as the Workflow Producer and returns ResolveStreamAppend. A retry of a task
+// whose append has no result in History can write the batch again. Core sends appends to each
+// Stream in command order.
+//
+// An empty Store name selects the runtime under the empty name, or the only runtime if there
+// is no such entry. Invalid seq or Stream references, missing runtimes and a Store outage at
+// the task heartbeat fail the Workflow Task. Invalid batches return a failed job.
+//
+// Lang must accept results for appends it no longer awaits. The terminal Workflow command drops
+// unresolved appends. Replay matches seq and Stream and uses the result in History.
+message AppendToStream {
+    // Lang's incremental sequence number for appends, starting at 1.
+    uint32 seq = 1;
+    temporal.api.sdk.v1.StreamRef stream = 2;
+    repeated temporal.api.common.v1.Payload bodies = 3;
 }

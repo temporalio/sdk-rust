@@ -32,7 +32,7 @@ import "temporal/sdk/core/nexus/nexus.proto";
 // 3. random-seed-updates
 // 4. signals/updates
 // 5. all others
-// 6. local activity resolutions
+// 6. Stream results and local activity resolutions
 // 7. queries
 // 8. evictions
 //
@@ -48,6 +48,13 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  in that same activation (prime example: cancelling not-wait-for-cancel activities). So, we do
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
+// * Stream results go with the local activity resolutions, for the same reason. Core records a
+//  Stream result in a `core_stream_append` marker, which History has after the
+//  `WorkflowTaskCompleted` event of its task. A replay must give the result before it reaches
+//  that event, so it scans ahead in History for the marker, as for a local activity marker. Each
+//  result in the marker has the index of the activation that got it, so the replay gives it in
+//  that same activation. In one activation, the Stream results go first, in `seq` order, and then
+//  the local activity resolutions. A task with a Stream marker retains its recorded groups.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -147,6 +154,8 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // An append to a Stream finished.
+        ResolveStreamAppend resolve_stream_append = 17;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -431,4 +440,24 @@ message RemoveFromCache {
         WORKFLOW_EXECUTION_ENDING = 10;
     }
     EvictionReason reason = 2;
+}
+
+// Core delivers the result in the next activation, or in the next task when the Store answers
+// during completion. Stream and Local Activity markers share an activation index. Replay
+// preserves the recorded activation groups for tasks that contain a Stream marker.
+message ResolveStreamAppend {
+    // The `seq` of the `AppendToStream`.
+    uint32 seq = 1;
+    oneof status {
+        StreamAppended appended = 2;
+        // An `ApplicationFailureInfo` of the type `stream_<reason>`, such as `stream_fenced`, with
+        // `non_retryable` set. Its details have one `binary/protobuf` payload of a
+        // `temporal.api.stream.v1.StreamErrorDetails`.
+        temporal.api.failure.v1.Failure failed = 3;
+    }
+}
+
+message StreamAppended {
+    bytes first_offset = 1;
+    bytes last_offset = 2;
 }

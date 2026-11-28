@@ -1141,6 +1141,12 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                Some(ActivationVariant::ResolveStreamAppend(_)) => {
+                    return Err(Box::new(Failure {
+                        message: "This SDK doesn't send any Stream command".to_string(),
+                        ..Default::default()
+                    }));
+                }
                 None => {
                     return Err(Box::new(Failure {
                         message: "Activation job missing variant".to_string(),

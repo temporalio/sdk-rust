@@ -7,6 +7,7 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
+pub(crate) mod streams;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;
@@ -37,6 +38,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
+            streams::{StreamResolution, Streams},
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
@@ -188,6 +190,7 @@ impl Workflows {
     ) -> Self {
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
+        let streams = Arc::new(Streams::new(&basics.worker_config, local_tx.clone()));
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let max_eager_activity_reservations_per_workflow_task = basics
@@ -249,6 +252,7 @@ impl Workflows {
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
+                        streams,
                     );
 
                     while let Some(output) = stream.next().await {
@@ -1523,13 +1527,16 @@ impl ValidatedCompletion {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum LocalResolution {
     LocalActivity(LocalActivityResolution),
+    Stream(StreamResolution),
 }
 impl LocalResolution {
     fn seq(&self) -> u32 {
         match self {
             LocalResolution::LocalActivity(lar) => lar.seq,
+            LocalResolution::Stream(resolution) => resolution.seq,
         }
     }
 
@@ -1538,6 +1545,7 @@ impl LocalResolution {
             LocalResolution::LocalActivity(lar) => {
                 matches!(lar.result, LocalActivityExecutionResult::Cancelled(_))
             }
+            LocalResolution::Stream(_) => false,
         }
     }
 }
@@ -1634,6 +1642,7 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    AppendToStream(AppendToStream),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1695,6 +1704,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
         };
         Ok(Self {
             variant,
@@ -1765,11 +1775,18 @@ impl From<OutgoingJob> for WorkflowActivationJob {
 
 /// Errors thrown inside of workflow machines
 #[derive(thiserror::Error, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) enum WFMachinesError {
     #[error("[TMPRL1100] Nondeterminism error: {0}")]
     Nondeterminism(String),
     #[error("Fatal error in workflow machines: {0}")]
     Fatal(String),
+    /// A Stream call that this Worker can't serve, on a Store with no runtime, with no Store name
+    /// and no runtime to pick for it, or in an outage, or a Stream marker over its size bound. The
+    /// Workflow Task fails with this message as-is. For an outage it starts with
+    /// `StreamStoreUnavailable:`, and for a marker with `StreamMarkerTooLarge:`.
+    #[error("{0}")]
+    Stream(String),
 }
 
 /// Helper macro to create Nondeterminism errors
@@ -1804,7 +1821,7 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
         }
     }
 
@@ -1883,7 +1900,7 @@ impl LocalActivityRequestSink for LAReqSink {
 /// 3. random-seed-updates
 /// 4. signals/updates
 /// 5. all others
-/// 6. local activity resolutions
+/// 6. Stream and Local Activity results, in recorded activation order
 /// 7. queries
 /// 8. evictions
 ///
@@ -1922,6 +1939,7 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::SignalWorkflow(_) => 3,
                 workflow_activation_job::Variant::DoUpdate(_) => 3,
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
+                workflow_activation_job::Variant::ResolveStreamAppend(_) => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.

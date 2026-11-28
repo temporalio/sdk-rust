@@ -9,12 +9,13 @@ use crate::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
             ActivationOrAuto, BufferedTasks, EvictionRequestResult, FailedActivationWFTReport,
             HeartbeatTimeoutMsg, HistoryUpdate, LocalActivityRequestSink, LocalResolution,
-            NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, RequestEvictMsg,
-            RunBasics, ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand,
-            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
-            WftFailureKind, WorkflowTaskInfo,
+            NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT, PreparedWFT,
+            RequestEvictMsg, RunBasics, ServerCommandsWithWorkflowInfo, TaskStorageMetrics,
+            WFCommand, WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION,
+            WFTReportStatus, WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
+            streams::{RunStreams, Streams, TaskState, is_stream_marker, task_attempt},
         },
     },
 };
@@ -72,6 +73,7 @@ pub(super) struct ManagedRun {
     ///
     /// This field is `None` when `WorkerTaskTypes.enable_local_activities` is false.
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+    streams: RunStreams,
     /// Set if the run is currently waiting on the execution of some local activities.
     waiting_on_la: Option<WaitingOnLAs>,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
@@ -107,13 +109,16 @@ impl ManagedRun {
         basics: RunBasics,
         wft: PermittedWFT,
         local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
+        streams: Arc<Streams>,
     ) -> (Self, RunUpdateAct) {
         let metrics = basics.metrics.clone();
         let config = basics.worker_config.clone();
+        let streams = RunStreams::new(streams, &basics);
         let wfm = WorkflowManager::new(basics);
         let mut me = Self {
             wfm,
             local_activity_request_sink,
+            streams,
             waiting_on_la: None,
             am_broken: false,
             wft: None,
@@ -224,6 +229,10 @@ impl ManagedRun {
         }
 
         self.paginator = Some(pwft.paginator);
+        if !was_legacy_query {
+            let task = TaskState::Open(task_attempt(&wft_info));
+            self.wfm.machines.stream_calls.set_task(task);
+        }
         self.wft = Some(OutstandingTask {
             info: wft_info,
             pending_queries,
@@ -265,9 +274,10 @@ impl ManagedRun {
             }
             r
         };
+        self.streams.dispatch(&mut self.wfm.machines.stream_calls);
 
         if activation.jobs.is_empty() {
-            if self.wfm.machines.outstanding_local_activity_count() > 0 {
+            if self.wfm.machines.outstanding_local_work() > 0 {
                 // If the activation has no jobs but there are outstanding LAs, we need to restart
                 // the WFT heartbeat.
                 if let Some(ref mut lawait) = self.waiting_on_la {
@@ -275,6 +285,7 @@ impl ManagedRun {
                     lawait.hb_timeout_handle = sink_heartbeat_timeout_start(
                         self.wfm.machines.run_id.clone(),
                         self.local_activity_request_sink.as_deref(),
+                        &self.streams,
                         start_time,
                         lawait.wft_timeout,
                     );
@@ -361,9 +372,7 @@ impl ManagedRun {
             Ok(Some(ActivationOrAuto::LangActivation(
                 self.wfm.get_next_activation()?,
             )))
-        } else if self.waiting_on_la.is_some()
-            && self.wfm.machines.outstanding_local_activity_count() == 0
-        {
+        } else if self.waiting_on_la.is_some() && self.wfm.machines.outstanding_local_work() == 0 {
             self.waiting_on_la
                 .take()
                 .expect("waiting_on_la was just checked")
@@ -381,7 +390,7 @@ impl ManagedRun {
                     .unwrap_or_default();
                 if has_pending_queries {
                     return Ok(Some(ActivationOrAuto::ReadyForQueries(
-                        self.wfm.machines.get_wf_activation(),
+                        self.wfm.machines.get_wf_activation()?,
                     )));
                 }
             }
@@ -697,6 +706,11 @@ impl ManagedRun {
                 });
         }
 
+        // History gets no marker from a failed task, so Workflow code must not get any of its
+        // Stream results.
+        if !is_no_report_query_fail {
+            self.streams.stop(&mut self.wfm.machines.stream_calls);
+        }
         self.reply_to_complete(
             ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
                 tt,
@@ -774,11 +788,10 @@ impl ManagedRun {
         let completing_heartbeat_autocomplete =
             matches!(self.activation, Some(OutstandingActivation::Autocomplete))
                 && self.waiting_on_la.is_some();
-        let completing_la_heartbeat = completing_heartbeat_autocomplete
-            || self
-                .waiting_on_la
-                .as_ref()
-                .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
+        let heartbeat_timeout_pending =
+            (self.waiting_on_la.as_ref()).is_some_and(|waiting| waiting.heartbeat_timeout_pending);
+        let completing_la_heartbeat =
+            completing_heartbeat_autocomplete || heartbeat_timeout_pending;
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
@@ -819,10 +832,16 @@ impl ManagedRun {
             let mut new_local_acts = self.wfm.drain_queued_local_activities();
             self.stamp_dispatching_task(&mut new_local_acts);
             self.sink_la_requests(new_local_acts)?;
+            self.streams.dispatch(&mut self.wfm.machines.stream_calls);
 
-            if self.wfm.machines.outstanding_local_activity_count() == 0 {
+            if self.wfm.machines.outstanding_local_work() == 0 {
                 Ok(None)
             } else {
+                // A forced task for a call that waits on a Store in an outage would only add
+                // events. So the task fails at its heartbeat, and the server retries it.
+                if heartbeat_timeout_pending && let Some(outage) = self.streams.outage() {
+                    return Err(WFMachinesError::Stream(outage));
+                }
                 let wft_timeout: Duration = self
                     .wfm
                     .machines
@@ -859,6 +878,7 @@ impl ManagedRun {
                     let hb_timeout_handle = sink_heartbeat_timeout_start(
                         self.run_id().to_string(),
                         self.local_activity_request_sink.as_deref(),
+                        &self.streams,
                         start_t,
                         wft_timeout,
                     );
@@ -882,6 +902,7 @@ impl ManagedRun {
                         hb_timeout_handle: sink_heartbeat_timeout_start(
                             self.run_id().to_string(),
                             self.local_activity_request_sink.as_deref(),
+                            &self.streams,
                             start_t,
                             wft_timeout,
                         ),
@@ -923,6 +944,7 @@ impl ManagedRun {
             return self._check_more_activations();
         }
         self.wfm.notify_of_local_result(res)?;
+        self.streams.dispatch(&mut self.wfm.machines.stream_calls);
         if self.activation.is_none() {
             self._check_more_activations()
         } else {
@@ -945,6 +967,7 @@ impl ManagedRun {
         if let Some(ref mut wait_dat) = self.waiting_on_la {
             wait_dat.hb_timeout_handle.abort();
             wait_dat.heartbeat_timeout_pending = true;
+            self.complete_stream_task();
             return self.activation.is_none();
         }
         false
@@ -991,6 +1014,64 @@ impl ManagedRun {
         self.task_buffer.has_tasks()
     }
 
+    /// Returns true if the run must replay from History before it can process the task `work`.
+    /// That's the case when both of these hold.
+    ///
+    /// - `work` isn't the next task of the run's History. It replaces the task that the run holds,
+    ///   or its `previous_started_event_id` is above the last started event id that the run knows,
+    ///   so another Worker completed a task.
+    /// - The run has Stream work, which is a call with no result in a marker, a marker that History
+    ///   doesn't have yet, or a Stream marker in the events of `work`.
+    pub(super) fn stream_work_is_stale_for(&self, work: &PreparedWFT) -> bool {
+        let machines = &self.wfm.machines;
+        let update = &work.update;
+        // The server hands out a task only after the previous one is over. So a task that arrives
+        // while the run still holds an unreported one replaces it, whatever its started event id.
+        // `awaiting_next_wft` is already set while lang answers attached queries. A replacing task
+        // then waits, and the held task's completion gets `NotFound`, which also replays the run.
+        let replaces_held_task = self.wft.is_some()
+            && !self.wfm.awaiting_next_wft
+            && !self.pending_work_is_legacy_query()
+            && work.legacy_query.is_none();
+        // A run that still replays has applied fewer events than its task has.
+        let held = (self.wft.iter())
+            .flat_map(|wft| {
+                [
+                    wft.info.started_event_id,
+                    wft.info.previous_started_event_id,
+                ]
+            })
+            .fold(machines.get_last_wft_started_id(), i64::max);
+        let after_other_tasks = update.is_real() && update.previous_wft_started_id > held;
+        (replaces_held_task || after_other_tasks)
+            && (machines.stream_calls.needs_next_task()
+                || machines.stream_calls.has_marker()
+                || update.get_events().iter().any(is_stream_marker))
+    }
+
+    /// Stops the Stream calls of the run, and evicts it. The run that replaces it processes `work`,
+    /// and replays from History what the other attempt or Worker recorded.
+    pub(super) fn evict_for_stale_stream_work(&mut self, work: PermittedWFT) -> RunUpdateAct {
+        // A broken run doesn't give lang a query, and a run with a legacy query must still answer
+        // it before it's evicted.
+        if !self.pending_work_is_legacy_query() {
+            self.streams.stop(&mut self.wfm.machines.stream_calls);
+            // A replay that went on with no Stream result would end in a false nondeterminism
+            // error.
+            self.am_broken = true;
+        }
+        self.task_buffer.buffer(work);
+        self.request_eviction(RequestEvictMsg {
+            run_id: self.run_id().to_string(),
+            message: "The server gave out a newer Workflow Task than the last one that the cached \
+                      run saw, so the run replays from History"
+                .to_string(),
+            reason: EvictionReason::CacheMiss,
+            auto_reply_fail: None,
+        })
+        .into_run_update_resp()
+    }
+
     pub(super) fn request_eviction(&mut self, info: RequestEvictMsg) -> EvictionRequestResult {
         // If we were waiting on a page fetch and we're getting evicted because fetching failed,
         // then make sure we allow the completion to proceed, otherwise we're stuck waiting forever.
@@ -1017,6 +1098,16 @@ impl ManagedRun {
                     reason=?info.reason,
                     outstanding_local_activities=outstanding_las,
                     "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are cancelled and will be re-executed on replay"
+                );
+            }
+            let outstanding_stream_calls = self.wfm.machines.stream_calls.outstanding();
+            if outstanding_stream_calls > 0 && self.config.max_cached_workflows == 0 {
+                warn!(
+                    run_id=%info.run_id,
+                    reason=?info.reason,
+                    outstanding_stream_calls,
+                    "Eviction requested while Stream calls are still in flight; Stream calls when \
+                     using max_cached_workflows=0 are stopped and will run again on replay"
                 );
             }
             debug!(run_id=%info.run_id, reason=%info.message, "Eviction requested");
@@ -1105,6 +1196,7 @@ impl ManagedRun {
                                 if let Some(waiting) = self.waiting_on_la.take() {
                                     waiting.hb_timeout_handle.abort();
                                 }
+                                self.streams.cancel();
                                 if let Err(e) =
                                     self.sink_la_requests(vec![LocalActRequest::CancelAllInRun(
                                         self.run_id().to_string(),
@@ -1236,18 +1328,22 @@ impl ManagedRun {
         let workflow_id = self.wfm.machines.workflow_id.clone();
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
+        // An evicted run with an open Stream call completes its task, and doesn't let it time out.
+        let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
             && (machines_wft_response.commands().peek().is_some()
-                || machines_wft_response.has_messages());
+                || machines_wft_response.has_messages()
+                || stream_calls_open);
 
         let query_responses = data.query_responses;
         let has_query_responses = !query_responses.is_empty();
         let is_query_playback = data.has_pending_query && !has_query_responses;
         // Unrecorded LAs must get a replacement task on which to execute after eviction, just
         // like LAs that remain outstanding across a workflow-task heartbeat.
-        let mut force_new_wft =
-            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las);
+        let mut force_new_wft = due_to_heartbeat_timeout
+            || (eviction_has_output && outstanding_las)
+            || stream_calls_open;
 
         // We only actually want to send commands back to the server if there are no more pending
         // activations and we are caught up on replay. We don't want to complete a wft if we already
@@ -1285,6 +1381,7 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
+                machines_wft_response.mark_open_stream_calls();
                 let mut commands: Vec<_> = machines_wft_response.commands().collect();
                 // The server already has the replayed task that lang's queued commands came from,
                 // so sending them again would repeat or contradict its history. Core pushes the
@@ -1321,6 +1418,7 @@ impl ManagedRun {
         let replaying = machines_wft_response.replaying;
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
             self.wfm.hold_local_resolutions_until_next_wft();
+            self.wfm.machines.stream_calls.set_task(TaskState::NoTask);
         }
         if evict_after_report {
             // The activation is still outstanding, so the eviction is only issued once the
@@ -1341,6 +1439,15 @@ impl ManagedRun {
                 task_token: self.wft.as_ref().map(|t| t.info.task_token.clone()),
             },
             resp_chan,
+        }
+    }
+
+    /// Closes the task to the Stream calls, so that it can complete while results still arrive.
+    /// Until the next task, no call starts and Workflow code gets no live result.
+    fn complete_stream_task(&mut self) {
+        if let Some(wft) = self.wft.as_ref() {
+            let task = TaskState::Completing(task_attempt(&wft.info));
+            self.wfm.machines.stream_calls.set_task(task);
         }
     }
 
@@ -1529,6 +1636,7 @@ fn put_queries_in_act(act: &mut WorkflowActivation, wft: &mut OutstandingTask) {
 fn sink_heartbeat_timeout_start(
     run_id: String,
     sink: Option<&dyn LocalActivityRequestSink>,
+    streams: &RunStreams,
     wft_start_time: Instant,
     wft_timeout: Duration,
 ) -> AbortHandle {
@@ -1544,6 +1652,8 @@ fn sink_heartbeat_timeout_start(
             deadline,
             abort_reg,
         }]);
+    } else {
+        streams.heartbeat_at(deadline, abort_reg);
     }
     abort_handle
 }
@@ -1651,7 +1761,7 @@ impl WorkflowManager {
             self.machines.apply_next_wft_from_history()?;
         }
         self.awaiting_activation_completion = self.machines.activation_needed();
-        Ok(self.machines.get_wf_activation())
+        self.machines.get_wf_activation()
     }
 
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
@@ -1718,6 +1828,7 @@ impl WorkflowManager {
     fn deferred_local_activity_seqs(&self) -> Vec<u32> {
         self.deferred_local_resolutions
             .iter()
+            .filter(|resolution| matches!(resolution, LocalResolution::LocalActivity(_)))
             .map(LocalResolution::seq)
             .collect()
     }
