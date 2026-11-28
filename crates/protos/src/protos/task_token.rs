@@ -69,7 +69,7 @@ struct ServerActivityToken {
 }
 
 /// The server exposes the scheduling event ID only in its internal task token.
-/// Return zero if a different token format lacks a valid event ID.
+/// An unreadable token must not prevent Activity task delivery.
 pub(crate) fn scheduled_event_id(task_token: &[u8]) -> i64 {
     ServerActivityToken::decode(task_token).map_or(0, |token| token.scheduled_event_id.max(0))
 }
@@ -80,8 +80,9 @@ mod tests {
 
     #[test]
     fn read_scheduled_event_id_from_field_four() {
-        // Field 1 holds a namespace and field 10 holds the started event ID.
+        // The scheduling event ID must remain distinct from the started event ID.
         assert_eq!(scheduled_event_id(&[0x0a, 1, b'n', 0x20, 5, 0x50, 9]), 5);
+        assert_eq!(scheduled_event_id(&[0x0a, 1, b'n', 0x50, 9]), 0);
         assert_eq!(scheduled_event_id(&[0xff]), 0);
         assert_eq!(scheduled_event_id(&[0x22, 1, 0]), 0);
         let negative = ServerActivityToken {

@@ -1006,14 +1006,18 @@ async fn activity_workflow() {
     .unwrap();
     // Poll activity and verify that it's been scheduled with correct parameters
     let task = core.poll_activity_task().await.unwrap();
-    assert_matches!(
-        task.variant,
+    let scheduled_event_id = match &task.variant {
         Some(act_task::Variant::Start(start_activity)) => {
-            assert_eq!(start_activity.activity_type, DEFAULT_ACTIVITY_TYPE.to_string());
+            assert_eq!(
+                start_activity.activity_type,
+                DEFAULT_ACTIVITY_TYPE.to_string()
+            );
             // Workflow-scheduled activities have no activity run ID
             assert!(start_activity.run_id.is_empty());
+            start_activity.scheduled_event_id
         }
-    );
+        _ => panic!("The Activity task did not contain a Start"),
+    };
     let response_payload = Payload {
         data: b"hello ".to_vec(),
         metadata: Default::default(),
@@ -1046,47 +1050,15 @@ async fn activity_workflow() {
         }
     );
     core.complete_execution(&task.run_id).await;
-}
-
-// Core reads the id of the scheduled event of an Activity from the server's task token, whose
-// format only a real server shows.
-#[tokio::test]
-async fn an_activity_task_has_the_id_of_its_scheduled_event() {
-    let mut starter = init_core_and_create_wf("activity_task_has_scheduled_event_id").await;
-    let core = starter.get_core_worker().await;
-    let task_q = starter.get_task_queue();
-    let task = core.poll_workflow_activation().await.unwrap();
-    core.complete_workflow_activation(
-        schedule_activity_cmd(
-            0,
-            task_q,
-            "act-1",
-            ActivityCancellationType::TryCancel,
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        )
-        .into_completion(task.run_id),
-    )
-    .await
-    .unwrap();
-    let task = core.poll_activity_task().await.unwrap();
-    let Some(act_task::Variant::Start(start)) = task.variant else {
-        panic!("The first Activity task starts the Activity");
-    };
-    core.complete_activity_task(ActivityTaskCompletion {
-        task_token: task.task_token,
-        result: Some(ActivityExecutionResult::ok(Payload::default())),
-    })
-    .await
-    .unwrap();
-    let task = core.poll_workflow_activation().await.unwrap();
-    core.complete_execution(&task.run_id).await;
+    // Mock tokens cannot check compatibility with the server's private token format.
     let history = starter.get_history().await;
-    let scheduled: Vec<i64> = (history.events.iter())
+    let scheduled: Vec<i64> = history
+        .events
+        .iter()
         .filter(|event| event.event_type() == EventType::ActivityTaskScheduled)
         .map(|event| event.event_id)
         .collect();
-    assert_eq!(scheduled, [start.scheduled_event_id]);
+    assert_eq!(scheduled, [scheduled_event_id]);
 }
 
 #[tokio::test]
