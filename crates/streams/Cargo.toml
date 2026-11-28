@@ -15,6 +15,7 @@ categories = ["development-tools"]
 enum-iterator = "2"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 prost = { workspace = true }
+thiserror = "2"
 
 [dependencies.temporalio-common]
 path = "../common"

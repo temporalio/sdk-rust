@@ -56,7 +56,7 @@ pub fn validate_offset(offset: &[u8], what: &str, reason: AnyReason) -> Result<(
 /// negative. Stores and readers tell Producers apart by their ids, and the attempts of a Producer
 /// by the fields of the attempt, so both have to be complete. The started time of a Workflow Task
 /// is the one optional field, because the server doesn't always send it. Each time of the attempt
-/// must have nanos from 0 to 999,999,999.
+/// must be at or after the Unix epoch and have nanos from 0 to 999,999,999.
 pub(crate) fn validate_producer(producer: Option<&Producer>) -> Result<&Producer, AnyError> {
     let producer =
         producer.ok_or_else(|| AnyError::invalid_argument("The request has no Producer"))?;
@@ -88,7 +88,7 @@ pub(crate) fn validate_producer(producer: Option<&Producer>) -> Result<&Producer
             let attempt = attempt.as_ref().ok_or_else(|| missing("attempt"))?;
             let scheduled = attempt.attempt_scheduled_time.as_ref();
             let scheduled = scheduled.ok_or_else(|| missing("attempt scheduled time"))?;
-            validate_nanos(scheduled.nanos, "attempt scheduled time")?;
+            validate_time(scheduled.seconds, scheduled.nanos, "attempt scheduled time")?;
             at_least_one(attempt.attempt, "Activity")?;
         }
         Kind::Client(_) => {}
@@ -118,12 +118,22 @@ fn validate_task(task: &WorkflowTaskAttempt) -> Result<(), AnyError> {
         ));
     }
     if let Some(started) = &task.started_time {
-        validate_nanos(started.nanos, "started time of the Workflow Task")?;
+        validate_time(
+            started.seconds,
+            started.nanos,
+            "started time of the Workflow Task",
+        )?;
     }
     at_least_one(task.attempt, "Workflow Task")
 }
 
-fn validate_nanos(nanos: i32, time: &str) -> Result<(), AnyError> {
+fn validate_time(seconds: i64, nanos: i32, time: &str) -> Result<(), AnyError> {
+    // Persisted attempt keys encode negative seconds as zero, which would misorder writes.
+    if seconds < 0 {
+        return Err(AnyError::invalid_argument(format!(
+            "The {time} is before the Unix epoch"
+        )));
+    }
     if !(0..=MAX_NANOS).contains(&nanos) {
         return Err(AnyError::invalid_argument(format!(
             "The {time} has {nanos} nanos, and it must have 0 to {MAX_NANOS}"
@@ -228,6 +238,14 @@ mod tests {
         }
         let started_event_id = "The Workflow Task attempt has no started event id";
         let cases = [
+            (
+                Some(standalone_activity(-1, 0, 1)),
+                "The attempt scheduled time is before the Unix epoch",
+            ),
+            (
+                Some(workflow(Some(task(1, 1, -1)))),
+                "The started time of the Workflow Task is before the Unix epoch",
+            ),
             (None, "The request has no Producer"),
             (
                 Some(with_scheduled_event_id(activity(0, 0, 1), -1)),

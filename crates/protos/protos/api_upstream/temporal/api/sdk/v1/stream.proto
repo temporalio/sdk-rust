@@ -22,7 +22,7 @@ import "temporal/api/stream/v1/message.proto";
 // SDKs encode references with this message so that other SDKs can decode them.
 message StreamRef {
   string id = 1;
-  // The registered Store name. Empty selects the configured default.
+  // When empty, the SDK uses its Store selector or the only registered Store.
   // This field is local to the SDK. Store and server requests omit it.
   string store = 2;
 }
