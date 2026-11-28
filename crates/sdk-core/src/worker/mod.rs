@@ -287,6 +287,7 @@ pub struct WorkerConfig {
     /// the runtime registered under `""`, or the only runtime. An unresolved Store fails the task.
     ///
     /// Replay uses the recorded Store for a ref with no Store name and makes no append call.
+    /// Replayed reads need that Store's runtime and retained Records to verify their digests.
     /// An explicit Store name must match History.
     ///
     /// Give each Store one name so its appends share one queue. Reusing a runtime under two names

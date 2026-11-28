@@ -1540,6 +1540,77 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+#[tokio::test]
+async fn a_panicked_waiting_read_fails_its_task_at_the_read_limit() {
+    let store = store(&["s"]).await;
+    store.panic_once(Op::Read);
+    let mut opts = StartOpts::new(&store);
+    opts.fails = 1;
+    opts.configure = Box::new(|wc| {
+        wc.stream_runtimes.settings.read_time = Some(Duration::from_millis(200));
+    });
+    // The heartbeat comes well after the read cutoff.
+    let run = start(history(Duration::from_secs(60)), opts);
+    let drive = run.drive(|activation| {
+        assert!(matches!(
+            activation.jobs[0].variant,
+            Some(Job::InitializeWorkflow(_))
+        ));
+        vec![
+            ReadStream {
+                seq: 1,
+                stream: Some(stream("s")),
+                wait: Some(Duration::from_secs(30).try_into().unwrap()),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    });
+    tokio::time::timeout(Duration::from_secs(10), drive)
+        .await
+        .expect("The read cutoff did not fail the task");
+    assert_eq!(
+        run.failed.lock()[0],
+        (
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+            "StreamStoreUnavailable: A Stream Store task ended without a result".to_string(),
+        )
+    );
+    assert!(run.sent().is_empty());
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+#[tokio::test]
+async fn a_terminal_command_drops_a_panicked_read() {
+    let store = store(&["s"]).await;
+    store.panic_once(Op::Read);
+    store.hold(Op::Append);
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let drive = run.drive(|activation| match activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![
+            ReadStream {
+                seq: 1,
+                stream: Some(stream("s")),
+                wait: Some(Duration::from_secs(30).try_into().unwrap()),
+                ..Default::default()
+            }
+            .into(),
+            append(1, "s"),
+        ],
+        Some(Job::ResolveStreamAppend(_)) => vec![complete()],
+        ref job => panic!("Unexpected activation {job:?}"),
+    });
+    let release = async {
+        wait_until(|| !store.reads().is_empty()).await;
+        store.release();
+    };
+    let (jobs, ()) = tokio::join!(drive, release);
+    assert_eq!(jobs.len(), 2);
+    assert!(run.failed.lock().is_empty());
+    assert!(command_types(&run.sent()[0]).contains(&CommandType::CompleteWorkflowExecution));
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
 /// Returns the bytes of the data of each Stream marker of `completion`, of either kind.
 fn marker_sizes(completion: &WorkflowTaskCompletion) -> Vec<usize> {
     let names = [STREAM_APPEND_MARKER_NAME, STREAM_READ_MARKER_NAME];

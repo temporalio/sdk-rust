@@ -404,14 +404,24 @@ impl WorkflowMachines {
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
+    pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
+        self.install_history(update);
+        self.apply_next_wft_from_history()?;
+        Ok(())
+    }
+
+    pub(crate) fn add_history_page(&mut self, mut page: HistoryUpdate) {
+        self.note_wft_events(page.get_events());
+        page.prepend_unapplied(&mut self.last_history_from_server);
+        self.install_history(page);
+    }
+
+    fn install_history(&mut self, mut update: HistoryUpdate) {
         update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
-        self.apply_next_wft_from_history()?;
-        Ok(())
     }
 
     /// Adds the Records of the next read markers of the history from the server.

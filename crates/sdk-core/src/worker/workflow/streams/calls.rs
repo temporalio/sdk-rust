@@ -59,7 +59,6 @@ impl From<ReplayError> for WFMachinesError {
 /// It's a fact of the format of that failure, which History keeps.
 const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
 
-/// Gives the failure of a [`WFMachinesError::StreamReplay`] its type.
 pub(crate) fn set_replay_failure_type(failure: &mut workflow_completion::Failure) {
     if let Some(FailureInfo::ApplicationFailureInfo(info)) =
         (failure.failure.as_mut()).and_then(|failure| failure.failure_info.as_mut())
@@ -68,7 +67,6 @@ pub(crate) fn set_replay_failure_type(failure: &mut workflow_completion::Failure
     }
 }
 
-/// Returns true for the failure of a [`WFMachinesError::StreamReplay`].
 pub(crate) fn is_stream_replay_failure(failure: &workflow_completion::Failure) -> bool {
     let info = (failure.failure.as_ref()).and_then(|failure| failure.failure_info.as_ref());
     matches!(info, Some(FailureInfo::ApplicationFailureInfo(info))
@@ -754,7 +752,6 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Returns true if the task in hand recorded a Stream marker that History doesn't have yet.
     pub(crate) fn has_marker(&self) -> bool {
         self.marked
     }
@@ -785,7 +782,6 @@ impl StreamCalls {
         appends + reads
     }
 
-    /// Returns true once the replay is over and the run makes live calls.
     pub(crate) fn is_live(&self) -> bool {
         self.phase == Phase::Live
     }
@@ -794,7 +790,6 @@ impl StreamCalls {
         &self.runtimes.settings
     }
 
-    /// Returns true while a live read of the task in hand has no answer.
     pub(crate) fn read_runs(&self) -> bool {
         self.phase == Phase::Live
             && self.task.is_open()
@@ -844,18 +839,11 @@ impl StreamCalls {
         (!self.marker.appends.is_empty()).then(|| mem::take(&mut self.marker))
     }
 
-    /// Returns the read marker of the live results that the last [`Self::take_jobs`] gave, if it
-    /// gave any.
     pub(crate) fn take_read_marker(&mut self) -> Option<StreamReadMarkerData> {
         (!self.read_marker.reads.is_empty()).then(|| mem::take(&mut self.read_marker))
     }
 
-    /// Returns a marker with no entry if the task completes with a new task `forced`, while a call
-    /// has no result in a marker and the task recorded none. A replay with chunking on would
-    /// otherwise take the task as a heartbeat and join it to the next one, whose activation
-    /// indexes would then not match. A task with another command event (`has_command_event`)
-    /// or with chunking off isn't joined, so it needs none. It's of the append kind if an append
-    /// is open.
+    // An empty marker preserves the task boundary so replay keeps activation indexes intact.
     pub(crate) fn take_completion_marker(
         &mut self,
         forced: bool,
@@ -881,8 +869,6 @@ impl StreamCalls {
         Some(marker)
     }
 
-    /// Makes each read that starts ask the Store to wait at most `max_wait`, and notes the reads
-    /// that then don't wait.
     pub(crate) fn limit_read_waits(&mut self, max_wait: Duration) {
         for request in &mut self.requests {
             let Request::Run(Call {
@@ -993,8 +979,6 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Starts read `seq` if it waits, the run is live, its task is open and has room for another
-    /// read result. After the read limit the read is a check.
     fn run_read(&mut self, seq: u32) {
         if self.phase != Phase::Live || !self.task.is_open() {
             return;
@@ -1008,7 +992,6 @@ impl StreamCalls {
         self.start_read(seq, self.read_limit_passed);
     }
 
-    /// Starts read `seq`, which waits. A check is one Store call with no wait.
     fn start_read(&mut self, seq: u32, check: bool) {
         let read = self.reads.get_mut(&seq).expect("The caller found the read");
         let call_id = CALL_IDS.fetch_add(1, Ordering::Relaxed);
@@ -1273,7 +1256,6 @@ fn valid_stream(call: CallKey, stream: Option<StreamRef>) -> Result<StreamRef, W
     Ok(stream)
 }
 
-/// Checks that neither maximum of the page of a read is negative.
 fn check_page_size(max_records: i32, max_bytes: i64) -> Result<(), AnyError> {
     let maximums = [
         ("max_records", i64::from(max_records)),
@@ -1312,12 +1294,10 @@ fn stop_call(requests: &mut Vec<Request>, call_id: u64) {
     }
 }
 
-/// Returns true for the failure of a Store in an outage.
 fn is_outage(failure: &StreamFailure) -> bool {
     failure.reason == StreamErrorReason::StoreUnavailable.as_str_name()
 }
 
-/// Returns the error that fails the task of a read in an outage, in the form of an append's.
 fn read_outage(stream: &StreamRef, failure: &StreamFailure) -> WFMachinesError {
     let error = ReadError::store_unavailable(failure.message.clone());
     WFMachinesError::Stream(format!(
@@ -1571,7 +1551,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Gives a running read the answer `done`.
     fn answer_read(calls: &mut StreamCalls, seq: u32, done: ReadDone) {
         let ReadState::Running(call_id, ..) = calls.reads[&seq].state else {
             panic!("read {seq} doesn't run");

@@ -872,7 +872,6 @@ impl ManagedRun {
         }
 
         let mut waits_for_page = false;
-        let unread_records = (self.paginator.as_ref()).is_some_and(ReplayReader::has_unread_in);
         // A heartbeat, and a query answer while work is open, force the next task, so they stop no
         // read.
         let forces_next_task = completing_la_heartbeat || !data.query_responses.is_empty();
@@ -881,9 +880,7 @@ impl ManagedRun {
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;
             match update_from_new_page {
-                Some(FetchedPage::History(update)) => {
-                    self.wfm.feed_history_from_new_page(update)?
-                }
+                Some(FetchedPage::History(update)) => self.wfm.machines.add_history_page(update),
                 Some(FetchedPage::StreamRecords(reads)) => {
                     self.wfm.machines.add_stream_reads(reads)
                 }
@@ -896,10 +893,9 @@ impl ManagedRun {
                 && !self.am_broken
                 && !completion.is_forced_failure
             {
-                self.wfm.apply_next_task_if_ready(unread_records)?;
-                waits_for_page = unread_records
-                    && !self.wfm.machines.activation_needed()
-                    && !self.wfm.ready_to_apply_next_wft();
+                self.wfm.apply_next_task_if_ready()?;
+                waits_for_page =
+                    !self.wfm.machines.activation_needed() && !self.wfm.ready_to_apply_next_wft();
                 if waits_for_page {
                     return Ok(None);
                 }
@@ -908,6 +904,7 @@ impl ManagedRun {
             self.stamp_dispatching_task(&mut new_local_acts);
             self.sink_la_requests(new_local_acts)?;
 
+            self.check_read_tasks()?;
             if !forces_next_task {
                 let hold = self.wfm.machines.has_work_for_server();
                 self.wfm.machines.stream_calls.hold_check_pages(hold);
@@ -1054,12 +1051,21 @@ impl ManagedRun {
         }
     }
 
-    /// Ends the reads of the task in hand that have no answer, at the timer of its read limit.
+    fn check_read_tasks(&self) -> Result<()> {
+        if self.wfm.machines.stream_calls.read_runs() {
+            self.streams.check_read_tasks()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn read_limit_reached(&mut self, generation: u64) -> RunUpdateAct {
         if !self.read_limit.expires(generation) {
             return None;
         }
-        if let Err(error) = self.wfm.machines.stream_calls.read_limit() {
+        if let Err(error) = self
+            .check_read_tasks()
+            .and_then(|()| self.wfm.machines.stream_calls.read_limit())
+        {
             return self.update_to_acts(Err(error.into()));
         }
         self.dispatch_stream_calls();
@@ -1071,7 +1077,6 @@ impl ManagedRun {
         self.update_to_acts(res.map(Into::into))
     }
 
-    /// Runs the timer of the read limit of the task in hand while one of its reads has no answer.
     fn sync_read_limit(&mut self) {
         if self.wft.is_none() || self.am_broken || !self.wfm.machines.stream_calls.read_runs() {
             return;
@@ -1080,8 +1085,6 @@ impl ManagedRun {
         self.streams.read_limit_at(&mut self.read_limit);
     }
 
-    /// Gives the task in hand its read limit, once the run is live and knows its Workflow Task
-    /// timeout.
     fn set_read_limit(&mut self) {
         if self.wfm.machines.stream_calls.is_live()
             && let Some(wft) = self.wft.as_ref()
@@ -1093,8 +1096,6 @@ impl ManagedRun {
         }
     }
 
-    /// Starts and stops the Stream calls that the machines decided on. A read waits for the Store
-    /// at most the time that the task has left to its read limit.
     fn dispatch_stream_calls(&mut self) {
         self.set_read_limit();
         let time_left = self.read_limit.left();
@@ -1885,12 +1886,6 @@ impl WorkflowManager {
         self.get_next_activation()
     }
 
-    /// Update the machines with some events from fetching another page of history. Does *not*
-    /// attempt to pull the next activation, unlike [Self::new_work_from_server].
-    fn feed_history_from_new_page(&mut self, update: HistoryUpdate) -> Result<()> {
-        self.machines.new_history_from_server(update)
-    }
-
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
     /// local activity or side effect
     fn notify_of_local_result(&mut self, resolved: LocalResolution) -> Result<()> {
@@ -1931,21 +1926,10 @@ impl WorkflowManager {
 
     /// If no activation is needed, apply the next workflow task and check again.
     /// Importantly, does not *drain* jobs.
-    fn apply_next_task_if_ready(&mut self, unread_stream_records: bool) -> Result<()> {
-        if self.machines.activation_needed() {
-            return Ok(());
-        }
-        loop {
+    fn apply_next_task_if_ready(&mut self) -> Result<()> {
+        while !self.machines.activation_needed() && self.machines.ready_to_apply_next_wft() {
             let consumed_events = self.machines.apply_next_wft_from_history()?;
-
-            if consumed_events == 0 || !self.machines.replaying || self.machines.activation_needed()
-            {
-                // Keep applying tasks while there are events, we are still replaying, and no
-                // activation is needed
-                break;
-            }
-            // The caller reads the Stream Records that the task after this one waits for.
-            if unread_stream_records && !self.machines.ready_to_apply_next_wft() {
+            if consumed_events == 0 || !self.machines.replaying {
                 break;
             }
         }

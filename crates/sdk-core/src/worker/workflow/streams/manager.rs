@@ -1,6 +1,7 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
 use super::{StreamRuntimes, StreamSettings, read::ReadDone};
+use crate::worker::workflow::WFMachinesError;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
 use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
@@ -58,7 +59,6 @@ pub(crate) enum Op {
     Read(ReadCall),
 }
 
-/// A read to run.
 #[derive(Debug)]
 pub(crate) struct ReadCall {
     /// The request of each try, with the `from_offset` and the page size of the read.
@@ -92,7 +92,10 @@ type Sink = Arc<dyn Fn(String, StreamResolution) + Send + Sync>;
 /// The running calls, keyed by run id and call id.
 type Tasks = Arc<Mutex<HashMap<String, HashMap<u64, Task>>>>;
 
+const TASK_ENDED: &str = "StreamStoreUnavailable: A Stream Store task ended without a result";
+
 struct Task {
+    is_read: bool,
     abort: AbortHandle,
     /// The failure of the last try, while the call waits to try again.
     outage: Option<String>,
@@ -131,11 +134,13 @@ impl StreamManager {
             match request {
                 Request::Run(call) => {
                     let call_id = call.call_id;
+                    let is_read = matches!(call.op, Op::Read(_));
                     let abort = self.spawn(run_id, call);
                     let run = tasks.entry(run_id.to_string()).or_default();
                     run.insert(
                         call_id,
                         Task {
+                            is_read,
                             abort,
                             outage: None,
                         },
@@ -174,10 +179,21 @@ impl StreamManager {
             .filter(|(_, task)| task.outage.is_some() || task.abort.is_finished())
             .min_by_key(|(call_id, _)| *call_id)
             .map(|(_, task)| {
-                task.outage.clone().unwrap_or_else(|| {
-                    "StreamStoreUnavailable: A Stream Store task ended without a result".to_string()
-                })
+                task.outage
+                    .clone()
+                    .unwrap_or_else(|| TASK_ENDED.to_string())
             })
+    }
+
+    pub(super) fn check_read_tasks(&self, run_id: &str) -> Result<(), WFMachinesError> {
+        // A read that ended without delivering a result must not become an empty page at cutoff.
+        if self.tasks.lock().get(run_id).is_some_and(|run| {
+            run.values()
+                .any(|task| task.is_read && task.abort.is_finished())
+        }) {
+            return Err(WFMachinesError::Stream(TASK_ENDED.to_string()));
+        }
+        Ok(())
     }
 
     fn spawn(&self, run_id: &str, call: Call) -> AbortHandle {
@@ -275,13 +291,8 @@ async fn run(
     }
 }
 
-/// Reads the page of Records after the `from_offset` of `read`. A page is one answer of the Store,
-/// which waits up to the read's wait for the first Record. An answer with no Record before the
-/// wait is up makes the read ask again from its `last_offset`, at most once per
-/// [`MIN_ASK_AGAIN`]. A try that fails with `StoreUnavailable`, or gets no answer by its deadline,
-/// is the last try of the read, and the read asks again after a backoff. A check is one try with
-/// no wait, which returns its outage. The run fails the task of a read whose last try failed, so a
-/// read notes no outage in the manager.
+// Back off after early empty pages to avoid repeated Store calls while no Records are available.
+// The run checks the last failure when the task ends, so read outages stay with the call.
 async fn read_page(
     runtime: &StreamRuntime,
     read: ReadCall,
