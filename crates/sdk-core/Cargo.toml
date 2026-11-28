@@ -97,6 +97,7 @@ reqwest = { version = "0.13", features = [
 ], default-features = false, optional = true }
 serde = "1.0"
 serde_json = { workspace = true }
+sha2 = "0.11"
 siphasher = "1.0"
 slotmap = "1.0"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
@@ -111,7 +112,7 @@ tokio = { version = "1.47", default-features = false, features = [
   "process",
   "macros",
 ] }
-tokio-util = { version = "0.7", features = ["io", "io-util"] }
+tokio-util = { version = "0.7", features = ["io", "io-util", "rt"] }
 tokio-stream = { version = "0.1", default-features = false }
 tonic = { workspace = true, default-features = false, features = [
   "tls-native-roots",

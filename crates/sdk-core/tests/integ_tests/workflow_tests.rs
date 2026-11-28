@@ -24,6 +24,7 @@ mod replay;
 mod resets;
 mod signals;
 mod stickyness;
+mod streams;
 mod timers;
 mod upsert_search_attrs;
 

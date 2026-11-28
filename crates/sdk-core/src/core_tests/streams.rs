@@ -1,6 +1,8 @@
 //! The Stream calls of Workflow code, through a Worker on a mock server. The mock server writes the
 //! History of each completion, so a replay Worker can replay it.
 
+mod reads;
+
 use self::AtTheEnd::{Answered, Runs, Taken, Waits, WithTheCommand};
 use crate::{
     StreamRuntimes, StreamSettings, Worker, WorkerConfig, WorkflowErrorType, init_replay_worker,
@@ -13,7 +15,9 @@ use crate::{
         test_worker_cfg,
     },
     worker::{
-        client::{WorkflowTaskCompletion, mocks::mock_worker_client},
+        client::{
+            LegacyQueryResult, MockWorkerClient, WorkflowTaskCompletion, mocks::mock_worker_client,
+        },
         streams::marker_details,
     },
 };
@@ -24,12 +28,14 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    iter,
     sync::Arc,
     time::{Duration, Instant},
 };
 use temporalio_common::{
     protos::{
-        constants::STREAM_APPEND_MARKER_NAME,
+        TaskToken,
+        constants::{STREAM_APPEND_MARKER_NAME, STREAM_READ_MARKER_NAME},
         coresdk::{
             ActivityTaskCompletion, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
@@ -39,14 +45,14 @@ use temporalio_common::{
                 stream_append_result,
             },
             workflow_activation::{
-                ResolveStreamAppend, StreamAppended, WorkflowActivation,
-                remove_from_cache::EvictionReason, resolve_stream_append,
+                ResolveStreamAppend, ResolveStreamRead, StreamAppended, WorkflowActivation,
+                remove_from_cache::EvictionReason, resolve_stream_append, resolve_stream_read,
                 workflow_activation_job::Variant as Job,
             },
             workflow_commands::{
                 ActivityCancellationType, AppendToStream, CancelWorkflowExecution,
                 CompleteWorkflowExecution, ContinueAsNewWorkflowExecution, FailWorkflowExecution,
-                QueryResult, QuerySuccess, RequestCancelActivity, ScheduleActivity,
+                QueryResult, QuerySuccess, ReadStream, RequestCancelActivity, ScheduleActivity,
                 ScheduleLocalActivity, StartTimer, UpdateResponse, query_result, update_response,
                 workflow_command::Variant as Command,
             },
@@ -55,16 +61,19 @@ use temporalio_common::{
         temporal::api::{
             command::v1::command::Attributes,
             common::v1::Payload,
-            enums::v1::{CommandType, WorkflowTaskFailedCause},
+            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
-                MarkerRecordedEventAttributes, WorkflowExecutionUpdateAcceptedEventAttributes,
-                WorkflowExecutionUpdateCompletedEventAttributes,
+                History, HistoryEvent, MarkerRecordedEventAttributes, TimerCanceledEventAttributes,
+                UpsertWorkflowSearchAttributesEventAttributes,
+                WorkflowExecutionUpdateAcceptedEventAttributes,
+                WorkflowExecutionUpdateCompletedEventAttributes, history_event,
             },
             query::v1::WorkflowQuery,
             update::v1::{Acceptance, Response as UpdateOutcome},
             workflowservice::v1::{
-                PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
+                GetWorkflowExecutionHistoryResponse, PollWorkflowTaskQueueResponse,
+                RespondWorkflowTaskCompletedResponse,
             },
         },
     },
@@ -174,7 +183,15 @@ struct StartOpts {
     refuse: Option<usize>,
     /// The failed Workflow Tasks that the server gets.
     fails: usize,
-    configure: fn(&mut WorkerConfig),
+    /// The query tasks that the server gets an answer for.
+    queries: usize,
+    /// The pages of History that the client fetches, in order.
+    pages: Vec<GetWorkflowExecutionHistoryResponse>,
+    /// The fetches of a page of History that fail, after `pages`.
+    failed_fetches: usize,
+    configure: Box<dyn FnOnce(&mut WorkerConfig)>,
+    /// The generated input that the run comes from, for the message of a failed task.
+    label: String,
 }
 
 impl StartOpts {
@@ -190,10 +207,17 @@ impl StartOpts {
             replay: false,
             refuse: None,
             fails: 0,
-            configure: |_| {},
+            queries: 0,
+            pages: vec![],
+            failed_fetches: 0,
+            configure: Box::new(|_| {}),
+            label: String::new(),
         }
     }
 }
+
+/// The task token of a query task that got an answer, with the message of a failed answer.
+type Answer = (Vec<u8>, Option<String>);
 
 struct Run {
     worker: Worker,
@@ -201,6 +225,7 @@ struct Run {
     sent: Arc<Mutex<Vec<WorkflowTaskCompletion>>>,
     /// The cause and the message of each failed Workflow Task.
     failed: Arc<Mutex<Vec<(WorkflowTaskFailedCause, String)>>>,
+    answers: Arc<Mutex<Vec<Answer>>>,
     /// The History that the completions wrote.
     history: Arc<Mutex<TestHistoryBuilder>>,
     /// Resolves once Core has taken each task of `StartOpts::tasks`, after the test dropped its
@@ -220,10 +245,15 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
         replay,
         refuse,
         fails,
+        queries,
+        pages,
+        failed_fetches,
         configure,
+        label,
     } = opts;
     let sent = Arc::new(Mutex::new(vec![]));
     let failed = Arc::new(Mutex::new(vec![]));
+    let answers = Arc::new(Mutex::new(vec![]));
     let history = Arc::new(Mutex::new(t.clone()));
     if replay {
         let mut config = test_worker_cfg().build().unwrap();
@@ -237,6 +267,7 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
             store,
             sent,
             failed,
+            answers,
             history,
             all_taken: None,
         };
@@ -287,7 +318,17 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
         let message = failure.as_ref().map(|f| f.message.clone());
         let mut failed = kept.lock();
         failed.push((*cause, message.unwrap_or_default()));
-        assert!(failed.len() <= fails, "A task failed: {failed:?}");
+        assert!(failed.len() <= fails, "A task failed: {failed:?} {label}");
+    };
+    let kept = answers.clone();
+    let answer = move |token: &TaskToken, result: &LegacyQueryResult| {
+        let failure = match result {
+            LegacyQueryResult::Succeeded(_) => None,
+            LegacyQueryResult::Failed(failed) => {
+                Some((failed.failure.as_ref()).map_or_else(String::new, |f| f.message.clone()))
+            }
+        };
+        kept.lock().push((token.clone().into_inner(), failure));
     };
     let from_channel = tasks.is_some();
     let mut mock = match tasks {
@@ -296,6 +337,12 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
             cfg.make_poll_stream_interminable = true;
             cfg.num_expected_completions = Some((0..).into());
             cfg.num_expected_fails = fails;
+            cfg.num_expected_legacy_query_resps = queries;
+            cfg.expect_legacy_query_matcher = Box::new(move |token, result| {
+                answer(token, result);
+                true
+            });
+            expect_pages(&mut cfg.mock_client, pages, failed_fetches);
             cfg.completion_mock_fn = Some(Box::new(complete));
             cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
                 fail(cause, failure);
@@ -318,12 +365,21 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
                     Ok(Default::default())
                 },
             );
+            (client.expect_respond_legacy_query())
+                .times(queries)
+                .returning(move |token, result| {
+                    answer(&token, &result);
+                    Ok(Default::default())
+                });
+            expect_pages(&mut client, pages, failed_fetches);
             MocksHolder::from_wft_stream(client, input)
         }
     };
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = cache;
         wc.stream_runtimes = runtimes(&store);
+        // A read with no answer ends at its read limit, so a short one keeps the tests fast.
+        wc.stream_runtimes.settings.read_time = Some(Duration::from_millis(250));
         if from_channel {
             // With one extractor, Core polls past a task of the channel once it processed it.
             wc.fetching_concurrency = 1;
@@ -335,9 +391,35 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
         store,
         sent,
         failed,
+        answers,
         history,
         all_taken: all_taken.filter(|_| from_channel),
     }
+}
+
+/// Returns the one page of a History with `events`.
+fn page(events: &[HistoryEvent]) -> GetWorkflowExecutionHistoryResponse {
+    GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: events.to_vec(),
+        }),
+        ..Default::default()
+    }
+}
+
+fn expect_pages(
+    client: &mut MockWorkerClient,
+    pages: Vec<GetWorkflowExecutionHistoryResponse>,
+    failed_fetches: usize,
+) {
+    for page in pages {
+        (client.expect_get_workflow_execution_history())
+            .times(1)
+            .returning(move |_, _, _| Ok(page.clone()));
+    }
+    (client.expect_get_workflow_execution_history())
+        .times(failed_fetches)
+        .returning(|_, _, _| Err(tonic::Status::not_found("The Workflow is gone")));
 }
 
 /// Adds the next Workflow Task to `t`, and returns it with the whole History.
@@ -351,6 +433,29 @@ fn task_of(t: &TestHistoryBuilder) -> PollWorkflowTaskQueueResponse {
     let mut task = hist_to_poll_resp(t, "fake_wf_id", ResponseType::AllHistory).resp;
     task.attempt = 1;
     task
+}
+
+/// Returns the query task that the server gave out directly before it scheduled `task`, when the
+/// last event of History was `last_event_id`.
+fn query_before(
+    task: &PollWorkflowTaskQueueResponse,
+    last_event_id: i64,
+) -> PollWorkflowTaskQueueResponse {
+    let mut query = task.clone();
+    query.task_token = rand::random::<[u8; 16]>().to_vec();
+    query.started_event_id = 0;
+    let history = query.history.as_mut().expect("The task has its History");
+    history
+        .events
+        .retain(|event| event.event_id <= last_event_id);
+    let started = (history.events.iter().rev())
+        .find(|event| event.event_type() == EventType::WorkflowTaskStarted);
+    query.previous_started_event_id = started.map_or(0, |event| event.event_id);
+    query.query = Some(WorkflowQuery {
+        query_type: "q".to_string(),
+        ..Default::default()
+    });
+    query
 }
 
 /// Answers the query of `activation`, if that's its first job.
@@ -394,6 +499,18 @@ fn appended(seq: u32, id: &str, offset: Vec<u8>, activation: u64) -> StreamAppen
 /// Adds the events of a completion that the server took to `history`.
 fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) {
     history.add_workflow_task_completed();
+    // A replay decides some commands by the flags that the completion used, such as a patch's
+    // search attribute. The flag that turns workflow task chunking off goes, so a History has
+    // chunking on, also from a build with the Cargo feature, unless a test turns it off.
+    let unchunked = CoreInternalFlags::DisableWorkflowTaskChunking as u32;
+    let mut metadata = completion.sdk_metadata.clone();
+    metadata.core_used_flags.retain(|flag| *flag != unchunked);
+    let event = history.last_event().map(|event| event.attributes.as_mut());
+    if let Some(Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(attrs))) =
+        event
+    {
+        attrs.sdk_metadata = Some(metadata);
+    }
     let completed = history.current_event_id();
     let mut accepted = HashMap::new();
     for command in &completion.commands {
@@ -408,6 +525,29 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             }
             Some(Attributes::StartTimerCommandAttributes(timer)) => {
                 history.add_timer_started(timer.timer_id.clone());
+            }
+            Some(Attributes::CancelTimerCommandAttributes(cancel)) => {
+                let events = history.get_full_history_info().unwrap().into_events();
+                let started = (events.iter().rev()).find_map(|event| match &event.attributes {
+                    Some(history_event::Attributes::TimerStartedEventAttributes(timer))
+                        if timer.timer_id == cancel.timer_id =>
+                    {
+                        Some(event.event_id)
+                    }
+                    _ => None,
+                });
+                history.add(TimerCanceledEventAttributes {
+                    timer_id: cancel.timer_id.clone(),
+                    started_event_id: started.expect("A canceled timer has its started event"),
+                    workflow_task_completed_event_id: completed,
+                    ..Default::default()
+                });
+            }
+            Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(upsert)) => {
+                history.add(UpsertWorkflowSearchAttributesEventAttributes {
+                    workflow_task_completed_event_id: completed,
+                    search_attributes: upsert.search_attributes.clone(),
+                });
             }
             Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
                 history.add_workflow_execution_completed();
@@ -429,8 +569,24 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
     }
 }
 
+/// Returns the event id of the acceptance of Update `id` in an earlier completion.
+fn accepted_event_id(history: &TestHistoryBuilder, id: &str) -> i64 {
+    let events = history.get_full_history_info().unwrap().into_events();
+    (events.iter())
+        .find_map(|event| match &event.attributes {
+            Some(history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(a))
+                if a.protocol_instance_id == id =>
+            {
+                Some(event.event_id)
+            }
+            _ => None,
+        })
+        .expect("A completed Update was accepted")
+}
+
 /// Adds the event of the Update message `id` of `completion`, at the place of its command, as the
-/// server does. `accepted` has the event id of each Update that the completion accepted.
+/// server does. `accepted` has the event id of each Update that the completion accepted. An Update
+/// that an earlier completion accepted has its event in `history`.
 fn write_update(
     history: &mut TestHistoryBuilder,
     completion: &WorkflowTaskCompletion,
@@ -457,11 +613,11 @@ fn write_update(
         }
         "Response" => {
             let response = UpdateOutcome::decode(&body.value[..]).unwrap();
-            let accepted_event_id = *(accepted.get(&instance))
-                .expect("The mock server can't write the result of an Update of an earlier task");
+            let accepted_id = (accepted.get(&instance).copied())
+                .unwrap_or_else(|| accepted_event_id(history, &instance));
             history.add(WorkflowExecutionUpdateCompletedEventAttributes {
                 meta: response.meta,
-                accepted_event_id,
+                accepted_event_id: accepted_id,
                 outcome: response.outcome,
             });
         }
@@ -524,8 +680,8 @@ impl Run {
         self.replay_with(true, workflow).await
     }
 
-    /// Replays as [`Run::replay`] does, with chunking on or off. The mock server writes no flag,
-    /// so a History has chunking on unless this turns it off.
+    /// Replays as [`Run::replay`] does, with chunking on or off. The mock server drops the flag
+    /// that turns chunking off, so a History has chunking on unless this turns it off.
     async fn replay_with(
         &self,
         chunking: bool,
@@ -692,9 +848,9 @@ async fn a_nondeterminism_failure_before_a_stream_marker_sends_one_fail_command(
     t.add_workflow_task_scheduled_and_started();
     let mut opts = StartOpts::new(&store);
     opts.served = None;
-    opts.configure = |wc| {
+    opts.configure = Box::new(|wc| {
         wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
-    };
+    });
     let run = start(t, opts);
     let activation = run.worker.poll_workflow_activation().await.unwrap();
     let cause = WorkflowTaskFailedCause::NonDeterministicError;
@@ -712,6 +868,37 @@ async fn a_nondeterminism_failure_before_a_stream_marker_sends_one_fail_command(
         Some("changed".to_string()),
     );
     assert_eq!(sent, [vec![expected]], "The commands of each completion");
+    assert_eq!(store.requests(), []);
+}
+
+// Core finds the error at the marker, so the Workflow fails with Core's error alone. Lang's
+// command that ends the Workflow came from the replayed task, and the server has that task.
+#[tokio::test]
+async fn a_stream_marker_with_no_call_fails_the_workflow_with_one_command() {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    let completed = t.current_event_id();
+    let appends = vec![appended(1, "s", vec![7], 1)];
+    add_stream_marker(&mut t, completed, &StreamAppendMarkerData { appends });
+    t.add_workflow_task_scheduled_and_started();
+    let mut opts = StartOpts::new(&store);
+    opts.served = None;
+    opts.configure = Box::new(|wc| {
+        wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    });
+    let run = start(t, opts);
+    assert_eq!(run.drive(|_| vec![complete()]).await.len(), 1);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+    let sent: Vec<_> = run.sent().iter().map(with_failures).collect();
+    let [completion] = &sent[..] else {
+        panic!("One completion: {sent:?}");
+    };
+    let [(CommandType::FailWorkflowExecution, Some(message))] = &completion[..] else {
+        panic!("One fail command: {completion:?}");
+    };
+    let error = "History has a result of Stream append 1 that Workflow code never issued";
+    assert!(message.contains(error), "{message}");
     assert_eq!(store.requests(), []);
 }
 
@@ -779,7 +966,7 @@ async fn an_append_with_no_store_name_replays_without_its_original_runtime() {
     ] {
         let mut opts = StartOpts::new(&store);
         opts.replay = true;
-        opts.configure = configure;
+        opts.configure = Box::new(configure);
         let replay = start(run.history.lock().clone(), opts);
         let (jobs, eviction) = drive_until_evicted(&replay.worker, nameless).await;
         assert_eq!(eviction, Some(EvictionReason::LangRequested));
@@ -802,11 +989,12 @@ async fn an_append_with_no_store_name_fails_its_task_with_no_runtime_to_pick(#[c
     let store = store(&["s"]).await;
     let mut opts = StartOpts::new(&store);
     opts.fails = 1;
-    opts.configure = match count {
+    let configure: fn(&mut WorkerConfig) = match count {
         0 => |wc| wc.stream_runtimes = StreamRuntimes::default(),
         2 => |wc| wc.stream_runtimes = runtimes_of(&[STORE, "other"]),
         _ => unreachable!(),
     };
+    opts.configure = Box::new(configure);
     let run = start(history(Duration::from_secs(60)), opts);
     let workflow: Workflow = |_| vec![append_with_no_store_name(1, "s")];
     assert_eq!(run.drive(workflow).await.len(), 1);
@@ -840,7 +1028,7 @@ fn the_store_under_the_empty_name(wc: &mut WorkerConfig) {
 async fn an_append_with_no_store_name_runs_on_the_runtime_under_the_empty_name() {
     let store = store(&["s"]).await;
     let mut opts = StartOpts::new(&store);
-    opts.configure = the_store_under_the_empty_name;
+    opts.configure = Box::new(the_store_under_the_empty_name);
     let run = start(history(Duration::from_secs(60)), opts);
     let nameless: Workflow = |activation| match &activation.jobs[0].variant {
         Some(Job::InitializeWorkflow(_)) => vec![append_with_no_store_name(1, "s")],
@@ -853,7 +1041,7 @@ async fn an_append_with_no_store_name_runs_on_the_runtime_under_the_empty_name()
     let writes = store.requests().len();
     let mut opts = StartOpts::new(&store);
     opts.replay = true;
-    opts.configure = the_store_under_the_empty_name;
+    opts.configure = Box::new(the_store_under_the_empty_name);
     let replay = start(run.history.lock().clone(), opts);
     let (replayed, evicted) = drive_until_evicted(&replay.worker, nameless).await;
     assert_eq!(evicted, Some(EvictionReason::LangRequested), "{replayed:?}");
@@ -1137,9 +1325,9 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result(
     }
     let mut opts = StartOpts::new(&store);
     opts.served = None;
-    opts.configure = |wc| {
+    opts.configure = Box::new(|wc| {
         wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
-    };
+    });
     let task_timeout = Duration::from_secs(if down { 1 } else { 60 });
     let run = start(ending.history(task_timeout), opts);
     let worker = &run.worker;
@@ -1246,7 +1434,10 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result(
 /// Returns the Stream of each call that reached the Store, once for each call.
 fn calls_at(store: &MemoryStore) -> Vec<String> {
     let mut calls: Vec<String> = (store.requests().into_iter())
-        .map(|Request::Append(append, _)| append.stream_id)
+        .filter_map(|request| match request {
+            Request::Append(append, _) => Some(append.stream_id),
+            Request::Read(_) => None,
+        })
         .collect();
     calls.sort();
     calls.dedup();
@@ -1262,6 +1453,7 @@ fn fast_tries(wc: &mut WorkerConfig) {
         retry_initial_interval: Duration::from_millis(10),
         retry_max_interval: Duration::from_millis(20),
         try_deadline: Duration::from_millis(50),
+        ..Default::default()
     };
 }
 
@@ -1293,13 +1485,14 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     }
     let mut opts = StartOpts::new(&store);
     opts.fails = 1;
-    opts.configure = match outage {
+    let configure: fn(&mut WorkerConfig) = match outage {
         Outage::FailsWithNoLocalActivityManager => |wc| {
             fast_tries(wc);
             wc.task_types = WorkerTaskTypes::workflow_only();
         },
         _ => fast_tries,
     };
+    opts.configure = Box::new(configure);
     let t = history(Duration::from_secs(1));
     let mut attempts = 1;
     if let Outage::FailsOnALaterAttempt = outage {
@@ -1347,12 +1540,84 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
-/// Returns the bytes of the data of each Stream marker of `completion`.
+#[tokio::test]
+async fn a_panicked_waiting_read_fails_its_task_at_the_read_limit() {
+    let store = store(&["s"]).await;
+    store.panic_once(Op::Read);
+    let mut opts = StartOpts::new(&store);
+    opts.fails = 1;
+    opts.configure = Box::new(|wc| {
+        wc.stream_runtimes.settings.read_time = Some(Duration::from_millis(200));
+    });
+    // The heartbeat comes well after the read cutoff.
+    let run = start(history(Duration::from_secs(60)), opts);
+    let drive = run.drive(|activation| {
+        assert!(matches!(
+            activation.jobs[0].variant,
+            Some(Job::InitializeWorkflow(_))
+        ));
+        vec![
+            ReadStream {
+                seq: 1,
+                stream: Some(stream("s")),
+                wait: Some(Duration::from_secs(30).try_into().unwrap()),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    });
+    tokio::time::timeout(Duration::from_secs(10), drive)
+        .await
+        .expect("The read cutoff did not fail the task");
+    assert_eq!(
+        run.failed.lock()[0],
+        (
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+            "StreamStoreUnavailable: A Stream Store task ended without a result".to_string(),
+        )
+    );
+    assert!(run.sent().is_empty());
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+#[tokio::test]
+async fn a_terminal_command_drops_a_panicked_read() {
+    let store = store(&["s"]).await;
+    store.panic_once(Op::Read);
+    store.hold(Op::Append);
+    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let drive = run.drive(|activation| match activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![
+            ReadStream {
+                seq: 1,
+                stream: Some(stream("s")),
+                wait: Some(Duration::from_secs(30).try_into().unwrap()),
+                ..Default::default()
+            }
+            .into(),
+            append(1, "s"),
+        ],
+        Some(Job::ResolveStreamAppend(_)) => vec![complete()],
+        ref job => panic!("Unexpected activation {job:?}"),
+    });
+    let release = async {
+        wait_until(|| !store.reads().is_empty()).await;
+        store.release();
+    };
+    let (jobs, ()) = tokio::join!(drive, release);
+    assert_eq!(jobs.len(), 2);
+    assert!(run.failed.lock().is_empty());
+    assert!(command_types(&run.sent()[0]).contains(&CommandType::CompleteWorkflowExecution));
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
+/// Returns the bytes of the data of each Stream marker of `completion`, of either kind.
 fn marker_sizes(completion: &WorkflowTaskCompletion) -> Vec<usize> {
+    let names = [STREAM_APPEND_MARKER_NAME, STREAM_READ_MARKER_NAME];
     (completion.commands.iter())
         .filter_map(|command| match command.attributes.as_ref() {
             Some(Attributes::RecordMarkerCommandAttributes(marker))
-                if marker.marker_name == STREAM_APPEND_MARKER_NAME =>
+                if names.contains(&marker.marker_name.as_str()) =>
             {
                 Some(marker.details["data"].payloads[0].data.len())
             }
@@ -1463,7 +1728,8 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     let t = history(task_timeout);
     let mut opts = StartOpts::new(&store);
     // An append that waits at the hold must not count as a try with no answer.
-    opts.configure = |wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600));
     if query {
         let mut task = hist_to_poll_resp(&t, "fake_wf_id", ResponseType::AllHistory).resp;
         let question = WorkflowQuery {
@@ -1513,7 +1779,8 @@ async fn a_forced_completion_with_an_open_append_keeps_its_task_apart_on_replay(
     store.hold_stream("s2");
     let mut opts = StartOpts::new(&store);
     // An append that waits at the hold must not count as a try with no answer.
-    opts.configure = |wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600));
     let held = store.clone();
     // Append 1 answers once the heartbeat completed task 1, and append 2 once Workflow code has the
     // result of append 1. So task 2 gives them in two activations.
@@ -1802,7 +2069,10 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     assert_eq!(writers(&store, "s"), expected);
     // A request id is unique to one append call, and the append of a later attempt is another call.
     let mut attempts = HashMap::new();
-    for Request::Append(append, request_id) in store.requests() {
+    for request in store.requests() {
+        let Request::Append(append, request_id) = request else {
+            continue;
+        };
         let (_, task, attempt) = writer(append.producer);
         let first = *attempts.entry(request_id).or_insert((task, attempt));
         assert_eq!(first, (task, attempt), "{earlier:?}");
@@ -1833,7 +2103,11 @@ async fn wait_until(mut done: impl FnMut() -> bool) {
     (tokio::time::timeout(Duration::from_secs(30), wait).await).expect("The wait timed out");
 }
 
-async fn respond(worker: &Worker, activation: &WorkflowActivation, workflow: Workflow) {
+async fn respond(
+    worker: &Worker,
+    activation: &WorkflowActivation,
+    workflow: impl FnOnce(&WorkflowActivation) -> Vec<Command>,
+) {
     let commands = workflow(activation);
     let completion = WorkflowActivationCompletion::from_cmds(activation.run_id.clone(), commands);
     worker
@@ -1883,7 +2157,8 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     };
     let mut opts = StartOpts::new(&store);
     // An append that waits at the hold must not count as a try with no answer.
-    opts.configure = |wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600));
     opts.served = None;
     let run = if other_task == OtherTask::WithNoActivationOut {
         // The answer of a query completes task 1 while the append runs.
@@ -2443,23 +2718,37 @@ async fn stream_markers_preserve_recorded_result_groups() {
 /// Returns Workflow code that a generated test runs: the commands of each activation that has a
 /// job other than a query or an Update, in order. The last of them ends the Workflow.
 fn script(rng: &mut StdRng) -> Vec<Vec<Command>> {
-    let (mut appends, mut locals, mut timers, mut activities) = (0, 0, 0, 0);
+    let (mut appends, mut reads, mut locals, mut timers, mut activities) = (0, 0, 0, 0, 0);
     let steps = rng.random_range(3..=10);
     (1..=steps)
         .map(|step| {
             let mut commands = vec![];
             for _ in 0..rng.random_range(0..=3) {
                 let id = format!("s{}", rng.random_range(0..3));
-                match rng.random_range(0..11) {
-                    0..=5 => {
+                match rng.random_range(0..13) {
+                    0..=4 => {
                         appends += 1;
                         commands.push(append(appends, &id));
                     }
-                    6..=8 => {
+                    // A read of the first Records of a Stream. Some reads wait for one if it has
+                    // none.
+                    5..=6 => {
+                        reads += 1;
+                        let wait = rng.random_bool(0.5).then(|| Duration::from_secs(60));
+                        let read = ReadStream {
+                            seq: reads,
+                            stream: Some(stream(&id)),
+                            wait: wait.map(|wait| wait.try_into().unwrap()),
+                            max_records: 2,
+                            ..Default::default()
+                        };
+                        commands.push(read.into());
+                    }
+                    7..=9 => {
                         locals += 1;
                         commands.push(local_activity(locals));
                     }
-                    9 => {
+                    10 => {
                         timers += 1;
                         commands.push(timer(timers));
                     }
@@ -2626,10 +2915,16 @@ fn replayed(
         .collect()
 }
 
-/// Returns a job as `append 3`, `append 3 failed`, `local 2`, `activity 1 cancelled` or the name of
-/// its kind.
+/// Returns a job as `append 3`, `append 3 failed`, `read 2 failed`, `local 2`, `activity 1
+/// cancelled` or the name of its kind. A page has its number of Records and its `last_offset`, as
+/// in `read 2 1 [5]`.
 fn summary(job: &Job) -> String {
     match job {
+        Job::ResolveStreamRead(ResolveStreamRead {
+            seq,
+            status: Some(resolve_stream_read::Status::Page(page)),
+        }) => format!("read {seq} {} {:?}", page.records.len(), page.last_offset),
+        Job::ResolveStreamRead(read) => format!("read {} failed", read.seq),
         Job::ResolveStreamAppend(ResolveStreamAppend {
             seq,
             status: Some(resolve_stream_append::Status::Failed(_)),
@@ -2694,6 +2989,11 @@ struct Reached {
     forced: usize,
     /// The runs that a new Worker took over.
     taken_over: usize,
+    /// The pages of reads with Records, and those with none.
+    pages: usize,
+    empty_pages: usize,
+    /// The pages of reads that don't wait, of a Stream that had a Record.
+    no_wait_pages: usize,
 }
 
 // Generated Workflow code runs with Local Activities, queries, rejected Updates, Activities that it
@@ -2769,6 +3069,9 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         let mut run = start(history(Duration::from_secs(1)), opts());
         let mut locals_rng = StdRng::seed_from_u64(seed + 1);
         let (mut earlier, mut progress, mut made) = (None, Progress::default(), HashMap::new());
+        // For each read that doesn't wait, true if its Stream had a Record when the first run sent
+        // it.
+        let mut had_records = HashMap::new();
         let live = loop {
             let mut number = 0;
             let workflow = |activation: &WorkflowActivation| {
@@ -2779,10 +3082,20 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
                 }
                 let commands = scripted(&script, &mut progress, earlier.as_mut(), activation);
                 for command in &commands {
-                    let Command::AppendToStream(append) = command else {
-                        continue;
+                    let (call, stream) = match command {
+                        Command::AppendToStream(append) => {
+                            (format!("append {}", append.seq), &append.stream)
+                        }
+                        Command::ReadStream(read) => {
+                            if read.wait.is_none() {
+                                let id = &read.stream.as_ref().unwrap().id;
+                                let had = !store.records(id).is_empty();
+                                had_records.entry(read.seq).or_insert(had);
+                            }
+                            (format!("read {}", read.seq), &read.stream)
+                        }
+                        _ => continue,
                     };
-                    let (call, stream) = (format!("append {}", append.seq), &append.stream);
                     made.insert(call, number);
                     if rng.random_bool(0.3) {
                         store.hold_stream(&stream.as_ref().unwrap().id);
@@ -2848,15 +3161,34 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
             assert_eq!(at, first.len(), "seed {seed}: {replayed:?} {first:?}");
         }
 
+        // Only the Store can end a read that doesn't wait with no Record, so such a read of a
+        // Stream that had a Record gets a page with one, or a failure.
+        let results = live.iter().flatten().filter_map(|job| match job {
+            Job::ResolveStreamRead(read) => Some(read),
+            _ => None,
+        });
+        for read in results.filter(|read| had_records.get(&read.seq) == Some(&true)) {
+            if let Some(resolve_stream_read::Status::Page(page)) = &read.status {
+                assert!(!page.records.is_empty(), "seed {seed}: {read:?}");
+                reached.no_wait_pages += 1;
+            }
+        }
         for (at, jobs) in live.iter().enumerate() {
             let summaries: Vec<String> = jobs.iter().map(summary).collect();
             for done in summaries
                 .iter()
-                .filter_map(|s| made.get(s.trim_end_matches(" failed")))
+                .filter_map(|s| made.get(&s.split(' ').take(2).collect::<Vec<_>>().join(" ")))
             {
                 match at == done + 1 {
                     true => reached.next += 1,
                     false => reached.later += 1,
+                }
+            }
+            for summary in summaries.iter().filter(|s| s.starts_with("read")) {
+                match summary.split(' ').nth(2) {
+                    Some("0") => reached.empty_pages += 1,
+                    Some("failed") => {}
+                    _ => reached.pages += 1,
                 }
             }
             for job in jobs {
@@ -2875,7 +3207,21 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         cancels,
         forced,
         taken_over,
+        pages,
+        empty_pages,
+        no_wait_pages,
     } = reached;
-    let counts = [next, later, queries, updates, cancels, forced, taken_over];
+    let counts = [
+        next,
+        later,
+        queries,
+        updates,
+        cancels,
+        forced,
+        taken_over,
+        pages,
+        empty_pages,
+        no_wait_pages,
+    ];
     assert!(counts.iter().all(|count| *count > 0), "{reached:?}");
 }

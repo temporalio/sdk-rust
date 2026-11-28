@@ -1,11 +1,11 @@
 use temporalio_common::protos::coresdk::external_data::{
-    LocalActivityMarkerData, StreamAppendResult,
+    LocalActivityMarkerData, StreamAppendResult, StreamReadResult,
 };
 
 /// A marker entry that records the index, within its Workflow Task, of the activation that gave
 /// its result. Local Activity and Stream results count activations with one index, so that a
 /// replay gives both kinds of result in the order of the first run.
-pub(super) trait HasActivationIndex {
+pub(crate) trait HasActivationIndex {
     /// Returns the index. A Local Activity marker of an older Core has none, and a replay keeps the
     /// batching of that Core for it.
     fn activation(&self) -> Option<u64>;
@@ -33,6 +33,12 @@ impl HasActivationIndex for LocalActivityMarkerData {
 }
 
 impl HasActivationIndex for StreamAppendResult {
+    fn activation(&self) -> Option<u64> {
+        Some(self.activation_index)
+    }
+}
+
+impl HasActivationIndex for StreamReadResult {
     fn activation(&self) -> Option<u64> {
         Some(self.activation_index)
     }

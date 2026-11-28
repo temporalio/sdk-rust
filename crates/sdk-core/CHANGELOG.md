@@ -42,8 +42,17 @@ relevant information.
   An outage at the task heartbeat fails the Workflow Task with `StreamStoreUnavailable:`.
 * [lang-internal] The experimental `temporalio-streams` crate provides the `StreamStore` trait,
   a validating `StreamRuntime` and `StoreLimits` for checking batches before dispatch.
+* [lang-internal] `ReadStream` returns one Store page in a `ResolveStreamRead` job.
+  `StreamSettings::read_time` bounds the wait in one Workflow Task. Read markers store offsets,
+  the Record count and a digest. Replay reads those Records again and verifies the digest.
 
 ### Fixed
+* A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.
+  New read markers preserve the Producer's optional timestamps and signed values during replay.
+  Workers can still replay the original marker format, including previously delivered oversized
+  Records. Older Workers cannot interpret the new digest format.
+* Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
+* Workflow queries retain task results when replay needs another History page.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

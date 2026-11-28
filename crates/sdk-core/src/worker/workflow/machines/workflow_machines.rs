@@ -1,20 +1,19 @@
 mod activation_index;
 mod local_acts;
 
+pub(crate) use activation_index::HasActivationIndex;
+
 use super::{
     Machines, NewMachineWithCommand, TemporalStateMachine,
     cancel_external_state_machine::new_external_cancel,
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
-    fail_workflow_state_machine::fail_workflow,
-    local_activity_state_machine::new_local_activity,
-    patch_state_machine::has_change,
-    signal_external_state_machine::new_external_signal,
-    stream_marker_state_machine::stream_marker,
-    timer_state_machine::new_timer,
+    fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
+    patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
+    stream_marker_state_machine::stream_marker, timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
-    workflow_machines::{activation_index::HasActivationIndex, local_acts::LocalActivityData},
+    workflow_machines::local_acts::LocalActivityData,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
 use crate::{
@@ -43,7 +42,9 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
-            streams::{Phase, StreamCalls, is_stream_marker, peeked_marker},
+            streams::{
+                PeekedMarker, Phase, ReplayReads, StreamCalls, is_stream_marker, peeked_marker,
+            },
         },
     },
 };
@@ -65,7 +66,6 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
-            external_data::StreamAppendMarkerData,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -404,14 +404,29 @@ impl WorkflowMachines {
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
+    pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
+        self.install_history(update);
+        self.apply_next_wft_from_history()?;
+        Ok(())
+    }
+
+    pub(crate) fn add_history_page(&mut self, mut page: HistoryUpdate) {
+        self.note_wft_events(page.get_events());
+        page.prepend_unapplied(&mut self.last_history_from_server);
+        self.install_history(page);
+    }
+
+    fn install_history(&mut self, mut update: HistoryUpdate) {
         update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
-        self.apply_next_wft_from_history()?;
-        Ok(())
+    }
+
+    /// Adds the Records of the next read markers of the history from the server.
+    pub(crate) fn add_stream_reads(&mut self, reads: ReplayReads) {
+        reads.add_to(&mut self.last_history_from_server);
     }
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
@@ -455,7 +470,7 @@ impl WorkflowMachines {
                 }
                 self.local_activity_data.done_executing(seq);
             }
-            LocalResolution::Stream(resolution) => self.stream_calls.resolve(resolution),
+            LocalResolution::Stream(resolution) => self.stream_calls.resolve(resolution)?,
         }
         Ok(result_important)
     }
@@ -474,13 +489,38 @@ impl WorkflowMachines {
     /// Returns the number of Local Activities and live Stream calls, which hold the Workflow Task
     /// open.
     pub(crate) fn outstanding_local_work(&self) -> usize {
-        self.outstanding_local_activity_count() + self.stream_calls.outstanding()
+        let stream_calls = self.stream_calls.outstanding(self.has_work_for_server());
+        self.outstanding_local_activity_count() + stream_calls
     }
 
-    /// Adds the marker of a completion that leaves a live Stream call open with no marker in its
-    /// task. The task's last `prepare_commands` already ran, so the command goes in directly.
-    fn mark_open_stream_calls(&mut self) {
-        let Some(data) = self.stream_calls.take_completion_marker() else {
+    /// Returns true if the task has a command or a message for the server. A marker asks the server
+    /// for nothing.
+    pub(crate) fn has_work_for_server(&self) -> bool {
+        let has_command = (self.commands.iter()).any(|c| {
+            !self.machine(c.machine).is_final_state()
+                && c.command.command_type() != CommandType::RecordMarker
+        });
+        has_command || !self.message_outbox.is_empty()
+    }
+
+    /// Readies the Stream calls of a completion, which asks for a new task if `forced`. With no new
+    /// task coming, an idle read stops until the next task. The completion records a marker with
+    /// no entry if it leaves a live call open with no marker in its task. The task's last
+    /// `prepare_commands` already ran, so the command goes in directly.
+    fn end_stream_calls_of_task(&mut self, forced: bool) {
+        if !forced {
+            self.stream_calls.stop_idle_reads();
+        }
+        let has_command_event = (self.commands.iter())
+            .any(|c| !self.machine(c.machine).is_final_state())
+            || !self.message_outbox.is_empty();
+        let chunking_disabled = self.last_history_from_server.chunking_disabled;
+        let marker = (self.stream_calls).take_completion_marker(
+            forced,
+            has_command_event,
+            chunking_disabled,
+        );
+        let Some(data) = marker else {
             return;
         };
         let marker = stream_marker(&data).expect("A marker with no entry is under the bound");
@@ -636,9 +676,11 @@ impl WorkflowMachines {
             let (activation, marker) = self.result_activations();
             let results = self.stream_calls.take_jobs(activation, marker);
             let jobs = self.order_results(jobs, results, activation);
-            // A replay places these results by their marker, so the marker must go where Workflow
+            // A replay places these results by their markers, so the markers must go where Workflow
             // code gets them, before the commands of this activation.
-            if let Some(data) = self.stream_calls.take_marker() {
+            let appends = self.stream_calls.take_marker().map(PeekedMarker::Append);
+            let reads = self.stream_calls.take_read_marker().map(PeekedMarker::Read);
+            for data in appends.into_iter().chain(reads) {
                 let marker = stream_marker(&data)?;
                 self.add_cmd_to_wf_task(marker, Default::default(), CommandIdKind::CoreInternal);
             }
@@ -1057,7 +1099,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamMarker(StreamAppendMarkerData),
+            StreamMarker(i64, PeekedMarker),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -1095,7 +1137,7 @@ impl WorkflowMachines {
                 }
             } else if let Some(data) = peeked_marker(e) {
                 self.task_has_stream_marker = true;
-                delayed_actions.push(DelayedAction::StreamMarker(data?));
+                delayed_actions.push(DelayedAction::StreamMarker(e.event_id, data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -1132,7 +1174,11 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
-                DelayedAction::StreamMarker(data) => self.stream_calls.peeked(data)?,
+                DelayedAction::StreamMarker(event_id, data) => {
+                    let update = &mut self.last_history_from_server;
+                    let records = ReplayReads::take_from(update, event_id);
+                    self.stream_calls.peeked(data, records)?;
+                }
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -1900,6 +1946,7 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
+                WFCommandVariant::ReadStream(attrs) => self.stream_calls.read(attrs)?,
             }
         }
         Ok(())
@@ -2144,10 +2191,10 @@ impl MachinesWFTResponseContent<'_> {
         self.me.get_metadata_for_wft_complete()
     }
 
-    /// Adds a Stream marker with no entry if the task leaves a live call open and has no marker.
-    /// Call it only for a completion that goes to the server.
-    pub(crate) fn mark_open_stream_calls(&mut self) {
-        self.me.mark_open_stream_calls();
+    /// Readies the Stream calls of a completion, which asks for a new task if `forced`. Call it
+    /// only for a completion that goes to the server.
+    pub(crate) fn end_stream_calls_of_task(&mut self, forced: bool) {
+        self.me.end_stream_calls_of_task(forced);
     }
 }
 

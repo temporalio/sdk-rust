@@ -287,6 +287,7 @@ pub struct WorkerConfig {
     /// the runtime registered under `""`, or the only runtime. An unresolved Store fails the task.
     ///
     /// Replay uses the recorded Store for a ref with no Store name and makes no append call.
+    /// Replayed reads need that Store's runtime and retained Records to verify their digests.
     /// An explicit Store name must match History.
     ///
     /// Give each Store one name so its appends share one queue. Reusing a runtime under two names
@@ -1866,6 +1867,13 @@ pub enum CompleteNexusError {
 pub enum WorkflowErrorType {
     /// A nondeterminism error
     Nondeterminism,
+    /// A replay whose Store has lost the Records that a Stream read of the Workflow got, or has
+    /// other ones. It fails the Workflow on the first attempt of the Workflow Task. A later
+    /// attempt reports nothing, as for [`WorkflowErrorType::Nondeterminism`]. A query of such a
+    /// Workflow fails, and the Workflow doesn't. A Store that gives no answer, or a Worker with no
+    /// runtime for the Store, fails only the Workflow Task.
+    /// NOTE: Experimental
+    StreamReplay,
 }
 
 /// This trait allows users to customize the performance characteristics of workers dynamically.
