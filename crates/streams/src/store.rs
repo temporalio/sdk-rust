@@ -9,7 +9,9 @@ use futures_util::future::BoxFuture;
 
 /// A Store for Temporal Streams. The SDK resolves a Stream ref to a Store and passes it the
 /// Stream id. A Nexus operation carries the create or append request id in its envelope. These
-/// methods take it as a separate argument.
+/// methods take it as a separate argument. See the [Store request and response messages][wire].
+///
+/// [wire]: https://github.com/temporalio/api/tree/21815b9/temporal/api/streamservice/v1
 ///
 /// # Record order
 ///
@@ -48,14 +50,14 @@ use futures_util::future::BoxFuture;
 ///   Producer and the caller's size limits. A Store with lower limits must check its own.
 ///
 /// The runtime checks response offsets and the presence of a body and Producer on each Record
-/// it returns. A malformed response gives [`AnyReason::StoreCorrupt`](crate::AnyReason::StoreCorrupt).
-/// A Record larger than the caller's limit gives [`AnyReason::Unsupported`](crate::AnyReason::Unsupported).
+/// it returns. A malformed response gives [`StoreCorrupt`](crate::AnyReason::StoreCorrupt).
+/// A Record over the caller's limit gives [`Unsupported`](crate::AnyReason::Unsupported).
 /// The Store remains responsible for guarantees that span calls, including resend detection
 /// and returning every Record in order.
 pub trait StreamStore: Send + Sync + 'static {
     /// Create a Stream and return `created = true`. For an existing id, check these cases in order.
     ///
-    /// 1. If the Stream has expired, return [`CreateReason::Expired`](crate::CreateReason::Expired).
+    /// 1. If the Stream has expired, return [`Expired`](crate::CreateReason::Expired).
     /// 2. If the nonempty `request_id` matches the original create, return `created = true` again.
     /// 3. With `UseExisting`, return `created = false`. With `Fail` or no policy, return
     ///    [`CreateReason::AlreadyExists`](crate::CreateReason::AlreadyExists).
