@@ -49,6 +49,10 @@ relevant information.
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
 
+* Workflow slot reservations share the cache limit, including waits for a custom slot supplier.
+* Shutdown drains accepted tasks and History fetches after Workflow polling has started.
+* Workers can use large cache limits without allocating entries up front.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added

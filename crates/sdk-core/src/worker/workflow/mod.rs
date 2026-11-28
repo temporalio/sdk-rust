@@ -358,6 +358,10 @@ impl Workflows {
                 WorkflowStreamAction::FailUnstoredWft { run_id, report } => {
                     self.handle_activation_failed(&run_id, Instant::now(), *report)
                         .await;
+                    if self.shutdown_token.is_cancelled() {
+                        // No cached run remains to wake shutdown after this reply.
+                        self.bump_stream();
+                    }
                 }
             }
         }
@@ -1997,9 +2001,12 @@ fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure
 mod tests {
     use super::*;
     use crate::{
-        abstractions::tests::fixed_size_permit_dealer, replay::TestHistoryBuilder,
-        test_help::hist_to_poll_resp, worker::client::mocks::mock_worker_client,
+        abstractions::tests::fixed_size_permit_dealer,
+        replay::{TestHistoryBuilder, canned_histories},
+        test_help::{MocksHolder, ResponseType, WorkerExt, hist_to_poll_resp, mock_worker},
+        worker::client::mocks::{mock_manual_worker_client, mock_worker_client},
     };
+    use futures_util::FutureExt;
     use itertools::Itertools;
     use temporalio_common::{
         payload_limits::{LimitClass, LimitSeverity},
@@ -2008,6 +2015,46 @@ mod tests {
             temporal::api::enums::v1::EventType,
         },
     };
+
+    #[tokio::test]
+    async fn shutdown_reports_history_fetch_failure_for_a_sticky_cache_miss() {
+        let history = canned_histories::single_timer("1");
+        let task = hist_to_poll_resp(&history, "workflow", ResponseType::OneTask(2)).resp;
+        let token = task.task_token.clone();
+        let (send_shutdown, shutdown) = oneshot::channel::<CancellationToken>();
+        let (report, mut reported) = oneshot::channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_get_workflow_execution_history()
+            .return_once(move |_, _, _| {
+                async move {
+                    // The cache miss is the only work left after the poller drains.
+                    shutdown.await.unwrap().cancelled().await;
+                    Err(tonic::Status::unavailable("History unavailable"))
+                }
+                .boxed()
+            });
+        client
+            .expect_fail_workflow_task()
+            .return_once(move |task, _, _| {
+                report.send(task.task_token.into_inner()).unwrap();
+                async { Ok(Default::default()) }.boxed()
+            });
+        let mut mocks = MocksHolder::from_wft_stream(client, stream::iter([task]));
+        mocks.worker_cfg(|config| config.fetching_concurrency = 2);
+        let worker = mock_worker(mocks);
+        let workflows = worker.task_subsystems.workflows.as_ref().unwrap();
+        send_shutdown
+            .send(workflows.shutdown_token.clone())
+            .unwrap();
+
+        assert_matches!(
+            worker.poll_workflow_activation().await,
+            Err(PollError::ShutDown)
+        );
+        assert_eq!(reported.try_recv().ok(), Some(token));
+        worker.drain_pollers_and_shutdown().await;
+    }
 
     #[test]
     fn task_storage_metrics_from_completion_keeps_directions_distinct() {

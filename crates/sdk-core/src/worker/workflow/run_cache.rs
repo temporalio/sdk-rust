@@ -43,7 +43,8 @@ impl RunCache {
             worker_config,
             sdk_name_and_version,
             server_capabilities,
-            runs: LruCache::new(
+            // The configured cache size is a limit, so allocate entries as runs arrive.
+            runs: LruCache::sparse(
                 NonZeroUsize::new(lru_size).expect("LRU size is guaranteed positive"),
             ),
             local_activity_request_sink: local_activity_request_sink

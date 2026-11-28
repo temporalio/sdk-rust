@@ -11,8 +11,9 @@ use crate::{
     },
 };
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
-use std::{future, sync::Arc};
+use std::sync::Arc;
 use temporalio_common::protos::coresdk::WorkflowSlotInfo;
+use tokio_util::task::TaskTracker;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -64,10 +65,14 @@ impl WFTExtractor {
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
+        let pending_fetches = TaskTracker::new();
+        let fetch_tracker = pending_fetches.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
                 let client = client.clone();
+                let guard = fetch_tracker.token();
                 async move {
+                    let _guard = guard;
                     match stream_in {
                         Ok((wft, permit)) => {
                             let run_id = wft.workflow_execution.run_id.clone();
@@ -100,9 +105,12 @@ impl WFTExtractor {
                 .left_future()
                 .left_future()
             })
-            .chain(stream::iter([future::ready(Ok(
-                WFTExtractorOutput::PollerDead,
-            ))
+            .chain(stream::iter([async move {
+                // `buffer_unordered` can otherwise deliver `PollerDead` before a slower fetch.
+                pending_fetches.close();
+                pending_fetches.wait().await;
+                Ok(WFTExtractorOutput::PollerDead)
+            }
             .right_future()
             .left_future()]));
 
@@ -154,5 +162,63 @@ impl WFTExtractor {
             |_: &mut ()| PollNext::Right,
         )
         .buffer_unordered(max_fetch_concurrency)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        abstractions::tests::fixed_size_permit_dealer,
+        replay::TestHistoryBuilder,
+        test_help::{ResponseType, hist_to_poll_resp},
+        worker::client::mocks::mock_manual_worker_client,
+    };
+    use temporalio_common::protos::temporal::api::{
+        enums::v1::EventType, workflowservice::v1::GetWorkflowExecutionHistoryResponse,
+    };
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn poller_end_waits_for_initial_history_fetch() {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_full_wf_task();
+        let mut task = hist_to_poll_resp(&history, "workflow", ResponseType::AllHistory).resp;
+        let second_page = task.history.as_mut().unwrap().events.split_off(1);
+        task.next_page_token = vec![1];
+        let release = Arc::new(Notify::new());
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_get_workflow_execution_history()
+            .times(1)
+            .return_once({
+                let release = release.clone();
+                move |_, _, _| {
+                    async move {
+                        release.notified().await;
+                        Ok(GetWorkflowExecutionHistoryResponse {
+                            history: Some(second_page.into()),
+                            ..Default::default()
+                        })
+                    }
+                    .boxed()
+                }
+            });
+        let permit = fixed_size_permit_dealer(1).acquire_owned().await;
+        let incoming = stream::iter([Ok((task.try_into().unwrap(), permit))]);
+        let output = WFTExtractor::build(Arc::new(client), 2, incoming, stream::pending());
+        futures_util::pin_mut!(output);
+
+        assert!(output.next().now_or_never().is_none());
+        release.notify_one();
+        assert!(matches!(
+            output.next().await,
+            Some(Ok(WFTExtractorOutput::NewWFT(_)))
+        ));
+        assert!(matches!(
+            output.next().await,
+            Some(Ok(WFTExtractorOutput::PollerDead))
+        ));
     }
 }
