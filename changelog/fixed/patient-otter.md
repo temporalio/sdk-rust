@@ -1,1 +1,1 @@
-Worker shutdown preserves Activity and Nexus tasks returned after another poll finishes with an empty response.
+Worker shutdown preserves Activity and Nexus tasks when another poll returns an empty response.

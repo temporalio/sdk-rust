@@ -960,8 +960,9 @@ mod tests {
                 capabilities,
             );
             let poller: BoxedPoller<_> = Box::new(buffer);
-            let stream = TaskPollerStream::new(poller, MetricsContext::no_op(), |_| {}, shutdown.clone())
-                .into_stream();
+            let stream =
+                TaskPollerStream::new(poller, MetricsContext::no_op(), |_| {}, shutdown.clone())
+                    .into_stream();
             pin_mut!(stream);
             let received = {
                 let next = stream.next();
@@ -977,7 +978,7 @@ mod tests {
                 empty_tx.send(T::default()).unwrap();
                 tokio::select! {
                     biased;
-                    result = &mut next => panic!("poll completed before the second response: {result:?}"),
+                    result = &mut next => panic!("poll ended before the task response. {result:?}"),
                     _ = issued.wait_for(|count| *count == 1) => {},
                 }
                 task_tx.send(task.clone()).unwrap();
