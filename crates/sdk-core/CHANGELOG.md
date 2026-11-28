@@ -37,6 +37,7 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* Workflow replay skips timed-out tasks consistently when a History page ends at the task start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
@@ -48,6 +49,12 @@ relevant information.
   the workflow. A nondeterminism error that Core finds during replay no longer sends lang's
   commands of the replayed task, such as its `CompleteWorkflowExecution`, next to Core's fail
   command.
+
+* A forced Workflow failure returns the original nondeterminism error once, including when a
+  Local Activity result is pending or the task only delivers an Update. The server aborts the
+  outstanding Update.
+* A stale sticky task replays every completed task in newer paginated History. A forced failure
+  completes without waiting for another History page.
 
 ## [0.12.0] - 2026-11-23
 

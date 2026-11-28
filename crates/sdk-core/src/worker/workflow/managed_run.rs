@@ -523,10 +523,8 @@ impl ManagedRun {
                 versioning_behavior,
             };
 
-            // Verify we can actually apply the next workflow task, which will happen as part of
-            // applying the completion to machines. If we can't, return early indicating we need
-            // to fetch a page.
-            if !self.wfm.ready_to_apply_next_wft() {
+            // A forced failure applies no next task, so it must not wait for another History page.
+            if !is_forced_failure && !self.wfm.ready_to_apply_next_wft() {
                 return if let Some(paginator) = self.paginator.take() {
                     debug!("Need to fetch a history page before next WFT can be applied");
                     self.completion_waiting_on_page_fetch = Some(rac);
@@ -679,6 +677,11 @@ impl ManagedRun {
             )
         {
             warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            // An earlier cache eviction may have kept queries that would delay this failure.
+            if let Some(wft) = self.wft.as_mut() {
+                wft.pending_queries.clear();
+            }
+            self.wfm.machines.allow_forced_failure_in_update_only_task();
             return self
                 .successful_completion(
                     vec![WFCommand::new(WFCommandVariant::FailWorkflow(
@@ -692,7 +695,7 @@ impl ManagedRun {
                     true,
                 )
                 .unwrap_or_else(|e| {
-                    dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
+                    dbg_panic!("A forced failure must not wait for a history page: {e:?}");
                     None
                 });
         }
@@ -896,6 +899,13 @@ impl ManagedRun {
                         resp_chan: completion.resp_chan,
                     }))
                 }
+            }
+            // Retrying a forced failure here would recurse on the same nondeterminism error.
+            Err(e @ WFMachinesError::Nondeterminism(_)) if completion.is_forced_failure => {
+                Err(RunUpdateErr {
+                    source: WFMachinesError::Fatal(format!("Could not fail the workflow: {e}")),
+                    complete_resp_chan: completion.resp_chan,
+                })
             }
             Err(e) => Err(RunUpdateErr {
                 source: e,
@@ -1253,8 +1263,10 @@ impl ManagedRun {
         // activations and we are caught up on replay. We don't want to complete a wft if we already
         // saw the final event in the workflow, or if we are playing back for the express purpose of
         // fulfilling a query. Eviction only reports output buffered by prior normal activations.
-        let should_respond = !(machines_wft_response.activation_needed
-            || (machines_wft_response.replaying && !data.is_forced_failure)
+        // Lang's reply to a pending job would replace a forced failure, so the failure can't wait.
+        let waits_for_more_activations = !data.is_forced_failure
+            && (machines_wft_response.activation_needed || machines_wft_response.replaying);
+        let should_respond = !(waits_for_more_activations
             || is_query_playback
             || (data.activation_was_eviction && !eviction_has_output)
             || machines_wft_response.have_seen_terminal_event);

@@ -681,6 +681,11 @@ impl WorkflowMachines {
         }
     }
 
+    /// The server accepts a forced failure without an Update response and aborts the Update.
+    pub(crate) fn allow_forced_failure_in_update_only_task(&mut self) {
+        self.update_only_task = false;
+    }
+
     /// Apply the language SDK's workflow commands and prepare the resulting commands for the server.
     pub(crate) fn iterate_machines(&mut self, results: Vec<WFCommand>) -> Result<()> {
         debug!(in_cmds = %results.display(), "wf bridge iteration fetch");
