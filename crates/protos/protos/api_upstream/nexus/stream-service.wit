@@ -209,7 +209,7 @@ interface stream-service {
     max-records: option<s32>,
     /// @nexus.doc "Page byte target. A larger Record can exceed it within SDK hard limits."
     max-bytes: option<s64>,
-    /// @nexus.doc "How long to wait for a new Record. Unset returns immediately."
+    /// @nexus.doc "Wait per page. Unset reads immediately, then iterators use a one-minute wait."
     wait: option<duration>,
   }
 
@@ -266,6 +266,8 @@ interface stream-service {
 
   // The Workflow API has no other way to create a Stream, so this function stays public.
   /// @nexus.operation name="CreateStream"
+  /// @nexus.output-transform python-type="Stream[BodyT]"
+  ///   python="_support.stream_from_create(result, nexus_client, body_type)"
   create-stream: func(request: create-stream-request) -> create-stream-result;
 
   /// @nexus.doc "Append one batch. For Workflow code, Core makes the call."
