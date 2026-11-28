@@ -1900,7 +1900,7 @@ impl LocalActivityRequestSink for LAReqSink {
 /// 3. random-seed-updates
 /// 4. signals/updates
 /// 5. all others
-/// 6. local activity resolutions, then Stream results
+/// 6. Stream and Local Activity results, in recorded activation order
 /// 7. queries
 /// 8. evictions
 ///

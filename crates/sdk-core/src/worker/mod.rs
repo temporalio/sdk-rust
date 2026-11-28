@@ -283,16 +283,17 @@ pub struct WorkerConfig {
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
 
-    /// The Stream runtimes of this Worker by Store name, with the settings of its Stream calls. A
-    /// Stream call on a Store with no runtime here fails the Workflow Task. A call with no Store
-    /// name uses the runtime under the empty name if there is one, else the only runtime, also in
-    /// a replay. If there is neither, the task fails. A replay compares the name that it picks
-    /// with History. So a change of the runtime that it picks, such as a new runtime under the
-    /// empty name or a renamed only runtime, makes the replay of a call with no Store name a
-    /// nondeterminism error. Give each Store one name, since Core orders the appends of a Stream
-    /// per Store name. A runtime under two names, or a Store name of more than 4096 bytes, fails
-    /// the start of the Worker. Core can't see two runtimes on one Store, so such a Worker starts.
-    /// NOTE: Experimental
+    /// Stream runtimes and retry settings for this Worker. A live call with no Store name uses
+    /// the runtime registered under `""`, or the only runtime. An unresolved Store fails the task.
+    ///
+    /// Replay uses the recorded Store for a ref with no Store name and makes no append call.
+    /// An explicit Store name must match History.
+    ///
+    /// Give each Store one name so its appends share one queue. Reusing a runtime under two names
+    /// or a Store name over 4096 bytes prevents Worker startup.
+    /// Core can't detect different runtimes backed by the same Store.
+    ///
+    /// Experimental.
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,
 

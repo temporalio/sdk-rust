@@ -50,7 +50,6 @@ impl From<CommandSent> for Recorded {
     }
 }
 
-/// Creates the marker command that records `data`, with its machine.
 pub(super) fn stream_marker(
     data: &StreamAppendMarkerData,
 ) -> Result<NewMachineWithCommand, WFMachinesError> {

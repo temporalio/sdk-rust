@@ -56,6 +56,7 @@ struct State {
     streams: HashMap<String, Stream>,
     requests: Vec<Request>,
     held: HashSet<Op>,
+    panic_once: HashSet<Op>,
     held_streams: HashSet<String>,
     failures: HashMap<Op, (AnyError, usize)>,
     lost_answers: HashMap<Op, usize>,
@@ -93,6 +94,11 @@ impl MemoryStore {
     pub fn release_stream(&self, id: &str) {
         self.state.lock().held_streams.remove(id);
         self.released.send_modify(|count| *count += 1);
+    }
+
+    /// Makes the next call panic before writing.
+    pub fn panic_once(&self, op: Op) {
+        self.state.lock().panic_once.insert(op);
     }
 
     /// Makes the next `times` calls of `op` fail with `error` before they write.
@@ -136,6 +142,7 @@ impl MemoryStore {
         let held = {
             let mut state = self.state.lock();
             state.requests.push(request);
+            assert!(!state.panic_once.remove(&op), "test Store panic");
             state.held.contains(&op)
         };
         if held {
