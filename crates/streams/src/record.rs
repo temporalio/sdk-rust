@@ -80,7 +80,7 @@ impl StoreLimits {
     }
 
     /// Validate the Stream id, Producer, Records and batch limits without a Store call.
-    /// SDKs can use this check for client appends that bypass [`StreamRuntime`](crate::StreamRuntime).
+    /// SDKs use this for client appends that bypass [`StreamRuntime`](crate::StreamRuntime).
     /// The size calculation does not allocate an encoded copy of the batch.
     pub fn validate_append(&self, request: &AppendRecordsRequest) -> Result<(), AppendError> {
         validate_stream_id(&request.stream_id)?;

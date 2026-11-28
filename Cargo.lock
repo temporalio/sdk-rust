@@ -4790,6 +4790,7 @@ dependencies = [
  "prost",
  "prost-wkt-types",
  "temporalio-common",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

@@ -1,5 +1,4 @@
-//! The digest of the Records of a page that a read gave Workflow code. A read marker keeps it in
-//! place of the Records, and a replay checks the Records that it reads again against it.
+//! History keeps a digest so replay can detect changed Records without storing their contents.
 
 use sha2::{Digest as _, Sha256};
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -8,15 +7,13 @@ use temporalio_streams::{
     proto::{StreamRecord, WorkflowTaskAttempt, producer::Kind},
 };
 
-/// Number of hash bytes in a read marker, excluding the version prefix.
+// History stores the version prefix separately from these hash bytes.
 const DIGEST_LEN: usize = 16;
 
-/// The first byte of the hashed input, so the digest differs from other hashes of the same bytes.
-/// It's a fact of the digest's format.
+// Separate Record digests from other hashes of the same bytes.
 const RECORDS_TAG: u8 = b'R';
 
-/// Original markers contain just the 16-byte hash. New markers prefix it with a version
-/// so that replay can still interpret both the old attempt keys and future encodings.
+// The version keeps changes to attempt encoding from breaking existing History.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DigestFormat {
     Legacy,
@@ -38,9 +35,7 @@ pub(crate) fn digest(records: &[StreamRecord]) -> Vec<u8> {
 }
 
 impl DigestFormat {
-    /// Lengths and counts are big-endian u64s. Offsets and payloads have the
-    /// same encoding in both versions. V1 preserves the presence and signed fields of the
-    /// Producer's attempt, which its fencing key deliberately normalizes.
+    // Fencing keys normalize attempt fields. Replay must detect changes to their original values.
     pub(super) fn hash(self, records: &[StreamRecord]) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update([RECORDS_TAG]);

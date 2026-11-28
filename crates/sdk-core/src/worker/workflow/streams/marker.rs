@@ -88,12 +88,10 @@ pub(crate) fn marker_details(
     )]))
 }
 
-/// Returns true if `event` is a Stream marker of either kind.
 pub(crate) fn is_stream_marker(event: &HistoryEvent) -> bool {
     marker_of(event).is_some()
 }
 
-/// Returns true if `event` is a `core_stream_read` marker.
 pub(crate) fn is_read_marker(event: &HistoryEvent) -> bool {
     marker_of(event).is_some_and(|marker| marker.marker_name == STREAM_READ_MARKER_NAME)
 }
@@ -108,7 +106,6 @@ pub(crate) fn peeked_marker(event: &HistoryEvent) -> Option<Result<PeekedMarker,
     })
 }
 
-/// Decodes a `core_stream_read` marker event, and returns `None` for any other event.
 pub(crate) fn peeked_read_marker(
     event: &HistoryEvent,
 ) -> Option<Result<StreamReadMarkerData, WFMachinesError>> {
@@ -223,7 +220,6 @@ mod tests {
     };
     use temporalio_streams::{AppendError, AppendReason};
 
-    /// Returns the marker event of `marker`, as Core records it.
     fn event(marker: &PeekedMarker) -> HistoryEvent {
         let (name, details) = match marker {
             PeekedMarker::Append(data) => (STREAM_APPEND_MARKER_NAME, marker_details(data)),

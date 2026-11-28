@@ -1143,21 +1143,19 @@ fn reads_with_peeked_results(
     }
 }
 
-/// Returns the name of each job of each activation, sorted, without the patches that only a
-/// replay gets.
+// Patch notifications occur only during replay.
 fn job_names(jobs: &[Vec<Job>]) -> Vec<Vec<String>> {
     let name = |job: &Job| match job {
         Job::NotifyHasPatch(_) => None,
-        Job::DoUpdate(update) => Some(format!("update {}", update.id)),
-        Job::ResolveActivity(result) => Some(format!("local activity {}", result.seq)),
+        Job::DoUpdate(update) => {
+            let mut update = update.clone();
+            update.run_validator = false;
+            Some(format!("{:?}", Job::DoUpdate(update)))
+        }
         other => Some(format!("{other:?}")),
     };
-    (jobs.iter())
-        .map(|jobs| {
-            let mut names: Vec<String> = jobs.iter().filter_map(name).collect();
-            names.sort();
-            names
-        })
+    jobs.iter()
+        .map(|jobs| jobs.iter().filter_map(name).collect())
         .collect()
 }
 
@@ -1448,9 +1446,7 @@ async fn replay_with_bound(
     }
 }
 
-// A replay gives the same activations whatever the size of its parts of Records. With chunking
-// off they are the activations of the first run. With chunking on it gives the results of a task
-// in fewer activations, as for a Local Activity.
+// Record prefetch limits and task chunking must not change the recorded activation groups.
 #[tokio::test]
 async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
     let (mut positions, mut peeked) = (HashMap::new(), HashMap::new());
@@ -1506,8 +1502,7 @@ async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
         for kind in peeked_in(&events, markers[last - 1].1) {
             *peeked.entry(kind).or_insert(0) += 1;
         }
-        // The replay waits once it applied the task whose completion is two before the one of
-        // the first unread marker. With chunking, a completion with no command joins two tasks.
+        // Stream tasks without command events must also keep their recorded activation groups.
         let completions: Vec<i64> = (events.iter())
             .filter(|event| event.event_type() == EventType::WorkflowTaskCompleted)
             .map(|event| event.event_id)
@@ -1539,18 +1534,8 @@ async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
         assert_eq!(in_parts, in_one_part, "seed {seed}");
         let fired = vec![Job::FireTimer(FireTimer { seq: 1 })];
         let first_run = [live, vec![fired]].concat();
-        if chunking {
-            let sorted = |jobs: &[Vec<String>]| {
-                let mut jobs = jobs.concat();
-                jobs.sort();
-                jobs
-            };
-            let of_first_run = sorted(&job_names(&first_run));
-            assert_eq!(sorted(&in_parts.jobs), of_first_run, "seed {seed}");
-            assert_eq!(in_parts.reads, read_jobs(&first_run), "seed {seed}");
-        } else {
-            assert_eq!(in_parts.jobs, job_names(&first_run), "seed {seed}");
-        }
+        assert_eq!(in_parts.jobs, job_names(&first_run), "seed {seed}");
+        assert_eq!(in_parts.reads, read_jobs(&first_run), "seed {seed}");
     }
     // The seeds end the first part at each position, with each kind of peeked result in the
     // completion before the wait, and some chunked replays wait after a task with no command.
@@ -1607,6 +1592,79 @@ async fn a_replay_reads_the_records_of_a_marker_in_a_later_page_of_history() {
         // The replay read the Records of each marker from the Store once.
         assert_eq!(store.reads().len() - before, markers, "{label}");
     }
+}
+
+// The server reads query state and History separately, so History can contain newer tasks.
+#[rstest::rstest]
+#[case::one_part(usize::MAX)]
+#[case::bounded_parts(1)]
+#[tokio::test]
+async fn a_query_reads_markers_from_history_newer_than_its_snapshot(#[case] bound: usize) {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 6).await;
+    let (live, t, whole) = first_run_with_a_timer_at_each_page(&store, 1).await;
+    let mut query = query_before(&whole, t.current_event_id() - 3);
+    let events = query.history.as_ref().unwrap().events.clone();
+    let markers = recorded_markers(&events).len();
+    let completions: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.event_type() == EventType::WorkflowTaskCompleted)
+        .map(|(at, _)| at)
+        .collect();
+    let (first, second) = (completions[1], completions[3]);
+    query.previous_started_event_id = 3;
+    query.history = Some(History {
+        events: events[..first].to_vec(),
+    });
+    query.next_page_token = vec![1];
+    let mut opts = StartOpts::new(&store);
+    opts.responses = vec![ResponseType::Raw(query)];
+    opts.queries = 1;
+    opts.served = None;
+    opts.configure = Box::new(move |wc| wc.stream_runtimes.settings.max_task_record_bytes = bound);
+    opts.pages = vec![
+        GetWorkflowExecutionHistoryResponse {
+            next_page_token: vec![1],
+            ..page(&events[first..second])
+        },
+        page(&events[second..]),
+    ];
+    let before = store.reads().len();
+    let replay = start(t, opts);
+    let mut jobs = vec![];
+    let drive = async {
+        loop {
+            let activation = replay.worker.poll_workflow_activation().await.unwrap();
+            if evicted(&replay.worker, &activation).await {
+                break;
+            }
+            let is_query = matches!(activation.jobs[0].variant, Some(Job::QueryWorkflow(_)));
+            if !is_query {
+                if jobs.is_empty() {
+                    assert!(store.reads().len() - before < markers);
+                }
+                jobs.push(jobs_of(&activation));
+            }
+            respond(
+                &replay.worker,
+                &activation,
+                read_with_a_timer_at_each_page(1),
+            )
+            .await;
+            if is_query {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), drive)
+        .await
+        .expect("The query did not finish");
+    replay.worker.drain_pollers_and_shutdown_ref().await;
+    let answers = replay.answers.lock().clone();
+    assert!(matches!(answers.as_slice(), [(_, None)]), "{answers:?}");
+    assert_eq!(job_names(&jobs), job_names(&live));
+    assert_eq!(store.reads().len() - before, markers);
 }
 
 /// What the task after the first page has.
@@ -1722,6 +1780,39 @@ async fn a_replay_goes_on_after_a_task_with_no_job_before_the_next_part(#[case] 
         replays.push(replay_with_bound(&store, &t, &poll, bound, label, reads_and_upserts()).await);
     }
     assert_eq!(replays[0], replays[1]);
+}
+
+#[tokio::test]
+async fn a_replay_read_panic_releases_the_completion_waiting_for_its_page() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 3).await;
+    let (_, t, whole) = first_run_with_a_timer_at_each_page(&store, 1).await;
+    let mut opts = StartOpts::new(&store);
+    opts.responses = vec![ResponseType::Raw(whole)];
+    opts.fails = 1;
+    opts.configure = Box::new(|wc| wc.stream_runtimes.settings.max_task_record_bytes = 1);
+    let replay = start(t, opts);
+    let workflow = read_with_a_timer_at_each_page(1);
+    let drive = drive_until_evicted(&replay.worker, |activation| {
+        // Initialization already has the first page. Its completion waits for the next one.
+        store.panic_once(Op::Read);
+        workflow(activation)
+    });
+    let (jobs, reason) = tokio::time::timeout(Duration::from_secs(10), drive)
+        .await
+        .expect("The completion still waits for the failed replay read");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(reason, Some(EvictionReason::PaginationOrHistoryFetch));
+    let failed = replay.failed.lock().clone();
+    let [(cause, message)] = failed.as_slice() else {
+        panic!("Expected a failure of the replaying task, got {failed:?}");
+    };
+    assert_eq!(
+        *cause,
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    );
+    assert!(message.contains("test Store panic"), "{message}");
+    replay.worker.drain_pollers_and_shutdown_ref().await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2615,10 +2706,16 @@ async fn a_read_outage_during_a_wait_fails_the_task() {
 // with the timer ask for the next task, and starts when that task opens.
 #[tokio::test]
 async fn the_read_results_of_one_task_have_a_bound() {
-    const BOUND: usize = 256;
+    const BOUND: usize = 2;
     let store = store(&["s"]).await;
-    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
-    let workflow = move |activation: &WorkflowActivation| -> Vec<Command> {
+    let mut opts = StartOpts::new(&store);
+    opts.configure = Box::new(|wc| wc.stream_runtimes.settings.max_task_read_results = BOUND);
+    let run = start(history(Duration::from_secs(60)), opts);
+    let budget_reached = tokio::sync::Notify::new();
+    let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
+        if results(activation).any(|result| result.seq == BOUND as u32) {
+            budget_reached.notify_one();
+        }
         let resolved = (activation.jobs.iter())
             .any(|job| matches!(job.variant, Some(Job::ResolveActivity(_))));
         match &activation.jobs[0].variant {
@@ -2634,7 +2731,9 @@ async fn the_read_results_of_one_task_have_a_bound() {
     };
     let local_activity_ends = async {
         let task = run.worker.poll_activity_task().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::timeout(Duration::from_secs(10), budget_reached.notified())
+            .await
+            .expect("The reads did not reach the result budget");
         let completion = ActivityTaskCompletion {
             task_token: task.task_token,
             result: Some(ActivityExecutionResult::ok(Payload::default())),
@@ -2666,9 +2765,12 @@ async fn the_read_results_of_one_task_have_a_bound() {
 // next task with no other event, and a replay gives the same jobs.
 #[tokio::test]
 async fn a_read_that_the_result_budget_holds_back_forces_the_next_task() {
-    const BOUND: u32 = 256;
+    const BOUND: u32 = 2;
     let store = store(&["s"]).await;
-    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
+    let mut opts = StartOpts::new(&store);
+    opts.configure =
+        Box::new(|wc| wc.stream_runtimes.settings.max_task_read_results = BOUND as usize);
+    let run = start(history(Duration::from_secs(60)), opts);
     let workflow = |activation: &WorkflowActivation| -> Vec<Command> {
         match &activation.jobs[0].variant {
             Some(Job::InitializeWorkflow(_)) => vec![read(1, "s", &[], Duration::ZERO).into()],

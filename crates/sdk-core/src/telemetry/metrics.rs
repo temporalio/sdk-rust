@@ -562,7 +562,7 @@ impl Instruments {
             }),
             stream_read_total: meter.counter(MetricParameters {
                 name: "stream_read_total".into(),
-                description: "Count of the requests that Stream reads sent to a Store".into(),
+                description: "Count of Stream read requests sent to a Store".into(),
                 unit: "".into(),
             }),
             stream_read_execution_failed: meter.counter(MetricParameters {
@@ -577,7 +577,7 @@ impl Instruments {
             }),
             stream_replay_read_total: meter.counter(MetricParameters {
                 name: "stream_replay_read_total".into(),
-                description: "Count of the requests that Stream replay reads sent to a Store".into(),
+                description: "Count of Stream replay read requests sent to a Store".into(),
                 unit: "".into(),
             }),
             stream_replay_read_execution_failed: meter.counter(MetricParameters {

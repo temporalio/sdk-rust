@@ -56,6 +56,7 @@ relevant information.
   Workers can still replay the original marker format, including previously delivered oversized
   Records. Older Workers cannot interpret the new digest format.
 * Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
+* Workflow queries retain task results when replay needs another History page.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

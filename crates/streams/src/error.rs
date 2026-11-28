@@ -97,9 +97,12 @@ pub enum DescribeReason {
 ///
 /// // An `AnyError` becomes the error of any operation, which is what `?` does with it.
 /// let invalid: AppendError = AnyError::invalid_argument("The Stream id is empty").into();
-/// assert_eq!(invalid.reason, AppendReason::Other(AnyReason::InvalidArgument));
+/// assert_eq!(
+///     invalid.reason,
+///     AppendReason::Other(AnyReason::InvalidArgument)
+/// );
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub struct StreamError<R> {
     /// Why the call failed.
     pub reason: R,
@@ -176,8 +179,6 @@ impl<R: Copy + Into<StreamErrorReason>> fmt::Display for StreamError<R> {
         write!(f, "{}: {}", self.token(), self.message)
     }
 }
-
-impl<R: Copy + fmt::Debug + Into<StreamErrorReason>> std::error::Error for StreamError<R> {}
 
 impl<R: WireReason> From<AnyError> for StreamError<R> {
     fn from(error: AnyError) -> Self {

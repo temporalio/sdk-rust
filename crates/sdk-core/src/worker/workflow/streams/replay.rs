@@ -13,7 +13,7 @@ use crate::{
     worker::{
         WorkerConfig,
         workflow::{
-            NextPageReq, PermittedWFT,
+            NextPageReq, PermittedWFT, UnstoredWftFailInfo,
             history_update::{HistoryPaginator, HistoryUpdate},
             wft_extraction::{FetchedPage, HistfetchRC, WFTExtractorOutput},
         },
@@ -70,35 +70,29 @@ pub(crate) struct ReplayReads {
 }
 
 impl ReplayReads {
-    /// Returns true if a run new to the cache must read the Records of the markers in the
-    /// events of `update` before it replays them.
+    // A replay must load marker Records before the machines can apply their History page.
     pub(crate) fn needed_by(update: &HistoryUpdate) -> bool {
         update.stream_reads.is_none() && update.get_events().iter().any(is_read_marker)
     }
 
-    /// Takes the Records that were read for the marker event `event_id` of `update`.
     pub(crate) fn take_from(update: &mut HistoryUpdate, event_id: i64) -> MarkerReads {
         (update.stream_reads.as_mut()).map_or_else(Vec::new, |reads| reads.take(event_id))
     }
 
-    /// Adds the Records of the next markers to `update`, which a completion waited for.
     pub(crate) fn add_to(self, update: &mut HistoryUpdate) {
         if let Some(reads) = &mut update.stream_reads {
             reads.extend(self);
         }
     }
 
-    /// Takes the results of the read entries of the marker event `event_id`.
     pub(crate) fn take(&mut self, event_id: i64) -> MarkerReads {
         self.reads.remove(&event_id).unwrap_or_default()
     }
 
-    /// Returns the event id of the first marker whose Records the replay hasn't read yet.
     pub(crate) fn unread(&self) -> Option<i64> {
         self.unread
     }
 
-    /// Adds the Records of the next part, and takes its first marker that is still unread.
     pub(crate) fn extend(&mut self, part: ReplayReads) {
         self.reads.extend(part.reads);
         self.unread = part.unread;
@@ -113,38 +107,61 @@ pub(in crate::worker::workflow) enum StreamRecordsReq {
     NewRun(Box<PermittedWFT>, Arc<HistfetchRC>),
     /// The next part, for a completion of the run that waits for it.
     NextPart(Box<NextPageReq>, Arc<HistfetchRC>),
+    HistoryPage(Box<NextPageReq>, HistoryUpdate, Arc<HistfetchRC>),
 }
 
 impl StreamRecordsReq {
-    /// Reads the Records. Each read entry gets its own result, so the read never fails as a whole.
-    pub(in crate::worker::workflow) async fn read(self) -> WFTExtractorOutput {
+    pub(in crate::worker::workflow) fn failure_context(
+        &self,
+    ) -> (String, Option<UnstoredWftFailInfo>) {
         match self {
-            StreamRecordsReq::NewRun(mut pwft, rc) => {
+            Self::NewRun(pwft, _) => {
+                let work = &pwft.work;
+                let info = UnstoredWftFailInfo {
+                    task_token: work.task_token.clone(),
+                    workflow_id: work.execution.workflow_id.clone(),
+                    attempt: work.attempt,
+                    workflow_type: work.workflow_type.clone(),
+                };
+                (work.execution.run_id.clone(), Some(info))
+            }
+            Self::NextPart(req, _) | Self::HistoryPage(req, _, _) => {
+                (req.paginator.run_id.clone(), None)
+            }
+        }
+    }
+
+    pub(in crate::worker::workflow) async fn read(self) -> WFTExtractorOutput {
+        let (req, update, rc) = match self {
+            Self::NewRun(mut pwft, rc) => {
                 let PermittedWFT {
                     work, paginator, ..
                 } = pwft.as_mut();
                 ReplayReader::read_first_part(paginator, &mut work.update).await;
-                WFTExtractorOutput::FetchResult(*pwft, rc)
+                return WFTExtractorOutput::FetchResult(*pwft, rc);
             }
-            StreamRecordsReq::NextPart(mut req, rc) => {
+            Self::NextPart(mut req, rc) => {
                 let reads = ReplayReader::read_next_part(&mut req.paginator).await;
-                WFTExtractorOutput::NextPage {
-                    paginator: req.paginator,
-                    update: FetchedPage::StreamRecords(reads),
-                    span: req.span,
-                    rc,
-                }
+                (req, FetchedPage::StreamRecords(reads), rc)
             }
+            Self::HistoryPage(mut req, mut update, rc) => {
+                ReplayReader::read_first_part(&mut req.paginator, &mut update).await;
+                (req, FetchedPage::History(update), rc)
+            }
+        };
+        WFTExtractorOutput::NextPage {
+            paginator: req.paginator,
+            update,
+            span: req.span,
+            rc,
         }
     }
 }
 
-/// Returns true if the replay of `entry` needs its Records from the Store.
 pub(crate) fn needs_records(entry: &StreamReadResult) -> bool {
     unread_page(entry).is_some()
 }
 
-/// Returns the page of `entry` if it has Records.
 fn unread_page(entry: &StreamReadResult) -> Option<&StreamReadPage> {
     match &entry.result {
         Some(stream_read_result::Result::Page(page)) if page.record_count > 0 => Some(page),
@@ -208,8 +225,6 @@ impl ReplayReader {
         }
     }
 
-    /// Queues each marker in `events` that has a read entry with Records, and returns the bytes of
-    /// Records that they record.
     pub(crate) fn queue<'a>(&mut self, events: impl Iterator<Item = &'a HistoryEvent>) -> u64 {
         let mut recorded = 0_u64;
         for event in events {
@@ -244,7 +259,6 @@ impl ReplayReader {
         recorded
     }
 
-    /// Returns true while a queued marker has no Records yet.
     pub(crate) fn has_unread(&self) -> bool {
         !self.unread.is_empty()
     }
@@ -297,19 +311,16 @@ impl ReplayReader {
         reads
     }
 
-    /// Makes `paginator` read the Records of the markers of its History, for a run new to
-    /// the cache.
     pub(crate) fn add_to(
         paginator: &mut HistoryPaginator,
         config: &WorkerConfig,
         metrics: &MetricsContext,
     ) {
-        let runtimes = config.stream_runtimes.clone();
-        paginator.stream_reader = Some(ReplayReader::new(runtimes, metrics.clone()));
+        paginator
+            .stream_reader
+            .get_or_insert_with(|| Self::new(config.stream_runtimes.clone(), metrics.clone()));
     }
 
-    /// Reads the first part of the Records of the markers of `update`, which has the whole
-    /// History, and keeps the markers after it for [`Self::read_next_part`].
     async fn read_first_part(paginator: &mut HistoryPaginator, update: &mut HistoryUpdate) {
         if let Some(reader) = &mut paginator.stream_reader {
             let recorded = reader.queue(update.get_events().iter());
@@ -324,14 +335,12 @@ impl ReplayReader {
         }
     }
 
-    /// Reads the next part of the Records, for a completion that waits for them.
     async fn read_next_part(paginator: &mut HistoryPaginator) -> ReplayReads {
         let reader = paginator.stream_reader.as_mut();
         let reader = reader.expect("A paginator with unread Stream Records has their reader");
         reader.read_next().await
     }
 
-    /// Returns true while a marker of the History of `paginator` has no Records yet.
     pub(crate) fn has_unread_in(paginator: &HistoryPaginator) -> bool {
         (paginator.stream_reader.as_ref()).is_some_and(ReplayReader::has_unread)
     }
@@ -343,7 +352,6 @@ impl ReplayReader {
         update.stream_reads = None;
     }
 
-    /// Reads the Records of one entry, and checks them against its count and its digest.
     async fn read_entry(
         &self,
         entry: &UnreadEntry,
@@ -531,7 +539,6 @@ impl Deadline {
     }
 }
 
-/// Returns an offset as hex, for a message.
 pub(crate) fn offset_text(offset: &[u8]) -> String {
     if offset.is_empty() {
         return "the start".to_string();
@@ -586,7 +593,6 @@ mod tests {
         NoRuntime,
     }
 
-    /// Returns the read marker `event_id` with `data`.
     fn marker_event(event_id: i64, data: &StreamReadMarkerData) -> HistoryEvent {
         let marker = MarkerRecordedEventAttributes {
             marker_name: STREAM_READ_MARKER_NAME.to_string(),
@@ -659,7 +665,6 @@ mod tests {
         }
     }
 
-    /// Returns a Stream id or a Store name, which is sometimes as long as an id may be.
     fn name(rng: &mut StdRng, short: &str) -> String {
         if rng.random_bool(0.8) {
             return short.to_string();
@@ -1083,16 +1088,24 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::retry_succeeds(Duration::from_secs(2), false, 2)]
+    #[case::deadline_during_attempt(Duration::from_secs(2), true, 2)]
+    #[case::deadline_before_retry(Duration::ZERO, true, 1)]
     #[tokio::test(start_paused = true)]
-    async fn replay_store_io_has_its_own_counters(#[values(false, true)] retry_hangs: bool) {
+    async fn replay_store_io_has_its_own_counters(
+        #[case] retry_bound: Duration,
+        #[case] retry_hangs: bool,
+        #[case] attempts: u64,
+    ) {
         let (buffer, metrics) = super::super::manager::tests::metric_buffer();
         let given = record(&[1], 0, 10);
         let mut first = true;
+        let started = Instant::now();
         let result = replay_record(
             &given,
             StreamSettings {
                 try_deadline: Duration::from_secs(10),
-                replay_retry_bound: Duration::from_secs(2),
+                replay_retry_bound: retry_bound,
                 retry_initial_interval: Duration::from_millis(50),
                 ..Default::default()
             },
@@ -1109,6 +1122,8 @@ mod tests {
         )
         .await;
         if retry_hangs {
+            let elapsed = started.elapsed();
+            assert!(elapsed >= retry_bound && elapsed < retry_bound + Duration::from_millis(50));
             assert!(matches!(
                 result.as_slice(),
                 [Some(Err(ReplayError::Unavailable(_)))]
@@ -1117,13 +1132,13 @@ mod tests {
             assert_eq!(result, vec![Some(Ok(vec![given]))]);
         }
         let expected = [
-            ("stream_replay_read_total", "", 2),
+            ("stream_replay_read_total", "", attempts),
             (
                 "stream_replay_read_execution_failed",
                 "stream_store_unavailable",
-                if retry_hangs { 2 } else { 1 },
+                if retry_hangs { attempts } else { 1 },
             ),
-            ("stream_replay_read_execution_latency", "", 2),
+            ("stream_replay_read_execution_latency", "", attempts),
         ]
         .into_iter()
         .chain((!retry_hangs).then_some(("stream_replay_read_records", "", 1)))
