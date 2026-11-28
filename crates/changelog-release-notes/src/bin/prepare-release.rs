@@ -16,6 +16,7 @@ const PROTOS_CRATE: &str = "temporalio-protos";
 const RELEASE_TOOL_CRATE: &str = "changelog-release-notes";
 const AWS_S3_DRIVER_CRATE: &str = "temporalio-aws-s3driver";
 const AWS_LAMBDA_CRATE: &str = "temporalio-sdk-aws-lambda";
+const STREAMS_CRATE: &str = "temporalio-streams";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -135,6 +136,8 @@ fn main() -> Result<(), String> {
         AWS_S3_DRIVER_CRATE.into(),
         "--exclude".into(),
         AWS_LAMBDA_CRATE.into(),
+        "--exclude".into(),
+        STREAMS_CRATE.into(),
     ];
     let core_update = vec![
         "set-version".into(),
