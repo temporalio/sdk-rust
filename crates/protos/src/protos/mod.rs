@@ -42,6 +42,7 @@ pub mod coresdk {
 
         use crate::protos::{
             ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL,
+            task_token::scheduled_event_id,
             temporal::api::{
                 common::v1::{Payload, Payloads, RetryPolicy, WorkflowExecution},
                 enums::v1::{
@@ -320,6 +321,11 @@ pub mod coresdk {
 
         impl ActivityTask {
             pub fn start_from_poll_resp(r: PollActivityTaskQueueResponse) -> Self {
+                let scheduled_event_id = if r.activity_run_id.is_empty() {
+                    scheduled_event_id(&r.task_token)
+                } else {
+                    0
+                };
                 let (workflow_id, run_id) = r
                     .workflow_execution
                     .map(|we| (we.workflow_id, we.run_id))
@@ -357,6 +363,7 @@ pub mod coresdk {
                             propagated_nexus_serialization_context: r
                                 .propagated_nexus_serialization_context,
                             workflow_task: None,
+                            scheduled_event_id,
                         },
                     )),
                 }
@@ -3118,7 +3125,7 @@ mod sdk_helpers {
         #[test]
         fn start_from_poll_resp_standalone_activity_populates_run_id() {
             let resp = PollActivityTaskQueueResponse {
-                task_token: vec![1, 2, 3],
+                task_token: vec![0x20, 5],
                 activity_run_id: "test-run-id-123".to_string(),
                 activity_id: "my-activity".to_string(),
                 ..Default::default()
@@ -3129,6 +3136,7 @@ mod sdk_helpers {
                 _ => panic!("expected Start variant"),
             };
             assert_eq!(start.run_id, "test-run-id-123");
+            assert_eq!(start.scheduled_event_id, 0);
             assert!(!start.is_local);
         }
 
@@ -3136,13 +3144,12 @@ mod sdk_helpers {
         fn start_from_poll_resp_workflow_activity_has_empty_run_id() {
             use crate::protos::temporal::api::common::v1::WorkflowExecution;
             let resp = PollActivityTaskQueueResponse {
-                task_token: vec![4, 5, 6],
+                task_token: vec![0x20, 5],
                 activity_id: "my-workflow-activity".to_string(),
                 workflow_execution: Some(WorkflowExecution {
                     workflow_id: "wf-123".to_string(),
                     run_id: "wf-run-456".to_string(),
                 }),
-                // activity_run_id intentionally absent — this is a workflow-scheduled activity
                 ..Default::default()
             };
             let task = ActivityTask::start_from_poll_resp(resp);
@@ -3151,7 +3158,7 @@ mod sdk_helpers {
                 _ => panic!("expected Start variant"),
             };
             assert!(start.run_id.is_empty());
-            // workflow_execution is preserved and distinct from run_id
+            assert_eq!(start.scheduled_event_id, 5);
             assert_eq!(start.workflow_execution.unwrap().run_id, "wf-run-456");
         }
 

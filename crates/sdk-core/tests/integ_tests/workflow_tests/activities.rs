@@ -1006,14 +1006,18 @@ async fn activity_workflow() {
     .unwrap();
     // Poll activity and verify that it's been scheduled with correct parameters
     let task = core.poll_activity_task().await.unwrap();
-    assert_matches!(
-        task.variant,
+    let scheduled_event_id = match &task.variant {
         Some(act_task::Variant::Start(start_activity)) => {
-            assert_eq!(start_activity.activity_type, DEFAULT_ACTIVITY_TYPE.to_string());
+            assert_eq!(
+                start_activity.activity_type,
+                DEFAULT_ACTIVITY_TYPE.to_string()
+            );
             // Workflow-scheduled activities have no activity run ID
             assert!(start_activity.run_id.is_empty());
+            start_activity.scheduled_event_id
         }
-    );
+        _ => panic!("The Activity task did not contain a Start"),
+    };
     let response_payload = Payload {
         data: b"hello ".to_vec(),
         metadata: Default::default(),
@@ -1046,6 +1050,15 @@ async fn activity_workflow() {
         }
     );
     core.complete_execution(&task.run_id).await;
+    // Mock tokens cannot check compatibility with the server's private token format.
+    let history = starter.get_history().await;
+    let scheduled: Vec<i64> = history
+        .events
+        .iter()
+        .filter(|event| event.event_type() == EventType::ActivityTaskScheduled)
+        .map(|event| event.event_id)
+        .collect();
+    assert_eq!(scheduled, [scheduled_event_id]);
 }
 
 #[tokio::test]

@@ -49,6 +49,9 @@ relevant information.
   `failure_reason`. Live append and read counters exclude replay. Replay Store reads have
   separate `stream_replay_read_total`, `stream_replay_read_execution_failed`,
   `stream_replay_read_records` and `stream_replay_read_execution_latency` instruments.
+* [lang-internal] Activity task `Start.scheduled_event_id` identifies the Workflow's
+  `ActivityTaskScheduled` event. Local and standalone Activities report zero, as does a
+  Workflow Activity whose task token has no valid event ID.
 
 ### Fixed
 * A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.

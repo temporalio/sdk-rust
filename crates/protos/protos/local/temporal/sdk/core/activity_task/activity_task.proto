@@ -73,6 +73,9 @@ message Start {
     // For a local activity, the workflow task in which Core dispatched this execution. Retries that
     // Core runs locally keep the value. Unset for other activities.
     WorkflowTaskAttempt workflow_task = 21;
+    // For an activity that a workflow scheduled, the event id of its ActivityTaskScheduled event.
+    // 0 for a local activity, for a standalone activity, and when Core can't read it.
+    int64 scheduled_event_id = 22;
 }
 
 // One attempt of a workflow task, from the poll response and the history of that attempt.

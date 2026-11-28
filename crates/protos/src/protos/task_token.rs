@@ -1,4 +1,5 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
+use prost::Message;
 use std::{
     borrow::Borrow,
     fmt::{Debug, Display, Formatter},
@@ -59,4 +60,34 @@ impl Borrow<[u8]> for TaskToken {
 
 pub(crate) fn format_task_token(tt: &[u8]) -> String {
     BASE64_STANDARD.encode(tt)
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ServerActivityToken {
+    #[prost(int64, tag = "4")]
+    scheduled_event_id: i64,
+}
+
+/// The server exposes the scheduling event ID only in its internal task token.
+/// An unreadable token must not prevent Activity task delivery.
+pub(crate) fn scheduled_event_id(task_token: &[u8]) -> i64 {
+    ServerActivityToken::decode(task_token).map_or(0, |token| token.scheduled_event_id.max(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_scheduled_event_id_from_field_four() {
+        // The scheduling event ID must remain distinct from the started event ID.
+        assert_eq!(scheduled_event_id(&[0x0a, 1, b'n', 0x20, 5, 0x50, 9]), 5);
+        assert_eq!(scheduled_event_id(&[0x0a, 1, b'n', 0x50, 9]), 0);
+        assert_eq!(scheduled_event_id(&[0xff]), 0);
+        assert_eq!(scheduled_event_id(&[0x22, 1, 0]), 0);
+        let negative = ServerActivityToken {
+            scheduled_event_id: -1,
+        };
+        assert_eq!(scheduled_event_id(&negative.encode_to_vec()), 0);
+    }
 }

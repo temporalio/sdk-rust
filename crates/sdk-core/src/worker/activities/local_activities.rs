@@ -646,6 +646,7 @@ impl LocalActivityManager {
                     run_id: String::new(),
                     propagated_nexus_serialization_context: None,
                     workflow_task: new_la.workflow_task,
+                    scheduled_event_id: 0,
                 })),
             }));
         }
