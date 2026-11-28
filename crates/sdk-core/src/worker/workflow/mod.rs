@@ -1168,6 +1168,16 @@ enum WftFailureKind {
     RetryableLegacyQuery,
 }
 
+impl WftFailureKind {
+    fn for_history_fetch(is_legacy_query: bool) -> Self {
+        if is_legacy_query {
+            Self::RetryableLegacyQuery
+        } else {
+            Self::Task
+        }
+    }
+}
+
 /// Identifies a WFT whose failure must be reported outside the normal activation completion path,
 /// because the run it belongs to was never stored or is being torn down.
 #[derive(Debug, Clone)]
@@ -1176,6 +1186,7 @@ struct UnstoredWftFailInfo {
     workflow_id: String,
     attempt: u32,
     workflow_type: String,
+    kind: WftFailureKind,
 }
 
 struct ServerCommandsWithWorkflowInfo {

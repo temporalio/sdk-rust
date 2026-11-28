@@ -176,7 +176,7 @@ impl WFStream {
                                     info.attempt,
                                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                                     ApiFailure::application_failure(message, true).into(),
-                                    WftFailureKind::Task,
+                                    info.kind,
                                     &state
                                         .metrics
                                         .with_new_attrs([workflow_type(info.workflow_type)]),
