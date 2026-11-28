@@ -457,7 +457,7 @@ impl ManagedRun {
                     info.attempt,
                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                     Failure::application_failure(reason, true).into(),
-                    WftFailureKind::Task,
+                    info.kind,
                     &self.metrics,
                 )))
             } else {

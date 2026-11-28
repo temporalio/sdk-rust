@@ -3634,7 +3634,7 @@ async fn fetch_failure_during_completion_evicts_the_run(#[values(false, true)] l
         wf_task.jobs.as_slice(),
         [WorkflowActivationJob {
             variant: Some(workflow_activation_job::Variant::RemoveFromCache(c)),
-        }] if c.message.contains("Fetching history")
+        }] if c.reason == EvictionReason::PaginationOrHistoryFetch as i32
     );
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
         .await
@@ -4518,6 +4518,36 @@ async fn payloads_too_large_doesnt_spam_task_fails() {
         ),
         5
     );
+}
+
+#[tokio::test]
+async fn uncached_legacy_query_fetch_failure_drops_query() {
+    let history = canned_histories::single_timer("1");
+    let mut poll = hist_to_poll_resp(&history, "wfid", 1.into()).resp;
+    poll.previous_started_event_id = poll.started_event_id;
+    poll.started_event_id = 0;
+    poll.query = Some(Default::default());
+    poll.history.as_mut().unwrap().events.truncate(1);
+    poll.next_page_token = vec![1];
+
+    let mut mock = mock_worker_client();
+    mock.expect_get_workflow_execution_history()
+        .once()
+        .returning(|_, _, _| Err(tonic::Status::unavailable("history page unavailable")));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let reported = failures.clone();
+    mock.expect_fail_workflow_task().returning(move |_, _, _| {
+        reported.fetch_add(1, Ordering::Relaxed);
+        Ok(Default::default())
+    });
+
+    let core = mock_worker(MocksHolder::from_wft_stream(mock, stream::iter([poll])));
+    assert_matches!(
+        core.poll_workflow_activation().await,
+        Err(PollError::ShutDown)
+    );
+    core.drain_pollers_and_shutdown().await;
+    assert_eq!(failures.load(Ordering::Relaxed), 0);
 }
 
 /// A history fetch failure for a run that was never cached is reported through a path that has no

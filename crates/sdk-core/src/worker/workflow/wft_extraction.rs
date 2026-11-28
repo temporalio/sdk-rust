@@ -6,7 +6,7 @@ use crate::{
         client::WorkerClient,
         workflow::{
             CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT, UnstoredWftFailInfo,
-            history_update::HistoryPaginator,
+            WftFailureKind, history_update::HistoryPaginator,
         },
     },
 };
@@ -76,6 +76,7 @@ impl WFTExtractor {
                                 workflow_id: wft.workflow_execution.workflow_id.clone(),
                                 attempt: wft.attempt,
                                 workflow_type: wft.workflow_type.clone(),
+                                kind: WftFailureKind::for_history_fetch(wft.legacy_query.is_some()),
                             };
                             Ok(match HistoryPaginator::from_poll(wft, client).await {
                                 Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
@@ -121,6 +122,9 @@ impl WFTExtractor {
                                 workflow_id: req.original_wft.work.execution.workflow_id.clone(),
                                 attempt: req.original_wft.work.attempt,
                                 workflow_type: req.original_wft.work.workflow_type.clone(),
+                                kind: WftFailureKind::for_history_fetch(
+                                    req.original_wft.work.legacy_query.is_some(),
+                                ),
                             };
                             match HistoryPaginator::from_fetchreq(req, client).await {
                                 Ok(r) => WFTExtractorOutput::FetchResult(r, rc),
