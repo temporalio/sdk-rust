@@ -11,6 +11,7 @@ option csharp_namespace = "Temporalio.Api.StreamService.V1";
 
 // Store requests omit the SDK Store name because routing is complete.
 // Nexus envelopes contain the request id. Direct Store calls pass it beside the request.
+// All offsets, including read cursors, are at most 1,024 bytes.
 
 import "google/protobuf/duration.proto";
 
@@ -55,7 +56,9 @@ message AppendRecordsRequest {
 // Experimental. Might change in the future.
 // The offsets of the first and the last Record of the batch.
 message AppendRecordsResponse {
+    // Required and nonempty.
     bytes first_offset = 1;
+    // Required and nonempty.
     bytes last_offset = 2;
 }
 
@@ -72,10 +75,8 @@ message ReadRecordsRequest {
     bytes from_offset = 2;
     // The maximum number of Records in one page. Zero uses the Store default.
     int32 max_records = 3;
-    // The maximum total size of the Records in one page, in bytes. A caller sets it so that a
-    // page fits a limit of its own, such as the size of a History marker. A Record larger than
-    // this is still returned, alone in its page, so a read always makes progress. Zero uses the
-    // Store default.
+    // The target size of a page in bytes. A larger Record is returned alone so the read can
+    // advance. Zero uses the Store default.
     int64 max_bytes = 4;
     // How long the read waits for a new Record before it returns an empty page. When it's unset,
     // the read returns immediately.
