@@ -4,7 +4,7 @@ use crate::{
         get_integ_client, get_integ_connection, get_integ_runtime_options,
         get_integ_server_options, get_integ_telem_options, integ_namespace, prom_metrics,
     },
-    integ_tests::mk_nexus_endpoint,
+    integ_tests::{mk_nexus_endpoint, workflow_tests::streams},
 };
 use anyhow::{anyhow, bail};
 use assert_matches::assert_matches;
@@ -33,16 +33,19 @@ use temporalio_common::{
                 self as activity_result, ActivityExecutionResult, activity_execution_result,
             },
             nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
-            workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+            workflow_activation::{
+                WorkflowActivationJob,
+                workflow_activation_job::{self, Variant as Job},
+            },
             workflow_commands::{
-                CancelWorkflowExecution, CompleteWorkflowExecution, ContinueAsNewWorkflowExecution,
-                FailWorkflowExecution, QueryResult, QuerySuccess, ScheduleActivity,
-                ScheduleLocalActivity, workflow_command,
+                AppendToStream, CancelWorkflowExecution, CompleteWorkflowExecution,
+                ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
+                ReadStream, ScheduleActivity, ScheduleLocalActivity, StartTimer, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            common::v1::RetryPolicy,
+            common::v1::{Payload, RetryPolicy},
             enums::v1::{
                 ActivityTaskFailedCause, NexusHandlerErrorRetryBehavior, WorkflowTaskFailedCause,
             },
@@ -86,7 +89,7 @@ use temporalio_sdk_core::{
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, MocksHolder, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, mock_worker, mock_worker_client,
+        build_mock_pollers, mock_worker, mock_worker_client, stream_store,
     },
 };
 use tokio::{
@@ -1202,6 +1205,135 @@ async fn activity_metrics() {
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
     )));
+}
+
+// Core counts each try of a Stream call of Workflow code for its Store, as it counts each attempt
+// of a Local Activity. It times each try of an append and of a replay's Store read.
+#[tokio::test]
+async fn stream_metrics() {
+    let namespace = integ_namespace();
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let mut starter = CoreWfStarter::new_with_runtime("stream_metrics", rt);
+    let (store, runtimes) = streams::store(2).await;
+    // The first try of an append finds the Store in an outage, so that append tries again.
+    let down = temporalio_streams::StreamError::store_unavailable("The Store is down");
+    store.fail(stream_store::Op::Append, down, 1);
+    starter.set_core_cfg_mutator(move |config| config.stream_runtimes = runtimes.clone());
+    let core = starter.get_core_worker().await;
+    starter.start_wf().await;
+
+    // The Workflow appends to and reads `s` and a Stream that nobody created, and then starts a
+    // timer. The task of the timer fails once, so its retry replays the read.
+    let missing = temporalio_streams::proto::sdk::StreamRef {
+        id: "missing".to_string(),
+        ..streams::stream()
+    };
+    let (mut failed, mut fired, mut results) = (false, false, 0);
+    loop {
+        let activation = core.poll_workflow_activation().await.unwrap();
+        let run_id = activation.run_id.clone();
+        if activation.is_only_eviction() {
+            let evicted = WorkflowActivationCompletion::empty(run_id);
+            core.complete_workflow_activation(evicted).await.unwrap();
+            continue;
+        }
+        let mut commands: Vec<workflow_command::Variant> = vec![];
+        for job in activation
+            .jobs
+            .iter()
+            .filter_map(|job| job.variant.as_ref())
+        {
+            match job {
+                Job::InitializeWorkflow(_) => {
+                    results = 0;
+                    for (seq, stream) in [(1, streams::stream()), (2, missing.clone())] {
+                        let append = AppendToStream {
+                            seq,
+                            stream: Some(stream.clone()),
+                            bodies: vec![Payload::from(b"hello".to_vec())],
+                        };
+                        commands.push(append.into());
+                        let read = ReadStream {
+                            seq,
+                            stream: Some(stream),
+                            max_records: 2,
+                            ..Default::default()
+                        };
+                        commands.push(read.into());
+                    }
+                }
+                Job::ResolveStreamAppend(_) | Job::ResolveStreamRead(_) => {
+                    results += 1;
+                    if results == 4 {
+                        let timer = StartTimer {
+                            seq: 1,
+                            start_to_fire_timeout: Some(prost_dur!(from_millis(10))),
+                        };
+                        commands.push(timer.into());
+                    }
+                }
+                Job::FireTimer(_) => fired = true,
+                _ => {}
+            }
+        }
+        if fired && !failed {
+            failed = true;
+            let failure = Failure::application_failure("The test fails this task".into(), false);
+            let fails = WorkflowActivationCompletion::fail(run_id, failure, None);
+            core.complete_workflow_activation(fails).await.unwrap();
+            fired = false;
+            continue;
+        }
+        if fired {
+            commands.push(CompleteWorkflowExecution { result: None }.into());
+        }
+        let completion = WorkflowActivationCompletion::from_cmds(run_id, commands);
+        core.complete_workflow_activation(completion).await.unwrap();
+        if fired {
+            break;
+        }
+    }
+    core.handle_eviction().await;
+
+    let body = get_text(format!("http://{addr}/metrics")).await;
+    let task_queue = starter.get_task_queue();
+    let store = streams::STORE;
+    let of_worker = format!(
+        "namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",stream_store=\"{store}\",\
+         task_queue=\"{task_queue}\""
+    );
+    let of_run = format!("{of_worker},workflow_type=\"{task_queue}\"");
+    let not_found = format!("failure_reason=\"stream_not_found\",{of_run}");
+    let outage = format!("failure_reason=\"stream_store_unavailable\",{of_run}");
+    let expected = [
+        ("append_total", &of_run, 3),
+        ("append_execution_failed", &outage, 1),
+        ("append_execution_failed", &not_found, 1),
+        ("append_execution_latency_count", &of_run, 3),
+        ("read_total", &of_run, 2),
+        ("read_execution_failed", &not_found, 1),
+        ("read_records", &of_run, 2),
+        ("replay_read_total", &of_worker, 1),
+        ("replay_read_records", &of_worker, 2),
+        ("replay_read_execution_latency_count", &of_worker, 1),
+    ];
+    let mut expected: Vec<String> = expected
+        .into_iter()
+        .map(|(name, attributes, value)| format!("temporal_stream_{name}{{{attributes}}} {value}"))
+        .collect();
+    let mut actual: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("temporal_stream_"))
+        .filter(|line| {
+            let metric = line.split('{').next().unwrap();
+            !metric.ends_with("_bucket") && !metric.ends_with("_sum")
+        })
+        .collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    assert_eq!(actual, expected, "{body}");
+    core.drain_pollers_and_shutdown_ref().await;
 }
 
 #[temporalio_macros::cloud_test_exclusion(

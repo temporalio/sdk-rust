@@ -37,9 +37,9 @@ use temporalio_streams::{
     record::StoreLimits,
 };
 
-const STORE: &str = "mem";
+pub(crate) const STORE: &str = "mem";
 
-fn stream() -> StreamRef {
+pub(crate) fn stream() -> StreamRef {
     StreamRef {
         id: "s".to_string(),
         store: STORE.to_string(),
@@ -47,7 +47,7 @@ fn stream() -> StreamRef {
 }
 
 /// Returns a Store with the Stream `s` of `count` Records, and its runtime for a Worker.
-async fn store(count: usize) -> (Arc<MemoryStore>, StreamRuntimes) {
+pub(crate) async fn store(count: usize) -> (Arc<MemoryStore>, StreamRuntimes) {
     let store = Arc::new(MemoryStore::default());
     let create = CreateStreamRequest {
         stream_id: "s".to_string(),

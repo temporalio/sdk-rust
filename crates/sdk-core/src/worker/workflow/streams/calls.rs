@@ -1362,7 +1362,10 @@ mod tests {
         super::{StreamManager, manager::recorded, read::record_bytes},
         *,
     };
-    use crate::test_help::stream_store::{MemoryStore, Request as StoreRequest};
+    use crate::{
+        telemetry::metrics::MetricsContext,
+        test_help::stream_store::{MemoryStore, Request as StoreRequest},
+    };
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
     use temporalio_common::protos::coresdk::{
@@ -3090,7 +3093,7 @@ mod tests {
         let manager = StreamManager::new(runtimes, Handle::current(), move |_, _| {
             tx.send(()).unwrap();
         });
-        manager.dispatch("r", calls.take_requests());
+        manager.dispatch("r", calls.take_requests(), |_| MetricsContext::no_op());
         for _ in 0..2 {
             timeout(Duration::from_secs(5), rx.recv())
                 .await

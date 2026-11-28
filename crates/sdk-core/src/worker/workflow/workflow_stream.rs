@@ -139,7 +139,11 @@ impl WFStream {
                                 update: FetchedPage::History(update),
                             } if ReplayReads::needed_by(&update) => {
                                 // The machines can peek a marker as soon as they receive its page.
-                                ReplayReader::add_to(&mut paginator, &state.worker_config);
+                                ReplayReader::add_to(
+                                    &mut paginator,
+                                    &state.worker_config,
+                                    &state.metrics,
+                                );
                                 let req = NextPageReq {
                                     paginator,
                                     span: Span::current(),
@@ -327,7 +331,8 @@ impl WFStream {
         // A run new to the cache replays its History, so it first reads the Records of its read
         // markers.
         if !self.runs.has_run(&run_id) && ReplayReads::needed_by(&pwft.work.update) {
-            ReplayReader::add_to(&mut pwft.paginator, &self.worker_config);
+            let (config, metrics) = (&self.worker_config, &self.metrics);
+            ReplayReader::add_to(&mut pwft.paginator, config, metrics);
             let rc = self.history_fetch_refcounter.clone();
             (self.stream_records_reads).push_back(StreamRecordsReq::NewRun(Box::new(pwft), rc));
             return Ok(None);

@@ -1,10 +1,13 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
 use super::{StreamRuntimes, StreamSettings, read::ReadDone};
-use crate::worker::workflow::WFMachinesError;
+use crate::{
+    telemetry::metrics::{FailureReason, MetricsContext, failure_reason},
+    worker::workflow::WFMachinesError,
+};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
-use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 use temporalio_common::protos::{
     coresdk::external_data::{StreamAppendOffsets, StreamFailure, stream_append_result},
     temporal::api::{
@@ -13,9 +16,9 @@ use temporalio_common::protos::{
     },
 };
 use temporalio_streams::{
-    AnyReason, ReadError, ReadPage, StreamError, StreamRuntime,
+    AnyReason, AppendError, ReadError, ReadPage, StreamError, StreamRuntime,
     proto::{
-        StreamErrorReason,
+        AppendRecordsResponse, StreamErrorReason,
         sdk::{AppendRecordsRequest, ReadRecordsRequest},
     },
 };
@@ -126,7 +129,12 @@ impl StreamManager {
         }
     }
 
-    pub(crate) fn dispatch(&self, run_id: &str, requests: Vec<Request>) {
+    pub(crate) fn dispatch(
+        &self,
+        run_id: &str,
+        requests: Vec<Request>,
+        mut metrics: impl FnMut(&str) -> MetricsContext,
+    ) {
         // The lock is held across each spawn, so a call's entry exists even if the call ends
         // immediately.
         let mut tasks = self.tasks.lock();
@@ -135,7 +143,8 @@ impl StreamManager {
                 Request::Run(call) => {
                     let call_id = call.call_id;
                     let is_read = matches!(call.op, Op::Read(_));
-                    let abort = self.spawn(run_id, call);
+                    let metrics = metrics(&call.store);
+                    let abort = self.spawn(run_id, call, metrics);
                     let run = tasks.entry(run_id.to_string()).or_default();
                     run.insert(
                         call_id,
@@ -196,7 +205,7 @@ impl StreamManager {
         Ok(())
     }
 
-    fn spawn(&self, run_id: &str, call: Call) -> AbortHandle {
+    fn spawn(&self, run_id: &str, call: Call, metrics: MetricsContext) -> AbortHandle {
         let Call {
             call_id,
             seq,
@@ -219,7 +228,7 @@ impl StreamManager {
         };
         let sink = self.sink.clone();
         let task = self.handle.spawn(async move {
-            let outcome = run(&runtime, seq, op, settings, &note).await;
+            let outcome = run(&runtime, seq, op, settings, &note, &metrics).await;
             if note.end() {
                 sink(
                     note.run_id,
@@ -251,11 +260,11 @@ async fn run(
     op: Op,
     settings: StreamSettings,
     note: &Note,
+    metrics: &MetricsContext,
 ) -> Outcome {
     match op {
         Op::Append(request, request_id) => {
-            let send = || runtime.append_records(request.clone(), request_id.clone());
-            let answer = tries(settings, note, send).await;
+            let answer = append(runtime, request, request_id, settings, note, metrics).await;
             Outcome::Append(match answer {
                 Ok(appended) => stream_append_result::Result::Appended(StreamAppendOffsets {
                     first_offset: appended.first_offset,
@@ -267,7 +276,7 @@ async fn run(
         Op::Read(read) => {
             let stream = (read.request.r#ref.clone()).expect("A read has the ref of its command");
             let from_offset = read.request.from_offset.clone();
-            let page = read_page(runtime, read, settings).await;
+            let page = read_page(runtime, read, settings, metrics).await;
             let page = page
                 .and_then(|page| {
                     // The Store runtime returns one Record even if it exceeds the request's soft
@@ -297,6 +306,7 @@ async fn read_page(
     runtime: &StreamRuntime,
     read: ReadCall,
     settings: StreamSettings,
+    metrics: &MetricsContext,
 ) -> Result<ReadPage, ReadError> {
     let ReadCall {
         mut request,
@@ -307,12 +317,7 @@ async fn read_page(
     if check {
         request.wait = None;
         let deadline = settings.read_check_deadline();
-        return match tokio::time::timeout(deadline, runtime.read_records_with_more(request)).await {
-            Ok(answer) => answer,
-            Err(_) => Err(StreamError::store_unavailable(format!(
-                "The Store gave no answer in {deadline:?}"
-            ))),
-        };
+        return read_attempt(runtime, request, deadline, metrics).await;
     }
     // A time past the end of the clock never ends the wait.
     let wait_until = Instant::now().checked_add(wait);
@@ -327,17 +332,7 @@ async fn read_page(
         // The Store can take the whole wait to answer, so the deadline of the try adds it.
         let deadline = settings.try_deadline.saturating_add(wait);
         let asked = Instant::now();
-        let read = runtime.read_records_with_more(request.clone());
-        let answer = match tokio::time::timeout(deadline, read).await {
-            Ok(Err(error)) if !is_outage(&error) => {
-                *last_try.lock() = None;
-                return Err(error);
-            }
-            Ok(answer) => answer,
-            Err(_) => Err(StreamError::store_unavailable(format!(
-                "The Store gave no answer in {deadline:?}"
-            ))),
-        };
+        let answer = read_attempt(runtime, request.clone(), deadline, metrics).await;
         match answer {
             Ok(page) => {
                 *last_try.lock() = None;
@@ -356,6 +351,10 @@ async fn read_page(
                 request.from_offset = page.response.last_offset;
                 waits = retry_waits(&settings);
             }
+            Err(error) if !is_outage(&error) => {
+                *last_try.lock() = None;
+                return Err(error);
+            }
             Err(error) => {
                 *last_try.lock() = Some(recorded(&error));
                 tokio::time::sleep(next_wait(&mut waits)).await;
@@ -364,34 +363,75 @@ async fn read_page(
     }
 }
 
-/// Sends the request again while the Store is in an outage. The loop has no time limit of its own,
-/// because the run fails its Workflow Task if, at the task's heartbeat, a call has had no answer
-/// since a try that failed. A resend is safe, because a Store doesn't write a batch whose request
-/// id it still remembers.
-async fn tries<T, R, F>(
+async fn read_attempt(
+    runtime: &StreamRuntime,
+    request: ReadRecordsRequest,
+    deadline: Duration,
+    metrics: &MetricsContext,
+) -> Result<ReadPage, ReadError> {
+    let mut started = false;
+    let read = runtime.read_records_observed(
+        request,
+        true,
+        || {
+            started = true;
+            metrics.stream_read_executed();
+        },
+        |count| metrics.stream_read_records(count as u64),
+    );
+    let answer = tokio::time::timeout(deadline, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(StreamError::store_unavailable(format!(
+                "The Store gave no answer in {deadline:?}"
+            )))
+        });
+    if started && let Err(error) = &answer {
+        failed(metrics, error).stream_read_execution_failed();
+    }
+    answer
+}
+
+// Resending with the original request id lets the Store return the first write's result.
+async fn append(
+    runtime: &StreamRuntime,
+    request: AppendRecordsRequest,
+    request_id: String,
     settings: StreamSettings,
     note: &Note,
-    mut send: impl FnMut() -> F,
-) -> Result<T, StreamError<R>>
-where
-    R: Copy + From<AnyReason> + Into<StreamErrorReason>,
-    F: Future<Output = Result<T, StreamError<R>>>,
-{
+    metrics: &MetricsContext,
+) -> Result<AppendRecordsResponse, AppendError> {
     let mut waits = retry_waits(&settings);
     loop {
-        let error = match tokio::time::timeout(settings.try_deadline, send()).await {
-            Ok(Err(error)) if is_outage(&error) => error,
-            Ok(answer) => {
+        let mut started = None;
+        let send = runtime.append_records_with_start(request.clone(), request_id.clone(), || {
+            started = Some(Instant::now());
+            metrics.stream_append_executed();
+        });
+        let answer = tokio::time::timeout(settings.try_deadline, send)
+            .await
+            .unwrap_or_else(|_| {
+                Err(StreamError::store_unavailable(format!(
+                    "The Store gave no answer in {:?}",
+                    settings.try_deadline
+                )))
+            });
+        if let Some(started) = started {
+            metrics.stream_append_exec_latency(started.elapsed());
+            if let Err(error) = &answer {
+                failed(metrics, error).stream_append_execution_failed();
+            }
+        }
+        match &answer {
+            Err(error) if is_outage(error) => {
+                note.set(Some(error));
+                tokio::time::sleep(next_wait(&mut waits)).await;
+            }
+            _ => {
                 note.set(None);
                 return answer;
             }
-            Err(_) => StreamError::store_unavailable(format!(
-                "The Store gave no answer in {:?}",
-                settings.try_deadline
-            )),
-        };
-        note.set(Some(&error));
-        tokio::time::sleep(next_wait(&mut waits)).await;
+        }
     }
 }
 
@@ -452,6 +492,13 @@ impl Note {
         }
         ended
     }
+}
+
+pub(super) fn failed<R: Copy + Into<StreamErrorReason>>(
+    metrics: &MetricsContext,
+    error: &StreamError<R>,
+) -> MetricsContext {
+    metrics.with_new_attrs([failure_reason(FailureReason::StreamError(error.token()))])
 }
 
 /// Returns true if `error` says that the Store is in an outage, so that another try of the call may
@@ -520,7 +567,7 @@ pub(super) fn cut(text: String) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         super::{
             read::After,
@@ -528,11 +575,28 @@ mod tests {
         },
         *,
     };
-    use crate::test_help::stream_store::{MemoryStore, Op as StoreOp};
+    use crate::{
+        telemetry::metrics::{MetricsCallBuffer, stream_store},
+        test_help::stream_store::{MemoryStore, Op as StoreOp},
+    };
     use prost::Message;
     use prost_types::Timestamp;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
-    use temporalio_common::protos::coresdk::external_data::stream_read_result;
+    use std::any::Any;
+    use temporalio_common::{
+        protos::coresdk::external_data::stream_read_result,
+        telemetry::{
+            TelemetryOptions,
+            metrics::{
+                CoreMeter,
+                core::{
+                    BufferAttributes, BufferInstrumentRef, CustomMetricAttributes,
+                    MetricCallBufferer, MetricEvent, MetricUpdateVal,
+                },
+            },
+            telemetry_init,
+        },
+    };
     use temporalio_streams::{
         AnyError, ReadReason, StreamStore,
         proto::{
@@ -560,6 +624,10 @@ mod tests {
         let sink = move |run_id, resolution| tx.send((run_id, resolution)).unwrap();
         let manager = StreamManager::new(runtimes, Handle::current(), sink);
         (store, manager, rx)
+    }
+
+    fn no_metrics(_: &str) -> MetricsContext {
+        MetricsContext::no_op()
     }
 
     fn stream() -> StreamRef {
@@ -606,7 +674,7 @@ mod tests {
     async fn a_try_with_no_answer_is_an_outage() {
         let (store, manager, mut results) = manager().await;
         store.hold(StoreOp::Append);
-        manager.dispatch("r", vec![append(1)]);
+        manager.dispatch("r", vec![append(1)], no_metrics);
         tokio::time::sleep(Duration::from_millis(5010)).await;
         let outage = "StreamStoreUnavailable: append of Stream \"s\" on Store \"mem\": \
                       stream_store_unavailable: The Store gave no answer in 5s";
@@ -629,11 +697,11 @@ mod tests {
         let (store, manager, mut results) = manager().await;
         let down = || AnyError::store_unavailable("The Store is down");
         store.fail(StoreOp::Append, down(), usize::MAX);
-        manager.dispatch("a", vec![append(1), append(2), append(3)]);
-        manager.dispatch("b", vec![append(4)]);
+        manager.dispatch("a", vec![append(1), append(2), append(3)], no_metrics);
+        manager.dispatch("b", vec![append(4)], no_metrics);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(manager.outage("a").is_some());
-        manager.dispatch("a", vec![Request::Stop(3)]);
+        manager.dispatch("a", vec![Request::Stop(3)], no_metrics);
         manager.cancel_run("a");
         assert_eq!(manager.outage("a"), None);
         assert!(manager.outage("b").is_some());
@@ -649,6 +717,202 @@ mod tests {
         let after = store.requests().len();
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert_eq!(store.requests().len(), after);
+    }
+
+    #[derive(Debug)]
+    struct Labels(HashMap<String, String>);
+
+    impl CustomMetricAttributes for Labels {
+        fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(in crate::worker::workflow::streams) struct Instrument(String);
+
+    impl BufferInstrumentRef for Instrument {}
+
+    fn labels(attributes: &BufferAttributes) -> Arc<Labels> {
+        (attributes.get().clone().as_any().downcast::<Labels>()).unwrap()
+    }
+
+    /// Returns the sum of each Stream counter and the sample count of each Stream histogram in
+    /// `buffer`, by the name of the metric and its `failure_reason`.
+    pub(in crate::worker::workflow::streams) fn totals(
+        buffer: &MetricsCallBuffer<Instrument>,
+    ) -> HashMap<(String, String), u64> {
+        let mut totals = HashMap::new();
+        for event in buffer.retrieve() {
+            match event {
+                MetricEvent::Create {
+                    params,
+                    populate_into,
+                    ..
+                } => populate_into
+                    .set(Instrument(params.name.to_string()))
+                    .unwrap(),
+                MetricEvent::CreateAttributes {
+                    populate_into,
+                    append_from,
+                    attributes,
+                } => {
+                    let mut set =
+                        append_from.map_or_else(HashMap::new, |from| labels(&from).0.clone());
+                    set.extend((attributes.into_iter()).map(|kv| (kv.key, kv.value.to_string())));
+                    populate_into.set(Arc::new(Labels(set))).unwrap();
+                }
+                MetricEvent::Update {
+                    instrument,
+                    attributes,
+                    update,
+                } => {
+                    let name = instrument.get().0.strip_prefix("temporal_");
+                    let Some(name) = name.filter(|name| name.starts_with("stream_")) else {
+                        continue;
+                    };
+                    let name = name.to_string();
+                    let set = labels(&attributes);
+                    assert_eq!(set.0["stream_store"], "mem", "{name}");
+                    let reason = set.0.get("failure_reason").cloned().unwrap_or_default();
+                    let value = match update {
+                        MetricUpdateVal::Delta(value) => value,
+                        MetricUpdateVal::Duration(_) => 1,
+                        other => panic!("{name} has the update {other:?}"),
+                    };
+                    *totals.entry((name, reason)).or_default() += value;
+                }
+            }
+        }
+        totals
+    }
+
+    fn read(call_id: u64, stream: StreamRef, check: bool) -> Request {
+        let request = ReadRecordsRequest {
+            r#ref: Some(stream),
+            max_records: 10,
+            max_bytes: 1000,
+            ..Default::default()
+        };
+        Request::Run(Call {
+            call_id,
+            seq: call_id as u32,
+            store: "mem".to_string(),
+            op: Op::Read(ReadCall {
+                request,
+                wait: Duration::ZERO,
+                check,
+                last_try: LastTry::default(),
+            }),
+        })
+    }
+
+    pub(in crate::worker::workflow::streams) fn metric_buffer()
+    -> (Arc<MetricsCallBuffer<Instrument>>, MetricsContext) {
+        let buffer = Arc::new(MetricsCallBuffer::<Instrument>::new(1000));
+        let meter: Arc<dyn CoreMeter> = buffer.clone();
+        let telemetry = telemetry_init(TelemetryOptions::builder().metrics(meter).build()).unwrap();
+        let metrics = MetricsContext::top_level("n".to_string(), "q".to_string(), &telemetry);
+        (buffer, metrics)
+    }
+
+    #[tokio::test]
+    async fn an_invalid_batch_produces_no_store_metrics() {
+        let (store, manager, mut results) = manager().await;
+        let (buffer, metrics) = metric_buffer();
+        let mut invalid = append(1);
+        let Request::Run(Call {
+            op: Op::Append(request, _),
+            ..
+        }) = &mut invalid
+        else {
+            unreachable!();
+        };
+        request.records.clear();
+        manager.dispatch("r", vec![invalid], |store| {
+            metrics.with_new_attrs([stream_store(store.to_string())])
+        });
+        let (_, resolution) = results.recv().await.unwrap();
+        let Outcome::Append(stream_append_result::Result::Failure(error)) = resolution.outcome
+        else {
+            panic!("The empty batch should fail");
+        };
+        assert_eq!(
+            error.reason,
+            StreamErrorReason::InvalidArgument.as_str_name()
+        );
+        assert!(store.requests().is_empty());
+        assert!(totals(&buffer).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_metrics_count_each_try_of_a_call() {
+        let (store, manager, mut results) = manager().await;
+        let (buffer, metrics) = metric_buffer();
+        let of_store = |store: &str| metrics.with_new_attrs([stream_store(store.to_string())]);
+        let down = || AnyError::store_unavailable("The Store is down");
+        let missing = StreamRef {
+            id: "missing".to_string(),
+            ..stream()
+        };
+        let mut batch = append(1);
+        let Request::Run(Call {
+            op: Op::Append(append, _),
+            ..
+        }) = &mut batch
+        else {
+            unreachable!();
+        };
+        append.records.push(append.records[0].clone());
+        let mut first = read(2, stream(), false);
+        let Request::Run(Call {
+            op: Op::Read(read_call),
+            ..
+        }) = &mut first
+        else {
+            unreachable!();
+        };
+        read_call.request.max_records = 1;
+        let calls = [
+            (Some(StoreOp::Append), batch),
+            (Some(StoreOp::Read), first),
+            (Some(StoreOp::Read), read(3, stream(), true)),
+            (None, read(4, missing, true)),
+        ];
+        for (outage, call) in calls {
+            if let Some(op) = outage {
+                store.fail(op, down(), 1);
+            }
+            manager.dispatch("r", vec![call], of_store);
+            let (_, resolution) = results.recv().await.unwrap();
+            if resolution.seq == 2 {
+                let Outcome::Read(page) = resolution.outcome else {
+                    panic!("Expected the limited read");
+                };
+                assert_eq!(page.records.len(), 1);
+            }
+        }
+        let expected = [
+            ("stream_append_total", "", 2),
+            (
+                "stream_append_execution_failed",
+                "stream_store_unavailable",
+                1,
+            ),
+            ("stream_append_execution_latency", "", 2),
+            ("stream_read_total", "", 4),
+            (
+                "stream_read_execution_failed",
+                "stream_store_unavailable",
+                2,
+            ),
+            ("stream_read_execution_failed", "stream_not_found", 1),
+            ("stream_read_records", "", 2),
+        ];
+        let expected = (expected.into_iter())
+            .map(|(name, reason, value)| ((name.to_string(), reason.to_string()), value))
+            .collect();
+        assert_eq!(totals(&buffer), expected);
     }
 
     /// Returns a failure message of at least `bytes` bytes. Its characters have 1 to 4 bytes, so
@@ -869,7 +1133,7 @@ mod tests {
                     store: "mem".to_string(),
                     op: Op::Read(read),
                 };
-                manager.dispatch("r", vec![Request::Run(call)]);
+                manager.dispatch("r", vec![Request::Run(call)], no_metrics);
                 let resolution = loop {
                     let look = Duration::from_millis(rng.random_range(1..40));
                     tokio::select! {

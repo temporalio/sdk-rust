@@ -8,12 +8,15 @@ use super::{
     manager::{cut, is_outage, next_wait, retry_waits},
     marker::{is_read_marker, peeked_read_marker},
 };
-use crate::worker::{
-    WorkerConfig,
-    workflow::{
-        NextPageReq, PermittedWFT, UnstoredWftFailInfo,
-        history_update::{HistoryPaginator, HistoryUpdate},
-        wft_extraction::{FetchedPage, HistfetchRC, WFTExtractorOutput},
+use crate::{
+    telemetry::metrics::{MetricsContext, stream_store},
+    worker::{
+        WorkerConfig,
+        workflow::{
+            NextPageReq, PermittedWFT, UnstoredWftFailInfo,
+            history_update::{HistoryPaginator, HistoryUpdate},
+            wft_extraction::{FetchedPage, HistfetchRC, WFTExtractorOutput},
+        },
     },
 };
 use futures_util::{
@@ -33,7 +36,7 @@ use temporalio_common::protos::{
     temporal::api::history::v1::HistoryEvent,
 };
 use temporalio_streams::{
-    AnyReason, ReadReason,
+    AnyReason, ReadReason, StreamError,
     proto::{
         StreamRecord,
         sdk::{ReadRecordsRequest, StreamRef},
@@ -200,16 +203,24 @@ struct UnreadEntry {
 
 /// A reader of the Records of read entries, for the replay of one run. It keeps the markers of
 /// History that it hasn't read yet, and reads them a part at a time.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub(crate) struct ReplayReader {
     runtimes: StreamRuntimes,
     unread: VecDeque<UnreadMarker>,
+    #[debug(skip)]
+    metrics: MetricsContext,
+    #[debug(skip)]
+    store_metrics: HashMap<String, MetricsContext>,
 }
 
 impl ReplayReader {
-    pub(crate) fn new(runtimes: StreamRuntimes) -> Self {
-        let unread = VecDeque::new();
-        Self { runtimes, unread }
+    pub(crate) fn new(runtimes: StreamRuntimes, metrics: MetricsContext) -> Self {
+        Self {
+            runtimes,
+            unread: VecDeque::new(),
+            metrics,
+            store_metrics: HashMap::new(),
+        }
     }
 
     pub(crate) fn queue<'a>(&mut self, events: impl Iterator<Item = &'a HistoryEvent>) -> u64 {
@@ -273,6 +284,13 @@ impl ReplayReader {
         let deadlines: HashMap<String, Deadline> = (entries.iter())
             .map(|(_, entry)| (entry.stream.store.clone(), Deadline::default()))
             .collect();
+        // History can have any Store name, so only a Store of this Worker gets metrics.
+        for store in deadlines.keys() {
+            if self.runtimes.get(store).is_some() {
+                let new = || self.metrics.with_new_attrs([stream_store(store.clone())]);
+                (self.store_metrics.entry(store.clone())).or_insert_with(new);
+            }
+        }
         let (reader, deadlines) = (&*self, &deadlines);
         let mut read = stream::iter(entries)
             .map(|(event_id, entry)| async move {
@@ -291,10 +309,14 @@ impl ReplayReader {
         reads
     }
 
-    pub(crate) fn add_to(paginator: &mut HistoryPaginator, config: &WorkerConfig) {
+    pub(crate) fn add_to(
+        paginator: &mut HistoryPaginator,
+        config: &WorkerConfig,
+        metrics: &MetricsContext,
+    ) {
         paginator
             .stream_reader
-            .get_or_insert_with(|| Self::new(config.stream_runtimes.clone()));
+            .get_or_insert_with(|| Self::new(config.stream_runtimes.clone(), metrics.clone()));
     }
 
     async fn read_first_part(paginator: &mut HistoryPaginator, update: &mut HistoryUpdate) {
@@ -358,6 +380,7 @@ impl ReplayReader {
                 range()
             )))
         })?;
+        let metrics = &self.store_metrics[&stream.store];
         let settings = self.runtimes.settings;
         let recorded = usize::try_from(entry.record_bytes).unwrap_or(usize::MAX);
         let mut records: Vec<StreamRecord> = vec![];
@@ -375,22 +398,56 @@ impl ReplayReader {
                 max_bytes: i64::try_from(recorded.saturating_sub(bytes)).unwrap_or(i64::MAX),
                 ..Default::default()
             };
-            let read = runtime.read_records(request);
-            let read = tokio::time::timeout(settings.try_deadline, read);
-            // Once the deadline passed, no try starts, and one in flight stops.
-            let answer = match future::select(pin!(deadline.passed()), pin!(read)).await {
-                Either::Left((first_error, _)) => {
+            let mut started = None;
+            let answer = {
+                let read = runtime.read_records_observed(
+                    request,
+                    false,
+                    || {
+                        started = Some(Instant::now());
+                        metrics.stream_replay_read_executed();
+                    },
+                    |count| metrics.stream_replay_read_records(count as u64),
+                );
+                let read = tokio::time::timeout(settings.try_deadline, read);
+                // Poll the shared deadline first so an expired deadline never starts a try.
+                match future::select(pin!(deadline.passed()), pin!(read)).await {
+                    Either::Left((first_error, _)) => Err(first_error),
+                    Either::Right((answer, _)) => Ok(answer),
+                }
+            };
+            let answer = match answer {
+                Err(first_error) => {
                     let bound = settings.replay_retry_bound();
+                    if let Some(started) = started {
+                        let error = temporalio_streams::ReadError::store_unavailable(&first_error);
+                        super::manager::failed(metrics, &error)
+                            .stream_replay_read_execution_failed();
+                        metrics.stream_replay_read_exec_latency(started.elapsed());
+                    }
                     return Err(ReplayError::Unavailable(cut(format!(
                         "The Store is unavailable, so the replay can't read {} within {bound:?} \
                          of its first failed try: {first_error}",
                         range()
                     ))));
                 }
-                Either::Right((answer, _)) => answer,
+                Ok(answer) => answer,
             };
+            let answer = answer.unwrap_or_else(|_| {
+                Err(StreamError::store_unavailable(format!(
+                    "The Store gave no answer in {:?}",
+                    settings.try_deadline
+                )))
+            });
+            if let Some(started) = started {
+                metrics.stream_replay_read_exec_latency(started.elapsed());
+                if let Err(error) = &answer {
+                    super::manager::failed(metrics, error).stream_replay_read_execution_failed();
+                }
+            }
             let error = match answer {
-                Ok(Ok(page)) => {
+                Ok(page) => {
+                    let page = page.response;
                     waits = retry_waits(&settings);
                     // An answer with no Records that moves the cursor passed entries that aren't
                     // Records, so it doesn't mean that Records are missing.
@@ -419,7 +476,7 @@ impl ReplayReader {
                 }
                 // These say what this Worker can't do, not what the Store lost, so another Worker
                 // may still read the Records.
-                Ok(Err(error))
+                Err(error)
                     if matches!(
                         error.reason,
                         ReadReason::Other(
@@ -434,11 +491,10 @@ impl ReplayReader {
                         range()
                     ))));
                 }
-                Ok(Err(error)) if !is_outage(&error) => {
+                Err(error) if !is_outage(&error) => {
                     return Err(gone(error.to_string()));
                 }
-                Ok(Err(error)) => error.to_string(),
-                Err(_) => format!("The Store gave no answer in {:?}", settings.try_deadline),
+                Err(error) => error.to_string(),
             };
             let left = deadline.start(settings.replay_retry_bound(), error);
             let wait = next_wait(&mut waits);
@@ -804,7 +860,7 @@ mod tests {
             let recorded: usize = needing.iter().map(|(_, bytes)| bytes).sum();
             runtimes.settings.max_task_record_bytes = rng.random_range(1..=2 * recorded + 1);
             let max_bytes = runtimes.settings.max_task_record_bytes;
-            let mut reader = ReplayReader::new(runtimes);
+            let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
             reader.queue(events.iter());
             // The reader gives each marker in one part, in the order of History.
             let mut results = HashMap::<i64, MarkerReads>::new();
@@ -961,6 +1017,7 @@ mod tests {
             &given,
             settings,
             StoreLimits::default(),
+            MetricsContext::no_op(),
             |page| {
                 page.record_bytes -= less;
             },
@@ -974,6 +1031,7 @@ mod tests {
         given: &StreamRecord,
         settings: StreamSettings,
         limits: StoreLimits,
+        metrics: MetricsContext,
         edit: impl FnOnce(&mut StreamReadPage),
         fault: impl FnMut(&mut StdRng, &StoreRead) -> Option<Fault> + Send + 'static,
     ) -> MarkerReads {
@@ -998,7 +1056,7 @@ mod tests {
         let runtime = StreamRuntime::new(Arc::new(model), limits);
         let mut runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
         runtimes.settings = settings;
-        let mut reader = ReplayReader::new(runtimes);
+        let mut reader = ReplayReader::new(runtimes, metrics);
         reader.queue([event].iter());
         reader.read_next().await.take(1)
     }
@@ -1011,6 +1069,7 @@ mod tests {
                 &given,
                 StreamSettings::default(),
                 StoreLimits::UNBOUNDED,
+                MetricsContext::no_op(),
                 |page| match format {
                     Some(f) => page.digest = f.hash(std::slice::from_ref(&given)),
                     None => page.digest[0] = 2,
@@ -1029,6 +1088,66 @@ mod tests {
                 _ => panic!("unexpected replay result"),
             }
         }
+    }
+
+    #[rstest::rstest]
+    #[case::retry_succeeds(Duration::from_secs(2), false, 2)]
+    #[case::deadline_during_attempt(Duration::from_secs(2), true, 2)]
+    #[case::deadline_before_retry(Duration::ZERO, true, 1)]
+    #[tokio::test(start_paused = true)]
+    async fn replay_store_io_has_its_own_counters(
+        #[case] retry_bound: Duration,
+        #[case] retry_hangs: bool,
+        #[case] attempts: u64,
+    ) {
+        let (buffer, metrics) = super::super::manager::tests::metric_buffer();
+        let given = record(&[1], 0, 10);
+        let mut first = true;
+        let started = Instant::now();
+        let result = replay_record(
+            &given,
+            StreamSettings {
+                try_deadline: Duration::from_secs(10),
+                replay_retry_bound: retry_bound,
+                retry_initial_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+            StoreLimits::default(),
+            metrics,
+            |_| {},
+            move |_, _| {
+                if std::mem::take(&mut first) {
+                    Some(Fault::Fails(StreamError::store_unavailable("down")))
+                } else {
+                    retry_hangs.then_some(Fault::Silent)
+                }
+            },
+        )
+        .await;
+        if retry_hangs {
+            let elapsed = started.elapsed();
+            assert!(elapsed >= retry_bound && elapsed < retry_bound + Duration::from_millis(50));
+            assert!(matches!(
+                result.as_slice(),
+                [Some(Err(ReplayError::Unavailable(_)))]
+            ));
+        } else {
+            assert_eq!(result, vec![Some(Ok(vec![given]))]);
+        }
+        let expected = [
+            ("stream_replay_read_total", "", attempts),
+            (
+                "stream_replay_read_execution_failed",
+                "stream_store_unavailable",
+                if retry_hangs { attempts } else { 1 },
+            ),
+            ("stream_replay_read_execution_latency", "", attempts),
+        ]
+        .into_iter()
+        .chain((!retry_hangs).then_some(("stream_replay_read_records", "", 1)))
+        .map(|(name, reason, value)| ((name.to_string(), reason.to_string()), value))
+        .collect();
+        assert_eq!(super::super::manager::tests::totals(&buffer), expected);
     }
 
     // A Record over the Record size of the runtime leaves its entry unknown, since a runtime with
@@ -1064,7 +1183,6 @@ mod tests {
         let (given, result) = replay_one_record(0, 10, settings, fault).await;
         assert_eq!(result, vec![Some(Ok(vec![given]))]);
     }
-
     #[tokio::test]
     async fn replay_rejects_changed_optional_producer_timestamp() {
         let mut original = record(&[1], 0, 10);
@@ -1117,7 +1235,7 @@ mod tests {
         let model = ModelStore::new(Model::new(0, vec![entry], |_, _| None));
         let runtime = StreamRuntime::new(Arc::new(model), StoreLimits::default());
         let runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
-        let mut reader = ReplayReader::new(runtimes);
+        let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
         reader.queue([event].iter());
         let result = reader.read_next().await.take(1);
         assert!(

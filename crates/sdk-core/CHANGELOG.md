@@ -45,6 +45,10 @@ relevant information.
 * [lang-internal] `ReadStream` returns one Store page in a `ResolveStreamRead` job.
   `StreamSettings::read_time` bounds the wait in one Workflow Task. Read markers store offsets,
   the Record count and a digest. Replay reads those Records again and verifies the digest.
+* Stream metrics record Store calls by `stream_store` and failures by
+  `failure_reason`. Live append and read counters exclude replay. Replay Store reads have
+  separate `stream_replay_read_total`, `stream_replay_read_execution_failed`,
+  `stream_replay_read_records` and `stream_replay_read_execution_latency` instruments.
 
 ### Fixed
 * A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.
