@@ -200,7 +200,7 @@ pub(crate) struct TonicErrorHandler {
     backoff: JitteredBackoff,
     throttle_backoff: JitteredBackoff,
     max_interval: Duration,
-    retry_started_at: Instant,
+    first_fatal_error_at: Option<tokio::time::Instant>,
     max_retries: usize,
     call_type: CallType,
     call_name: &'static str,
@@ -216,7 +216,7 @@ impl TonicErrorHandler {
             max_interval: call_info.retry_cfg.max_interval,
             backoff: call_info.retry_cfg.jittered_backoff(),
             throttle_backoff: throttle_cfg.jittered_backoff(),
-            retry_started_at: Instant::now(),
+            first_fatal_error_at: None,
             retry_short_circuit: call_info.retry_short_circuit,
         }
     }
@@ -344,7 +344,12 @@ impl ErrorHandler<tonic::Status> for TonicErrorHandler {
                 }
             }
         } else if self.call_type == CallType::TaskLongPoll
-            && self.retry_started_at.elapsed() <= LONG_POLL_FATAL_GRACE
+            // Measured from the first such error, since a healthy poll can itself outlast the grace
+            && self
+                .first_fatal_error_at
+                .get_or_insert_with(tokio::time::Instant::now)
+                .elapsed()
+                <= LONG_POLL_FATAL_GRACE
         {
             // We permit "fatal" errors while long polling for a while, because some proxies return
             // stupid error codes while getting ready, among other weird infra issues
@@ -377,12 +382,9 @@ mod tests {
     };
     use assert_matches::assert_matches;
     use prost::Message;
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Instant,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use temporalio_common::protos::temporal::api::workflowservice::v1::{
         CountWorkflowExecutionsResponse, PollActivityTaskQueueRequest, PollNexusTaskQueueRequest,
@@ -448,7 +450,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn long_poll_non_retryable_errors() {
         for code in [
             Code::InvalidArgument,
@@ -469,17 +471,18 @@ mod tests {
                     },
                     TEST_RETRY_CONFIG,
                 );
+                // The poll itself may wait longer than the grace before its first error
+                tokio::time::advance(LONG_POLL_FATAL_GRACE + Duration::from_secs(5)).await;
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
-                err_handler.retry_started_at =
-                    Instant::now() - LONG_POLL_FATAL_GRACE - Duration::from_secs(1);
+                tokio::time::advance(LONG_POLL_FATAL_GRACE + Duration::from_secs(1)).await;
                 let result = err_handler.handle(2, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::ForwardError(_));
             }
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn long_poll_retryable_errors_never_fatal() {
         for code in RETRYABLE_ERROR_CODES {
             for call_name in [POLL_WORKFLOW_METH_NAME, POLL_ACTIVITY_METH_NAME] {
@@ -494,8 +497,7 @@ mod tests {
                 );
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
-                err_handler.retry_started_at =
-                    Instant::now() - LONG_POLL_FATAL_GRACE - Duration::from_secs(1);
+                tokio::time::advance(LONG_POLL_FATAL_GRACE + Duration::from_secs(1)).await;
                 let result = err_handler.handle(2, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
             }

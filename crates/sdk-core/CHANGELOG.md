@@ -37,6 +37,9 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* Task polls now measure the 60-second grace for non-retryable errors from the first such error,
+  not from the start of the poll. An error ending a long poll no longer stops the worker at once.
+
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
