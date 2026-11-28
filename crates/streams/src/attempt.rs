@@ -135,7 +135,7 @@ pub const ATTEMPT_KEY_LEN: usize = 28;
 
 /// Encodes the attempt of a Producer as a fixed-size key. For two attempts of the same Producer,
 /// the byte order of the keys is the order of the attempts. That holds when the nanos of each time
-/// are from 0 to 999,999,999, and the runtime refuses a write with other nanos.
+/// are from 0 to 999,999,999 and the time is at or after the Unix epoch, as required on writes.
 ///
 /// The layout of the key depends on the kind of the Producer. A Producer has one kind, so all its
 /// keys have one layout, and two layouts never meet in a comparison. The fields are big-endian, in
@@ -239,8 +239,7 @@ mod tests {
         let attempts = [-1, 1, 256, i32::MAX];
         for seconds in [-1, 0, 1, 256, i64::MAX] {
             for nanos in [-1, 0, 1, 256, 999_999_999, 1_000_000_000, i32::MAX] {
-                // A time before 1970 counts as 1970, as it does in the key.
-                let at = i128::from(seconds.max(0)) * 1_000_000_000 + i128::from(nanos);
+                let at = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
                 for attempt in attempts {
                     let scheduled = (0, 0, 0, at, attempt);
                     activities.push((scheduled, activity(seconds, nanos, attempt)));

@@ -201,6 +201,8 @@ pub(crate) struct WorkflowMachines {
     /// for rejected updates, from shifting the positions of later ones. Local Activity and Stream
     /// results share it.
     activation_index: u64,
+    /// Stream results must retain their activation boundaries even after their marker is drained.
+    task_has_stream_marker: bool,
     /// The index that History gives each Local Activity result of the next activation, by seq. A
     /// live result has the index of the activation that gets it.
     local_result_activations: HashMap<u32, u64>,
@@ -364,6 +366,7 @@ impl WorkflowMachines {
             encountered_patch_markers: Default::default(),
             local_activity_data: LocalActivityData::default(),
             activation_index: 0,
+            task_has_stream_marker: false,
             local_result_activations: Default::default(),
             stream_calls,
             have_seen_terminal_event: false,
@@ -524,11 +527,26 @@ impl WorkflowMachines {
     /// Returns the index of the next activation of the task, and the one of the next Local
     /// Activity result of History. Stream results count activations with the same index.
     fn result_activations(&self) -> (u64, Option<u64>) {
-        let next = self.local_activity_data.next_resolution();
-        (
-            self.activation_index,
-            next.and_then(HasActivationIndex::activation),
-        )
+        let next_local = self
+            .local_activity_data
+            .next_resolution()
+            .and_then(HasActivationIndex::activation);
+        let mut activation = self.activation_index;
+        if self.task_has_stream_marker {
+            // A chunk can start in an earlier task. Its current index can already cover two groups.
+            for index in [
+                next_local,
+                self.stream_calls.next_ready_activation(),
+                self.stream_calls.first_held_activation(),
+                self.local_result_activations.values().copied().min(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                activation = activation.min(index);
+            }
+        }
+        (activation, next_local)
     }
 
     /// Returns start info for the workflow if it has started
@@ -901,6 +919,7 @@ impl WorkflowMachines {
         let num_events_to_process = events.len();
         if num_events_to_process > 0 {
             self.activation_index = 0;
+            self.task_has_stream_marker = false;
         }
 
         // Process any WFT completed events in the next sequence, as well as peek ahead to the
@@ -1107,6 +1126,7 @@ impl WorkflowMachines {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
             } else if let Some(data) = peeked_marker(e) {
+                self.task_has_stream_marker = true;
                 delayed_actions.push(DelayedAction::StreamMarker(e.event_id, data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
@@ -1585,7 +1605,7 @@ impl WorkflowMachines {
                     // cancels the activity during an earlier one.
                     if self
                         .local_activity_data
-                        .has_held_preresolution(seq, self.activation_index)
+                        .has_held_preresolution(seq, self.result_activations().0)
                     {
                         continue;
                     }
@@ -2044,7 +2064,7 @@ impl WorkflowMachines {
     /// recorded resolutions so the task can make progress.
     fn release_held_local_activity_resolutions_if_idle(&mut self) -> Result<()> {
         if !self.activation_needed() {
-            if self.last_history_from_server.chunking_disabled {
+            if self.last_history_from_server.chunking_disabled || self.task_has_stream_marker {
                 // Advance to the next marker's activation index without sending an empty activation.
                 // Stop there so resolutions recorded in later activations remain separate.
                 if let Some(next) = self.local_activity_data.next_resolution()
@@ -2069,9 +2089,6 @@ impl WorkflowMachines {
                 }
             } else {
                 self.apply_local_activity_peeked_resolutions(true)?;
-                // Core gives the Stream results of History in the same way as these Local Activity
-                // results.
-                self.stream_calls.release_ready();
             }
         }
         Ok(())
@@ -2082,14 +2099,18 @@ impl WorkflowMachines {
     /// activation in this WFT. Older markers lack grouping information and retain the historical
     /// batching behavior.
     fn apply_local_activity_peeked_resolutions(&mut self, include_held: bool) -> Result<()> {
+        let (activation, _) = self.result_activations();
         while let Some(seq) = self
             .local_activity_data
-            .peek_preresolution_seq(include_held, self.activation_index)
+            .peek_preresolution_seq(include_held, activation)
         {
             // Core first gives a Stream result that the first run gave in an earlier activation. At
             // the same index the Stream result goes first, so the Local Activity result also waits
             // for a result whose call Workflow code hasn't issued yet.
-            let (_, marker) = self.result_activations();
+            let marker = self
+                .local_activity_data
+                .next_resolution()
+                .and_then(HasActivationIndex::activation);
             let ready = self.stream_calls.next_ready_activation();
             let held = self.stream_calls.first_held_activation();
             if let Some(marker) = marker

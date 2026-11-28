@@ -228,8 +228,6 @@ pub(crate) struct StreamCalls {
     held: Held,
     /// Results from History whose calls Workflow code has issued, by the activation that gets them.
     ready: BTreeMap<(u64, CallKey), Ready>,
-    /// The last result of `ready` that a release gave to the next activation.
-    released: Option<(u64, CallKey)>,
     /// The live results of the activation in hand, which its markers record.
     marker: StreamAppendMarkerData,
     read_marker: StreamReadMarkerData,
@@ -272,7 +270,6 @@ impl StreamCalls {
             done: BTreeSet::new(),
             held: Held::default(),
             ready: BTreeMap::new(),
-            released: None,
             marker: StreamAppendMarkerData::default(),
             read_marker: StreamReadMarkerData::default(),
             marked: false,
@@ -313,18 +310,24 @@ impl StreamCalls {
         } = command;
         next_seq("append", seq, &mut self.last_append)?;
         let mut stream = valid_stream(CallKey::Append(seq), stream)?;
-        self.resolve_store(&mut stream)?;
-        self.check_runtime(&stream)?;
+        if self.phase == Phase::Live {
+            self.resolve_store(&mut stream)?;
+            if self.runtimes.get(&stream.store).is_none() {
+                return Err(no_runtime(&stream));
+            }
+        }
         let attempt = match self.phase {
             Phase::Live => self.task.attempt(),
             Phase::Replaying | Phase::ReplayOnly | Phase::Stopped => None,
         };
         let state = AppendState::Waiting { bodies, attempt };
         let queue = key(&stream);
-        self.queues
-            .entry(queue.clone())
-            .or_default()
-            .push_back(CallKey::Append(seq));
+        if self.phase == Phase::Live {
+            self.queues
+                .entry(queue.clone())
+                .or_default()
+                .push_back(CallKey::Append(seq));
+        }
         self.appends.insert(seq, Append { stream, state });
         self.match_append(seq)?;
         self.start_head(&queue);
@@ -348,14 +351,18 @@ impl StreamCalls {
         next_seq("read", seq, &mut self.last_read)?;
         let call = CallKey::Read(seq);
         let mut stream = valid_stream(call, stream)?;
-        self.resolve_store(&mut stream)?;
+        if self.phase == Phase::Live {
+            self.resolve_store(&mut stream)?;
+        }
         let wait = validate_offset(&from_offset, "The offset", AnyReason::InvalidArgument)
             .and_then(|()| check_page_size(max_records, max_bytes))
             .and_then(|()| wait.map_or(Ok(Duration::ZERO), wait_duration))
             .map_err(|error| {
                 WFMachinesError::Fatal(format!("Stream {call} is invalid: {}", error.message))
             })?;
-        self.check_runtime(&stream)?;
+        if self.phase == Phase::Live && self.runtimes.get(&stream.store).is_none() {
+            return Err(no_runtime(&stream));
+        }
         // A page must fit a task with no Records yet.
         let room = self.runtimes.settings.max_task_record_bytes();
         let max_bytes = match max_bytes {
@@ -462,7 +469,7 @@ impl StreamCalls {
     pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
-            && ((self.ready.keys().next()).is_some_and(|key| self.is_due(key, activation, marker))
+            && ((self.ready.keys().next()).is_some_and(|key| Self::is_due(key, activation, marker))
                 || (self.task.is_open() && self.done.first().is_some_and(|c| self.fits(*c))))
     }
 
@@ -477,13 +484,12 @@ impl StreamCalls {
     ) -> Vec<(u64, workflow_activation_job::Variant)> {
         let mut jobs = vec![];
         while let Some(key) = self.ready.keys().next().copied()
-            && self.is_due(&key, activation, marker)
+            && Self::is_due(&key, activation, marker)
         {
             let ready = self.ready.remove(&key).expect("The key was just read");
             self.leave(key.1);
             jobs.push((key.0, ready.job()));
         }
-        self.released = None;
         if !self.task.is_open() {
             return jobs;
         }
@@ -562,24 +568,56 @@ impl StreamCalls {
         if self.phase != Phase::Replaying {
             return Ok(());
         }
-        let appends = (self.appends.iter()).map(|(seq, append)| (CallKey::Append(*seq), append));
-        let unserved = (appends.map(|(call, append)| (call, &append.stream)))
-            .chain((self.reads.iter()).map(|(seq, read)| (CallKey::Read(*seq), &read.stream)))
-            .filter(|(_, stream)| self.runtimes.get(&stream.store).is_none())
-            .min_by_key(|(call, _)| *call);
-        if let Some((_, stream)) = unserved {
-            return Err(no_runtime(stream));
+        // Implicit and explicit refs can resolve to the same queue when replay goes live.
+        let appends = self.appends.iter().filter_map(|(&seq, append)| {
+            matches!(append.state, AppendState::Waiting { .. })
+                .then_some((CallKey::Append(seq), &append.stream))
+        });
+        let reads = self.reads.iter().filter_map(|(&seq, read)| {
+            matches!(read.state, ReadState::Waiting).then_some((CallKey::Read(seq), &read.stream))
+        });
+        let mut pending: Vec<_> = appends.chain(reads).collect();
+        pending.sort_unstable_by_key(|(call, _)| *call);
+        let mut resolved = Vec::with_capacity(pending.len());
+        for (call, stream) in pending {
+            let mut stream = stream.clone();
+            self.resolve_store(&mut stream)?;
+            if self.runtimes.get(&stream.store).is_none() {
+                return Err(no_runtime(&stream));
+            }
+            resolved.push((call, stream));
         }
-        self.phase = Phase::Live;
         let attempt = self.task.attempt();
-        for append in self.appends.values_mut() {
-            if let AppendState::Waiting {
-                attempt: waiting, ..
-            } = &mut append.state
-            {
-                *waiting = attempt;
+        for (call, stream) in resolved {
+            match call {
+                CallKey::Append(seq) => {
+                    let append = self
+                        .appends
+                        .get_mut(&seq)
+                        .expect("The waiting append is present");
+                    if let AppendState::Waiting {
+                        attempt: waiting, ..
+                    } = &mut append.state
+                    {
+                        *waiting = attempt;
+                    }
+                    self.queues
+                        .entry(key(&stream))
+                        .or_default()
+                        .push_back(CallKey::Append(seq));
+                    append.stream = stream;
+                }
+                CallKey::Read(seq) => {
+                    let read = self
+                        .reads
+                        .get_mut(&seq)
+                        .expect("The waiting read is present");
+                    read.request.r#ref = Some(stream.clone());
+                    read.stream = stream;
+                }
             }
         }
+        self.phase = Phase::Live;
         self.start_heads();
         Ok(())
     }
@@ -796,19 +834,8 @@ impl StreamCalls {
         self.held.first_result().map(|(at, _)| at)
     }
 
-    /// Releases the results from History to the next activation in the order of the first run,
-    /// regardless of their index. It stops at the first result whose call Workflow code hasn't
-    /// issued. A replay with chunking on does the same for Local Activity results when it has no
-    /// other job to give.
-    pub(crate) fn release_ready(&mut self) {
-        let held = self.held.first_result();
-        let comes = |key: &&(u64, CallKey)| held.is_none_or(|held| **key < held);
-        self.released = self.ready.keys().take_while(comes).last().copied();
-    }
-
-    fn is_due(&self, key: &(u64, CallKey), activation: u64, marker: Option<u64>) -> bool {
-        (key.0 <= activation || self.released.is_some_and(|released| *key <= released))
-            && marker.is_none_or(|marker| key.0 < marker)
+    fn is_due(key: &(u64, CallKey), activation: u64, marker: Option<u64>) -> bool {
+        key.0 <= activation && marker.is_none_or(|marker| key.0 < marker)
     }
 
     /// Returns the append marker of the live results that the last [`Self::take_jobs`] gave, if it
@@ -873,7 +900,6 @@ impl StreamCalls {
         }
     }
 
-    /// Returns the calls that the Worker must start or stop.
     pub(crate) fn take_requests(&mut self) -> Vec<Request> {
         mem::take(&mut self.requests)
     }
@@ -885,7 +911,6 @@ impl StreamCalls {
         self.task = TaskState::NoTask;
         self.held = Held::default();
         self.ready.clear();
-        self.released = None;
         self.marker = StreamAppendMarkerData::default();
         self.read_marker = StreamReadMarkerData::default();
         self.marked = false;
@@ -899,8 +924,7 @@ impl StreamCalls {
     }
 
     /// Gives a ref with no Store name the Store of the Worker's runtime under the empty name, else
-    /// of its only runtime. A replay does the same, so it compares History with the Store that a
-    /// live call uses.
+    /// of its only runtime. Replay uses the Store recorded in the marker.
     fn resolve_store(&self, stream: &mut StreamRef) -> Result<(), WFMachinesError> {
         if !stream.store.is_empty() {
             return Ok(());
@@ -916,14 +940,6 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Checks that a live call can run on the Store of `stream`.
-    fn check_runtime(&self, stream: &StreamRef) -> Result<(), WFMachinesError> {
-        if self.phase == Phase::Live && self.runtimes.get(&stream.store).is_none() {
-            return Err(no_runtime(stream));
-        }
-        Ok(())
-    }
-
     fn match_append(&mut self, seq: u32) -> Result<(), WFMachinesError> {
         let Some(append) = self.appends.get_mut(&seq) else {
             return Ok(());
@@ -932,6 +948,9 @@ impl StreamCalls {
             return Ok(());
         };
         let call = CallKey::Append(seq);
+        if append.stream.store.is_empty() {
+            append.stream.store.clone_from(&entry.store);
+        }
         check_stream(call, &append.stream, &entry.stream_id, &entry.store)?;
         if !matches!(append.state, AppendState::Waiting { .. }) {
             return Err(second("result", call));
@@ -952,6 +971,9 @@ impl StreamCalls {
             return Ok(());
         };
         let (call, entry) = (CallKey::Read(seq), &held.entry);
+        if read.stream.store.is_empty() {
+            read.stream.store.clone_from(&entry.store);
+        }
         check_stream(call, &read.stream, &entry.stream_id, &entry.store)?;
         let from_offset = &read.request.from_offset;
         if entry.from_offset != *from_offset {
@@ -1182,19 +1204,14 @@ impl StreamCalls {
         self.requests.push(Request::Run(call));
     }
 
-    /// Removes `call` from the run. A live call left its queue when its result arrived.
     fn leave(&mut self, call: CallKey) {
-        let stream = match call {
-            CallKey::Append(seq) => (self.appends.remove(&seq))
-                .filter(|append| !matches!(append.state, AppendState::Done(_)))
-                .map(|append| append.stream),
+        match call {
+            CallKey::Append(seq) => {
+                self.appends.remove(&seq);
+            }
             CallKey::Read(seq) => {
                 self.reads.remove(&seq);
-                None
             }
-        };
-        if let Some(stream) = stream {
-            self.leave_queue(&key(&stream), call);
         }
     }
 
@@ -1361,8 +1378,10 @@ fn key(stream: &StreamRef) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{StreamManager, manager::recorded, read::record_bytes};
-    use super::*;
+    use super::{
+        super::{StreamManager, manager::recorded, read::record_bytes},
+        *,
+    };
     use crate::test_help::stream_store::{MemoryStore, Request as StoreRequest};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
@@ -1661,21 +1680,6 @@ mod tests {
         assert_eq!(entries(live.take_marker()), [(3, 2)]);
     }
 
-    #[test]
-    fn a_release_ends_with_its_activation() {
-        let mut replay = calls(Phase::Replaying, 9);
-        replay.append(append(1, "1")).unwrap();
-        replay.peeked(marker(2, 1, "1"), vec![]).unwrap();
-        replay.release_ready();
-        assert_eq!(jobs(&mut replay, 0), ["append 1"]);
-        // A result of the next task waits for its own activation.
-        replay.append(append(2, "2")).unwrap();
-        replay.peeked(marker(1, 2, "2"), vec![]).unwrap();
-        assert!(!replay.has_jobs(0, None));
-    }
-
-    // Core asks for a new task for an open read only when it knows for certain that the Stream
-    // has Records for it. Otherwise the read stops at the completion and starts in the next task.
     #[test]
     fn a_read_needs_the_next_task_only_when_its_stream_has_more_for_it() {
         let mut live = calls(Phase::Live, 3);
@@ -2835,19 +2839,21 @@ mod tests {
             command.stream.as_mut().unwrap().store.clear();
             command
         };
-        for phase in [Phase::Live, Phase::Replaying, Phase::ReplayOnly] {
-            for stores in [&[][..], &["mem", "other"][..]] {
-                let mut calls = StreamCalls::new("n", "w", "r", runtimes(stores), phase);
-                calls.set_task(TaskState::Open(task_attempt(3)));
-                let error = format!(
-                    "A Stream call with no Store name needs a Stream runtime under the empty \
-                     name or exactly one Stream runtime, and this Worker has {}",
-                    stores.len()
-                );
-                let result = calls.append(nameless(1));
-                assert_eq!(result, Err(WFMachinesError::Stream(error)), "{phase:?}");
-                assert!(calls.appends.is_empty(), "{phase:?}");
-            }
+        for stores in [&[][..], &["mem", "other"][..]] {
+            let mut live = StreamCalls::new("n", "w", "r", runtimes(stores), Phase::Live);
+            live.set_task(TaskState::Open(task_attempt(3)));
+            assert!(matches!(
+                live.append(nameless(1)),
+                Err(WFMachinesError::Stream(_))
+            ));
+            assert!(live.appends.is_empty());
+        }
+        for stores in [&[][..], &["other"][..], &["mem", "other"][..]] {
+            let mut replay = StreamCalls::new("n", "w", "r", runtimes(stores), Phase::ReplayOnly);
+            replay.append(nameless(1)).unwrap();
+            replay.peeked(marker(0, 1, "s"), vec![]).unwrap();
+            assert_eq!(jobs(&mut replay, 0), ["append 1"]);
+            assert!(replay.take_requests().is_empty());
         }
         let mut live = calls(Phase::Live, 3);
         live.append(nameless(1)).unwrap();
@@ -2866,27 +2872,16 @@ mod tests {
         let mut replaying = calls(Phase::Replaying, 3);
         replaying.append(nameless(1)).unwrap();
         replaying.append(append(2, "s")).unwrap();
+        replaying.append(nameless(3)).unwrap();
         replaying.go_live().unwrap();
-        let running: Vec<(u32, String)> = (replaying.take_requests().into_iter())
-            .map(|request| match request {
-                Request::Run(call) => (call.seq, call.store),
-                Request::Stop(_) => panic!("Nothing stops"),
-            })
-            .collect();
-        assert_eq!(running, [(1, "mem".to_string())]);
-
-        let mut replay = calls(Phase::ReplayOnly, 9);
-        replay.append(nameless(1)).unwrap();
-        replay.peeked(marker(0, 1, "s"), vec![]).unwrap();
-        assert_eq!(jobs(&mut replay, 0), ["append 1"]);
-        let mut other = StreamCalls::new("n", "w", "r", runtimes(&["other"]), Phase::ReplayOnly);
-        other.append(nameless(1)).unwrap();
-        let error = "Stream append 1 is for Stream `s` in Store `other`, and History has it for \
-                     Stream `s` in Store `mem`";
-        assert_eq!(
-            other.peeked(marker(0, 1, "s"), vec![]),
-            Err(WFMachinesError::Nondeterminism(error.to_string()))
-        );
+        for seq in 1..=3 {
+            let requests = replaying.take_requests();
+            let [Request::Run(call)] = requests.as_slice() else {
+                panic!("Expected only append {seq}, got {requests:?}");
+            };
+            assert_eq!((call.seq, call.store.as_str()), (seq, "mem"));
+            finish(&mut replaying, seq, None);
+        }
     }
 
     #[test]
@@ -2896,33 +2891,33 @@ mod tests {
             command.stream.as_mut().unwrap().store.clear();
             command
         };
-        for phase in [Phase::Live, Phase::Replaying, Phase::ReplayOnly] {
-            for stores in [&[][..], &["mem", "other"][..]] {
-                let mut calls = StreamCalls::new("n", "w", "r", runtimes(stores), phase);
-                calls.set_task(TaskState::Open(task_attempt(3)));
-                let error = format!(
-                    "A Stream call with no Store name needs a Stream runtime under the empty \
-                     name or exactly one Stream runtime, and this Worker has {}",
-                    stores.len()
-                );
-                let result = calls.read(nameless(1));
-                assert_eq!(result, Err(WFMachinesError::Stream(error)), "{phase:?}");
-                assert!(calls.reads.is_empty(), "{phase:?}");
-            }
+        for stores in [&[][..], &["mem", "other"][..]] {
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes(stores), Phase::Live);
+            calls.set_task(TaskState::Open(task_attempt(3)));
+            assert!(matches!(
+                calls.read(nameless(1)),
+                Err(WFMachinesError::Stream(_))
+            ));
+            assert!(calls.reads.is_empty());
         }
-        let mut live = calls(Phase::Live, 3);
-        live.read(nameless(1)).unwrap();
-        let stores: Vec<(String, String)> = (live.take_requests().into_iter())
-            .map(|request| match request {
+        for phase in [Phase::Live, Phase::Replaying] {
+            let mut calls = calls(phase, 3);
+            calls.read(nameless(1)).unwrap();
+            calls.go_live().unwrap();
+            let requests = calls.take_requests();
+            let [
                 Request::Run(Call {
                     store,
                     op: Op::Read(read),
                     ..
-                }) => (store, read.request.r#ref.unwrap().store),
-                _ => panic!("Only the read runs"),
-            })
-            .collect();
-        assert_eq!(stores, [("mem".to_string(), "mem".to_string())]);
+                }),
+            ] = requests.as_slice()
+            else {
+                panic!("Expected one read, got {requests:?}");
+            };
+            assert_eq!(store, "mem");
+            assert_eq!(read.request.r#ref.as_ref().unwrap().store, "mem");
+        }
 
         let entry = StreamReadResult {
             seq: 1,
@@ -2937,18 +2932,21 @@ mod tests {
                 reads: vec![entry.clone()],
             })
         };
-        let mut replay = calls(Phase::ReplayOnly, 9);
-        replay.read(nameless(1)).unwrap();
-        replay.peeked(marker(), vec![]).unwrap();
-        assert_eq!(jobs(&mut replay, 0), ["read 1: failed"]);
-        let mut other = StreamCalls::new("n", "w", "r", runtimes(&["other"]), Phase::ReplayOnly);
-        other.read(nameless(1)).unwrap();
-        let error = "Stream read 1 is for Stream `s` in Store `other`, and History has it for \
-                     Stream `s` in Store `mem`";
-        assert_eq!(
-            other.peeked(marker(), vec![]),
-            Err(WFMachinesError::Nondeterminism(error.to_string()))
-        );
+        for stores in [&[][..], &["other"][..], &["mem", "other"][..]] {
+            let mut replay = StreamCalls::new("n", "w", "r", runtimes(stores), Phase::ReplayOnly);
+            replay.read(nameless(1)).unwrap();
+            replay.peeked(marker(), vec![]).unwrap();
+            assert_eq!(jobs(&mut replay, 0), ["read 1: failed"]);
+            assert!(replay.take_requests().is_empty());
+        }
+        let mut named = calls(Phase::ReplayOnly, 9);
+        let mut command = read(1, "s", &[]);
+        command.stream.as_mut().unwrap().store = "other".into();
+        named.read(command).unwrap();
+        assert!(matches!(
+            named.peeked(marker(), vec![]),
+            Err(WFMachinesError::Nondeterminism(_))
+        ));
     }
 
     #[test]
@@ -3001,12 +2999,8 @@ mod tests {
         assert_eq!(jobs(&mut replay, 0), ["read 1: failed"]);
         let mut recorded_in_mem = with_default(Phase::ReplayOnly);
         recorded_in_mem.read(nameless(1)).unwrap();
-        let error = "Stream read 1 is for Stream `s` in Store ``, and History has it for Stream \
-                     `s` in Store `mem`";
-        assert_eq!(
-            recorded_in_mem.peeked(marker("mem"), vec![]),
-            Err(WFMachinesError::Nondeterminism(error.to_string()))
-        );
+        recorded_in_mem.peeked(marker("mem"), vec![]).unwrap();
+        assert_eq!(jobs(&mut recorded_in_mem, 0), ["read 1: failed"]);
     }
 
     #[test]
@@ -3055,12 +3049,8 @@ mod tests {
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
         let mut recorded_in_mem = with_default(Phase::ReplayOnly);
         recorded_in_mem.append(nameless(1)).unwrap();
-        let error = "Stream append 1 is for Stream `s` in Store ``, and History has it for Stream \
-                     `s` in Store `mem`";
-        assert_eq!(
-            recorded_in_mem.peeked(marker(0, 1, "s"), vec![]),
-            Err(WFMachinesError::Nondeterminism(error.to_string()))
-        );
+        recorded_in_mem.peeked(marker(0, 1, "s"), vec![]).unwrap();
+        assert_eq!(jobs(&mut recorded_in_mem, 0), ["append 1"]);
     }
 
     #[test]

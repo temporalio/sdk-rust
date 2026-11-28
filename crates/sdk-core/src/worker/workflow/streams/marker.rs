@@ -88,7 +88,6 @@ pub(crate) fn marker_details(
     )]))
 }
 
-/// Returns true if `event` is a Stream marker of either kind.
 pub(crate) fn is_stream_marker(event: &HistoryEvent) -> bool {
     marker_of(event).is_some()
 }

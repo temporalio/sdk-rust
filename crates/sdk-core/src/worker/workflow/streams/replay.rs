@@ -489,11 +489,13 @@ pub(crate) fn offset_text(offset: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        StreamSettings, marker_details,
-        test_store::{Entry, Fault, Model, ModelStore, client},
+    use super::{
+        super::{
+            StreamSettings, marker_details,
+            test_store::{Entry, Fault, Model, ModelStore, client},
+        },
+        *,
     };
-    use super::*;
     use parking_lot::Mutex;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::{Arc, atomic::Ordering};

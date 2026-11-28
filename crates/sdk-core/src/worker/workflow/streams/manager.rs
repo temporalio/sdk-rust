@@ -74,7 +74,6 @@ pub(crate) struct ReadCall {
 /// if a read has one at the read limit, at the completion or at the heartbeat.
 pub(crate) type LastTry = Arc<Mutex<Option<StreamFailure>>>;
 
-/// The result of a call, sent to its run.
 #[derive(Debug)]
 pub(crate) struct StreamResolution {
     pub(crate) call_id: u64,
@@ -124,7 +123,6 @@ impl StreamManager {
         }
     }
 
-    /// Starts and stops calls of the run `run_id`.
     pub(crate) fn dispatch(&self, run_id: &str, requests: Vec<Request>) {
         // The lock is held across each spawn, so a call's entry exists even if the call ends
         // immediately.
@@ -171,10 +169,15 @@ impl StreamManager {
     pub(crate) fn outage(&self, run_id: &str) -> Option<String> {
         let tasks = self.tasks.lock();
         let run = tasks.get(run_id)?;
+        // A finished task still in the map never delivered a result or received a cancellation.
         run.iter()
-            .filter_map(|(call_id, task)| Some((*call_id, task.outage.as_ref()?)))
+            .filter(|(_, task)| task.outage.is_some() || task.abort.is_finished())
             .min_by_key(|(call_id, _)| *call_id)
-            .map(|(_, outage)| outage.clone())
+            .map(|(_, task)| {
+                task.outage.clone().unwrap_or_else(|| {
+                    "StreamStoreUnavailable: A Stream Store task ended without a result".to_string()
+                })
+            })
     }
 
     fn spawn(&self, run_id: &str, call: Call) -> AbortHandle {
@@ -507,11 +510,13 @@ pub(super) fn cut(text: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        read::After,
-        test_store::{Entry, Fault, Model, ModelStore, client},
+    use super::{
+        super::{
+            read::After,
+            test_store::{Entry, Fault, Model, ModelStore, client},
+        },
+        *,
     };
-    use super::*;
     use crate::test_help::stream_store::{MemoryStore, Op as StoreOp};
     use prost::Message;
     use prost_types::Timestamp;
