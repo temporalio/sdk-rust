@@ -681,8 +681,7 @@ impl WorkflowMachines {
         }
     }
 
-    /// Lets Core fail the workflow in an update-only task. The fail command accepts no update, but
-    /// the server takes it and aborts the update.
+    /// The server accepts a forced failure without an Update response and aborts the Update.
     pub(crate) fn allow_forced_failure_in_update_only_task(&mut self) {
         self.update_only_task = false;
     }

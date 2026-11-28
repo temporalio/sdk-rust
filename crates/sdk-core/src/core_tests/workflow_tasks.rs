@@ -1520,12 +1520,8 @@ async fn fail_wft_then_recover() {
     core.drain_pollers_and_shutdown().await;
 }
 
-/// The type of each command of each completion, with the message of its failure if any.
 type SentCommands = Arc<Mutex<Vec<Vec<(CommandType, Option<String>)>>>>;
 
-/// Runs the tasks of `mh` with `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`,
-/// so nondeterminism fails the workflow rather than the task, and completes each activation with
-/// `lang` until the run is evicted. Returns the commands of each completion.
 async fn run_failing_workflow_on_nondeterminism(
     mh: MockPollCfg,
     mut lang: impl FnMut(&WorkflowActivation) -> WorkflowActivationCompletion,
@@ -1545,7 +1541,6 @@ async fn run_failing_workflow_on_nondeterminism(
     sent.lock().clone()
 }
 
-/// Returns a worker for `mh` that fails workflows on nondeterminism, and the commands it sends.
 fn worker_failing_workflows_on_nondeterminism(mut mh: MockPollCfg) -> (Worker, SentCommands) {
     let sent = SentCommands::default();
     let kept = sent.clone();
@@ -1715,16 +1710,14 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its
     );
 }
 
-/// The state of the local activity of a live task when lang fails the task.
 #[derive(Clone, Copy, Debug)]
 enum LocalActivityAtTheFailure {
     Running,
     ResultCameDuringTheActivation,
 }
 
-// The workflow fails, so the failure must not wait for the local activity. A result that came
-// while lang had the activation must not activate lang again or follow the fail command. The
-// result and the completion go through one ordered queue, so the result reaches the run first.
+// A Local Activity result received during an activation must not replace lang's failure.
+// Both notifications use one queue, so completing the Activity first fixes their order.
 #[rstest]
 #[case::running(LocalActivityAtTheFailure::Running)]
 #[case::result_came_during_the_activation(LocalActivityAtTheFailure::ResultCameDuringTheActivation)]
@@ -1798,46 +1791,10 @@ async fn a_nondeterminism_failure_in_a_live_task_with_a_local_activity_sends_one
     );
 }
 
-/// When the first run's workflow code scheduled local activity 2 of task 1.
-#[derive(Clone, Copy, Debug)]
-enum SecondLocalActivity {
-    AtTheFirstResult,
-    WithTheFirst,
-}
-
-/// What lang answers if Core activates it again after its failure.
-#[derive(Clone, Copy, Debug)]
-enum ReplyAfterTheFailure {
-    FailsAgain,
-    StartsTheTimer,
-    SendsNoCommands,
-}
-
-// History records the two results for activations 1 and 2 of task 1, so replay holds the second
-// one while lang fails the first. The held result must not keep the failure from going out, give
-// lang another activation, or let lang's next reply replace the cause.
-#[rstest]
-#[case::at_the_first_result(
-    SecondLocalActivity::AtTheFirstResult,
-    ReplyAfterTheFailure::FailsAgain
-)]
-#[case::with_the_first_then_a_failure(
-    SecondLocalActivity::WithTheFirst,
-    ReplyAfterTheFailure::FailsAgain
-)]
-#[case::with_the_first_then_a_timer(
-    SecondLocalActivity::WithTheFirst,
-    ReplyAfterTheFailure::StartsTheTimer
-)]
-#[case::with_the_first_then_no_commands(
-    SecondLocalActivity::WithTheFirst,
-    ReplyAfterTheFailure::SendsNoCommands
-)]
+// History assigns the second result to a later activation.
+// Releasing it after lang fails would let another reply replace the failure.
 #[tokio::test]
-async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_command(
-    #[case] second: SecondLocalActivity,
-    #[case] reply: ReplyAfterTheFailure,
-) {
+async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_command() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
@@ -1869,24 +1826,12 @@ async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_co
         activations.borrow_mut().push(act.jobs.clone());
         let count = activations.borrow().len();
         match &act.jobs[0].variant {
-            Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
-                let commands = match second {
-                    SecondLocalActivity::AtTheFirstResult => vec![local_activity(1)],
-                    SecondLocalActivity::WithTheFirst => vec![local_activity(1), local_activity(2)],
-                };
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_)) if count == 1 => {
+                let commands = vec![local_activity(1), local_activity(2)];
                 WorkflowActivationCompletion::from_cmds(act.run_id.clone(), commands)
             }
             _ if count == 2 => langs_nondeterminism_failure(act),
-            _ => match reply {
-                ReplyAfterTheFailure::FailsAgain => langs_nondeterminism_failure(act),
-                ReplyAfterTheFailure::StartsTheTimer => WorkflowActivationCompletion::from_cmds(
-                    act.run_id.clone(),
-                    vec![start_timer_cmd(1, Duration::from_secs(1))],
-                ),
-                ReplyAfterTheFailure::SendsNoCommands => {
-                    WorkflowActivationCompletion::empty(act.run_id.clone())
-                }
-            },
+            _ => panic!("Unexpected activation after lang failed: {act:?}"),
         }
     };
     let run = run_failing_workflow_on_nondeterminism(mh, lang);
@@ -1914,28 +1859,21 @@ async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_co
     );
 }
 
-/// Who finds the nondeterminism in an update-only task.
 #[derive(Clone, Copy, Debug)]
 enum UpdateOnlyNondeterminism {
-    /// Lang fails the activation, as the Rust SDK does with `[TMPRL1100]`.
     Lang,
-    /// Lang sends a command without accepting the update, which Core rejects.
     Core,
 }
 
-/// The state of the run when the update-only task comes.
 #[derive(Clone, Copy, Debug)]
 enum RunAtTheUpdate {
-    /// The worker completed task 1 and kept the run.
     Cached,
-    /// The task brings all of history, as a poll that is not sticky does. The update then comes
-    /// with the workflow's initialization, so the activation is not update-only.
+    /// Cold replay includes initialization, so the Update-only restriction doesn't apply.
     Cold,
 }
 
-// A live task that only delivers an update has no new events but its own scheduled and started
-// events. The forced fail command is not an update response, so it must not trip Core's check
-// for commands in an update-only activation. The workflow fails once, with the error found.
+// A forced failure must bypass the restriction on commands in an Update-only task.
+// Otherwise Core retries the same forced failure recursively.
 #[rstest]
 #[case::lang_cached(UpdateOnlyNondeterminism::Lang, RunAtTheUpdate::Cached)]
 #[case::core_cached(UpdateOnlyNondeterminism::Core, RunAtTheUpdate::Cached)]
@@ -2014,16 +1952,12 @@ async fn a_nondeterminism_failure_in_an_update_only_task_fails_the_workflow_once
     );
 }
 
-/// Where the nondeterminism is, in a history whose second page ends inside a task.
 #[derive(Clone, Copy, Debug)]
 enum NondeterminismAtTheLastPage {
-    /// Lang fails the activation of the last task that the second page completes.
     Lang,
-    /// Lang's command in the activation before that task differs from it, which Core finds.
     Core,
 }
 
-/// The events of `t` with an id in `ids`, as a page of `GetWorkflowExecutionHistory`.
 fn history_page(
     t: &TestHistoryBuilder,
     ids: RangeInclusive<i64>,
@@ -2041,8 +1975,6 @@ fn history_page(
     }
 }
 
-/// Mocks that poll `task`, and fetch the page of `pages` with the requested page token. The
-/// counter counts the fetches.
 fn paged_history_mocks(
     wf_id: &str,
     t: TestHistoryBuilder,
@@ -2065,10 +1997,6 @@ fn paged_history_mocks(
     (mh, fetches)
 }
 
-/// Runs a workflow that starts timer `n` in activation `n`, until `found_by` makes activation
-/// `failing_activation` nondeterministic. Checks that lang's completion returns, that the workflow
-/// fails once with the error found, and that lang gets no activation after it. Returns the value
-/// of `fetches` when lang got the failing activation.
 async fn fail_a_timer_loop_once(
     mh: MockPollCfg,
     found_by: NondeterminismAtTheLastPage,
@@ -2137,10 +2065,7 @@ async fn fail_a_timer_loop_once(
     fetches_at_the_failure
 }
 
-// The poll brings the first page of a long history and the paginator fetches the rest by page
-// token. The second page ends inside task 3, so the failure in task 2 would come before the last
-// page if the paginator stopped there. It loads every page first, since only the current task
-// follows the previous started event. The workflow fails once and lang's completion returns.
+// Only the current task follows the previous start, so Core must fetch every page first.
 #[rstest]
 #[case::lang(NondeterminismAtTheLastPage::Lang, 2)]
 #[case::core(NondeterminismAtTheLastPage::Core, 1)]
@@ -2183,12 +2108,8 @@ async fn a_nondeterminism_failure_in_a_paged_history_sends_one_command(
     );
 }
 
-// A sticky task comes for a run that is no longer cached, so Core fetches history from the start.
-// By then the task timed out and another worker completed the next two tasks, so the history goes
-// past the task's own started event. Two tasks then follow the previous started event, and the
-// paginator stops after the second page, which ends inside the last task. A forced failure at the
-// last task of that page must not wait for the next one. The server refuses the completion of a
-// timed out task, which doesn't change what Core sends.
+// A stale sticky poll can fetch History newer than its own task.
+// A forced failure must complete even when that replay needs another page.
 #[rstest]
 #[case::lang(NondeterminismAtTheLastPage::Lang, 5)]
 #[case::core(NondeterminismAtTheLastPage::Core, 4)]
@@ -2217,7 +2138,6 @@ async fn a_nondeterminism_failure_before_the_next_page_of_a_timed_out_task_sends
         ),
         (13, 18)
     );
-    // That task times out, and another worker completes the next attempt and one more task.
     t.add_workflow_task_timed_out();
     t.add_full_wf_task();
     let started = t.add_timer_started("4".to_string());
@@ -2240,10 +2160,8 @@ async fn a_nondeterminism_failure_before_the_next_page_of_a_timed_out_task_sends
     );
 }
 
-// As above, a sticky task for an uncached run reads a history that goes past its started event.
-// Here no task has a command. The first page ends inside a task, so the first update ends at the
-// task of signal "2", which only the events after it on that page show to be complete. Lang must
-// still get every signal once, in order, before Core completes the task.
+// The first page's trailing events confirm the task for signal "2" is complete.
+// Splitting those events into the next update must not omit that task.
 #[tokio::test]
 async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang() {
     let wf_id = "fake_wf_id";
@@ -2260,7 +2178,6 @@ async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang
         ),
         (3, 7)
     );
-    // That task times out, and another worker completes the next attempt and three more signals.
     t.add_workflow_task_timed_out();
     t.add_full_wf_task();
     for signal in ["2", "3", "4"] {
@@ -2272,7 +2189,6 @@ async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang
         (vec![1], history_page(&t, 19..=23, vec![])),
     ];
     let (mut mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
-    // With no matching expectation, mockall panics with the arguments, so with Core's error.
     mh.expect_fail_wft_matcher = Box::new(|_, _, _| false);
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
@@ -2385,6 +2301,29 @@ async fn a_timeout_on_the_next_page_does_not_change_workflow_history_length() {
         [(1, 11), (2, 19), (3, 24)],
         "a historical timed-out task must not set the Workflow's observed History length"
     );
+}
+
+#[tokio::test]
+async fn pending_cache_eviction_keeps_forced_failure_with_an_attached_query() {
+    let history = canned_histories::single_timer("1");
+    let mut poll = hist_to_poll_resp(&history, "wf", ResponseType::ToTaskNum(1)).resp;
+    poll.queries.insert("q1".into(), Default::default());
+    let mock = MockPollCfg::from_resp_batches("wf", history, [poll], mock_worker_client());
+    let (core, sent) = worker_failing_workflows_on_nondeterminism(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.request_wf_eviction(
+        &act.run_id,
+        "Workflow cache full",
+        EvictionReason::CacheFull,
+    );
+    core.complete_workflow_activation(langs_nondeterminism_failure(&act))
+        .await
+        .unwrap();
+
+    assert_eq!(*sent.lock(), fails_with_langs_error());
+    core.handle_eviction().await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]
@@ -4315,7 +4254,7 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .await
         .unwrap();
 
-    // The first page holds the signal's task, so lang gets it before Core fetches the next page.
+    // The signal must be delivered before the next page's fetch fails.
     let wf_task = core.poll_workflow_activation().await.unwrap();
     assert_matches!(
         wf_task.jobs.as_slice(),

@@ -37,7 +37,7 @@ relevant information.
 ## Unreleased
 
 ### Fixed
-* Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
+* Workflow replay skips timed-out tasks consistently when a History page ends at the task start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

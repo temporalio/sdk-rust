@@ -523,9 +523,7 @@ impl ManagedRun {
                 versioning_behavior,
             };
 
-            // Verify we can actually apply the next workflow task, which will happen as part of
-            // applying the completion to machines. If we can't, return early indicating we need
-            // to fetch a page. A forced failure applies no next task, so it never waits for one.
+            // A forced failure applies no next task, so it must not wait for another History page.
             if !is_forced_failure && !self.wfm.ready_to_apply_next_wft() {
                 return if let Some(paginator) = self.paginator.take() {
                     debug!("Need to fetch a history page before next WFT can be applied");
@@ -679,6 +677,10 @@ impl ManagedRun {
             )
         {
             warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            // An earlier cache eviction may have kept queries that would delay this failure.
+            if let Some(wft) = self.wft.as_mut() {
+                wft.pending_queries.clear();
+            }
             self.wfm.machines.allow_forced_failure_in_update_only_task();
             return self
                 .successful_completion(
@@ -898,8 +900,7 @@ impl ManagedRun {
                     }))
                 }
             }
-            // A nondeterminism error here would make `failed_completion` force the failure again,
-            // and hit the same error, until the stack overflows. So the task fails instead.
+            // Retrying a forced failure here would recurse on the same nondeterminism error.
             Err(e @ WFMachinesError::Nondeterminism(_)) if completion.is_forced_failure => {
                 Err(RunUpdateErr {
                     source: WFMachinesError::Fatal(format!("Could not fail the workflow: {e}")),
